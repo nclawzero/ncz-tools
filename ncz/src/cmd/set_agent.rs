@@ -199,11 +199,7 @@ mod tests {
             &["image", "exists", "localhost/zeroclaw:latest"],
             out(0, "", ""),
         );
-        runner.expect(
-            "sudo",
-            &["systemctl", "daemon-reload"],
-            out(0, "", ""),
-        );
+        runner.expect("sudo", &["systemctl", "daemon-reload"], out(0, "", ""));
         runner.expect(
             "sudo",
             &["systemctl", "stop", "openclaw.service"],
