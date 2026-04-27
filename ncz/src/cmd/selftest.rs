@@ -5,5 +5,7 @@ use crate::cli::Context;
 use crate::error::NczError;
 
 pub fn run(_ctx: &Context) -> Result<i32, NczError> {
-    Err(NczError::Precondition("selftest: not yet implemented".into()))
+    Err(NczError::Precondition(
+        "selftest: not yet implemented".into(),
+    ))
 }

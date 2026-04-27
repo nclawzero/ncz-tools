@@ -5,5 +5,7 @@ use crate::cli::Context;
 use crate::error::NczError;
 
 pub fn run(_ctx: &Context, _agent: Option<&str>) -> Result<i32, NczError> {
-    Err(NczError::Precondition("restart: not yet implemented".into()))
+    Err(NczError::Precondition(
+        "restart: not yet implemented".into(),
+    ))
 }

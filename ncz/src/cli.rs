@@ -41,17 +41,11 @@ pub enum Command {
         agent: Option<String>,
     },
     /// Restart the active or named agent.
-    Restart {
-        agent: Option<String>,
-    },
+    Restart { agent: Option<String> },
     /// Pause (stop) the active or named agent.
-    Pause {
-        agent: Option<String>,
-    },
+    Pause { agent: Option<String> },
     /// Resume (start) the active or named agent.
-    Resume {
-        agent: Option<String>,
-    },
+    Resume { agent: Option<String> },
     /// Print binary, runtime, and image versions.
     Version,
     /// Manage LLM providers (list|test|set-primary).

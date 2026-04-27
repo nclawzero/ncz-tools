@@ -94,8 +94,7 @@ pub fn atomic_write(path: &Path, contents: &[u8], mode: u32) -> Result<(), NczEr
     let perms = fs::Permissions::from_mode(mode);
     fs::set_permissions(tmp.path(), perms)?;
 
-    tmp.persist(path)
-        .map_err(|e| NczError::Io(e.error))?;
+    tmp.persist(path).map_err(|e| NczError::Io(e.error))?;
 
     // fsync the parent directory so the rename survives crash.
     File::open(parent)?.sync_all()?;
