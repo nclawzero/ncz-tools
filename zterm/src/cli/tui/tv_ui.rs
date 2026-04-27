@@ -713,6 +713,7 @@ fn refresh_status_line(
     tapp.set_status_line(build_status_line(w, h, state));
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_event_loop(
     app: &mut Application,
     chat_lines: Rc<RefCell<Vec<String>>>,
@@ -1425,11 +1426,11 @@ fn dispatch_command(
     }
 }
 
-/// Read a snapshot of configured workspaces (name + optional label
-/// + active flag) from the shared App. Used to populate the
-/// workspace-switch picker. Uses `try_lock` so a stalled worker
-/// can't hang the TV thread; returns an empty vec in that case
-/// (the caller renders a friendly "no workspaces" message).
+/// Read a snapshot of configured workspaces from the shared App.
+///
+/// Captures name, optional label, and active flag for the workspace-switch
+/// picker. Uses `try_lock` so a stalled worker cannot hang the TV thread;
+/// returns an empty vec in that case.
 fn snapshot_workspace_names(shared_app: &Arc<Mutex<App>>) -> Vec<WorkspacePickerEntry> {
     let Ok(guard) = shared_app.try_lock() else {
         return Vec::new();
@@ -1513,13 +1514,13 @@ fn run_theme_editor(app: &mut Application, initial: [u8; 63]) -> Option<[u8; 63]
                 palette[idx] = join_attr((fg + 15) & 0x0F, bg);
                 app.set_palette(Some(palette.to_vec()));
             }
-            kc if kc == 0x4900 => {
+            0x4900 => {
                 // KB_PGUP
                 let (fg, bg) = split_attr(palette[idx]);
                 palette[idx] = join_attr(fg, (bg + 1) & 0x0F);
                 app.set_palette(Some(palette.to_vec()));
             }
-            kc if kc == 0x5100 => {
+            0x5100 => {
                 // KB_PGDN
                 let (fg, bg) = split_attr(palette[idx]);
                 palette[idx] = join_attr(fg, (bg + 15) & 0x0F);
@@ -1601,11 +1602,11 @@ fn draw_theme_editor(app: &mut Application, palette: &[u8; 63], idx: usize) {
     }
 }
 
-/// Present a MenuBox-style modal picker of workspaces. Each entry's
-/// MenuItem carries an index-encoded command ID (`CMD_WS_SELECT_BASE
-/// + i`) so the caller can map the return value back to a
-/// workspace name. Returns the selected workspace name, or `None`
-/// on Esc/cancel.
+/// Present a MenuBox-style modal picker of workspaces.
+///
+/// Each entry's MenuItem carries an index-encoded command ID
+/// (`CMD_WS_SELECT_BASE + i`) so the caller can map the return value back to a
+/// workspace name. Returns the selected workspace name, or `None` on Esc/cancel.
 fn run_workspace_picker(app: &mut Application, entries: &[WorkspacePickerEntry]) -> Option<String> {
     use turbo_vision::core::geometry::Point;
 
