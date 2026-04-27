@@ -78,7 +78,7 @@ pub fn switch_agent(
     }
 
     let image = quadlet::image_for(&target_quadlet)?.unwrap_or_default();
-    if !podman::image_exists(ctx.runner, &image)? {
+    if image.is_empty() || !podman::image_exists(ctx.runner, &image)? {
         return Err(NczError::Precondition(format!(
             "container image for {target} is missing ({}); run 'ncz update' first",
             if image.is_empty() { "unknown" } else { &image }
