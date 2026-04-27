@@ -1,0 +1,1189 @@
+//! OpenClaw gateway WebSocket client — v0.2 slice 3a (plumbing only).
+//!
+//! This slice stands up the WebSocket lifecycle: connect + read loop +
+//! write loop + pending-request correlation. The **handshake** (sending
+//! `connect` with a signed device identity) and **first RPC** (`models.list`
+//! etc.) land in slices 3b/3c.
+//!
+//! ### Architecture
+//!
+//! ```text
+//!                         caller task
+//!                            │
+//!              send_request(method, params)
+//!                            │
+//!                            ▼
+//!     ┌─────────────────────────────────────┐
+//!     │ 1. register(id) → oneshot::Receiver │
+//!     │ 2. mpsc::Sender<RequestFrame>       │
+//!     │ 3. await receiver for ResponseFrame │
+//!     └─────────────────────────────────────┘
+//!                            │
+//!              mpsc::Sender<RequestFrame>
+//!                            │
+//!                            ▼
+//!                  ┌──────────────────┐
+//!                  │ write_loop task  │  ← serializes + sends on WS
+//!                  └──────────────────┘
+//!                            │
+//!                            ▼
+//!                      [ WebSocket ]
+//!                            ▲
+//!                            │
+//!                  ┌──────────────────┐
+//!                  │  read_loop task  │  ← parses incoming frames
+//!                  └──────────────────┘
+//!                            │
+//!          ┌─────────────────┼──────────────────┐
+//!          ▼                 ▼                  ▼
+//!     Frame::Res        Frame::Event        Frame::Req
+//!     pending.resolve   event_tx.send       (never from server — log & drop)
+//! ```
+//!
+//! The read loop is the **single owner** of the WebSocket stream half;
+//! every other task interacts via the `mpsc` channel or the
+//! `PendingRequests` map. No shared-mutable-WebSocket.
+
+use anyhow::{anyhow, Context, Result};
+use futures::{SinkExt, StreamExt};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+use tokio_tungstenite::{
+    connect_async,
+    tungstenite::{Error as WsError, Message as WsMessage},
+};
+
+use super::wire::{Frame, PendingRequests, RequestFrame, ResponseFrame};
+
+/// Default timeout for a single RPC round-trip. Applies to any caller
+/// that uses the convenience `send_request` without its own timeout.
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Channel capacity for the outbound request queue. Small on purpose —
+/// backpressure the caller rather than buffer arbitrary requests.
+const OUTBOUND_CAPACITY: usize = 16;
+
+/// Channel capacity for server-pushed events. Streaming turns can push
+/// bursty deltas; bump higher than outbound.
+const EVENT_CAPACITY: usize = 256;
+
+/// WebSocket-connected openclaw gateway client. This struct is the
+/// single outward-facing handle — caller tasks clone the `outbound_tx`
+/// and `pending` / `event_rx` out of it to do real work.
+///
+/// Dropping this struct does **not** cancel the read/write loops; call
+/// `disconnect()` explicitly for a graceful shutdown. The background
+/// tasks also shut down on any WebSocket error and flip `connected` to
+/// false — callers should recheck `is_connected()` after errors.
+pub struct OpenClawClient {
+    /// Shared in-flight-request tracker. Reader clones this to fan
+    /// responses; callers register pending ids here.
+    pending: PendingRequests,
+
+    /// Mpsc sink for client → server frames. The write-loop task is
+    /// the only consumer. Wrapped in Option so  can drop
+    /// the sender (closing the channel) without moving out of .
+    outbound_tx: Option<mpsc::Sender<RequestFrame>>,
+
+    /// Event frames (`Frame::Event`) from the server. The read loop
+    /// pushes, a single consumer pops. `None` after `disconnect()`.
+    event_rx: Option<mpsc::Receiver<super::wire::EventFrame>>,
+
+    /// Becomes `false` when read or write loop exits (including
+    /// graceful disconnect).
+    connected: Arc<AtomicBool>,
+
+    /// Read + write loop join handles; retained for graceful shutdown.
+    /// Result of the last successful handshake. None if the client
+    /// has not handshaken yet (e.g. built via the raw connect for
+    /// testing). AgentClient method impls can inspect this to branch
+    /// on server version / advertised method set.
+    hello_ok: Option<super::handshake::HelloOk>,
+
+    read_task: Option<JoinHandle<()>>,
+    write_task: Option<JoinHandle<()>>,
+}
+
+impl std::fmt::Debug for OpenClawClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenClawClient")
+            .field("connected", &self.connected.load(Ordering::Relaxed))
+            .field("event_rx_live", &self.event_rx.is_some())
+            .finish()
+    }
+}
+
+impl OpenClawClient {
+    /// Open a WebSocket connection to the openclaw gateway at `url`.
+    ///
+    /// `url` must be a `ws://` or `wss://` URL (openclaw's http-listen
+    /// error messages are explicit that the gateway is WebSocket-first,
+    /// not HTTP). This function **does not perform the handshake** — it
+    /// only establishes the transport. The server will send a
+    /// `connect.challenge` event immediately; callers are responsible
+    /// for pulling that event off `event_rx`, signing it with their
+    /// `DeviceIdentity`, and sending a `connect` request before any
+    /// other method call succeeds. (Slice 3b packages the handshake.)
+    pub async fn connect(url: &str) -> Result<Self> {
+        let (ws_stream, _response) = connect_async(url)
+            .await
+            .with_context(|| format!("openclaw: WebSocket upgrade to {url} failed"))?;
+
+        let (ws_sink, ws_stream) = ws_stream.split();
+        let pending = PendingRequests::new();
+        let (outbound_tx, outbound_rx) = mpsc::channel::<RequestFrame>(OUTBOUND_CAPACITY);
+        let (event_tx, event_rx) = mpsc::channel::<super::wire::EventFrame>(EVENT_CAPACITY);
+        let connected = Arc::new(AtomicBool::new(true));
+
+        let read_task = tokio::spawn(read_loop(
+            ws_stream,
+            pending.clone(),
+            event_tx,
+            connected.clone(),
+        ));
+
+        let write_task = tokio::spawn(write_loop(ws_sink, outbound_rx, connected.clone()));
+
+        Ok(Self {
+            pending,
+            outbound_tx: Some(outbound_tx),
+            event_rx: Some(event_rx),
+            connected,
+            hello_ok: None,
+            read_task: Some(read_task),
+            write_task: Some(write_task),
+        })
+    }
+
+    /// True while both read and write loops are live. Flips to false on
+    /// any WebSocket error or graceful disconnect.
+    pub fn is_connected(&self) -> bool {
+        self.connected.load(Ordering::Relaxed)
+    }
+
+    /// Take ownership of the event receiver. Only one consumer task is
+    /// intended to own this at a time (slice 3b's handshake will take
+    /// it first to pick off the `connect.challenge` event; the TUI will
+    /// take it back for session-message streaming after handshake).
+    pub fn take_event_rx(&mut self) -> Option<mpsc::Receiver<super::wire::EventFrame>> {
+        self.event_rx.take()
+    }
+
+    /// Fire-and-await an RPC: generate a request id, register it in
+    /// `pending`, push the frame onto the outbound queue, and await
+    /// the correlated response. Times out after
+    /// `DEFAULT_REQUEST_TIMEOUT`.
+    pub async fn send_request(
+        &self,
+        method: impl Into<String>,
+        params: Option<serde_json::Value>,
+    ) -> Result<ResponseFrame> {
+        self.send_request_with_timeout(method, params, DEFAULT_REQUEST_TIMEOUT)
+            .await
+    }
+
+    /// Same as `send_request` but with an explicit timeout. Callers
+    /// that know their method blocks on a long-running agent turn
+    /// should bump this.
+    pub async fn send_request_with_timeout(
+        &self,
+        method: impl Into<String>,
+        params: Option<serde_json::Value>,
+        timeout: Duration,
+    ) -> Result<ResponseFrame> {
+        if !self.is_connected() {
+            return Err(anyhow!("openclaw: connection closed"));
+        }
+        let req = RequestFrame::new(method, params);
+        let id = req.id.clone();
+        let rx = self.pending.register(id.clone()).await;
+        let tx = self
+            .outbound_tx
+            .as_ref()
+            .ok_or_else(|| anyhow!("openclaw: write loop dropped (connection closed)"))?;
+        tx.send(req)
+            .await
+            .map_err(|_| anyhow!("openclaw: write loop dropped (connection closed)"))?;
+
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(frame)) => Ok(frame),
+            Ok(Err(_)) => Err(anyhow!(
+                "openclaw: request {id} abandoned (connection closed before response)"
+            )),
+            Err(_) => Err(anyhow!(
+                "openclaw: request {id} timed out after {timeout:?}"
+            )),
+        }
+    }
+
+    /// Graceful shutdown. Signals the write loop to exit, which closes
+    /// the socket and causes the read loop to exit too. Abandons any
+    /// in-flight requests (their callers see "connection closed").
+    pub async fn disconnect(&mut self) {
+        // Drop the sender so the write loop sees the mpsc close.
+        self.outbound_tx.take();
+        self.connected.store(false, Ordering::Relaxed);
+        self.pending.abort_all().await;
+        if let Some(t) = self.write_task.take() {
+            let _ = t.await;
+        }
+        if let Some(t) = self.read_task.take() {
+            // Read loop may be blocked on the socket; it will exit when
+            // the socket closes. Wait at most a second.
+            let _ = tokio::time::timeout(Duration::from_secs(1), t).await;
+        }
+    }
+}
+
+impl OpenClawClient {
+    // ==================================================================
+    // connect + handshake + AgentClient-facing method impls
+    // ==================================================================
+
+    /// High-level bootstrap: WebSocket upgrade + full handshake in one
+    /// call. Returns a client whose hello_ok is populated and whose
+    /// send_request can be used for any method in
+    /// hello_ok.features.methods.
+    pub async fn connect_and_handshake(
+        url: &str,
+        device: &super::device::DeviceIdentity,
+        params: &super::handshake::HandshakeParams,
+    ) -> anyhow::Result<Self> {
+        let mut client = Self::connect(url).await?;
+        let mut event_rx = client
+            .event_rx
+            .take()
+            .expect("fresh client must have event_rx");
+        let hello_ok =
+            super::handshake::perform_handshake(&client, &mut event_rx, device, params).await?;
+        client.event_rx = Some(event_rx);
+        client.hello_ok = Some(hello_ok);
+        Ok(client)
+    }
+
+    /// Result of the last successful handshake. None if the client
+    /// was built via the raw connect (e.g. for protocol-level tests).
+    pub fn hello_ok(&self) -> Option<&super::handshake::HelloOk> {
+        self.hello_ok.as_ref()
+    }
+
+    /// Fire the server health RPC. Returns true on success; false
+    /// on a server-reported error. Matches the semantics of
+    /// ZeroclawClient::health for trait AgentClient.
+    pub async fn rpc_health(&self) -> anyhow::Result<bool> {
+        let res = self.send_request("health", None).await?;
+        Ok(res.ok)
+    }
+
+    /// Fire models.list and return the parsed model catalog. Raw
+    /// openclaw shape (id, name, provider, alias?, contextWindow?,
+    /// reasoning?) — higher-level helpers on top of this reshape
+    /// into the zterm-wide Provider / Model types.
+    pub async fn rpc_models_list(&self) -> anyhow::Result<Vec<super::handshake::ModelChoice>> {
+        use anyhow::Context;
+        let res = self.send_request("models.list", None).await?;
+        if !res.ok {
+            let msg = res
+                .error
+                .as_ref()
+                .map(|e| format!("{} ({})", e.message, e.code))
+                .unwrap_or_else(|| "no error body".to_string());
+            anyhow::bail!("openclaw: models.list failed: {}", msg);
+        }
+        let payload = res
+            .payload
+            .ok_or_else(|| anyhow::anyhow!("openclaw: models.list response missing payload"))?;
+        #[derive(serde::Deserialize)]
+        struct ModelsListResult {
+            models: Vec<super::handshake::ModelChoice>,
+        }
+        let parsed: ModelsListResult = serde_json::from_value(payload)
+            .context("openclaw: models.list payload did not match schema")?;
+        Ok(parsed.models)
+    }
+    /// Fire `sessions.list` with the caller's filter options and
+    /// return the parsed row set. Pass `SessionsListOpts::default()`
+    /// for the sensible defaults openclaw ships (no derived titles
+    /// or preview reads — both are per-session file I/O).
+    pub async fn rpc_sessions_list(
+        &self,
+        opts: SessionsListOpts,
+    ) -> anyhow::Result<super::handshake::OpenClawSessionsListResult> {
+        use anyhow::Context;
+        let mut params = serde_json::Map::new();
+        if let Some(limit) = opts.limit {
+            params.insert("limit".into(), serde_json::json!(limit));
+        }
+        if let Some(am) = opts.active_minutes {
+            params.insert("activeMinutes".into(), serde_json::json!(am));
+        }
+        if opts.include_global {
+            params.insert("includeGlobal".into(), serde_json::json!(true));
+        }
+        if opts.include_derived_titles {
+            params.insert("includeDerivedTitles".into(), serde_json::json!(true));
+        }
+        if opts.include_last_message {
+            params.insert("includeLastMessage".into(), serde_json::json!(true));
+        }
+        if let Some(s) = opts.search {
+            params.insert("search".into(), serde_json::json!(s));
+        }
+
+        let params_val = if params.is_empty() {
+            None
+        } else {
+            Some(serde_json::Value::Object(params))
+        };
+        let res = self.send_request("sessions.list", params_val).await?;
+        if !res.ok {
+            let err = res
+                .error
+                .as_ref()
+                .map(|e| format!("{} ({})", e.message, e.code))
+                .unwrap_or_else(|| "no error body".to_string());
+            anyhow::bail!("openclaw: sessions.list failed: {}", err);
+        }
+        let payload = res
+            .payload
+            .ok_or_else(|| anyhow::anyhow!("openclaw: sessions.list response missing payload"))?;
+        serde_json::from_value(payload)
+            .context("openclaw: sessions.list payload did not match SessionsListResult schema")
+    }
+
+    /// Fire `sessions.send` and return the initial ack. This is the
+    /// fire half of a streaming chat turn — the server acknowledges
+    /// the turn synchronously with a `runId` and then broadcasts the
+    /// response body via `session.message` events. See slice 3f for
+    /// the streaming consumer.
+    ///
+    /// `key` must be a canonical session key returned by a prior
+    /// `sessions.create` or `sessions.list`. The server will reject
+    /// free-form keys.
+    ///
+    /// `opts.idempotency_key` is strongly recommended on retriable
+    /// call sites (e.g. reconnect-then-resend) — the server dedupes
+    /// by this key and re-acks the same runId for duplicate sends.
+    /// If None the server generates a random UUID per call.
+    pub async fn rpc_sessions_send(
+        &self,
+        key: &str,
+        message: &str,
+        opts: SessionsSendOpts,
+    ) -> anyhow::Result<super::handshake::OpenClawSessionSendAck> {
+        use anyhow::Context;
+        let mut params = serde_json::Map::new();
+        params.insert("key".into(), serde_json::json!(key));
+        params.insert("message".into(), serde_json::json!(message));
+        if let Some(t) = opts.thinking {
+            params.insert("thinking".into(), serde_json::json!(t));
+        }
+        if let Some(ms) = opts.timeout_ms {
+            params.insert("timeoutMs".into(), serde_json::json!(ms));
+        }
+        if let Some(idem) = opts.idempotency_key {
+            params.insert("idempotencyKey".into(), serde_json::json!(idem));
+        }
+
+        let res = self
+            .send_request("sessions.send", Some(serde_json::Value::Object(params)))
+            .await?;
+        if !res.ok {
+            let err = res
+                .error
+                .as_ref()
+                .map(|e| format!("{} ({})", e.message, e.code))
+                .unwrap_or_else(|| "no error body".to_string());
+            anyhow::bail!("openclaw: sessions.send failed: {}", err);
+        }
+        let payload = res
+            .payload
+            .ok_or_else(|| anyhow::anyhow!("openclaw: sessions.send response missing payload"))?;
+        serde_json::from_value(payload)
+            .context("openclaw: sessions.send payload did not match SessionSendAck schema")
+    }
+
+    /// Fire `sessions.create` with optional filter / seed params.
+    /// Returns the canonical key of the created session.
+    pub async fn rpc_sessions_create(
+        &self,
+        opts: SessionsCreateOpts,
+    ) -> anyhow::Result<super::handshake::OpenClawSessionCreateResult> {
+        use anyhow::Context;
+        let mut params = serde_json::Map::new();
+        if let Some(v) = opts.key {
+            params.insert("key".into(), serde_json::json!(v));
+        }
+        if let Some(v) = opts.agent_id {
+            params.insert("agentId".into(), serde_json::json!(v));
+        }
+        if let Some(v) = opts.label {
+            params.insert("label".into(), serde_json::json!(v));
+        }
+        if let Some(v) = opts.model {
+            params.insert("model".into(), serde_json::json!(v));
+        }
+        if let Some(v) = opts.message {
+            params.insert("message".into(), serde_json::json!(v));
+        }
+
+        let params_val = if params.is_empty() {
+            None
+        } else {
+            Some(serde_json::Value::Object(params))
+        };
+        let res = self.send_request("sessions.create", params_val).await?;
+        if !res.ok {
+            let err = res
+                .error
+                .as_ref()
+                .map(|e| format!("{} ({})", e.message, e.code))
+                .unwrap_or_else(|| "no error body".to_string());
+            anyhow::bail!("openclaw: sessions.create failed: {}", err);
+        }
+        let payload = res
+            .payload
+            .ok_or_else(|| anyhow::anyhow!("openclaw: sessions.create response missing payload"))?;
+        serde_json::from_value(payload)
+            .context("openclaw: sessions.create payload did not match SessionCreateResult schema")
+    }
+    /// Fire a chat turn and collect the assistant's reply from the
+    /// `session.message` event stream. This is the high-level turn
+    /// method the REPL uses — synchronous-feeling from the caller's
+    /// perspective, even though the bytes come back as a stream of
+    /// events over WebSocket.
+    ///
+    /// Flow:
+    ///   1. `sessions.messages.subscribe(key)` — route session events
+    ///      for this session key to our connId
+    ///   2. `sessions.send(key, message, opts)` — fire the turn,
+    ///      get the `runId`
+    ///   3. Loop on `event_rx` pulling `session.message` events whose
+    ///      `sessionKey` matches; return the first message with
+    ///      `role == "assistant"`
+    ///   4. `sessions.messages.unsubscribe(key)` — best-effort cleanup
+    ///
+    /// Returns the assistant message's `content` field as a String.
+    /// Tool-call responses (where `content` is a structured object,
+    /// not a plain string) are JSON-stringified — slice 3g can
+    /// surface tool calls to the terminal UX properly; for now the
+    /// REPL sees raw JSON.
+    ///
+    /// Borrow contract: takes `&mut self` because `event_rx` lives on
+    /// the client as an `Option<Receiver>` and is consumed / restored
+    /// across stages of this call. Don't interleave this call with
+    /// `take_event_rx()` or another `send_and_collect` on the same
+    /// client — single-consumer at a time.
+    pub async fn rpc_sessions_send_and_collect(
+        &mut self,
+        key: &str,
+        message: &str,
+        opts: SessionsSendOpts,
+        timeout: std::time::Duration,
+    ) -> anyhow::Result<String> {
+        // Stage 1: subscribe — server starts routing session.message
+        // events for this key to our connection.
+        let sub_res = self
+            .send_request(
+                "sessions.messages.subscribe",
+                Some(serde_json::json!({ "key": key })),
+            )
+            .await?;
+        if !sub_res.ok {
+            let err = sub_res
+                .error
+                .as_ref()
+                .map(|e| format!("{} ({})", e.message, e.code))
+                .unwrap_or_else(|| "no error body".to_string());
+            anyhow::bail!("openclaw: sessions.messages.subscribe failed: {}", err);
+        }
+
+        // Stage 2: fire the turn.
+        let _ack = self.rpc_sessions_send(key, message, opts).await?;
+
+        // Stage 3: take event_rx for the collect loop, then put it back
+        // on a best-effort basis so subsequent calls still work even if
+        // the collect errors out.
+        let mut event_rx = self
+            .event_rx
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("openclaw: event_rx already taken"))?;
+
+        let collect_res = collect_assistant_message(&mut event_rx, key, timeout).await;
+
+        self.event_rx = Some(event_rx);
+
+        // Stage 4: unsubscribe — best effort. A failure here is not
+        // fatal (server GCs subscribers on disconnect) so we log and
+        // return the collect result either way.
+        if let Err(e) = self
+            .send_request(
+                "sessions.messages.unsubscribe",
+                Some(serde_json::json!({ "key": key })),
+            )
+            .await
+        {
+            tracing::debug!("openclaw: sessions.messages.unsubscribe error (ignored): {e}");
+        }
+
+        collect_res
+    }
+
+    /// Rich variant of `rpc_sessions_send_and_collect` that returns
+    /// the full `TurnResult` (text + tool_calls + tool_results +
+    /// thinking + run_id) accumulated across all assistant messages
+    /// in the turn.
+    ///
+    /// Use this when the caller wants to surface tool activity
+    /// (REPL renderer in slice B-2). The plain `..._and_collect`
+    /// method is a thin wrapper that returns only the `.text`
+    /// field for `AgentClient::submit_turn` compatibility.
+    pub async fn rpc_sessions_send_and_collect_rich(
+        &mut self,
+        key: &str,
+        message: &str,
+        opts: SessionsSendOpts,
+        timeout: std::time::Duration,
+    ) -> anyhow::Result<super::handshake::TurnResult> {
+        // Stage 1: subscribe.
+        let sub_res = self
+            .send_request(
+                "sessions.messages.subscribe",
+                Some(serde_json::json!({ "key": key })),
+            )
+            .await?;
+        if !sub_res.ok {
+            let err = sub_res
+                .error
+                .as_ref()
+                .map(|e| format!("{} ({})", e.message, e.code))
+                .unwrap_or_else(|| "no error body".to_string());
+            anyhow::bail!("openclaw: sessions.messages.subscribe failed: {}", err);
+        }
+
+        // Stage 2: fire the turn.
+        let ack = self.rpc_sessions_send(key, message, opts).await?;
+        let run_id = Some(ack.run_id.clone());
+
+        // Stage 3: take event_rx for the collect loop.
+        let mut event_rx = self
+            .event_rx
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("openclaw: event_rx already taken"))?;
+
+        let mut turn = super::handshake::TurnResult {
+            run_id,
+            ..Default::default()
+        };
+        let collect_res = collect_turn_result(&mut event_rx, key, timeout, &mut turn).await;
+
+        self.event_rx = Some(event_rx);
+
+        // Stage 4: unsubscribe (best effort).
+        if let Err(e) = self
+            .send_request(
+                "sessions.messages.unsubscribe",
+                Some(serde_json::json!({ "key": key })),
+            )
+            .await
+        {
+            tracing::debug!("openclaw: sessions.messages.unsubscribe error (ignored): {e}");
+        }
+
+        collect_res.map(|_| turn)
+    }
+
+    /// Fire `sessions.delete` — remove a session from the store.
+    ///
+    /// Sets `deleteTranscript: true` so the on-disk transcript file
+    /// is removed too — zterm treats delete as a real delete, not
+    /// a soft-hide.
+    pub async fn rpc_sessions_delete(&self, key: &str) -> anyhow::Result<()> {
+        let params = serde_json::json!({ "key": key, "deleteTranscript": true });
+        let res = self.send_request("sessions.delete", Some(params)).await?;
+        if !res.ok {
+            let err = res
+                .error
+                .as_ref()
+                .map(|e| format!("{} ({})", e.message, e.code))
+                .unwrap_or_else(|| "no error body".to_string());
+            anyhow::bail!("openclaw: sessions.delete failed: {}", err);
+        }
+        Ok(())
+    }
+}
+
+impl Drop for OpenClawClient {
+    fn drop(&mut self) {
+        self.connected.store(false, Ordering::Relaxed);
+        // Best-effort: abort loop tasks. Callers who need graceful
+        // shutdown should call `disconnect` explicitly before Drop.
+        if let Some(t) = self.read_task.take() {
+            t.abort();
+        }
+        if let Some(t) = self.write_task.take() {
+            t.abort();
+        }
+    }
+}
+
+// ======================================================================
+// read / write loops (private)
+// ======================================================================
+
+async fn read_loop(
+    mut ws_stream: impl StreamExt<Item = Result<WsMessage, WsError>> + Unpin + Send,
+    pending: PendingRequests,
+    event_tx: mpsc::Sender<super::wire::EventFrame>,
+    connected: Arc<AtomicBool>,
+) {
+    while let Some(msg_res) = ws_stream.next().await {
+        match msg_res {
+            Ok(WsMessage::Text(text)) => match Frame::from_json(&text) {
+                Ok(Frame::Res(res)) => {
+                    let _delivered = pending.resolve(res).await;
+                }
+                Ok(Frame::Event(ev)) => {
+                    if event_tx.send(ev).await.is_err() {
+                        // Receiver dropped — no one cares about events.
+                        // Keep the read loop alive anyway so response
+                        // correlation still works.
+                    }
+                }
+                Ok(Frame::Req(_)) => {
+                    tracing::warn!(
+                        "openclaw: server sent a Req frame to client (unexpected); dropping"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!("openclaw: bad frame from server: {e}");
+                }
+            },
+            Ok(WsMessage::Binary(_)) => {
+                tracing::warn!("openclaw: binary frame received; protocol is text-only, dropping");
+            }
+            Ok(WsMessage::Ping(_)) | Ok(WsMessage::Pong(_)) | Ok(WsMessage::Frame(_)) => {
+                // tungstenite handles Ping/Pong automatically at the
+                // transport layer; nothing to do here.
+            }
+            Ok(WsMessage::Close(frame)) => {
+                tracing::debug!("openclaw: server closed WebSocket: {frame:?}");
+                break;
+            }
+            Err(e) => {
+                tracing::warn!("openclaw: WebSocket read error: {e}");
+                break;
+            }
+        }
+    }
+    connected.store(false, Ordering::Relaxed);
+    pending.abort_all().await;
+}
+
+async fn write_loop(
+    mut ws_sink: impl SinkExt<WsMessage, Error = WsError> + Unpin + Send,
+    mut outbound_rx: mpsc::Receiver<RequestFrame>,
+    connected: Arc<AtomicBool>,
+) {
+    while let Some(req) = outbound_rx.recv().await {
+        let frame = Frame::Req(req);
+        let json = match frame.to_json() {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("openclaw: failed to encode outbound frame: {e}");
+                continue;
+            }
+        };
+        if let Err(e) = ws_sink.send(WsMessage::Text(json)).await {
+            tracing::warn!("openclaw: WebSocket write error: {e}");
+            break;
+        }
+    }
+    // Best-effort graceful close.
+    let _ = ws_sink.send(WsMessage::Close(None)).await;
+    connected.store(false, Ordering::Relaxed);
+}
+
+// ----------------------------------------------------------------------
+// unit tests — the WebSocket lifecycle itself needs a live peer, so
+// this module's coverage is about plumbing invariants that compile to
+// something testable without one: struct shape, timeout semantics on a
+// closed connection.
+// ----------------------------------------------------------------------
+
+/// Drain `session.message` events until we see an assistant reply
+/// for the given session key, then return its `content` text.
+///
+/// Non-matching events (other sessions, non-message events) are
+/// skipped in place. On timeout returns a clear error so callers
+/// can retry or abort. On channel-closed returns an error — the
+/// WebSocket has dropped out from under us.
+async fn collect_assistant_message(
+    event_rx: &mut tokio::sync::mpsc::Receiver<super::wire::EventFrame>,
+    session_key: &str,
+    timeout: std::time::Duration,
+) -> anyhow::Result<String> {
+    let deadline = tokio::time::Instant::now() + timeout;
+
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            anyhow::bail!(
+                "openclaw: session.message stream timed out after {:?}",
+                timeout
+            );
+        }
+
+        let rx_res = tokio::time::timeout(remaining, event_rx.recv()).await;
+        let event = match rx_res {
+            Ok(Some(ev)) => ev,
+            Ok(None) => anyhow::bail!("openclaw: event channel closed mid-stream"),
+            Err(_) => anyhow::bail!(
+                "openclaw: session.message stream timed out after {:?}",
+                timeout
+            ),
+        };
+
+        if event.event != "session.message" {
+            continue;
+        }
+
+        let payload = match &event.payload {
+            Some(p) => p,
+            None => continue,
+        };
+
+        // Only messages for this session.
+        if payload
+            .get("sessionKey")
+            .and_then(|v| v.as_str())
+            .map(|s| s != session_key)
+            .unwrap_or(true)
+        {
+            continue;
+        }
+
+        let message = match payload.get("message") {
+            Some(m) => m,
+            None => continue,
+        };
+
+        let role = message.get("role").and_then(|v| v.as_str()).unwrap_or("");
+
+        if role != "assistant" {
+            continue;
+        }
+
+        // Parse content parts and return the display-text view —
+        // concatenation of `text`-type parts only. Thinking +
+        // tool-call parts are surfaced through AssistantContent's
+        // other accessors (see slice 3h + handshake.rs).
+        let parsed = match message.get("content") {
+            Some(v) => super::handshake::AssistantContent::parse(v),
+            None => super::handshake::AssistantContent { parts: Vec::new() },
+        };
+
+        // Common agent pattern: first assistant turn is pure tool_use
+        // (run a command), second turn carries the actual text reply.
+        // Skip tool-only messages and keep consuming — the subscribe
+        // is still active, so the next session.message for this key
+        // arrives on the same event_rx. Outer timeout bounds the wait.
+        if parsed.is_tool_only() {
+            tracing::debug!("openclaw: assistant turn was tool-only; waiting for text reply");
+            continue;
+        }
+
+        return Ok(parsed.display_text());
+    }
+}
+
+/// Like `collect_assistant_message` but accumulates tool_calls,
+/// tool_results, and thinking from all intermediate assistant
+/// messages into `turn`, and returns `()` when a terminal
+/// text-bearing assistant reply arrives (or timeout). The caller
+/// owns the TurnResult; this function only mutates it in place.
+async fn collect_turn_result(
+    event_rx: &mut tokio::sync::mpsc::Receiver<super::wire::EventFrame>,
+    session_key: &str,
+    timeout: std::time::Duration,
+    turn: &mut super::handshake::TurnResult,
+) -> anyhow::Result<()> {
+    let deadline = tokio::time::Instant::now() + timeout;
+
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            anyhow::bail!(
+                "openclaw: session.message stream timed out after {:?}",
+                timeout
+            );
+        }
+
+        let rx_res = tokio::time::timeout(remaining, event_rx.recv()).await;
+        let event = match rx_res {
+            Ok(Some(ev)) => ev,
+            Ok(None) => anyhow::bail!("openclaw: event channel closed mid-stream"),
+            Err(_) => anyhow::bail!(
+                "openclaw: session.message stream timed out after {:?}",
+                timeout
+            ),
+        };
+
+        if event.event != "session.message" {
+            continue;
+        }
+        let payload = match &event.payload {
+            Some(p) => p,
+            None => continue,
+        };
+        if payload
+            .get("sessionKey")
+            .and_then(|v| v.as_str())
+            .map(|s| s != session_key)
+            .unwrap_or(true)
+        {
+            continue;
+        }
+        let message = match payload.get("message") {
+            Some(m) => m,
+            None => continue,
+        };
+        let role = message.get("role").and_then(|v| v.as_str()).unwrap_or("");
+        if role != "assistant" {
+            continue;
+        }
+
+        let content = match message.get("content") {
+            Some(v) => super::handshake::AssistantContent::parse(v),
+            None => super::handshake::AssistantContent { parts: Vec::new() },
+        };
+
+        turn.merge(&content);
+
+        // If this message has text content, it's the terminal
+        // assistant reply for the turn — return. Otherwise keep
+        // consuming (tool_use only, or thinking only, etc.).
+        if !content.display_text().is_empty() {
+            return Ok(());
+        }
+        tracing::debug!(
+            "openclaw: intermediate assistant message ({} tool_calls, {} tool_results so far)",
+            turn.tool_calls.len(),
+            turn.tool_results.len()
+        );
+    }
+}
+
+/// Filter + include options for `OpenClawClient::rpc_sessions_list`.
+///
+/// `Default` yields no filters, no derived-title reads, no
+/// last-message previews — the cheap "just enumerate keys" path.
+/// Setting `include_derived_titles` or `include_last_message`
+/// triggers a per-session file read on the server; cap the result
+/// set with `limit` on large stores.
+#[derive(Debug, Clone, Default)]
+pub struct SessionsListOpts {
+    pub limit: Option<u32>,
+    pub active_minutes: Option<u32>,
+    pub include_global: bool,
+    pub include_derived_titles: bool,
+    pub include_last_message: bool,
+    pub search: Option<String>,
+}
+
+/// Options for `OpenClawClient::rpc_sessions_send`. Only the
+/// commonly-needed openclaw fields are exposed; attachments are
+/// out of scope for v0.2 (the schema takes an unknown[] — zterm's
+/// terminal UX has no way to surface attached content anyway).
+#[derive(Debug, Clone, Default)]
+pub struct SessionsSendOpts {
+    /// Optional thinking prefix to attach to the turn. Passes
+    /// through to the underlying model as a reasoning directive
+    /// (e.g. "think step by step" for models that support it).
+    pub thinking: Option<String>,
+
+    /// Server-side timeout in milliseconds. None uses the gateway's
+    /// configured default (varies by model / provider).
+    pub timeout_ms: Option<u64>,
+
+    /// Caller-supplied idempotency key — the server dedupes by this
+    /// key and re-acks the same runId on duplicate sends. Generate a
+    /// UUID per logical turn and reuse across retries.
+    pub idempotency_key: Option<String>,
+}
+
+/// Creation options for `OpenClawClient::rpc_sessions_create`.
+///
+/// All fields optional — openclaw will synthesize a key if the
+/// caller doesn't supply one.
+#[derive(Debug, Clone, Default)]
+pub struct SessionsCreateOpts {
+    pub key: Option<String>,
+    pub agent_id: Option<String>,
+    pub label: Option<String>,
+    pub model: Option<String>,
+    pub message: Option<String>,
+}
+
+#[cfg(test)]
+pub(super) fn tests_support_new_fake(
+    pending: PendingRequests,
+    outbound_tx: Option<mpsc::Sender<RequestFrame>>,
+    connected: bool,
+) -> OpenClawClient {
+    let (_event_tx, event_rx) = mpsc::channel::<super::wire::EventFrame>(1);
+    OpenClawClient {
+        pending,
+        outbound_tx,
+        event_rx: Some(event_rx),
+        connected: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(connected)),
+        hello_ok: None,
+        read_task: None,
+        write_task: None,
+    }
+}
+
+// =====================================================================
+// AgentClient trait impl for OpenClawClient
+//
+// Maps the trait surface onto the RPC helpers in this module plus a
+// small amount of reshape logic for list_providers / get_models /
+// list_provider_models (all derive from models.list).
+// =====================================================================
+
+use crate::cli::agent::AgentClient;
+use crate::cli::client::{Config, Model, Provider, Session};
+
+const SUBMIT_TURN_DEFAULT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+fn display_name_for_row(row: &super::handshake::OpenClawSessionRow) -> String {
+    row.derived_title
+        .clone()
+        .or_else(|| row.display_name.clone())
+        .or_else(|| row.label.clone())
+        .unwrap_or_else(|| row.key.clone())
+}
+
+fn row_into_session(row: super::handshake::OpenClawSessionRow) -> Session {
+    let id = row.session_id.clone().unwrap_or_else(|| row.key.clone());
+    let name = display_name_for_row(&row);
+    Session {
+        id,
+        name,
+        model: String::new(),
+        provider: String::new(),
+    }
+}
+
+fn choice_into_model(m: super::handshake::ModelChoice) -> Model {
+    Model {
+        id: m.id,
+        display_name: m.name,
+        provider: m.provider,
+        context_window: m.context_window.map(|n| n as usize),
+        supports_reasoning: m.reasoning.unwrap_or(false),
+    }
+}
+
+#[async_trait::async_trait]
+impl AgentClient for OpenClawClient {
+    async fn health(&self) -> anyhow::Result<bool> {
+        self.rpc_health().await
+    }
+
+    async fn get_config(&self) -> anyhow::Result<Config> {
+        anyhow::bail!(
+            "openclaw: get_config not supported — openclaw gateway has no HTTP config              surface (pure-WS protocol). Use rpc_models_list() / rpc_sessions_list()              for discoverable state instead."
+        )
+    }
+
+    async fn put_config(&self, _config: &Config) -> anyhow::Result<()> {
+        anyhow::bail!(
+            "openclaw: put_config not supported — config mutation is not part of the              gateway protocol. Edit ~/.openclaw/openclaw.json out-of-band and restart."
+        )
+    }
+
+    async fn list_providers(&self) -> anyhow::Result<Vec<Provider>> {
+        use std::collections::BTreeSet;
+        let models = self.rpc_models_list().await?;
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        let mut providers = Vec::new();
+        for m in models {
+            if seen.insert(m.provider.clone()) {
+                providers.push(Provider {
+                    id: m.provider.clone(),
+                    name: m.provider,
+                    requires_key: false,
+                    api_key_env: None,
+                });
+            }
+        }
+        Ok(providers)
+    }
+
+    async fn get_models(&self, provider: &str) -> anyhow::Result<Vec<Model>> {
+        let all = self.rpc_models_list().await?;
+        Ok(all
+            .into_iter()
+            .filter(|m| m.provider == provider)
+            .map(choice_into_model)
+            .collect())
+    }
+
+    async fn list_provider_models(&self, provider: &str) -> anyhow::Result<Vec<String>> {
+        let all = self.rpc_models_list().await?;
+        Ok(all
+            .into_iter()
+            .filter(|m| m.provider == provider)
+            .map(|m| m.id)
+            .collect())
+    }
+
+    async fn list_sessions(&self) -> anyhow::Result<Vec<Session>> {
+        let result = self
+            .rpc_sessions_list(SessionsListOpts {
+                limit: Some(200),
+                ..Default::default()
+            })
+            .await?;
+        Ok(result.sessions.into_iter().map(row_into_session).collect())
+    }
+
+    async fn create_session(&self, name: &str) -> anyhow::Result<Session> {
+        let created = self
+            .rpc_sessions_create(SessionsCreateOpts {
+                label: Some(name.to_string()),
+                ..Default::default()
+            })
+            .await?;
+        Ok(Session {
+            id: created.key.clone(),
+            name: created.label.unwrap_or_else(|| created.key.clone()),
+            model: String::new(),
+            provider: String::new(),
+        })
+    }
+
+    async fn load_session(&self, session_id: &str) -> anyhow::Result<Session> {
+        let result = self
+            .rpc_sessions_list(SessionsListOpts {
+                limit: Some(500),
+                ..Default::default()
+            })
+            .await?;
+        for row in result.sessions {
+            if row.key == session_id || row.session_id.as_deref() == Some(session_id) {
+                return Ok(row_into_session(row));
+            }
+        }
+        anyhow::bail!("openclaw: session not found: {session_id}")
+    }
+
+    async fn delete_session(&self, session_id: &str) -> anyhow::Result<()> {
+        self.rpc_sessions_delete(session_id).await
+    }
+
+    async fn submit_turn(&mut self, session_id: &str, message: &str) -> anyhow::Result<String> {
+        self.rpc_sessions_send_and_collect(
+            session_id,
+            message,
+            SessionsSendOpts {
+                idempotency_key: Some(uuid::Uuid::new_v4().to_string()),
+                ..Default::default()
+            },
+            SUBMIT_TURN_DEFAULT_TIMEOUT,
+        )
+        .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn openclaw_client_implements_agent_client() {
+        // Compile-time assertion: dropping impl AgentClient for
+        // OpenClawClient will fail the test suite here rather than
+        // leave the trait dangling. Mirrors the identical check on
+        // ZeroclawClient in cli/client.rs.
+        fn assert_agent_client<T: crate::cli::agent::AgentClient>() {}
+        assert_agent_client::<OpenClawClient>();
+    }
+
+    #[tokio::test]
+    async fn send_request_on_closed_connection_errors_cleanly() {
+        // Manually build an OpenClawClient whose connected flag is
+        // already false — exercises the early-return in send_request
+        // without needing a live socket.
+        let pending = PendingRequests::new();
+        let (outbound_tx, _outbound_rx) = mpsc::channel::<RequestFrame>(OUTBOUND_CAPACITY);
+        let (_event_tx, event_rx) = mpsc::channel::<super::super::wire::EventFrame>(EVENT_CAPACITY);
+
+        let client = OpenClawClient {
+            pending,
+            outbound_tx: Some(outbound_tx),
+            event_rx: Some(event_rx),
+            connected: Arc::new(AtomicBool::new(false)),
+            hello_ok: None,
+            read_task: None,
+            write_task: None,
+        };
+
+        assert!(!client.is_connected());
+        let err = client
+            .send_request("models.list", None)
+            .await
+            .expect_err("closed connection should error");
+        assert!(err.to_string().contains("connection closed"));
+    }
+
+    #[tokio::test]
+    async fn send_request_errors_when_write_loop_is_gone() {
+        // connected=true, but the outbound receiver has already been
+        // dropped → the send() in send_request fails.
+        let pending = PendingRequests::new();
+        let (outbound_tx, outbound_rx) = mpsc::channel::<RequestFrame>(OUTBOUND_CAPACITY);
+        drop(outbound_rx); // simulate write loop having exited
+
+        let (_event_tx, event_rx) = mpsc::channel::<super::super::wire::EventFrame>(EVENT_CAPACITY);
+
+        let client = OpenClawClient {
+            pending,
+            outbound_tx: Some(outbound_tx),
+            event_rx: Some(event_rx),
+            connected: Arc::new(AtomicBool::new(true)),
+            hello_ok: None,
+            read_task: None,
+            write_task: None,
+        };
+
+        let err = client
+            .send_request("models.list", None)
+            .await
+            .expect_err("dropped write loop should error");
+        assert!(err.to_string().contains("write loop dropped"));
+    }
+
+    #[tokio::test]
+    async fn take_event_rx_returns_some_then_none() {
+        let pending = PendingRequests::new();
+        let (outbound_tx, _outbound_rx) = mpsc::channel::<RequestFrame>(OUTBOUND_CAPACITY);
+        let (_event_tx, event_rx) = mpsc::channel::<super::super::wire::EventFrame>(EVENT_CAPACITY);
+
+        let mut client = OpenClawClient {
+            pending,
+            outbound_tx: Some(outbound_tx),
+            event_rx: Some(event_rx),
+            connected: Arc::new(AtomicBool::new(true)),
+            hello_ok: None,
+            read_task: None,
+            write_task: None,
+        };
+        assert!(client.take_event_rx().is_some());
+        assert!(client.take_event_rx().is_none());
+    }
+}

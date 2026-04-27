@@ -1,0 +1,25 @@
+FROM rust:latest
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    pkg-config \
+    libssl-dev \
+    curl \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy source
+COPY . .
+
+# Build release binary
+RUN cargo build --release
+
+# Verify binary
+RUN file target/release/zterm && \
+    ldd target/release/zterm && \
+    target/release/zterm --help
+
+CMD ["/bin/bash"]

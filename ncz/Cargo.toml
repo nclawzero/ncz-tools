@@ -1,0 +1,32 @@
+[package]
+name = "ncz"
+version = "0.1.0"
+description = "nclawzero device-ops umbrella CLI: status, set-agent, logs, providers, sandbox, integrity, update, channel, health, inspect, selftest"
+keywords = ["nclawzero", "edge", "device-ops", "podman", "systemd"]
+categories = ["command-line-utilities"]
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lib]
+name = "ncz"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ncz"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.5", default-features = false, features = ["derive", "std", "help", "usage", "error-context"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+ureq = { version = "2.10", default-features = false }
+rustix = { version = "0.38", features = ["fs", "process"] }
+tempfile = "3.10"
+time = { version = "0.3", default-features = false, features = ["formatting", "macros"] }
+secrecy = { version = "0.8", features = ["serde"] }
+
+[dev-dependencies]
+tempfile = "3.10"

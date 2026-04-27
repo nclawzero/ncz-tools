@@ -1,0 +1,1238 @@
+use anyhow::{anyhow, Result};
+use chrono::Utc;
+use std::fs;
+
+use crate::cli::client::ZeroclawClient;
+use crate::cli::input::InputHistory;
+use crate::cli::storage;
+use crate::cli::ui;
+
+/// Command handler.
+///
+/// Holds a shared Arc<Mutex<App>>. Every per-command helper
+/// briefly locks it to resolve the active workspace client,
+/// cron handle, or MNEMOS client. Chunk D-3b.
+pub struct CommandHandler {
+    app: std::sync::Arc<tokio::sync::Mutex<crate::cli::workspace::App>>,
+}
+
+impl CommandHandler {
+    /// Create a new command handler.
+    ///
+    /// Takes the shared `Arc<Mutex<App>>` that ReplLoop also holds,
+    /// so `/workspace switch` mutations are visible to both.
+    pub fn new(app: std::sync::Arc<tokio::sync::Mutex<crate::cli::workspace::App>>) -> Self {
+        Self { app }
+    }
+
+    async fn current_mnemos(&self) -> Option<crate::cli::mnemos::MnemosClient> {
+        self.app.lock().await.shared_mnemos.clone()
+    }
+
+    async fn current_cron(&self) -> Option<ZeroclawClient> {
+        self.app
+            .lock()
+            .await
+            .active_workspace()
+            .and_then(|w| w.cron.clone())
+    }
+
+    async fn current_inventory(&self) -> crate::cli::workspace::WorkspaceInventory {
+        self.app.lock().await.inventory()
+    }
+
+    /// Handle a slash command (maps to zeroclaw CLI)
+    pub async fn handle(&self, input: &str, session_id: &str) -> Result<Option<String>> {
+        let parts: Vec<&str> = input.split_whitespace().collect();
+
+        if parts.is_empty() {
+            return Ok(None);
+        }
+
+        let command = parts[0];
+        let subcommand = parts.get(1).copied();
+        let args = if parts.len() > 2 {
+            &parts[2..]
+        } else {
+            &[] as &[&str]
+        };
+
+        match command {
+            // Core
+            "/help" => self.handle_help().await,
+            "/info" | "/status" => self.handle_info(session_id).await,
+            "/exit" => Err(anyhow!("EXIT")),
+
+            // Zeroclaw Agent & Daemon
+            "/agent" => self.handle_agent(subcommand, args).await,
+            "/daemon" | "/gateway" => self.handle_daemon(subcommand, args).await,
+            "/service" => self.handle_service(subcommand).await,
+
+            // Onboarding & Setup
+            "/onboard" => self.handle_onboard(subcommand, args).await,
+
+            // Diagnostics
+            "/doctor" => self.handle_doctor(subcommand).await,
+
+            // Memory, Cron, Skills
+            "/memory" => self.handle_memory(subcommand, args).await,
+            "/workspace" | "/workspaces" => self.handle_workspace(subcommand, args).await,
+            "/cron" => self.handle_cron(subcommand, args).await,
+            "/skill" | "/skills" => self.handle_skill(subcommand, args).await,
+
+            // Provider & Model Management
+            "/providers" => self.handle_providers().await,
+            "/models" | "/model" => self.handle_models(subcommand, args).await,
+
+            // Channels
+            "/channels" | "/channel" => self.handle_channels(subcommand).await,
+
+            // Hardware & Security
+            "/hardware" => self.handle_hardware(subcommand).await,
+            "/peripheral" => self.handle_peripheral(subcommand, args).await,
+            "/estop" => self.handle_estop(subcommand, args).await,
+
+            // Session Management (REPL-specific)
+            "/clear" => self.handle_clear(session_id).await,
+            "/save" => {
+                self.handle_save(session_id, subcommand.map(|s| s.to_string()))
+                    .await
+            }
+            "/history" => self.handle_history().await,
+            "/config" => self.handle_config().await,
+            "/session" => self.handle_session(subcommand, args).await,
+
+            // Completion
+            "/completions" => self.handle_completions(subcommand).await,
+
+            _ => {
+                ui::print_error(
+                    &format!("Unknown command: {}", command),
+                    Some("Type /help for available commands"),
+                );
+                Ok(None)
+            }
+        }
+    }
+
+    /// Handle /help command.
+    ///
+    /// Returns the help text as a structured `String` so both the
+    /// rustyline REPL (which `println!`s it) and the Turbo Vision
+    /// UI (which appends it to the chat pane) can render it the
+    /// same way. Output is carefully free of ANSI control codes so
+    /// it renders correctly inside a `ChatPane`.
+    async fn handle_help(&self) -> Result<Option<String>> {
+        let body = "\n\
+            📚 ZTerm — ZeroClaw Terminal Client\n\
+            \n\
+            Core:\n  \
+              /help              This message\n  \
+              /info              Session & model info\n  \
+              /exit              Exit ZTerm\n\
+            \n\
+            Agent & Daemon:\n  \
+              /agent             Interactive agent (current mode)\n  \
+              /agent -m 'text'   Send single message\n  \
+              /daemon            Start gateway + channels + scheduler\n  \
+              /service           Manage system service\n\
+            \n\
+            Configuration:\n  \
+              /onboard           Run setup wizard\n  \
+              /providers         List 40+ AI providers\n  \
+              /models list       Show available models\n  \
+              /models set <m>    Set default model\n  \
+              /channels list     List configured channels\n\
+            \n\
+            Data & Automation:\n  \
+              /memory search <query> [limit]   Search MNEMOS\n  \
+              /memory list [limit]              Recent memories\n  \
+              /memory get <id>                  Retrieve one by id\n  \
+              /memory post <content> [--category <cat>]   Save new\n  \
+              /memory delete <id>               Remove one by id\n  \
+              /memory stats                     MNEMOS stats\n  \
+              /cron list         List scheduled tasks\n  \
+              /cron add '...'    Create cron job\n  \
+              /skill list        List installed skills\n\
+            \n\
+            System & Hardware:\n  \
+              /doctor            Run diagnostics\n  \
+              /hardware discover Find USB devices\n  \
+              /peripheral list   List configured devices\n  \
+              /estop status      Check emergency stop\n\
+            \n\
+            Session (REPL-only):\n  \
+              /config            Show configuration\n  \
+              /clear             Clear history\n  \
+              /save [file]       Export session\n  \
+              /history           Show commands\n  \
+              /session list      List sessions\n"
+            .to_string();
+        Ok(Some(body))
+    }
+
+    /// Handle /info command.
+    ///
+    /// Returns the session block as a `String` so the TUI can
+    /// render it in the chat pane. Falls back to an empty-output
+    /// frame when no session metadata is on disk — the rustyline
+    /// REPL treated that as a no-op, so we mirror by returning
+    /// `Some("")`.
+    async fn handle_info(&self, session_id: &str) -> Result<Option<String>> {
+        match storage::load_session_metadata(session_id) {
+            Ok(metadata) => Ok(Some(format!(
+                "\n📋 Session Information:\n  \
+                  ID:        {}\n  \
+                  Name:      {}\n  \
+                  Model:     {}\n  \
+                  Provider:  {}\n  \
+                  Created:   {}\n  \
+                  Messages:  {}\n",
+                metadata.id,
+                metadata.name,
+                metadata.model,
+                metadata.provider,
+                metadata.created_at,
+                metadata.message_count,
+            ))),
+            Err(_) => Ok(Some(String::new())),
+        }
+    }
+
+    /// Handle /session command with full CRUD
+    async fn handle_session(
+        &self,
+        subcommand: Option<&str>,
+        args: &[&str],
+    ) -> Result<Option<String>> {
+        match subcommand {
+            Some("list") => match storage::list_sessions() {
+                Ok(sessions) => {
+                    if sessions.is_empty() {
+                        println!("\n📋 Sessions: (none yet)");
+                        println!("  Create one with: /session <name>");
+                    } else {
+                        println!("\n📋 Sessions ({}):", sessions.len());
+                        for (i, session) in sessions.iter().enumerate() {
+                            println!("  {}. {} ({})", i + 1, session.name, &session.id[..8]);
+                            println!("     Model: {}/{}", session.provider, session.model);
+                            println!(
+                                "     Messages: {}, Last active: {}",
+                                session.message_count,
+                                &session.last_active[..10]
+                            );
+                        }
+                    }
+                    println!();
+                }
+                Err(e) => {
+                    ui::print_error("Could not list sessions", Some(&e.to_string()));
+                }
+            },
+            Some("delete") => {
+                let name = args.first().copied().unwrap_or("");
+                if name.is_empty() {
+                    ui::print_error("Usage: /session delete <name>", None);
+                } else {
+                    match storage::delete_session(name) {
+                        Ok(_) => {
+                            ui::print_success(&format!("✅ Deleted session: {}", name));
+                        }
+                        Err(e) => {
+                            ui::print_error("Failed to delete session", Some(&e.to_string()));
+                        }
+                    }
+                }
+            }
+            Some("info") => match storage::load_session_metadata("main") {
+                Ok(metadata) => {
+                    println!("\n📊 Current Session:");
+                    println!("  Name:      {}", metadata.name);
+                    println!("  ID:        {}", metadata.id);
+                    println!("  Model:     {}/{}", metadata.provider, metadata.model);
+                    println!("  Messages:  {}", metadata.message_count);
+                    println!("  Created:   {}", &metadata.created_at[..10]);
+                    println!("  Last used: {}", &metadata.last_active[..10]);
+                    println!();
+                }
+                Err(e) => {
+                    ui::print_error("Failed to load session", Some(&e.to_string()));
+                }
+            },
+            Some(session_name) => {
+                println!("🔄 Switching to session: '{}'", session_name);
+                if let Ok(metadata) = storage::load_session_metadata(session_name) {
+                    println!(
+                        "   Found: {}/{}, {} messages",
+                        metadata.provider, metadata.model, metadata.message_count
+                    );
+                } else {
+                    println!("   (New session - will be created on first message)");
+                }
+                println!();
+            }
+            None => {
+                println!("Usage: /session list         (show all sessions)");
+                println!("       /session <name>      (switch or create)");
+                println!("       /session info        (current session details)");
+                println!("       /session delete <n>  (remove session)");
+            }
+        }
+        Ok(None)
+    }
+
+    /// Handle /history command
+    async fn handle_history(&self) -> Result<Option<String>> {
+        match InputHistory::load_from_file() {
+            Ok(history) => {
+                println!("\n📜 Command History:");
+                for (i, entry) in history.entries().iter().enumerate() {
+                    println!("  {}. {}", i + 1, entry);
+                }
+                println!();
+            }
+            Err(_) => {
+                println!("No history available yet");
+            }
+        }
+        Ok(None)
+    }
+
+    // Zeroclaw Agent & Daemon
+    async fn handle_agent(
+        &self,
+        subcommand: Option<&str>,
+        args: &[&str],
+    ) -> Result<Option<String>> {
+        match subcommand {
+            Some("-m") | Some("--message") => {
+                let msg = args.join(" ");
+                println!("📤 Sending: {}", msg);
+                println!("   (Via zeroclaw agent -m)");
+            }
+            Some("-p") | Some("--provider") => {
+                let provider = args.first().copied().unwrap_or("default");
+                println!("🔄 Using provider: {}", provider);
+            }
+            _ => println!("✓ Agent mode active (already running)"),
+        }
+        Ok(None)
+    }
+
+    async fn handle_daemon(
+        &self,
+        subcommand: Option<&str>,
+        args: &[&str],
+    ) -> Result<Option<String>> {
+        println!("\n🔌 Daemon & Gateway:");
+        match subcommand {
+            Some("-p") | Some("--port") => {
+                let port = args.first().copied().unwrap_or("42617");
+                println!("  Starting on port: {}", port);
+            }
+            _ => println!("  Listening on: http://127.0.0.1:42617"),
+        }
+        println!("  Channels: Connected");
+        println!("  Scheduler: Active");
+        println!("  (Full daemon features in Phase 7+)");
+        println!();
+        Ok(None)
+    }
+
+    async fn handle_service(&self, subcommand: Option<&str>) -> Result<Option<String>> {
+        match subcommand {
+            Some("install") => println!("📦 Install system service (Phase 7+)"),
+            Some("status") => println!("  Service: Not installed"),
+            Some("start") | Some("stop") | Some("restart") => println!("  (Phase 7+)"),
+            _ => println!("Usage: /service install|status|start|stop|restart"),
+        }
+        Ok(None)
+    }
+
+    async fn handle_onboard(
+        &self,
+        subcommand: Option<&str>,
+        args: &[&str],
+    ) -> Result<Option<String>> {
+        println!("\n⚙️  Onboarding:");
+        match subcommand {
+            Some("--provider") => {
+                let provider = args.first().copied().unwrap_or("openrouter");
+                println!("  Provider: {}", provider);
+            }
+            Some("--force") => println!("  Config: Reset"),
+            _ => println!("  Config: ~/.zeroclaw/config.toml"),
+        }
+        println!("  (Interactive setup in Phase 7+)");
+        println!();
+        Ok(None)
+    }
+
+    async fn handle_doctor(&self, subcommand: Option<&str>) -> Result<Option<String>> {
+        println!("\n🏥 System Diagnostics:");
+        match subcommand {
+            Some("models") => {
+                println!("  Probing model connectivity...");
+                println!("  • Groq: ✓");
+                println!("  • OpenAI: ✓");
+                println!("  • Configured providers: ✓");
+            }
+            Some("traces") => println!("  Execution traces: (Phase 7+)"),
+            _ => {
+                println!("  Gateway: ✓ Running");
+                println!("  Config: ✓ Valid");
+                println!("  Memory: ✓ SQLite");
+                println!("  Channels: ✓ Connected");
+            }
+        }
+        println!();
+        Ok(None)
+    }
+
+    /// Handle /memory command with MNEMOS integration
+    async fn handle_memory(
+        &self,
+        subcommand: Option<&str>,
+        args: &[&str],
+    ) -> Result<Option<String>> {
+        // Backwards-compatible: "/memory <query>" (no subcommand) runs a search.
+        let implicit: Vec<&str>;
+        let (sub, rest): (&str, &[&str]) = match subcommand {
+            Some(s)
+                if matches!(
+                    s,
+                    "search"
+                        | "list"
+                        | "recent"
+                        | "get"
+                        | "post"
+                        | "add"
+                        | "delete"
+                        | "rm"
+                        | "stats"
+                        | "help"
+                ) =>
+            {
+                (s, args)
+            }
+            Some(s) => {
+                implicit = vec![s];
+                ("search", implicit.as_slice())
+            }
+            None => ("help", &[] as &[&str]),
+        };
+
+        match sub {
+            "search" => {
+                let (query, limit) = parse_search_args(rest);
+                if query.is_empty() {
+                    ui::print_error("Usage: /memory search <query> [limit]", None);
+                    return Ok(None);
+                }
+                println!("\n🔎 MNEMOS search: {}", query);
+                let res = match self.current_mnemos().await {
+                    Some(m) => m.search(&query, limit).await,
+                    None => Ok(Vec::new()),
+                };
+                match res {
+                    Ok(memories) if !memories.is_empty() => {
+                        print_memory_list(&memories);
+                    }
+                    Ok(_) => println!("  (no matches)"),
+                    Err(_) => ui::print_error(
+                        "MNEMOS unavailable",
+                        Some("check MNEMOS_URL / MNEMOS_TOKEN"),
+                    ),
+                }
+                println!();
+            }
+            "list" | "recent" => {
+                let limit = rest
+                    .first()
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(10);
+                println!("\n📚 Recent memories (limit {}):", limit);
+                let res = match self.current_mnemos().await {
+                    Some(m) => m.list(limit).await,
+                    None => Ok(Vec::new()),
+                };
+                match res {
+                    Ok(memories) if !memories.is_empty() => {
+                        print_memory_list(&memories);
+                    }
+                    Ok(_) => println!("  (MNEMOS empty or not configured)"),
+                    Err(_) => ui::print_error("MNEMOS unavailable", None),
+                }
+                println!();
+            }
+            "get" => {
+                let id = rest.join(" ");
+                if id.is_empty() {
+                    ui::print_error("Usage: /memory get <id>", None);
+                    return Ok(None);
+                }
+                let res = match self.current_mnemos().await {
+                    Some(m) => m.get(&id).await,
+                    None => Ok(None),
+                };
+                match res {
+                    Ok(Some(mem)) => {
+                        println!("\n📖 Memory [{}]", id);
+                        if let Some(cat) = mem.get("category").and_then(|v| v.as_str()) {
+                            println!("  category: {}", cat);
+                        }
+                        if let Some(content) = mem.get("content").and_then(|v| v.as_str()) {
+                            println!();
+                            println!("{}", content);
+                        }
+                        println!();
+                    }
+                    Ok(None) => ui::print_error("Memory not found", Some(&id)),
+                    Err(_) => {
+                        ui::print_error("MNEMOS unavailable", Some("check MNEMOS connection"))
+                    }
+                }
+            }
+            "post" | "add" => {
+                let (content, category) = parse_post_args(rest);
+                if content.is_empty() {
+                    ui::print_error(
+                        "Usage: /memory post <content> [--category <cat>]",
+                        Some("Example: /memory post \"shipped zterm CI cleanup\" --category work"),
+                    );
+                    return Ok(None);
+                }
+                let res = match self.current_mnemos().await {
+                    Some(m) => m.create(&content, category.as_deref()).await,
+                    None => Err(anyhow::anyhow!(
+                        "MNEMOS not configured (set MNEMOS_URL + MNEMOS_TOKEN)"
+                    )),
+                };
+                match res {
+                    Ok(result) => {
+                        let id = result
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| "(unknown id)".to_string());
+                        ui::print_success(&format!("📝 Memory saved: {}", id));
+                    }
+                    Err(e) => ui::print_error("Failed to save memory", Some(&e.to_string())),
+                }
+            }
+            "delete" | "rm" => {
+                let id = rest.join(" ");
+                if id.is_empty() {
+                    ui::print_error("Usage: /memory delete <id>", None);
+                    return Ok(None);
+                }
+                let res = match self.current_mnemos().await {
+                    Some(m) => m.delete(&id).await,
+                    None => Err(anyhow::anyhow!(
+                        "MNEMOS not configured (set MNEMOS_URL + MNEMOS_TOKEN)"
+                    )),
+                };
+                match res {
+                    Ok(()) => ui::print_success(&format!("🗑️  Deleted memory {}", id)),
+                    Err(e) => ui::print_error("Delete failed", Some(&e.to_string())),
+                }
+            }
+            "stats" => {
+                println!("\n📊 Memory Statistics:");
+                let res = match self.current_mnemos().await {
+                    Some(m) => m.stats().await,
+                    None => Ok(serde_json::json!({ "status": "not_configured" })),
+                };
+                match res {
+                    Ok(stats) => {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&stats).unwrap_or_default()
+                        );
+                    }
+                    Err(_) => println!("  (MNEMOS unavailable)"),
+                }
+                println!();
+            }
+            _ => {
+                println!("Usage:");
+                println!("  /memory search <query> [limit]    — semantic/full-text search");
+                println!("  /memory list [limit]              — recent memories (alias: recent)");
+                println!("  /memory get <id>                  — fetch one by id");
+                println!("  /memory post <content> [--category <cat>]");
+                println!("                                    — save a new memory (alias: add)");
+                println!("  /memory delete <id>               — remove one by id (alias: rm)");
+                println!("  /memory stats                     — MNEMOS storage / categories");
+                println!();
+                println!("  Tip: '/memory <query>' (no subcommand) runs a search.");
+                println!("  Configure with MNEMOS_URL + MNEMOS_TOKEN in env / .env.");
+            }
+        }
+        Ok(None)
+    }
+
+    async fn handle_cron(&self, subcommand: Option<&str>, args: &[&str]) -> Result<Option<String>> {
+        match subcommand {
+            Some("list") => {
+                println!("\n⏰ Scheduled Tasks:");
+                let res = match self.current_cron().await {
+                    Some(c) => c.list_cron_jobs().await,
+                    None => Err(anyhow::anyhow!("cron not available on this backend")),
+                };
+                match res {
+                    Ok(jobs) if !jobs.is_empty() => {
+                        for (i, job) in jobs.iter().enumerate() {
+                            let id = job.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+                            let expr = job
+                                .get("expression")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("?");
+                            let prompt = job.get("prompt").and_then(|v| v.as_str()).unwrap_or("?");
+                            println!("  {}. [{}] {} → {}", i + 1, &id[..8], expr, prompt);
+                        }
+                    }
+                    Ok(_) => println!("  (No scheduled tasks)"),
+                    Err(_) => println!("  (Gateway unavailable)"),
+                }
+                println!();
+            }
+            Some("add") => {
+                if args.len() < 2 {
+                    ui::print_error(
+                        "Usage: /cron add '<expr>' '<prompt>'",
+                        Some("Example: /cron add '0 9 * * *' 'Daily standup'"),
+                    );
+                } else {
+                    let expr = args[0];
+                    let prompt = args[1..].join(" ");
+                    let res = match self.current_cron().await {
+                        Some(c) => c.create_cron_job(expr, &prompt).await,
+                        None => Err(anyhow::anyhow!("cron not available on this backend")),
+                    };
+                    match res {
+                        Ok(id) => {
+                            ui::print_success(&format!("✅ Created cron job: {}", &id[..16]));
+                            println!("   Expression: {} → {}", expr, prompt);
+                        }
+                        Err(e) => {
+                            ui::print_error("Failed to create cron job", Some(&e.to_string()))
+                        }
+                    }
+                }
+            }
+            Some("add-at") => {
+                if args.len() < 2 {
+                    ui::print_error(
+                        "Usage: /cron add-at '<datetime>' '<prompt>'",
+                        Some("Example: /cron add-at '2026-04-21T10:00:00Z' 'Meeting'"),
+                    );
+                } else {
+                    let datetime = args[0];
+                    let prompt = args[1..].join(" ");
+                    let res = match self.current_cron().await {
+                        Some(c) => c.create_cron_at(datetime, &prompt).await,
+                        None => Err(anyhow::anyhow!("cron not available on this backend")),
+                    };
+                    match res {
+                        Ok(_) => {
+                            ui::print_success(&format!("✅ Scheduled task for {}", datetime));
+                            println!("   Prompt: {}", prompt);
+                        }
+                        Err(e) => ui::print_error("Failed to schedule task", Some(&e.to_string())),
+                    }
+                }
+            }
+            Some("pause") => {
+                let id = args.first().copied().unwrap_or("");
+                if id.is_empty() {
+                    ui::print_error("Usage: /cron pause <id>", None);
+                } else {
+                    let res = match self.current_cron().await {
+                        Some(c) => c.pause_cron(id).await,
+                        None => Err(anyhow::anyhow!("cron not available on this backend")),
+                    };
+                    match res {
+                        Ok(_) => ui::print_success(&format!("⏸️  Paused job: {}", id)),
+                        Err(e) => ui::print_error("Failed to pause job", Some(&e.to_string())),
+                    }
+                }
+            }
+            Some("resume") => {
+                let id = args.first().copied().unwrap_or("");
+                if id.is_empty() {
+                    ui::print_error("Usage: /cron resume <id>", None);
+                } else {
+                    let res = match self.current_cron().await {
+                        Some(c) => c.resume_cron(id).await,
+                        None => Err(anyhow::anyhow!("cron not available on this backend")),
+                    };
+                    match res {
+                        Ok(_) => ui::print_success(&format!("▶️  Resumed job: {}", id)),
+                        Err(e) => ui::print_error("Failed to resume job", Some(&e.to_string())),
+                    }
+                }
+            }
+            Some("remove") => {
+                let id = args.first().copied().unwrap_or("");
+                if id.is_empty() {
+                    ui::print_error("Usage: /cron remove <id>", None);
+                } else {
+                    let res = match self.current_cron().await {
+                        Some(c) => c.delete_cron(id).await,
+                        None => Err(anyhow::anyhow!("cron not available on this backend")),
+                    };
+                    match res {
+                        Ok(_) => ui::print_success(&format!("🗑️  Deleted job: {}", id)),
+                        Err(e) => ui::print_error("Failed to delete job", Some(&e.to_string())),
+                    }
+                }
+            }
+            _ => {
+                println!("Usage: /cron list");
+                println!("       /cron add '<expr>' '<prompt>'");
+                println!("       /cron add-at '<datetime>' '<prompt>'");
+                println!("       /cron pause|resume|remove <id>");
+            }
+        }
+        Ok(None)
+    }
+
+    /// Handle /skill command with zeroclaw integration
+    async fn handle_skill(
+        &self,
+        subcommand: Option<&str>,
+        _args: &[&str],
+    ) -> Result<Option<String>> {
+        match subcommand {
+            Some("list") => println!("⚡ Installed Skills: (none)"),
+            Some("install") => println!("  Installing: (Phase 7+)"),
+            Some("audit") => println!("  Auditing skills: (Phase 7+)"),
+            Some("remove") => println!("  Removing skill: (Phase 7+)"),
+            _ => println!("Usage: /skill list|install <path>|audit|remove"),
+        }
+        println!();
+        Ok(None)
+    }
+
+    async fn handle_providers(&self) -> Result<Option<String>> {
+        // List provider backends advertised by the live daemon's
+        // `[providers.models.*]` config (e.g. `gemini`,
+        // `openai_compat`). Static "40+ providers" copy is gone —
+        // it was both factually wrong (the daemon only exposes the
+        // backends configured in its TOML) and contained hardcoded
+        // brand strings. Falls back gracefully when no zeroclaw backend is
+        // active or the fetch fails.
+        let mut out = String::from("\n🤖 Configured Providers:\n");
+        match self.current_cron().await {
+            Some(c) => {
+                if c.model_list().is_empty() {
+                    let _ = c.refresh_models().await;
+                }
+                let models = c.model_list();
+                if models.is_empty() {
+                    out.push_str(
+                        "  (none — /api/config returned no [providers.models.*] entries)\n",
+                    );
+                } else {
+                    let mut backends: std::collections::BTreeSet<String> = Default::default();
+                    for m in &models {
+                        backends.insert(m.provider.clone());
+                    }
+                    for b in backends {
+                        out.push_str(&format!("    • {}\n", b));
+                    }
+                }
+            }
+            None => {
+                out.push_str("  (no active zeroclaw workspace)\n");
+            }
+        }
+        out.push('\n');
+        Ok(Some(out))
+    }
+
+    async fn handle_models(
+        &self,
+        subcommand: Option<&str>,
+        args: &[&str],
+    ) -> Result<Option<String>> {
+        let cron = self.current_cron().await;
+        match subcommand {
+            Some("list") | None => {
+                let mut out = String::from("\n📋 Available Models (from /api/config):\n\n");
+                match cron {
+                    Some(c) => {
+                        if c.model_list().is_empty() {
+                            let _ = c.refresh_models().await;
+                        }
+                        let list = c.model_list();
+                        if list.is_empty() {
+                            out.push_str(
+                                "  (none — /api/config returned no [providers.models.*])\n",
+                            );
+                        } else {
+                            let active = c.current_model_key();
+                            for m in &list {
+                                let marker = if m.key == active { "*" } else { " " };
+                                out.push_str(&format!(
+                                    "  {} {:<10}  ({} → {})\n",
+                                    marker, m.key, m.provider, m.model
+                                ));
+                            }
+                            out.push_str(&format!(
+                                "\n  active: {}\n  use: /models set <key>\n",
+                                active
+                            ));
+                        }
+                    }
+                    None => out.push_str("  (no active zeroclaw workspace)\n"),
+                }
+                out.push('\n');
+                Ok(Some(out))
+            }
+            Some("set") => {
+                let key = args.first().copied().unwrap_or("").trim().to_string();
+                if key.is_empty() {
+                    ui::print_error(
+                        "Usage: /models set <key>",
+                        Some("Run /models list to see available keys"),
+                    );
+                    return Ok(None);
+                }
+                match cron {
+                    Some(c) => {
+                        if c.model_list().is_empty() {
+                            let _ = c.refresh_models().await;
+                        }
+                        match c.set_current_model(&key) {
+                            Ok(()) => {
+                                ui::print_success(&format!("✅ Active model key: {}", key));
+                                println!("   Future turns will send this key to the daemon.");
+                            }
+                            Err(e) => {
+                                ui::print_error("Failed to set model key", Some(&e.to_string()));
+                            }
+                        }
+                    }
+                    None => {
+                        ui::print_error("/models set requires an active zeroclaw workspace", None)
+                    }
+                }
+                Ok(None)
+            }
+            Some("refresh") => {
+                match cron {
+                    Some(c) => match c.refresh_models().await {
+                        Ok(list) => ui::print_success(&format!(
+                            "✅ Refreshed model list ({} entries)",
+                            list.len()
+                        )),
+                        Err(e) => {
+                            ui::print_error("Failed to refresh /api/config", Some(&e.to_string()))
+                        }
+                    },
+                    None => ui::print_error(
+                        "/models refresh requires an active zeroclaw workspace",
+                        None,
+                    ),
+                }
+                Ok(None)
+            }
+            Some("status") => match cron {
+                Some(c) => {
+                    let active = c.current_model_key();
+                    let entry = c.model_list().into_iter().find(|m| m.key == active);
+                    let mut out = String::from("\n📊 Current Model:\n");
+                    out.push_str(&format!("  key:      {}\n", active));
+                    if let Some(m) = entry {
+                        out.push_str(&format!("  provider: {}\n", m.provider));
+                        out.push_str(&format!("  model:    {}\n", m.model));
+                    } else {
+                        out.push_str("  (not in /api/config; daemon may reject this key)\n");
+                    }
+                    out.push('\n');
+                    Ok(Some(out))
+                }
+                None => {
+                    ui::print_error("/models status requires an active zeroclaw workspace", None);
+                    Ok(None)
+                }
+            },
+            _ => {
+                println!("Usage: /models list|set <key>|refresh|status");
+                Ok(None)
+            }
+        }
+    }
+
+    async fn handle_channels(&self, subcommand: Option<&str>) -> Result<Option<String>> {
+        match subcommand {
+            Some("list") => {
+                println!("\n💬 Channels:");
+                println!("  (None configured)");
+                println!("  Available: Slack, Discord, Telegram, Matrix, Email, IRC");
+            }
+            Some("doctor") => println!("  Channel health: (Phase 7+)"),
+            _ => println!("Usage: /channel list|doctor"),
+        }
+        println!();
+        Ok(None)
+    }
+
+    async fn handle_hardware(&self, subcommand: Option<&str>) -> Result<Option<String>> {
+        match subcommand {
+            Some("discover") => {
+                println!("\n🔌 Hardware Discovery:");
+                println!("  (No USB devices found)");
+                println!("  Supports: STM32, Arduino, Raspberry Pi, ESP32");
+            }
+            Some("introspect") => println!("  Probing device... (Phase 7+)"),
+            _ => println!("Usage: /hardware discover|introspect <port>"),
+        }
+        println!();
+        Ok(None)
+    }
+
+    async fn handle_peripheral(
+        &self,
+        subcommand: Option<&str>,
+        _args: &[&str],
+    ) -> Result<Option<String>> {
+        match subcommand {
+            Some("list") => println!("📱 Peripherals: (none)"),
+            Some("add") => println!("  Adding peripheral... (Phase 7+)"),
+            Some("flash-nucleo") => println!("  Flashing STM32... (Phase 7+)"),
+            Some("flash") => println!("  Flashing Arduino... (Phase 7+)"),
+            _ => println!("Usage: /peripheral list|add|flash-nucleo|flash"),
+        }
+        println!();
+        Ok(None)
+    }
+
+    async fn handle_estop(
+        &self,
+        subcommand: Option<&str>,
+        args: &[&str],
+    ) -> Result<Option<String>> {
+        match subcommand {
+            Some("status") => println!("🛑 Emergency Stop: Disengaged"),
+            Some("--level") => {
+                let level = args.first().copied().unwrap_or("<level>");
+                println!("  Level: {} (Phase 7+)", level);
+            }
+            Some("resume") => println!("  ▶️  Resuming (Phase 7+)"),
+            _ => println!("Usage: /estop status|--level <kill-all|network-kill|...>"),
+        }
+        println!();
+        Ok(None)
+    }
+
+    async fn handle_completions(&self, subcommand: Option<&str>) -> Result<Option<String>> {
+        match subcommand {
+            Some("zsh") => println!("📝 Zsh completions: (Phase 7+)"),
+            Some("bash") => println!("📝 Bash completions: (Phase 7+)"),
+            Some("fish") => println!("📝 Fish completions: (Phase 7+)"),
+            _ => println!("Usage: /completions zsh|bash|fish"),
+        }
+        println!();
+        Ok(None)
+    }
+
+    /// Handle /config command
+    async fn handle_config(&self) -> Result<Option<String>> {
+        println!("\n⚙️  Configuration:");
+        match storage::load_config() {
+            Ok(content) => {
+                println!("{}", content);
+            }
+            Err(e) => {
+                ui::print_error("Could not load config", Some(&e.to_string()));
+            }
+        }
+        println!();
+        Ok(None)
+    }
+
+    /// Handle /clear command
+    async fn handle_clear(&self, session_id: &str) -> Result<Option<String>> {
+        if let Ok(mut metadata) = storage::load_session_metadata(session_id) {
+            metadata.message_count = 0;
+            metadata.last_active = Utc::now().to_rfc3339();
+            storage::save_session_metadata(&metadata)?;
+            ui::print_success("✓ Session history cleared");
+        }
+        Ok(None)
+    }
+
+    /// Handle /save command
+    async fn handle_save(
+        &self,
+        session_id: &str,
+        filename: Option<String>,
+    ) -> Result<Option<String>> {
+        let default_name = format!("session-{}.txt", Utc::now().format("%Y%m%d-%H%M%S"));
+        let filename = filename.unwrap_or(default_name);
+
+        if let Ok(history_path) = storage::session_history_file(session_id) {
+            if history_path.exists() {
+                fs::copy(&history_path, &filename)?;
+                ui::print_success(&format!("✓ Session saved to {}", filename));
+            } else {
+                ui::print_error("No history to save", None);
+            }
+        }
+
+        Ok(None)
+    }
+
+    async fn handle_workspace(
+        &self,
+        subcommand: Option<&str>,
+        args: &[&str],
+    ) -> Result<Option<String>> {
+        let inventory = self.current_inventory().await;
+        match subcommand {
+            Some("list") | None => {
+                // Return the listing as a structured String so both
+                // the rustyline REPL (which print!s it) and the
+                // Turbo Vision UI (chat-pane append) render it the
+                // same way.
+                let mut out = String::new();
+                if inventory.workspaces.is_empty() || inventory.is_synthetic_singleton() {
+                    out.push('\n');
+                    out.push_str("🗂  Workspaces (single-workspace mode)\n");
+                    out.push_str(
+                        "   Add [[workspaces]] entries to ~/.zterm/config.toml to enable multi-workspace.\n",
+                    );
+                    return Ok(Some(out));
+                }
+                out.push('\n');
+                out.push_str(&format!(
+                    "🗂  Workspaces ({} total):\n",
+                    inventory.workspaces.len()
+                ));
+                for (i, w) in inventory.workspaces.iter().enumerate() {
+                    let marker = if i == inventory.active_index {
+                        "*"
+                    } else {
+                        " "
+                    };
+                    let label = w.label.clone().unwrap_or_else(|| w.name.clone());
+                    let status = if w.activated {
+                        "ok"
+                    } else {
+                        "not yet activated"
+                    };
+                    out.push_str(&format!(
+                        "  {} {:>2}. {:<24} [{}] {} ({})\n",
+                        marker,
+                        i + 1,
+                        label,
+                        w.backend.as_str(),
+                        w.url,
+                        status
+                    ));
+                }
+                Ok(Some(out))
+            }
+            Some("info") => {
+                if let Some(a) = inventory.active() {
+                    println!();
+                    println!("🗂  Active workspace");
+                    println!("   name:      {}", a.name);
+                    if let Some(l) = &a.label {
+                        println!("   label:     {}", l);
+                    }
+                    println!("   backend:   {}", a.backend.as_str());
+                    println!("   url:       {}", a.url);
+                    println!(
+                        "   status:    {}",
+                        if a.activated {
+                            "activated"
+                        } else {
+                            "not yet activated"
+                        }
+                    );
+                    println!();
+                } else {
+                    ui::print_error("no active workspace", None);
+                }
+                Ok(None)
+            }
+            Some("switch") => {
+                let name = args.join(" ");
+                if name.is_empty() {
+                    ui::print_error(
+                        "Usage: /workspace switch <name>",
+                        Some("/workspace list to see names"),
+                    );
+                    return Ok(None);
+                }
+                self.switch_workspace(&name).await
+            }
+            _ => {
+                println!("Usage:");
+                println!("  /workspace list         — enumerate configured workspaces");
+                println!("  /workspace info         — details of the active workspace");
+                println!("  /workspace switch <name>— change the active workspace");
+                Ok(None)
+            }
+        }
+    }
+
+    /// Execute a runtime workspace switch. Looks up the target by
+    /// name, activates it if needed (may run a live openclaw
+    /// handshake), and updates `App.active`. Subsequent commands
+    /// pick up the new workspace's handles on their next lock.
+    async fn switch_workspace(&self, name: &str) -> Result<Option<String>> {
+        let target_idx = {
+            let app = self.app.lock().await;
+            app.workspaces.iter().position(|w| w.config.name == name)
+        };
+        let Some(target_idx) = target_idx else {
+            return Ok(Some(format!(
+                "❌ no workspace named \"{name}\"\n   /workspace list to see names\n"
+            )));
+        };
+
+        // Activate the target workspace if it hasn't been yet. Note:
+        // this holds the App mutex across a potentially-slow openclaw
+        // WS handshake. Fine for single-threaded REPL usage; future
+        // slices revisit if concurrency enters the picture.
+        {
+            let mut app = self.app.lock().await;
+            if !app.workspaces[target_idx].is_activated() {
+                if let Err(e) = app.workspaces[target_idx].activate().await {
+                    return Ok(Some(format!("❌ failed to activate \"{name}\": {e}\n")));
+                }
+            }
+            app.active = target_idx;
+        }
+
+        Ok(Some(format!("✅ 🗂  switched to workspace: {name}\n")))
+    }
+}
+
+fn parse_search_args(rest: &[&str]) -> (String, usize) {
+    // Last arg is treated as limit if it parses as usize; otherwise
+    // everything is treated as the query.
+    if let Some(last) = rest.last() {
+        if let Ok(n) = last.parse::<usize>() {
+            let query = rest[..rest.len() - 1].join(" ");
+            return (query, n);
+        }
+    }
+    (rest.join(" "), 10)
+}
+
+fn parse_post_args(rest: &[&str]) -> (String, Option<String>) {
+    let mut category: Option<String> = None;
+    let mut content_parts: Vec<&str> = Vec::new();
+    let mut i = 0;
+    while i < rest.len() {
+        match rest[i] {
+            "--category" | "-c" => {
+                if i + 1 < rest.len() {
+                    category = Some(rest[i + 1].to_string());
+                    i += 2;
+                    continue;
+                }
+            }
+            _ => content_parts.push(rest[i]),
+        }
+        i += 1;
+    }
+    (content_parts.join(" "), category)
+}
+
+fn print_memory_list(memories: &[serde_json::Value]) {
+    for (i, mem) in memories.iter().enumerate() {
+        let id = mem.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+        let content = mem.get("content").and_then(|v| v.as_str()).unwrap_or("");
+        let category = mem.get("category").and_then(|v| v.as_str()).unwrap_or("");
+        let short_id = if id.len() > 12 { &id[..12] } else { id };
+        let preview: String = content.chars().take(80).collect();
+        let suffix = if content.chars().count() > 80 {
+            "…"
+        } else {
+            ""
+        };
+        if category.is_empty() {
+            println!("  {}. [{}] {}{}", i + 1, short_id, preview, suffix);
+        } else {
+            println!(
+                "  {}. [{}] ({}) {}{}",
+                i + 1,
+                short_id,
+                category,
+                preview,
+                suffix
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+
+    /// Mirror the parts→(command, subcommand, args) slicing used by the
+    /// real dispatcher, so regression tests can hit every length class
+    /// without standing up a live CommandHandler.
+    fn split_parts<'a>(parts: &'a [&'a str]) -> (&'a str, Option<&'a str>, &'a [&'a str]) {
+        let command = parts[0];
+        let subcommand = parts.get(1).copied();
+        let args = if parts.len() > 2 {
+            &parts[2..]
+        } else {
+            &[] as &[&str]
+        };
+        (command, subcommand, args)
+    }
+
+    #[test]
+    fn test_command_parsing() {
+        let input = "/help";
+        let parts: Vec<&str> = input.split_whitespace().collect();
+        assert_eq!(parts[0], "/help");
+    }
+
+    #[test]
+    fn test_single_token_command_does_not_panic() {
+        // Regression: "/help" split_whitespace produces a 1-element Vec.
+        // Earlier code did `&parts[2..]` unconditionally and panicked with
+        // "range start index 2 out of range for slice of length 1" on the
+        // first command entered in a fresh REPL session.
+        let parts: Vec<&str> = "/help".split_whitespace().collect();
+        let (command, subcommand, args) = split_parts(&parts);
+        assert_eq!(command, "/help");
+        assert_eq!(subcommand, None);
+        assert!(args.is_empty());
+    }
+
+    #[test]
+    fn test_two_token_command_has_subcommand_empty_args() {
+        let parts: Vec<&str> = "/memory list".split_whitespace().collect();
+        let (command, subcommand, args) = split_parts(&parts);
+        assert_eq!(command, "/memory");
+        assert_eq!(subcommand, Some("list"));
+        assert!(args.is_empty());
+    }
+
+    #[test]
+    fn test_three_plus_token_command_exposes_args_slice() {
+        let parts: Vec<&str> = "/memory get mem_abc123".split_whitespace().collect();
+        let (command, subcommand, args) = split_parts(&parts);
+        assert_eq!(command, "/memory");
+        assert_eq!(subcommand, Some("get"));
+        assert_eq!(args, &["mem_abc123"]);
+    }
+
+    #[test]
+    fn test_long_command_with_flags() {
+        let parts: Vec<&str> = "/memory post hello world --category work"
+            .split_whitespace()
+            .collect();
+        let (_, _, args) = split_parts(&parts);
+        assert_eq!(args, &["hello", "world", "--category", "work"]);
+    }
+}

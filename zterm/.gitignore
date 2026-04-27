@@ -1,0 +1,43 @@
+# Rust build artifacts
+/target/
+*.rs.bk
+Cargo.lock.bak
+
+# Secrets + local config
+.env
+.env.local
+!.env.example
+*.pem
+*.key
+id_ed25519*
+id_rsa*
+
+# Internal dev artifacts (kept in ARGONAS private mirror, NOT shipped to GitHub)
+PHASE_*.md
+*_PHASE*.md
+BUILD_ON_*.sh
+MANUAL_BUILD_*.md
+TEST_ON_*.md
+DEPLOY_TO_*.md
+DEPLOY_*.md
+test-ws.sh
+run_phase*.sh
+run_phase8_tests.sh
+SUMMARY_*.md
+PROJECT_COMPLETION.md
+ZTERM_READINESS_REPORT.md
+ZTERM_PHASE*_TEST_REPORT*
+ZTERM_PHASE*_TEST_RESULTS*
+TEST_REPORT.md
+ZEROCLAW_TEST_PLAN.md
+DOCKER_BUILD_AMD64.sh
+
+# Per-project Claude Code guidance (internal; not shipped with public releases)
+CLAUDE.md
+CLAUDE-*.md
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.swp

@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+members = [
+    "zterm",
+    "ncz",
+]
+
+[workspace.package]
+edition = "2021"
+license = "Apache-2.0"
+authors = ["Jason Perlow <jperlow@gmail.com>"]
+repository = "https://github.com/nclawzero/ncz-tools"
+
+# Size-tuned release profile for embedded arm64 / Pi Zero-class targets.
+# Members may opt out by setting `[profile.release]` in their own Cargo.toml.
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
+
+# zterm prefers speed-optimized release builds; override the workspace default.
+[profile.release.package.zterm]
+opt-level = 3

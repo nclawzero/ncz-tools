@@ -1,0 +1,61 @@
+# ~/.zterm/config.toml — zterm v0.2 multi-workspace example.
+#
+# zterm reads this file at startup. When the file exists and has at
+# least one [[workspaces]] entry, multi-workspace mode is active:
+#
+#   - The `active = "..."` field picks which workspace boots first.
+#   - Override at launch with `zterm tui --workspace <name>`.
+#   - Switch at runtime with `/workspace switch <name>` inside the REPL.
+#   - `/workspace list` / `/workspace info` inspect the current set.
+#
+# When the file is absent or has no [[workspaces]] entries, zterm falls
+# back to single-workspace mode — synthesizes one zeroclaw workspace
+# from the `--remote` + `--token` CLI flags. v0.1 users see zero
+# change.
+#
+# MNEMOS memory is user-global: one MnemosClient is shared across
+# every workspace. Configure it via the `MNEMOS_URL` + `MNEMOS_TOKEN`
+# environment variables (not in this file).
+
+# -------------------------------------------------------------------
+# Which workspace starts active on boot. Must match one of the
+# [[workspaces]] entries below. If the named workspace is an openclaw
+# backend, zterm runs the live handshake at startup.
+# -------------------------------------------------------------------
+active = "zeroclaw-typhon"
+
+# -------------------------------------------------------------------
+# Workspaces. Each entry is a named claw-family agent backend.
+# -------------------------------------------------------------------
+
+# A zeroclaw backend on a typhon x86 host. Token lives in an env var
+# (preferred — never commit a token into version-controlled config).
+[[workspaces]]
+name = "zeroclaw-typhon"
+backend = "zeroclaw"
+url = "http://127.0.0.1:42617"
+token_env = "ZEROCLAW_TOKEN_TYPHON"
+label = "typhon (zeroclaw)"     # optional; displayed in /workspace list
+
+# An openclaw backend on the same host. Openclaw uses pure-WebSocket
+# + ed25519 device-key auth — no token required when the gateway is
+# in loopback / auth.mode:"none" mode.
+[[workspaces]]
+name = "openclaw-typhon"
+backend = "openclaw"
+url = "ws://127.0.0.1:18789"
+label = "typhon (openclaw)"
+
+# A zeroclaw backend on a Pi / edge host. Inline token here is fine
+# for ephemeral / test workspaces but don't commit config with a
+# real token populated — use token_env for production secrets.
+[[workspaces]]
+name = "zeroclaw-jetson"
+backend = "zeroclaw"
+url = "http://192.168.207.62:42617"
+token = "ephemeral-pi-token-for-testing-only"
+
+# Per-backend model + provider pinning is out of scope for the config
+# layer; it lives on the agent daemon itself (zeroclaw.toml, openclaw
+# config, etc.). zterm's `/models set <provider/model>` (zeroclaw-only
+# today) lets you change the default at runtime.

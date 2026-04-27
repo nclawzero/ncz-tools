@@ -1,0 +1,46 @@
+default:
+  image: rust:1.93-slim
+  cache:
+    key: cargo-rust-1-93-v1
+    paths:
+      - .cargo/
+      - target/
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq pkg-config libssl-dev
+
+variables:
+  CARGO_HOME: $CI_PROJECT_DIR/.cargo
+  CARGO_TERM_COLOR: never
+
+stages:
+  - lint
+  - test
+  - build
+
+fmt:
+  stage: lint
+  script:
+    - rustup component add rustfmt
+    - cargo fmt --all -- --check
+
+clippy:
+  stage: lint
+  script:
+    - rustup component add clippy
+    - cargo clippy --workspace --all-targets -- -D warnings
+  allow_failure: true   # advisory while ncz scaffolds; ratchet to hard-fail post v0.1
+
+test:
+  stage: test
+  script:
+    - cargo test --workspace --all-features
+
+build:
+  stage: build
+  script:
+    - cargo build --workspace --release
+  artifacts:
+    paths:
+      - target/release/ncz
+      - target/release/zterm
+    expire_in: 1 week
