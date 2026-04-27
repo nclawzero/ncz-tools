@@ -11,10 +11,10 @@ pub fn read(paths: &Paths) -> Result<String, NczError> {
     match fs::read_to_string(paths.agent_state()) {
         Ok(s) => {
             let trimmed = s.trim().to_string();
-            if AGENTS.iter().any(|a| *a == trimmed) {
-                Ok(trimmed)
-            } else {
+            if trimmed.is_empty() {
                 Ok(DEFAULT.to_string())
+            } else {
+                Ok(trimmed)
             }
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(DEFAULT.to_string()),
@@ -23,7 +23,7 @@ pub fn read(paths: &Paths) -> Result<String, NczError> {
 }
 
 pub fn write(paths: &Paths, agent: &str) -> Result<(), NczError> {
-    if !AGENTS.iter().any(|a| *a == agent) {
+    if !AGENTS.contains(&agent) {
         return Err(NczError::Usage(format!("unknown agent: {agent}")));
     }
     let body = format!("{agent}\n");

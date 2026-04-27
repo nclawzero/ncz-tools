@@ -36,6 +36,17 @@ pub fn start(runner: &dyn CommandRunner, unit: &str) -> Result<(), NczError> {
     Ok(())
 }
 
+pub fn restart(runner: &dyn CommandRunner, unit: &str) -> Result<(), NczError> {
+    let out = runner.run("sudo", &["systemctl", "restart", unit])?;
+    if !out.ok() {
+        return Err(NczError::Exec {
+            cmd: format!("systemctl restart {unit}"),
+            msg: out.stderr,
+        });
+    }
+    Ok(())
+}
+
 pub fn stop(runner: &dyn CommandRunner, unit: &str) -> Result<(), NczError> {
     let _ = runner.run("sudo", &["systemctl", "stop", unit])?;
     Ok(())

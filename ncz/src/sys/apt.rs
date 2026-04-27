@@ -4,7 +4,7 @@
 use crate::{error::NczError, sys::CommandRunner};
 
 pub fn update(runner: &dyn CommandRunner) -> Result<(), NczError> {
-    let out = runner.run("sudo", &["apt-get", "update", "-qq"])?;
+    let out = runner.run("sudo", &["apt-get", "update"])?;
     if !out.ok() {
         return Err(NczError::Exec {
             cmd: "apt-get update".into(),

@@ -92,6 +92,7 @@ pub(crate) mod fake {
     /// register expectations and assert on call order.
     pub struct FakeRunner {
         pub responses: Mutex<HashMap<String, ProcessOutput>>,
+        pub http_responses: Mutex<HashMap<String, u16>>,
         pub calls: Mutex<Vec<String>>,
     }
 
@@ -99,6 +100,7 @@ pub(crate) mod fake {
         pub fn new() -> Self {
             Self {
                 responses: Mutex::new(HashMap::new()),
+                http_responses: Mutex::new(HashMap::new()),
                 calls: Mutex::new(vec![]),
             }
         }
@@ -106,6 +108,12 @@ pub(crate) mod fake {
         pub fn expect(&self, cmd: &str, args: &[&str], reply: ProcessOutput) {
             let key = format!("{} {}", cmd, args.join(" "));
             self.responses.lock().unwrap().insert(key, reply);
+        }
+
+        #[allow(dead_code)]
+        pub fn expect_http(&self, port: u16, path: &str, status: u16) {
+            let key = format!("http {port} {path}");
+            self.http_responses.lock().unwrap().insert(key, status);
         }
     }
 
@@ -120,6 +128,25 @@ pub(crate) mod fake {
                 .cloned()
                 .ok_or_else(|| NczError::Exec {
                     cmd: cmd.into(),
+                    msg: format!("FakeRunner: unexpected call: {key}"),
+                })
+        }
+
+        fn http_get_local(
+            &self,
+            port: u16,
+            path: &str,
+            _timeout_secs: u64,
+        ) -> Result<u16, NczError> {
+            let key = format!("http {port} {path}");
+            self.calls.lock().unwrap().push(key.clone());
+            self.http_responses
+                .lock()
+                .unwrap()
+                .get(&key)
+                .copied()
+                .ok_or_else(|| NczError::Exec {
+                    cmd: "http_get_local".into(),
                     msg: format!("FakeRunner: unexpected call: {key}"),
                 })
         }

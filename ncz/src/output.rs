@@ -21,8 +21,7 @@ pub fn emit<T: Render>(value: &T, json: bool) -> io::Result<()> {
     let stdout = io::stdout();
     let mut out = stdout.lock();
     if json {
-        serde_json::to_writer_pretty(&mut out, value)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        serde_json::to_writer_pretty(&mut out, value).map_err(io::Error::other)?;
         writeln!(out)?;
     } else {
         value.render_text(&mut out)?;

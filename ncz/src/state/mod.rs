@@ -51,6 +51,21 @@ impl Paths {
     pub fn primary_provider(&self) -> PathBuf {
         self.etc_dir.join("primary-provider")
     }
+    pub fn providers_dir(&self) -> PathBuf {
+        self.etc_dir.join("providers.d")
+    }
+    pub fn agent_config_dir(&self) -> PathBuf {
+        self.etc_dir.join("agents")
+    }
+    pub fn agent_primary_provider(&self, agent: &str) -> PathBuf {
+        self.agent_config_dir().join(agent).join("primary-provider")
+    }
+    pub fn sandbox_dir(&self) -> PathBuf {
+        self.etc_dir.join("sandbox")
+    }
+    pub fn version(&self) -> PathBuf {
+        self.etc_dir.join("version")
+    }
     pub fn manifest(&self) -> PathBuf {
         self.etc_dir.join("manifest.sha256")
     }

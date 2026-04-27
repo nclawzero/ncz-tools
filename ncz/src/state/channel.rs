@@ -16,7 +16,7 @@ pub fn read(paths: &Paths) -> Result<String, NczError> {
 }
 
 pub fn write(paths: &Paths, channel: &str) -> Result<(), NczError> {
-    if !CHANNELS.iter().any(|c| *c == channel) {
+    if !CHANNELS.contains(&channel) {
         return Err(NczError::Usage(format!("unknown channel: {channel}")));
     }
     let body = format!("{channel}\n");

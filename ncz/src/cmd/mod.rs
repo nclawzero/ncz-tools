@@ -8,6 +8,8 @@
 use crate::cli::{Command, Context};
 use crate::error::NczError;
 
+mod common;
+
 pub mod channel;
 pub mod health;
 pub mod inspect;
