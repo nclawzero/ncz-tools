@@ -26,6 +26,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
+use tokio::runtime::Handle;
 use tokio::sync::{mpsc, Mutex};
 use tracing::{info, warn};
 
@@ -776,6 +777,7 @@ pub async fn run(
     });
 
     let blocking_app = Arc::clone(&app);
+    let runtime_handle = Handle::current();
     tokio::task::spawn_blocking(move || {
         run_blocking(
             blocking_app,
@@ -786,6 +788,7 @@ pub async fn run(
             connect_splash,
             req_tx,
             event_rx,
+            runtime_handle,
         )
     })
     .await
@@ -1340,6 +1343,7 @@ fn run_blocking(
     connect_splash: Option<String>,
     req_tx: mpsc::Sender<WorkerRequest>,
     mut event_rx: mpsc::UnboundedReceiver<TurnChunk>,
+    runtime_handle: Handle,
 ) -> Result<()> {
     let mut tapp =
         Application::new().map_err(|e| anyhow::anyhow!("turbo-vision init failed: {e:?}"))?;
@@ -1503,6 +1507,7 @@ fn run_blocking(
         &mut status_state,
         &mut typewriter_state,
         &app,
+        &runtime_handle,
         w,
         h,
     )?;
@@ -1666,6 +1671,7 @@ fn run_event_loop(
     status_state: &mut StatusState,
     typewriter_state: &mut Option<TypewriterState>,
     shared_app: &Arc<Mutex<App>>,
+    runtime_handle: &Handle,
     w: i16,
     h: i16,
 ) -> Result<()> {
@@ -1945,6 +1951,7 @@ fn run_event_loop(
                 &chat_lines,
                 &req_tx,
                 shared_app,
+                runtime_handle,
                 status_state,
                 &mut response_in_flight,
             );
@@ -2193,6 +2200,7 @@ fn handle_command(
     chat_lines: &Rc<RefCell<Vec<String>>>,
     req_tx: &mpsc::Sender<WorkerRequest>,
     shared_app: &Arc<Mutex<App>>,
+    runtime_handle: &Handle,
     status_state: &mut StatusState,
     response_in_flight: &mut bool,
 ) {
@@ -2321,13 +2329,43 @@ fn handle_command(
             );
         }
         CMD_SESSION_OPEN => {
-            dispatch_command(
-                "/session list",
-                chat_lines,
-                req_tx,
-                status_state,
-                response_in_flight,
-            );
+            if *response_in_flight {
+                note_response_busy(status_state);
+                return;
+            }
+            match load_session_picker_entries(shared_app, runtime_handle) {
+                Ok(entries) if entries.is_empty() => {
+                    chat_lines
+                        .borrow_mut()
+                        .push("[session] no backend sessions returned".to_string());
+                    chat_lines.borrow_mut().push(String::new());
+                }
+                Ok(entries) => {
+                    if let Some(entry) = run_session_picker(app, &entries) {
+                        match session_switch_command_for_picker_entry(&entry) {
+                            Ok(cmdline) => dispatch_command(
+                                &cmdline,
+                                chat_lines,
+                                req_tx,
+                                status_state,
+                                response_in_flight,
+                            ),
+                            Err(e) => {
+                                chat_lines
+                                    .borrow_mut()
+                                    .push(format!("[session] cannot switch via picker: {e}"));
+                                chat_lines.borrow_mut().push(String::new());
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    chat_lines
+                        .borrow_mut()
+                        .push(format!("[session] could not load backend sessions: {e}"));
+                    chat_lines.borrow_mut().push(String::new());
+                }
+            }
         }
         _ => {}
     }
@@ -2568,6 +2606,53 @@ struct WorkspacePickerEntry {
     active: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionPickerEntry {
+    id: String,
+    name: String,
+    model: String,
+    provider: String,
+}
+
+impl From<Session> for SessionPickerEntry {
+    fn from(session: Session) -> Self {
+        Self {
+            id: session.id,
+            name: session.name,
+            model: session.model,
+            provider: session.provider,
+        }
+    }
+}
+
+fn load_session_picker_entries(
+    shared_app: &Arc<Mutex<App>>,
+    runtime_handle: &Handle,
+) -> Result<Vec<SessionPickerEntry>> {
+    let client = {
+        let guard = shared_app.blocking_lock();
+        guard.active_workspace().and_then(|w| w.client.clone())
+    }
+    .ok_or_else(|| anyhow::anyhow!("no active workspace client"))?;
+
+    let sessions = runtime_handle.block_on(async {
+        let locked = client.lock().await;
+        locked.list_sessions().await
+    })?;
+
+    Ok(sessions.into_iter().map(SessionPickerEntry::from).collect())
+}
+
+fn session_switch_command_for_picker_entry(entry: &SessionPickerEntry) -> Result<String> {
+    let id = entry.id.trim();
+    if id.is_empty() || id.split_whitespace().count() != 1 {
+        return Err(anyhow::anyhow!(
+            "backend session id is not a single command token"
+        ));
+    }
+    Ok(format!("/session switch {id}"))
+}
+
 /// Theme color editor modal (E-8b MVP).
 ///
 /// Presents a small framed dialog stuck at the top-right corner so
@@ -2758,6 +2843,58 @@ fn run_workspace_picker(app: &mut Application, entries: &[WorkspacePickerEntry])
     }
     let idx = selected.checked_sub(CMD_WS_SELECT_BASE)? as usize;
     entries.get(idx).map(|e| e.name.clone())
+}
+
+/// Present a MenuBox-style modal picker of backend sessions.
+///
+/// The selected row maps back to the backend session id; the caller dispatches
+/// `/session switch <id>` through the same worker/CommandHandler path as typed
+/// slash commands so session binding remains centralized.
+fn run_session_picker(
+    app: &mut Application,
+    entries: &[SessionPickerEntry],
+) -> Option<SessionPickerEntry> {
+    use turbo_vision::core::geometry::Point;
+
+    const CMD_SESSION_SELECT_BASE: u16 = 1400;
+
+    let items: Vec<MenuItem> = entries
+        .iter()
+        .enumerate()
+        .map(|(i, e)| {
+            let label = format!(
+                " {}  [{} / {}]  {}",
+                e.name,
+                empty_label(&e.provider),
+                empty_label(&e.model),
+                e.id
+            );
+            MenuItem::with_shortcut(&label, CMD_SESSION_SELECT_BASE + i as u16, 0, "", 0)
+        })
+        .collect();
+
+    let (tw, th) = app.terminal.size();
+    let w = tw;
+    let h = th;
+    let position = Point::new((w / 2) - 28, (h / 3).max(3));
+
+    let menu = turbo_vision::core::menu_data::Menu::from_items(items);
+    let mut menu_box = MenuBox::new(position, menu);
+    let selected = menu_box.execute(&mut app.terminal);
+
+    if selected == 0 {
+        return None;
+    }
+    let idx = selected.checked_sub(CMD_SESSION_SELECT_BASE)? as usize;
+    entries.get(idx).cloned()
+}
+
+fn empty_label(value: &str) -> &str {
+    if value.trim().is_empty() {
+        "-"
+    } else {
+        value
+    }
 }
 
 /// Custom read-only scrolling text view over a shared `Vec<String>`
@@ -3019,6 +3156,40 @@ mod tests {
             lines.borrow().as_slice(),
             ["> hello", "complete response", ""]
         );
+    }
+
+    #[test]
+    fn session_picker_entry_builds_switch_command_from_backend_id() {
+        let entry = SessionPickerEntry {
+            id: "sess-123".to_string(),
+            name: "scratch".to_string(),
+            model: "gpt-test".to_string(),
+            provider: "test".to_string(),
+        };
+
+        assert_eq!(
+            session_switch_command_for_picker_entry(&entry).unwrap(),
+            "/session switch sess-123"
+        );
+    }
+
+    #[test]
+    fn session_picker_entry_rejects_non_token_backend_id() {
+        let entry = SessionPickerEntry {
+            id: "bad id".to_string(),
+            name: "scratch".to_string(),
+            model: String::new(),
+            provider: String::new(),
+        };
+
+        assert!(session_switch_command_for_picker_entry(&entry).is_err());
+    }
+
+    #[test]
+    fn empty_picker_labels_render_as_dash() {
+        assert_eq!(empty_label(""), "-");
+        assert_eq!(empty_label("  "), "-");
+        assert_eq!(empty_label("openai"), "openai");
     }
 
     #[test]

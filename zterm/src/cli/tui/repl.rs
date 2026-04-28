@@ -217,19 +217,7 @@ impl ReplLoop {
 
             // Handle commands
             if input.starts_with('/') {
-                if let Some(action) = legacy_session_action(&input) {
-                    match self.apply_legacy_session_action(action).await {
-                        Ok(()) => {
-                            println!("✅ Active backend session: {}", self.session.name);
-                        }
-                        Err(e) => {
-                            ui::print_error(&e.to_string(), None);
-                        }
-                    }
-                    continue;
-                }
-
-                match self.command_handler.handle(&input, &self.session.id).await {
+                match self.handle_slash_command(&input).await {
                     Ok(Some(text)) => {
                         // Handlers that were refactored to return
                         // their output as a String (so the Turbo
@@ -304,6 +292,53 @@ impl ReplLoop {
         // Save history on exit
         self.history.save_to_file()?;
         Ok(())
+    }
+
+    async fn handle_slash_command(&mut self, input: &str) -> Result<Option<String>> {
+        if let Some(action) = legacy_session_action(input) {
+            self.apply_legacy_session_action(action).await?;
+            return Ok(Some(format!(
+                "✅ Active backend session: {}\n",
+                self.session.name
+            )));
+        }
+
+        let preflight = command_session_preflight(input);
+        let workspace_switch_target = workspace_switch_target(input);
+        let workspace_before_dispatch =
+            if preflight == CommandSessionPreflight::AfterWorkspaceSwitch {
+                self.current_workspace_name().await.ok()
+            } else {
+                None
+            };
+
+        let command_session_id = if preflight == CommandSessionPreflight::BeforeDispatch {
+            self.ensure_session_for_active_workspace().await?
+        } else {
+            self.session.id.clone()
+        };
+
+        let result = self
+            .command_handler
+            .handle(input, &command_session_id)
+            .await?;
+
+        if preflight == CommandSessionPreflight::AfterWorkspaceSwitch {
+            let workspace_after_dispatch = self.current_workspace_name().await.ok();
+            let successful_switch = matches!(
+                (workspace_switch_target.as_deref(), workspace_after_dispatch.as_deref()),
+                (Some(target), Some(active)) if target == active
+            );
+            if successful_switch || workspace_after_dispatch != workspace_before_dispatch {
+                self.ensure_session_for_active_workspace()
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!("workspace switched, but session setup failed: {e}")
+                    })?;
+            }
+        }
+
+        Ok(result)
     }
 
     /// Print REPL banner with theme colors
@@ -471,6 +506,51 @@ fn single_remaining_session_target<'a>(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommandSessionPreflight {
+    None,
+    BeforeDispatch,
+    AfterWorkspaceSwitch,
+}
+
+fn command_session_preflight(cmdline: &str) -> CommandSessionPreflight {
+    let mut parts = cmdline.split_whitespace();
+    let Some(command) = parts.next() else {
+        return CommandSessionPreflight::None;
+    };
+    let subcommand = parts.next();
+
+    match command {
+        "/info" | "/status" | "/clear" | "/save" => CommandSessionPreflight::BeforeDispatch,
+        "/session" if matches!(subcommand, Some("info") | Some("delete")) => {
+            CommandSessionPreflight::BeforeDispatch
+        }
+        "/workspace" | "/workspaces"
+            if matches!(subcommand, Some("switch")) && parts.next().is_some() =>
+        {
+            CommandSessionPreflight::AfterWorkspaceSwitch
+        }
+        _ => CommandSessionPreflight::None,
+    }
+}
+
+fn workspace_switch_target(cmdline: &str) -> Option<String> {
+    let mut parts = cmdline.split_whitespace();
+    let command = parts.next()?;
+    if !matches!(command, "/workspace" | "/workspaces") {
+        return None;
+    }
+    if parts.next()? != "switch" {
+        return None;
+    }
+    let target = parts.collect::<Vec<_>>().join(" ");
+    if target.is_empty() {
+        None
+    } else {
+        Some(target)
+    }
+}
+
 #[derive(Debug)]
 enum LegacySessionResolution {
     Existing(Session),
@@ -624,6 +704,7 @@ mod tests {
     struct FakeWorkspaceClient {
         sessions: Vec<Session>,
         submitted: Arc<StdMutex<Vec<(String, String)>>>,
+        deleted: Arc<StdMutex<Vec<String>>>,
     }
 
     #[async_trait::async_trait]
@@ -670,7 +751,8 @@ mod tests {
                 .ok_or_else(|| anyhow::anyhow!("session not found"))
         }
 
-        async fn delete_session(&self, _session_id: &str) -> anyhow::Result<()> {
+        async fn delete_session(&self, session_id: &str) -> anyhow::Result<()> {
+            self.deleted.lock().unwrap().push(session_id.to_string());
             Ok(())
         }
 
@@ -690,10 +772,12 @@ mod tests {
         name: &str,
         sessions: Vec<Session>,
         submitted: Arc<StdMutex<Vec<(String, String)>>>,
+        deleted: Arc<StdMutex<Vec<String>>>,
     ) -> Workspace {
         let fake = FakeWorkspaceClient {
             sessions,
             submitted,
+            deleted,
         };
         let boxed: Box<dyn AgentClient + Send + Sync> = Box::new(fake);
         Workspace {
@@ -717,6 +801,8 @@ mod tests {
     async fn repl_workspace_switch_rebinds_session_before_next_turn() {
         let alpha_submitted = Arc::new(StdMutex::new(Vec::new()));
         let beta_submitted = Arc::new(StdMutex::new(Vec::new()));
+        let alpha_deleted = Arc::new(StdMutex::new(Vec::new()));
+        let beta_deleted = Arc::new(StdMutex::new(Vec::new()));
         let alpha = session("alpha-session", "chat");
         let beta = session("beta-session", "chat");
         let app = Arc::new(Mutex::new(App {
@@ -726,8 +812,15 @@ mod tests {
                     "alpha",
                     vec![alpha.clone()],
                     Arc::clone(&alpha_submitted),
+                    Arc::clone(&alpha_deleted),
                 ),
-                workspace(1, "beta", vec![beta.clone()], Arc::clone(&beta_submitted)),
+                workspace(
+                    1,
+                    "beta",
+                    vec![beta.clone()],
+                    Arc::clone(&beta_submitted),
+                    Arc::clone(&beta_deleted),
+                ),
             ],
             active: 0,
             shared_mnemos: None,
@@ -759,5 +852,60 @@ mod tests {
             beta_submitted.lock().unwrap().as_slice(),
             &[("beta-session".to_string(), "hello beta".to_string())]
         );
+    }
+
+    #[tokio::test]
+    async fn repl_workspace_switch_then_delete_active_new_workspace_session_is_blocked() {
+        let alpha_submitted = Arc::new(StdMutex::new(Vec::new()));
+        let beta_submitted = Arc::new(StdMutex::new(Vec::new()));
+        let alpha_deleted = Arc::new(StdMutex::new(Vec::new()));
+        let beta_deleted = Arc::new(StdMutex::new(Vec::new()));
+        let alpha = session("alpha-session", "chat");
+        let beta = session("beta-session", "chat");
+        let app = Arc::new(Mutex::new(App {
+            workspaces: vec![
+                workspace(
+                    0,
+                    "alpha",
+                    vec![alpha.clone()],
+                    Arc::clone(&alpha_submitted),
+                    Arc::clone(&alpha_deleted),
+                ),
+                workspace(
+                    1,
+                    "beta",
+                    vec![beta.clone()],
+                    Arc::clone(&beta_submitted),
+                    Arc::clone(&beta_deleted),
+                ),
+            ],
+            active: 0,
+            shared_mnemos: None,
+            config_path: PathBuf::from("test-config.toml"),
+        }));
+        let mut repl = ReplLoop::new(
+            Arc::clone(&app),
+            alpha,
+            "model".to_string(),
+            "provider".to_string(),
+        )
+        .unwrap();
+
+        repl.ensure_session_for_active_workspace().await.unwrap();
+        repl.handle_slash_command("/workspace switch beta")
+            .await
+            .unwrap();
+
+        assert_eq!(repl.session.id, "beta-session");
+
+        let out = repl
+            .handle_slash_command("/session delete chat")
+            .await
+            .expect("delete command should complete")
+            .expect("delete command should return output");
+
+        assert!(out.contains("Cannot delete active session"));
+        assert!(beta_deleted.lock().unwrap().is_empty());
+        assert!(alpha_deleted.lock().unwrap().is_empty());
     }
 }
