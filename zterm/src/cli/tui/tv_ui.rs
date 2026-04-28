@@ -515,10 +515,12 @@ pub async fn run(
                             let mut client = client_arc.lock().await;
                             let (turn_sink, turn_rx) = mpsc::unbounded_channel::<TurnChunk>();
                             let observed_finished = Arc::new(AtomicBool::new(false));
+                            let forwarded_token = Arc::new(AtomicBool::new(false));
                             let mut forward_task = tokio::spawn(forward_turn_chunks(
                                 turn_rx,
                                 worker_sink.clone(),
                                 Arc::clone(&observed_finished),
+                                Arc::clone(&forwarded_token),
                             ));
                             client.set_stream_sink(Some(turn_sink));
                             let submit_result = client.submit_turn(&worker_session_id, &text).await;
@@ -546,7 +548,11 @@ pub async fn run(
                                     observed_finished.load(Ordering::Acquire)
                                 }
                             };
-                            for chunk in submit_turn_fallback_chunks(&submit_result, saw_finished) {
+                            for chunk in submit_turn_fallback_chunks(
+                                &submit_result,
+                                saw_finished,
+                                forwarded_token.load(Ordering::Acquire),
+                            ) {
                                 let _ = worker_sink.send(chunk);
                             }
                         }
@@ -604,10 +610,21 @@ pub async fn run(
                         };
                     }
                     let mut session_switched = false;
-                    if let Some(target_session) = session_switch_target(&cmdline) {
-                        match resolve_or_create_session_for_worker(&worker_app, target_session)
-                            .await
-                        {
+                    if let Some(session_action) = session_action(&cmdline) {
+                        let target_session = session_action.target();
+                        let action_label = match session_action {
+                            SessionAction::Switch { .. } => "switch session to",
+                            SessionAction::Create { .. } => "create session",
+                        };
+                        let session_result = match session_action {
+                            SessionAction::Switch { target } => {
+                                resolve_or_create_session_for_worker(&worker_app, target).await
+                            }
+                            SessionAction::Create { target } => {
+                                create_new_session_for_worker(&worker_app, target).await
+                            }
+                        };
+                        match session_result {
                             Ok(session) => {
                                 command_session_id = session.id.clone();
                                 match current_workspace_name(&worker_app).await {
@@ -629,7 +646,7 @@ pub async fn run(
                             }
                             Err(e) => {
                                 let _ = worker_sink.send(TurnChunk::Finished(Err(format!(
-                                    "could not switch session to `{target_session}`: {e}"
+                                    "could not {action_label} `{target_session}`: {e}"
                                 ))));
                                 continue;
                             }
@@ -765,6 +782,7 @@ async fn forward_turn_chunks(
     mut turn_rx: mpsc::UnboundedReceiver<TurnChunk>,
     ui_sink: StreamSink,
     observed_finished: Arc<AtomicBool>,
+    forwarded_token: Arc<AtomicBool>,
 ) -> bool {
     let mut saw_finished = false;
     while let Some(chunk) = turn_rx.recv().await {
@@ -779,7 +797,10 @@ async fn forward_turn_chunks(
             }
             continue;
         }
-        let _ = ui_sink.send(chunk);
+        let is_token = matches!(&chunk, TurnChunk::Token(_));
+        if ui_sink.send(chunk).is_ok() && is_token {
+            forwarded_token.store(true, Ordering::Release);
+        }
     }
     saw_finished
 }
@@ -787,12 +808,17 @@ async fn forward_turn_chunks(
 fn submit_turn_fallback_chunks(
     submit_result: &Result<String>,
     saw_finished: bool,
+    forwarded_token: bool,
 ) -> Vec<TurnChunk> {
     if saw_finished {
         return Vec::new();
     }
 
     match submit_result {
+        Ok(_) if forwarded_token => vec![TurnChunk::Finished(Err(
+            "partial response incomplete; backend stream ended without a finished frame"
+                .to_string(),
+        ))],
         Ok(text) => {
             let mut chunks = Vec::new();
             if !text.is_empty() {
@@ -943,6 +969,38 @@ async fn resolve_or_create_session_for_worker(
     }
 
     let session = client.lock().await.create_session(session_name).await?;
+    save_worker_session_metadata(&session)?;
+    Ok(session)
+}
+
+async fn create_new_session_for_worker(
+    app: &Arc<Mutex<App>>,
+    session_name: &str,
+) -> Result<Session> {
+    let client = {
+        let guard = app.lock().await;
+        guard.active_workspace().and_then(|w| w.client.clone())
+    }
+    .ok_or_else(|| anyhow::anyhow!("no active workspace client"))?;
+
+    {
+        let locked = client.lock().await;
+        plan_worker_session_create(session_name, locked.list_sessions().await)?;
+    }
+
+    create_session_for_worker_client(&client, session_name).await
+}
+
+async fn create_session_for_worker_client(
+    client: &Arc<Mutex<Box<dyn crate::cli::agent::AgentClient + Send + Sync>>>,
+    session_name: &str,
+) -> Result<Session> {
+    let session = client.lock().await.create_session(session_name).await?;
+    save_worker_session_metadata(&session)?;
+    Ok(session)
+}
+
+fn save_worker_session_metadata(session: &Session) -> Result<()> {
     let metadata = storage::SessionMetadata {
         id: session.id.clone(),
         name: session.name.clone(),
@@ -960,7 +1018,7 @@ async fn resolve_or_create_session_for_worker(
             metadata.id
         );
     }
-    Ok(session)
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -979,6 +1037,36 @@ fn plan_worker_session_resolution(
         Some(session) => Ok(WorkerSessionResolution::Existing(session.clone())),
         None => Ok(WorkerSessionResolution::Create),
     }
+}
+
+fn plan_worker_session_create(requested: &str, list_result: Result<Vec<Session>>) -> Result<()> {
+    let sessions = list_result
+        .map_err(|e| anyhow::anyhow!("could not list sessions from active backend: {e}"))?;
+
+    let conflicts: Vec<&Session> = sessions
+        .iter()
+        .filter(|session| session.id == requested || session.name == requested)
+        .collect();
+    if conflicts.is_empty() {
+        return Ok(());
+    }
+
+    Err(duplicate_worker_session_create_error(requested, conflicts))
+}
+
+fn duplicate_worker_session_create_error(
+    requested: &str,
+    conflicts: Vec<&Session>,
+) -> anyhow::Error {
+    let candidates = conflicts
+        .iter()
+        .map(|session| format!("backend id={} name={}", session.id, session.name))
+        .collect::<Vec<_>>()
+        .join("; ");
+
+    anyhow::anyhow!(
+        "backend session id/name '{requested}' already exists; refusing explicit create. Candidates: {candidates}"
+    )
 }
 
 fn choose_worker_session_by_id_or_name<'a>(
@@ -1088,15 +1176,34 @@ fn stdout_only_slash_command_block_message(cmdline: &str) -> Option<String> {
     ))
 }
 
-fn session_switch_target(cmdline: &str) -> Option<&str> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionAction<'a> {
+    Switch { target: &'a str },
+    Create { target: &'a str },
+}
+
+impl<'a> SessionAction<'a> {
+    fn target(self) -> &'a str {
+        match self {
+            SessionAction::Switch { target } | SessionAction::Create { target } => target,
+        }
+    }
+}
+
+fn session_action(cmdline: &str) -> Option<SessionAction<'_>> {
     let mut parts = cmdline.split_whitespace();
     if parts.next()? != "/session" {
         return None;
     }
     match parts.next()? {
         "list" | "info" | "delete" => None,
-        "switch" | "create" => parts.next(),
-        name => Some(name),
+        "switch" => Some(SessionAction::Switch {
+            target: parts.next()?,
+        }),
+        "create" => Some(SessionAction::Create {
+            target: parts.next()?,
+        }),
+        name => Some(SessionAction::Switch { target: name }),
     }
 }
 
@@ -2698,15 +2805,15 @@ mod tests {
     #[test]
     fn submit_turn_result_gets_worker_fallback_chunks_only_without_finished() {
         let err: Result<String> = Err(anyhow::anyhow!("backend unavailable"));
-        let err_chunks = submit_turn_fallback_chunks(&err, false);
+        let err_chunks = submit_turn_fallback_chunks(&err, false, false);
         match err_chunks.as_slice() {
             [TurnChunk::Finished(Err(message))] => assert_eq!(message, "backend unavailable"),
             other => panic!("expected synthetic error Finished, got {other:?}"),
         }
-        assert!(submit_turn_fallback_chunks(&err, true).is_empty());
+        assert!(submit_turn_fallback_chunks(&err, true, false).is_empty());
 
         let ok: Result<String> = Ok("done".to_string());
-        let ok_chunks = submit_turn_fallback_chunks(&ok, false);
+        let ok_chunks = submit_turn_fallback_chunks(&ok, false, false);
         match ok_chunks.as_slice() {
             [TurnChunk::Token(text), TurnChunk::Finished(Ok(done))] => {
                 assert_eq!(text, "done");
@@ -2714,12 +2821,24 @@ mod tests {
             }
             other => panic!("expected synthetic success Token + Finished, got {other:?}"),
         }
-        assert!(submit_turn_fallback_chunks(&ok, true).is_empty());
+        assert!(submit_turn_fallback_chunks(&ok, true, false).is_empty());
 
         let empty_ok: Result<String> = Ok(String::new());
-        match submit_turn_fallback_chunks(&empty_ok, false).as_slice() {
+        match submit_turn_fallback_chunks(&empty_ok, false, false).as_slice() {
             [TurnChunk::Finished(Ok(done))] => assert!(done.is_empty()),
             other => panic!("expected synthetic empty success Finished, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ok_submit_turn_with_forwarded_tokens_finishes_with_partial_error() {
+        let ok: Result<String> = Ok("complete response".to_string());
+
+        match submit_turn_fallback_chunks(&ok, false, true).as_slice() {
+            [TurnChunk::Finished(Err(message))] => {
+                assert!(message.contains("partial response incomplete"));
+            }
+            other => panic!("expected synthetic partial error Finished, got {other:?}"),
         }
     }
 
@@ -2728,7 +2847,7 @@ mod tests {
         let lines = Rc::new(RefCell::new(vec!["> hello".to_string(), String::new()]));
         let ok: Result<String> = Ok("complete response".to_string());
 
-        for chunk in submit_turn_fallback_chunks(&ok, false) {
+        for chunk in submit_turn_fallback_chunks(&ok, false, false) {
             apply_chunk(chunk, &lines);
         }
 
@@ -2847,6 +2966,7 @@ mod tests {
         let (turn_tx, turn_rx) = mpsc::unbounded_channel();
         let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
         let observed_finished = Arc::new(AtomicBool::new(false));
+        let forwarded_token = Arc::new(AtomicBool::new(false));
 
         turn_tx
             .send(TurnChunk::Finished(Ok("first".to_string())))
@@ -2856,12 +2976,52 @@ mod tests {
             .unwrap();
         drop(turn_tx);
 
-        assert!(forward_turn_chunks(turn_rx, ui_tx, Arc::clone(&observed_finished)).await);
+        assert!(
+            forward_turn_chunks(
+                turn_rx,
+                ui_tx,
+                Arc::clone(&observed_finished),
+                Arc::clone(&forwarded_token),
+            )
+            .await
+        );
         assert!(observed_finished.load(Ordering::Acquire));
+        assert!(!forwarded_token.load(Ordering::Acquire));
 
         match ui_rx.recv().await {
             Some(TurnChunk::Finished(Ok(text))) => assert_eq!(text, "first"),
             other => panic!("expected first Finished, got {other:?}"),
+        }
+        assert!(ui_rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn forward_turn_chunks_tracks_forwarded_tokens_without_finished() {
+        let (turn_tx, turn_rx) = mpsc::unbounded_channel();
+        let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
+        let observed_finished = Arc::new(AtomicBool::new(false));
+        let forwarded_token = Arc::new(AtomicBool::new(false));
+
+        turn_tx
+            .send(TurnChunk::Token("partial".to_string()))
+            .unwrap();
+        drop(turn_tx);
+
+        assert!(
+            !forward_turn_chunks(
+                turn_rx,
+                ui_tx,
+                Arc::clone(&observed_finished),
+                Arc::clone(&forwarded_token),
+            )
+            .await
+        );
+        assert!(!observed_finished.load(Ordering::Acquire));
+        assert!(forwarded_token.load(Ordering::Acquire));
+
+        match ui_rx.recv().await {
+            Some(TurnChunk::Token(text)) => assert_eq!(text, "partial"),
+            other => panic!("expected forwarded token, got {other:?}"),
         }
         assert!(ui_rx.recv().await.is_none());
     }
@@ -2968,19 +3128,22 @@ mod tests {
     }
 
     #[test]
-    fn session_switch_target_only_matches_real_switches() {
-        assert_eq!(session_switch_target("/session research"), Some("research"));
+    fn session_action_carries_switch_and_create_intent() {
         assert_eq!(
-            session_switch_target("/session switch research"),
-            Some("research")
+            session_action("/session research"),
+            Some(SessionAction::Switch { target: "research" })
         );
         assert_eq!(
-            session_switch_target("/session create scratch"),
-            Some("scratch")
+            session_action("/session switch research"),
+            Some(SessionAction::Switch { target: "research" })
         );
-        assert_eq!(session_switch_target("/session list"), None);
-        assert_eq!(session_switch_target("/session info"), None);
-        assert_eq!(session_switch_target("/workspace switch prod"), None);
+        assert_eq!(
+            session_action("/session create scratch"),
+            Some(SessionAction::Create { target: "scratch" })
+        );
+        assert_eq!(session_action("/session list"), None);
+        assert_eq!(session_action("/session info"), None);
+        assert_eq!(session_action("/workspace switch prod"), None);
     }
 
     #[test]
@@ -3111,6 +3274,63 @@ mod tests {
                 panic!("expected create plan, got existing session {}", session.id)
             }
         }
+    }
+
+    #[test]
+    fn worker_session_resolution_switch_and_bare_prefer_existing_backend_match() {
+        let sessions = vec![Session {
+            id: "sess-123".to_string(),
+            name: "Research".to_string(),
+            model: "m".to_string(),
+            provider: "p".to_string(),
+        }];
+
+        let resolution = plan_worker_session_resolution("Research", Ok(sessions))
+            .expect("successful backend listing should resolve existing session");
+
+        match resolution {
+            WorkerSessionResolution::Existing(session) => assert_eq!(session.id, "sess-123"),
+            WorkerSessionResolution::Create => panic!("expected existing session resolution"),
+        }
+    }
+
+    #[test]
+    fn worker_session_create_fails_closed_on_existing_name_or_id() {
+        let sessions = vec![
+            Session {
+                id: "sess-123".to_string(),
+                name: "Research".to_string(),
+                model: "m".to_string(),
+                provider: "p".to_string(),
+            },
+            Session {
+                id: "scratch".to_string(),
+                name: "Scratchpad".to_string(),
+                model: "m".to_string(),
+                provider: "p".to_string(),
+            },
+        ];
+
+        let name_err = plan_worker_session_create("Research", Ok(sessions.clone())).unwrap_err();
+        assert!(name_err.to_string().contains("already exists"));
+        assert!(name_err.to_string().contains("sess-123"));
+
+        let id_err = plan_worker_session_create("scratch", Ok(sessions)).unwrap_err();
+        assert!(id_err.to_string().contains("already exists"));
+        assert!(id_err.to_string().contains("Scratchpad"));
+    }
+
+    #[test]
+    fn worker_session_create_allows_absent_name_after_authoritative_listing() {
+        let sessions = vec![Session {
+            id: "sess-123".to_string(),
+            name: "Research".to_string(),
+            model: "m".to_string(),
+            provider: "p".to_string(),
+        }];
+
+        plan_worker_session_create("Scratch", Ok(sessions))
+            .expect("absent session name should permit explicit create");
     }
 
     #[test]

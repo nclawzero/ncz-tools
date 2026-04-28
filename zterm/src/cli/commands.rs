@@ -1254,12 +1254,12 @@ fn exact_local_metadata<'a>(
     local_sessions.iter().find(|metadata| metadata.id == id)
 }
 
-fn short_session_id(id: &str) -> &str {
-    &id[..8.min(id.len())]
+fn short_session_id(id: &str) -> String {
+    id.chars().take(8).collect()
 }
 
-fn short_date(value: &str) -> &str {
-    &value[..10.min(value.len())]
+fn short_date(value: &str) -> String {
+    value.chars().take(10).collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1565,6 +1565,16 @@ mod tests {
         assert!(out.contains("Model: p/m"));
         assert!(out.contains("Cached metadata: 7 messages, last active 2026-04-27"));
         assert!(!out.contains("Stale Local Name"));
+    }
+
+    #[test]
+    fn backend_session_list_truncates_multibyte_ids_on_char_boundaries() {
+        let backend = vec![session("ééééééééé", "Unicode")];
+
+        let out = super::format_backend_session_list(&backend, &[]);
+
+        assert!(out.contains("Unicode (éééééééé)"));
+        assert!(out.contains("ID:    ééééééééé"));
     }
 
     #[test]
