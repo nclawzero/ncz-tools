@@ -244,10 +244,7 @@ fn running_agents_checked(runner: &dyn CommandRunner) -> Result<Vec<String>, Ncz
     Ok(running)
 }
 
-fn require_running_agents(
-    runner: &dyn CommandRunner,
-    expected: &[String],
-) -> Result<(), NczError> {
+fn require_running_agents(runner: &dyn CommandRunner, expected: &[String]) -> Result<(), NczError> {
     let mut observed = Vec::new();
     let mut state_errors = Vec::new();
     for agent_name in agent::AGENTS {
@@ -498,9 +495,7 @@ fn with_recovery_context(err: NczError, context: String) -> NczError {
             cmd,
             msg: format!("{msg}; {context}"),
         },
-        NczError::Io(err) => {
-            NczError::Io(io::Error::new(err.kind(), format!("{err}; {context}")))
-        }
+        NczError::Io(err) => NczError::Io(io::Error::new(err.kind(), format!("{err}; {context}"))),
         other => NczError::Inconsistent(format!("{other}; {context}")),
     }
 }
@@ -707,7 +702,10 @@ mod tests {
         assert!(matches!(err, NczError::Inconsistent(_)));
         assert!(err.to_string().contains("stop zeroclaw.service"));
         assert!(err.to_string().contains("restored previous agent state"));
-        assert_eq!(fs::read_to_string(paths.agent_state()).unwrap(), "openclaw\n");
+        assert_eq!(
+            fs::read_to_string(paths.agent_state()).unwrap(),
+            "openclaw\n"
+        );
         runner.assert_done();
     }
 
@@ -744,7 +742,10 @@ mod tests {
         assert!(matches!(err, NczError::Inconsistent(_)));
         assert!(err.to_string().contains("start openclaw.service"));
         assert!(err.to_string().contains("restored previous agent state"));
-        assert_eq!(fs::read_to_string(paths.agent_state()).unwrap(), "openclaw\n");
+        assert_eq!(
+            fs::read_to_string(paths.agent_state()).unwrap(),
+            "openclaw\n"
+        );
         runner.assert_done();
     }
 
@@ -794,7 +795,10 @@ mod tests {
         assert!(matches!(err, NczError::Io(_)));
         assert!(err.to_string().contains("restored previous agent state"));
         assert!(err.to_string().contains("verified rollback active set"));
-        assert_eq!(fs::read_to_string(paths.agent_state()).unwrap(), "openclaw\n");
+        assert_eq!(
+            fs::read_to_string(paths.agent_state()).unwrap(),
+            "openclaw\n"
+        );
         runner.assert_done();
     }
 
@@ -991,7 +995,10 @@ mod tests {
         assert!(matches!(err, NczError::Inconsistent(_)));
         let msg = err.to_string();
         assert!(msg.contains("restored pre-command running agents: openclaw"));
-        assert_eq!(fs::read_to_string(paths.agent_state()).unwrap(), "openclaw\n");
+        assert_eq!(
+            fs::read_to_string(paths.agent_state()).unwrap(),
+            "openclaw\n"
+        );
         runner.assert_done();
     }
 
@@ -1046,7 +1053,10 @@ mod tests {
         let err = switch_agent(&ctx(&runner), &paths, "zeroclaw", 1).unwrap_err();
         assert!(matches!(err, NczError::Inconsistent(_)));
         assert!(err.to_string().contains("verify rollback active set"));
-        assert_eq!(fs::read_to_string(paths.agent_state()).unwrap(), "openclaw\n");
+        assert_eq!(
+            fs::read_to_string(paths.agent_state()).unwrap(),
+            "openclaw\n"
+        );
         runner.assert_done();
     }
 
@@ -1368,7 +1378,10 @@ mod tests {
 
         let err = switch_agent(&ctx(&runner), &paths, "zeroclaw", 1).unwrap_err();
         assert!(matches!(err, NczError::Inconsistent(_)));
-        assert_eq!(fs::read_to_string(paths.agent_state()).unwrap(), "openclaw\n");
+        assert_eq!(
+            fs::read_to_string(paths.agent_state()).unwrap(),
+            "openclaw\n"
+        );
         runner.assert_done();
     }
 
@@ -1405,7 +1418,13 @@ mod tests {
         );
         runner.expect_http(42617, "/health", 200);
         expect_unit_state(&runner, "zeroclaw.service", "loaded", "active", "running");
-        expect_unit_state(&runner, "openclaw.service", "loaded", "activating", "start-post");
+        expect_unit_state(
+            &runner,
+            "openclaw.service",
+            "loaded",
+            "activating",
+            "start-post",
+        );
         expect_unit_state(&runner, "hermes.service", "loaded", "inactive", "dead");
         expect_stop_success(&runner, "zeroclaw.service");
         expect_stop_success(&runner, "hermes.service");
@@ -1425,7 +1444,10 @@ mod tests {
         let err = switch_agent(&ctx(&runner), &paths, "zeroclaw", 1).unwrap_err();
         assert!(matches!(err, NczError::Inconsistent(_)));
         assert!(err.to_string().contains("openclaw.service not terminal"));
-        assert_eq!(fs::read_to_string(paths.agent_state()).unwrap(), "openclaw\n");
+        assert_eq!(
+            fs::read_to_string(paths.agent_state()).unwrap(),
+            "openclaw\n"
+        );
         runner.assert_done();
     }
 
@@ -1477,7 +1499,10 @@ mod tests {
 
         let err = switch_agent(&ctx(&runner), &paths, "zeroclaw", 1).unwrap_err();
         assert!(matches!(err, NczError::Exec { .. }));
-        assert_eq!(fs::read_to_string(paths.agent_state()).unwrap(), "openclaw\n");
+        assert_eq!(
+            fs::read_to_string(paths.agent_state()).unwrap(),
+            "openclaw\n"
+        );
         runner.assert_done();
     }
 
@@ -1541,7 +1566,10 @@ mod tests {
 
         let err = switch_agent(&ctx(&runner), &paths, "zeroclaw", 1).unwrap_err();
         assert!(matches!(err, NczError::Exec { .. }));
-        assert_eq!(fs::read_to_string(paths.agent_state()).unwrap(), "openclaw\n");
+        assert_eq!(
+            fs::read_to_string(paths.agent_state()).unwrap(),
+            "openclaw\n"
+        );
         runner.assert_done();
     }
 
@@ -1723,7 +1751,10 @@ mod tests {
         let err = switch_agent(&ctx(&runner), &paths, "zeroclaw", 1).unwrap_err();
         assert!(matches!(err, NczError::Inconsistent(_)));
         assert!(err.to_string().contains("stop zeroclaw.service"));
-        assert_eq!(fs::read_to_string(paths.agent_state()).unwrap(), "openclaw\n");
+        assert_eq!(
+            fs::read_to_string(paths.agent_state()).unwrap(),
+            "openclaw\n"
+        );
         runner.assert_done();
     }
 
@@ -1771,7 +1802,10 @@ mod tests {
         let err = switch_agent(&ctx(&runner), &paths, "zeroclaw", 1).unwrap_err();
         assert!(matches!(err, NczError::Inconsistent(_)));
         assert!(err.to_string().contains("start openclaw.service"));
-        assert_eq!(fs::read_to_string(paths.agent_state()).unwrap(), "openclaw\n");
+        assert_eq!(
+            fs::read_to_string(paths.agent_state()).unwrap(),
+            "openclaw\n"
+        );
         runner.assert_done();
     }
 }

@@ -158,13 +158,7 @@ pub fn add(
     let path = mcp_state::declaration_path(paths, &declaration.name)?;
     Ok(McpAddReport {
         schema_version: common::SCHEMA_VERSION,
-        server: server_report(
-            ctx,
-            mcp_state::McpRecord {
-                declaration,
-                path,
-            },
-        ),
+        server: server_report(ctx, mcp_state::McpRecord { declaration, path }),
     })
 }
 

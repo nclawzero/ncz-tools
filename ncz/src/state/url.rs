@@ -18,10 +18,7 @@ pub fn host(url: &str) -> Option<&str> {
             .map(|(host, _)| host)
             .filter(|host| !host.is_empty());
     }
-    authority
-        .split(':')
-        .next()
-        .filter(|host| !host.is_empty())
+    authority.split(':').next().filter(|host| !host.is_empty())
 }
 
 pub fn has_userinfo(url: &str) -> bool {

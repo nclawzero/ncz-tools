@@ -187,7 +187,12 @@ fn join_reader(
 ) -> Result<(Vec<u8>, bool), NczError> {
     handle
         .join()
-        .map_err(|_| NczError::Io(io::Error::new(io::ErrorKind::Other, "reader thread panicked")))?
+        .map_err(|_| {
+            NczError::Io(io::Error::new(
+                io::ErrorKind::Other,
+                "reader thread panicked",
+            ))
+        })?
         .map_err(NczError::Io)
 }
 
@@ -291,9 +296,7 @@ pub(crate) mod fake {
                     .lock()
                     .unwrap()
                     .iter()
-                    .filter(|(key, replies)| {
-                        !http_repeatable.contains(*key) && !replies.is_empty()
-                    })
+                    .filter(|(key, replies)| !http_repeatable.contains(*key) && !replies.is_empty())
                     .map(|(key, _)| key.clone()),
             );
             pending.sort();
@@ -310,7 +313,10 @@ pub(crate) mod fake {
                 unexpected.is_empty(),
                 "FakeRunner: unexpected calls: {unexpected:?}"
             );
-            assert!(pending.is_empty(), "FakeRunner: unused expectations: {pending:?}");
+            assert!(
+                pending.is_empty(),
+                "FakeRunner: unused expectations: {pending:?}"
+            );
         }
 
         fn unexpected_call(&self, cmd: &str, key: String) -> NczError {

@@ -5,8 +5,8 @@
 //! quotes values when needed; the reader tolerates `export KEY=value` from
 //! hand-edited files.
 
-use std::fs;
 use std::fmt::Write as _;
+use std::fs;
 use std::io;
 use std::path::Path;
 
@@ -109,8 +109,9 @@ pub fn provider_binding_matches(
     let binding_key = provider_binding_key(provider)?;
     Ok(entries.iter().any(|entry| {
         entry.key == binding_key
-            && parse_provider_binding_value(&entry.value)
-                .is_some_and(|(bound_key_env, bound_url)| bound_key_env == key_env && bound_url == url)
+            && parse_provider_binding_value(&entry.value).is_some_and(
+                |(bound_key_env, bound_url)| bound_key_env == key_env && bound_url == url,
+            )
     }))
 }
 
@@ -186,7 +187,9 @@ fn validate_provider_binding_name(provider: &str) -> Result<(), NczError> {
             .chars()
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
     {
-        return Err(NczError::Usage(format!("invalid provider name: {provider}")));
+        return Err(NczError::Usage(format!(
+            "invalid provider name: {provider}"
+        )));
     }
     Ok(())
 }

@@ -566,8 +566,13 @@ fn require_provider_binding(
     entries: &[agent_env::AgentEnvEntry],
     provider: &provider_state::ProviderDeclaration,
 ) -> Result<(), ModelQueryError> {
-    if agent_env::provider_binding_matches(entries, &provider.name, &provider.key_env, &provider.url)
-        .map_err(|err| ModelQueryError::Config(err.to_string()))?
+    if agent_env::provider_binding_matches(
+        entries,
+        &provider.name,
+        &provider.key_env,
+        &provider.url,
+    )
+    .map_err(|err| ModelQueryError::Config(err.to_string()))?
     {
         return Ok(());
     }
@@ -721,13 +726,7 @@ mod tests {
         fs::create_dir_all(&paths.etc_dir).unwrap();
         fs::write(paths.agent_env(), "EXAMPLE_API_KEY=secret\n").unwrap();
         if let Some(url) = provider_url_for_test(paths) {
-            agent_env::set_provider_binding(
-                paths,
-                "example",
-                "EXAMPLE_API_KEY",
-                &url,
-            )
-            .unwrap();
+            agent_env::set_provider_binding(paths, "example", "EXAMPLE_API_KEY", &url).unwrap();
         }
     }
 

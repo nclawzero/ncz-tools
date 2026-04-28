@@ -362,7 +362,14 @@ mod tests {
 
         let provider = files
             .iter()
-            .find(|file| file.path == paths.providers_dir().join("local.env").display().to_string())
+            .find(|file| {
+                file.path
+                    == paths
+                        .providers_dir()
+                        .join("local.env")
+                        .display()
+                        .to_string()
+            })
             .unwrap();
         assert_eq!(
             provider.lines,

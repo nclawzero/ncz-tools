@@ -507,15 +507,13 @@ mod tests {
         };
         assert_eq!(report.provider_bindings, vec!["together"]);
         let entries = agent_env::read(&paths).unwrap();
-        assert!(
-            agent_env::provider_binding_matches(
-                &entries,
-                "together",
-                "TOGETHER_API_KEY",
-                "https://api.example.test"
-            )
-            .unwrap()
-        );
+        assert!(agent_env::provider_binding_matches(
+            &entries,
+            "together",
+            "TOGETHER_API_KEY",
+            "https://api.example.test"
+        )
+        .unwrap());
     }
 
     #[test]

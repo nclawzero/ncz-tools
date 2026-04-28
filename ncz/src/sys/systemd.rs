@@ -80,7 +80,10 @@ pub fn stop(runner: &dyn CommandRunner, unit: &str) -> Result<(), NczError> {
         Ok(state) => Err(NczError::Exec {
             cmd: format!("systemctl stop {unit}"),
             msg: if out.ok() {
-                format!("stop exited 0 but unit is not stopped; {}", state.describe())
+                format!(
+                    "stop exited 0 but unit is not stopped; {}",
+                    state.describe()
+                )
             } else {
                 format!("{stop_msg}; {}", state.describe())
             },
@@ -206,9 +209,7 @@ mod tests {
     fn show(load_state: &str, active_state: &str, sub_state: &str) -> ProcessOutput {
         out(
             0,
-            &format!(
-                "LoadState={load_state}\nActiveState={active_state}\nSubState={sub_state}\n"
-            ),
+            &format!("LoadState={load_state}\nActiveState={active_state}\nSubState={sub_state}\n"),
             "",
         )
     }

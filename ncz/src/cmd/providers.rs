@@ -1250,7 +1250,9 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(matches!(err, NczError::Precondition(message) if message.contains("same value in agent-env")));
+        assert!(
+            matches!(err, NczError::Precondition(message) if message.contains("same value in agent-env"))
+        );
         assert_eq!(fs::read_to_string(legacy_file).unwrap(), legacy);
         assert!(!paths.providers_dir().join("local.json").exists());
     }

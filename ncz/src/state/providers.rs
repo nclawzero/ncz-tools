@@ -1005,7 +1005,10 @@ fn inline_credential_for_path(
         .map(|secret| (parsed.declaration.key_env, secret)))
 }
 
-fn canonical_json_inline_credential(value: &Value, fallback_name: &str) -> Option<(String, String)> {
+fn canonical_json_inline_credential(
+    value: &Value,
+    fallback_name: &str,
+) -> Option<(String, String)> {
     let field = json_inline_secret_field(value)?;
     let secret = value.get(field)?.as_str()?.to_string();
     let key_env = value
@@ -1578,7 +1581,9 @@ mod tests {
 
         let err = migrate_legacy(&paths).unwrap_err();
 
-        assert!(matches!(err, NczError::Precondition(message) if message.contains("conflicts with existing LOCAL_API_KEY")));
+        assert!(
+            matches!(err, NczError::Precondition(message) if message.contains("conflicts with existing LOCAL_API_KEY"))
+        );
         assert!(paths.providers_dir().join("local.env").exists());
         assert!(!paths.providers_dir().join("local.json").exists());
         assert_eq!(

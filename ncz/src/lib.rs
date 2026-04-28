@@ -22,7 +22,12 @@ use clap::Parser;
 pub fn run() -> Result<i32, NczError> {
     let cli = match cli::Cli::try_parse() {
         Ok(cli) => cli,
-        Err(err) if matches!(err.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion) => {
+        Err(err)
+            if matches!(
+                err.kind(),
+                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+            ) =>
+        {
             err.print().map_err(NczError::Io)?;
             return Ok(0);
         }
