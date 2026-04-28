@@ -186,6 +186,7 @@ pub async fn run(
         .client
         .clone()
         .expect("workspace client populated after activate()");
+    let active_storage_scope = local_storage_scope_for_workspace(active_ws)?;
 
     // Test connection through the trait
     info!("Testing gateway connection...");
@@ -203,7 +204,8 @@ pub async fn run(
     let session_name = session_name.unwrap_or_else(|| "main".to_string());
     info!("Loading session: {}", session_name);
 
-    let session = load_or_create_session(&active_client, &session_name).await?;
+    let session =
+        load_or_create_session(&active_client, &active_storage_scope, &session_name).await?;
     info!("Session loaded: {}", session.id);
 
     // Get current model/provider. The `~/.zterm/config.toml` value
@@ -280,16 +282,18 @@ async fn load_or_create_session(
     client: &std::sync::Arc<
         tokio::sync::Mutex<Box<dyn crate::cli::agent::AgentClient + Send + Sync>>,
     >,
+    scope: &storage::LocalWorkspaceScope,
     session_name: &str,
 ) -> Result<Session> {
-    let local_metadata = storage::load_session_metadata(session_name).ok();
-    load_or_create_session_with_metadata(client, session_name, local_metadata).await
+    let local_metadata = storage::load_scoped_session_metadata(scope, session_name).ok();
+    load_or_create_session_with_metadata(client, scope, session_name, local_metadata).await
 }
 
 async fn load_or_create_session_with_metadata(
     client: &std::sync::Arc<
         tokio::sync::Mutex<Box<dyn crate::cli::agent::AgentClient + Send + Sync>>,
     >,
+    scope: &storage::LocalWorkspaceScope,
     session_name: &str,
     local_metadata: Option<SessionMetadata>,
 ) -> Result<Session> {
@@ -344,7 +348,7 @@ async fn load_or_create_session_with_metadata(
         last_active: Utc::now().to_rfc3339(),
     };
     if storage::is_safe_session_id(&metadata.id) {
-        storage::save_session_metadata(&metadata)?;
+        storage::save_scoped_session_metadata(scope, &metadata)?;
     } else {
         warn!(
             "not saving local metadata for unsafe session id: {}",
@@ -353,6 +357,16 @@ async fn load_or_create_session_with_metadata(
     }
 
     Ok(session)
+}
+
+fn local_storage_scope_for_workspace(
+    workspace: &crate::cli::workspace::Workspace,
+) -> Result<storage::LocalWorkspaceScope> {
+    storage::workspace_scope(
+        workspace.config.backend.as_str(),
+        &workspace.config.name,
+        workspace.config.id.as_deref(),
+    )
 }
 
 fn choose_boot_session_by_id_or_name<'a>(
@@ -481,6 +495,10 @@ mod tests {
         }
     }
 
+    fn scope() -> storage::LocalWorkspaceScope {
+        storage::workspace_scope("zeroclaw", "test", None).unwrap()
+    }
+
     fn boxed_client(fake: BootFakeClient) -> Arc<Mutex<Box<dyn AgentClient + Send + Sync>>> {
         Arc::new(Mutex::new(Box::new(fake)))
     }
@@ -499,6 +517,7 @@ mod tests {
 
         let selected = load_or_create_session_with_metadata(
             &boxed_client(fake),
+            &scope(),
             "main",
             Some(metadata("foreign-main", "main")),
         )
@@ -524,6 +543,7 @@ mod tests {
 
         let selected = load_or_create_session_with_metadata(
             &boxed_client(fake),
+            &scope(),
             "main",
             Some(metadata("foreign-main", "main")),
         )

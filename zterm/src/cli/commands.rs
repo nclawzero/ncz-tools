@@ -52,9 +52,24 @@ impl CommandHandler {
             .and_then(|w| w.client.clone())
     }
 
+    async fn current_storage_scope(&self) -> Option<storage::LocalWorkspaceScope> {
+        let app = self.app.lock().await;
+        let workspace = app.active_workspace()?;
+        storage::workspace_scope(
+            workspace.config.backend.as_str(),
+            &workspace.config.name,
+            workspace.config.id.as_deref(),
+        )
+        .ok()
+    }
+
     /// Handle a slash command (maps to zeroclaw CLI)
     pub async fn handle(&self, input: &str, session_id: &str) -> Result<Option<String>> {
-        let parts: Vec<&str> = input.split_whitespace().collect();
+        let parts_owned = match tokenize_slash_command(input) {
+            Ok(parts) => parts,
+            Err(e) => return Ok(Some(format!("❌ Could not parse command: {e}\n"))),
+        };
+        let parts: Vec<&str> = parts_owned.iter().map(String::as_str).collect();
 
         if parts.is_empty() {
             return Ok(None);
@@ -198,7 +213,10 @@ impl CommandHandler {
         };
         match load_result {
             Ok(session) => {
-                let local_sessions = storage::list_sessions().unwrap_or_default();
+                let local_sessions = match self.current_storage_scope().await {
+                    Some(scope) => storage::list_scoped_sessions(&scope).unwrap_or_default(),
+                    None => Vec::new(),
+                };
                 let local_metadata = exact_local_metadata(&local_sessions, &session.id);
                 Ok(Some(format_backend_session_info(&session, local_metadata)))
             }
@@ -230,7 +248,12 @@ impl CommandHandler {
                 };
                 match list_result {
                     Ok(sessions) => {
-                        let local_sessions = storage::list_sessions().unwrap_or_default();
+                        let local_sessions = match self.current_storage_scope().await {
+                            Some(scope) => {
+                                storage::list_scoped_sessions(&scope).unwrap_or_default()
+                            }
+                            None => Vec::new(),
+                        };
                         out.push_str(&format_backend_session_list(&sessions, &local_sessions));
                     }
                     Err(e) => {
@@ -247,7 +270,8 @@ impl CommandHandler {
                         return Ok(Some(out));
                     };
 
-                    match resolve_delete_session_target(&client, name).await {
+                    let scope = self.current_storage_scope().await;
+                    match resolve_delete_session_target(&client, scope.as_ref(), name).await {
                         Ok(target) if target.id == session_id => {
                             out.push_str(&format!(
                                 "❌ Cannot delete active session '{}'; switch to another session before deleting it\n",
@@ -258,7 +282,13 @@ impl CommandHandler {
                             Ok(()) => {
                                 let display = target.display_name().to_string();
                                 if let Some(local_id) = target.local_id.as_deref() {
-                                    if let Err(e) = storage::delete_session(local_id) {
+                                    if let Err(e) = scope
+                                        .as_ref()
+                                        .ok_or_else(|| anyhow!("no active workspace storage scope"))
+                                        .and_then(|scope| {
+                                            storage::delete_scoped_session(scope, local_id)
+                                        })
+                                    {
                                         out.push_str(&format!(
                                             "⚠️ Backend deleted session '{display}', but local metadata cleanup failed: {e}\n"
                                         ));
@@ -303,8 +333,12 @@ impl CommandHandler {
                 };
                 match load_result {
                     Ok(session) => {
-                        let local_metadata = storage::load_session_metadata(&session.id)
-                            .ok()
+                        let local_metadata = self
+                            .current_storage_scope()
+                            .await
+                            .and_then(|scope| {
+                                storage::load_scoped_session_metadata(&scope, &session.id).ok()
+                            })
                             .filter(|metadata| metadata.id == session.id);
                         out.push_str(&format_backend_session_info(
                             &session,
@@ -674,13 +708,9 @@ impl CommandHandler {
                     Err(e) => out.push_str(&format!("  (Gateway unavailable: {e})\n")),
                 }
             }
-            Some("add") => {
-                if args.len() < 2 {
-                    out.push_str("Usage: /cron add '<expr>' '<prompt>'\n");
-                    out.push_str("Example: /cron add '0 9 * * *' 'Daily standup'\n");
-                } else {
-                    let expr = args[0];
-                    let prompt = args[1..].join(" ");
+            Some("add") => match parse_cron_add_args(args) {
+                Err(message) => out.push_str(&message),
+                Ok((expr, prompt)) => {
                     let res = match self.current_cron().await {
                         Some(c) => c.create_cron_job(expr, &prompt).await,
                         None => Err(anyhow::anyhow!("cron not available on this backend")),
@@ -696,14 +726,10 @@ impl CommandHandler {
                         }
                     }
                 }
-            }
-            Some("add-at") => {
-                if args.len() < 2 {
-                    out.push_str("Usage: /cron add-at '<datetime>' '<prompt>'\n");
-                    out.push_str("Example: /cron add-at '2026-04-21T10:00:00Z' 'Meeting'\n");
-                } else {
-                    let datetime = args[0];
-                    let prompt = args[1..].join(" ");
+            },
+            Some("add-at") => match parse_cron_add_at_args(args) {
+                Err(message) => out.push_str(&message),
+                Ok((datetime, prompt)) => {
                     let res = match self.current_cron().await {
                         Some(c) => c.create_cron_at(datetime, &prompt).await,
                         None => Err(anyhow::anyhow!("cron not available on this backend")),
@@ -716,7 +742,7 @@ impl CommandHandler {
                         Err(e) => out.push_str(&format!("❌ Failed to schedule task: {e}\n")),
                     }
                 }
-            }
+            },
             Some("pause") => {
                 let id = args.first().copied().unwrap_or("");
                 if id.is_empty() {
@@ -1049,10 +1075,15 @@ impl CommandHandler {
 
     /// Handle /clear command
     async fn handle_clear(&self, session_id: &str) -> Result<Option<String>> {
-        if let Ok(mut metadata) = storage::load_session_metadata(session_id) {
+        let Some(scope) = self.current_storage_scope().await else {
+            return Ok(Some(
+                "No local session history metadata found to clear\n".to_string(),
+            ));
+        };
+        if let Ok(mut metadata) = storage::load_scoped_session_metadata(&scope, session_id) {
             metadata.message_count = 0;
             metadata.last_active = Utc::now().to_rfc3339();
-            storage::save_session_metadata(&metadata)?;
+            storage::save_scoped_session_metadata(&scope, &metadata)?;
             return Ok(Some("✓ Session history cleared\n".to_string()));
         }
         Ok(Some(
@@ -1069,12 +1100,14 @@ impl CommandHandler {
         let default_name = format!("session-{}.txt", Utc::now().format("%Y%m%d-%H%M%S"));
         let filename = filename.unwrap_or(default_name);
 
-        if let Ok(history_path) = storage::session_history_file(session_id) {
-            if history_path.exists() {
-                fs::copy(&history_path, &filename)?;
-                return Ok(Some(format!("✓ Session saved to {filename}\n")));
-            } else {
-                return Ok(Some("No history to save\n".to_string()));
+        if let Some(scope) = self.current_storage_scope().await {
+            if let Ok(history_path) = storage::scoped_session_history_file(&scope, session_id) {
+                if history_path.exists() {
+                    fs::copy(&history_path, &filename)?;
+                    return Ok(Some(format!("✓ Session saved to {filename}\n")));
+                } else {
+                    return Ok(Some("No history to save\n".to_string()));
+                }
             }
         }
 
@@ -1223,6 +1256,105 @@ fn parse_single_session_target<'a>(
             "{usage}\n❌ Session targets must be a single id/name token; extra tokens were not ignored.\n"
         )),
     }
+}
+
+fn tokenize_slash_command(input: &str) -> std::result::Result<Vec<String>, String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut chars = input.chars().peekable();
+    let mut quote: Option<char> = None;
+    let mut token_started = false;
+
+    while let Some(ch) = chars.next() {
+        match quote {
+            Some('\'') => {
+                if ch == '\'' {
+                    quote = None;
+                } else {
+                    current.push(ch);
+                }
+            }
+            Some('"') => match ch {
+                '"' => quote = None,
+                '\\' => match chars.next() {
+                    Some(next) => current.push(next),
+                    None => current.push('\\'),
+                },
+                _ => current.push(ch),
+            },
+            Some(_) => unreachable!(),
+            None => match ch {
+                '\'' | '"' => {
+                    quote = Some(ch);
+                    token_started = true;
+                }
+                '\\' => {
+                    token_started = true;
+                    match chars.next() {
+                        Some(next) => current.push(next),
+                        None => current.push('\\'),
+                    }
+                }
+                ch if ch.is_whitespace() => {
+                    if token_started {
+                        tokens.push(std::mem::take(&mut current));
+                        token_started = false;
+                    }
+                }
+                _ => {
+                    token_started = true;
+                    current.push(ch);
+                }
+            },
+        }
+    }
+
+    if let Some(ch) = quote {
+        return Err(format!("unterminated {ch} quote"));
+    }
+    if token_started {
+        tokens.push(current);
+    }
+    Ok(tokens)
+}
+
+fn parse_cron_add_args<'a>(args: &'a [&'a str]) -> std::result::Result<(&'a str, String), String> {
+    let usage =
+        "Usage: /cron add '<expr>' '<prompt>'\nExample: /cron add '0 9 * * *' 'Daily standup'\n";
+    if args.len() < 2 {
+        return Err(usage.to_string());
+    }
+    let expr = args[0].trim();
+    let prompt = args[1..].join(" ");
+    if expr.split_whitespace().count() != 5 {
+        return Err(format!(
+            "{usage}❌ Cron expression must contain exactly 5 fields.\n"
+        ));
+    }
+    if prompt.trim().is_empty() {
+        return Err(usage.to_string());
+    }
+    Ok((expr, prompt))
+}
+
+fn parse_cron_add_at_args<'a>(
+    args: &'a [&'a str],
+) -> std::result::Result<(&'a str, String), String> {
+    let usage = "Usage: /cron add-at '<datetime>' '<prompt>'\nExample: /cron add-at '2026-04-21T10:00:00Z' 'Meeting'\n";
+    if args.len() < 2 {
+        return Err(usage.to_string());
+    }
+    let datetime = args[0].trim();
+    let prompt = args[1..].join(" ");
+    if chrono::DateTime::parse_from_rfc3339(datetime).is_err() {
+        return Err(format!(
+            "{usage}❌ Datetime must be RFC3339, such as 2026-04-21T10:00:00Z.\n"
+        ));
+    }
+    if prompt.trim().is_empty() {
+        return Err(usage.to_string());
+    }
+    Ok((datetime, prompt))
 }
 
 fn format_backend_session_list(
@@ -1440,9 +1572,12 @@ impl DeleteSessionTarget {
 
 async fn resolve_delete_session_target(
     client: &Arc<Mutex<Box<dyn AgentClient + Send + Sync>>>,
+    scope: Option<&storage::LocalWorkspaceScope>,
     requested: &str,
 ) -> Result<DeleteSessionTarget> {
-    let local_sessions = storage::list_sessions().unwrap_or_default();
+    let local_sessions = scope
+        .map(|scope| storage::list_scoped_sessions(scope).unwrap_or_default())
+        .unwrap_or_default();
     let backend_sessions = client.lock().await.list_sessions().await;
 
     match backend_sessions {
@@ -1632,7 +1767,7 @@ mod tests {
     use crate::cli::agent::{AgentClient, StreamSink};
     use crate::cli::client::Config;
     use crate::cli::client::{Model, Provider, Session};
-    use crate::cli::storage::SessionMetadata;
+    use crate::cli::storage::{self, SessionMetadata};
     use crate::cli::workspace::{App, Backend, Workspace, WorkspaceConfig};
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex as StdMutex};
@@ -1697,6 +1832,60 @@ mod tests {
             .collect();
         let (_, _, args) = split_parts(&parts);
         assert_eq!(args, &["hello", "world", "--category", "work"]);
+    }
+
+    #[test]
+    fn slash_tokenizer_preserves_documented_cron_add_quotes() {
+        let parts = super::tokenize_slash_command("/cron add '0 9 * * *' 'Daily standup'")
+            .expect("quoted cron command should parse");
+        assert_eq!(
+            parts,
+            vec![
+                "/cron".to_string(),
+                "add".to_string(),
+                "0 9 * * *".to_string(),
+                "Daily standup".to_string()
+            ]
+        );
+        let args: Vec<&str> = parts[2..].iter().map(String::as_str).collect();
+        let (expr, prompt) = super::parse_cron_add_args(&args).unwrap();
+        assert_eq!(expr, "0 9 * * *");
+        assert_eq!(prompt, "Daily standup");
+    }
+
+    #[test]
+    fn slash_tokenizer_preserves_documented_cron_add_at_quotes() {
+        let parts = super::tokenize_slash_command("/cron add-at '2026-04-21T10:00:00Z' 'Meeting'")
+            .expect("quoted add-at command should parse");
+        assert_eq!(
+            parts,
+            vec![
+                "/cron".to_string(),
+                "add-at".to_string(),
+                "2026-04-21T10:00:00Z".to_string(),
+                "Meeting".to_string()
+            ]
+        );
+        let args: Vec<&str> = parts[2..].iter().map(String::as_str).collect();
+        let (datetime, prompt) = super::parse_cron_add_at_args(&args).unwrap();
+        assert_eq!(datetime, "2026-04-21T10:00:00Z");
+        assert_eq!(prompt, "Meeting");
+    }
+
+    #[test]
+    fn cron_add_rejects_malformed_quoted_expression_locally() {
+        let parts = super::tokenize_slash_command("/cron add '0 9 * *' 'Daily standup'")
+            .expect("quoted command should tokenize before validation");
+        let args: Vec<&str> = parts[2..].iter().map(String::as_str).collect();
+        let err = super::parse_cron_add_args(&args).unwrap_err();
+
+        assert!(err.contains("exactly 5 fields"));
+    }
+
+    #[test]
+    fn slash_tokenizer_rejects_unterminated_quotes() {
+        let err = super::tokenize_slash_command("/cron add '0 9 * * *").unwrap_err();
+        assert!(err.contains("unterminated"));
     }
 
     #[test]
@@ -1988,6 +2177,53 @@ mod tests {
         }))
     }
 
+    fn app_with_two_fake_clients(
+        alpha_name: &str,
+        alpha_fake: FakeAgentClient,
+        beta_name: &str,
+        beta_fake: FakeAgentClient,
+    ) -> Arc<Mutex<App>> {
+        let alpha_boxed: Box<dyn AgentClient + Send + Sync> = Box::new(alpha_fake);
+        let beta_boxed: Box<dyn AgentClient + Send + Sync> = Box::new(beta_fake);
+        Arc::new(Mutex::new(App {
+            workspaces: vec![
+                Workspace {
+                    id: 0,
+                    config: WorkspaceConfig {
+                        id: None,
+                        name: alpha_name.to_string(),
+                        backend: Backend::Zeroclaw,
+                        url: "http://alpha.example".to_string(),
+                        token_env: None,
+                        token: None,
+                        label: None,
+                        namespace_aliases: Vec::new(),
+                    },
+                    client: Some(Arc::new(Mutex::new(alpha_boxed))),
+                    cron: None,
+                },
+                Workspace {
+                    id: 1,
+                    config: WorkspaceConfig {
+                        id: None,
+                        name: beta_name.to_string(),
+                        backend: Backend::Zeroclaw,
+                        url: "http://beta.example".to_string(),
+                        token_env: None,
+                        token: None,
+                        label: None,
+                        namespace_aliases: Vec::new(),
+                    },
+                    client: Some(Arc::new(Mutex::new(beta_boxed))),
+                    cron: None,
+                },
+            ],
+            active: 0,
+            shared_mnemos: None,
+            config_path: PathBuf::from("test-config.toml"),
+        }))
+    }
+
     #[tokio::test]
     async fn advertised_local_commands_return_structured_tui_output() {
         let handler = super::CommandHandler::new(app_with_fake_client(FakeAgentClient::default()));
@@ -2051,6 +2287,99 @@ mod tests {
         assert!(out.contains("Cannot delete active session"));
         assert!(out.contains("switch to another session"));
         assert!(deleted.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn command_handler_scopes_clear_save_and_delete_cleanup_to_active_workspace() {
+        let suffix = uuid::Uuid::new_v4();
+        let alpha_name = format!("alpha-{suffix}");
+        let beta_name = format!("beta-{suffix}");
+        let alpha_scope = storage::workspace_scope("zeroclaw", &alpha_name, None).unwrap();
+        let beta_scope = storage::workspace_scope("zeroclaw", &beta_name, None).unwrap();
+        let mut alpha_meta = metadata("main", "Alpha Main");
+        alpha_meta.message_count = 4;
+        let mut beta_meta = metadata("main", "Beta Main");
+        beta_meta.message_count = 8;
+        storage::save_scoped_session_metadata(&alpha_scope, &alpha_meta).unwrap();
+        storage::save_scoped_session_metadata(&beta_scope, &beta_meta).unwrap();
+        std::fs::write(
+            storage::scoped_session_history_file(&alpha_scope, "main").unwrap(),
+            "alpha history\n",
+        )
+        .unwrap();
+        std::fs::write(
+            storage::scoped_session_history_file(&beta_scope, "main").unwrap(),
+            "beta history\n",
+        )
+        .unwrap();
+
+        let alpha_deleted = Arc::new(StdMutex::new(Vec::new()));
+        let beta_deleted = Arc::new(StdMutex::new(Vec::new()));
+        let handler = super::CommandHandler::new(app_with_two_fake_clients(
+            &alpha_name,
+            FakeAgentClient {
+                sessions: vec![session("active", "Active"), session("main", "Main")],
+                deleted: Arc::clone(&alpha_deleted),
+            },
+            &beta_name,
+            FakeAgentClient {
+                sessions: vec![session("main", "Main")],
+                deleted: Arc::clone(&beta_deleted),
+            },
+        ));
+
+        let clear_out = handler.handle("/clear", "main").await.unwrap().unwrap();
+        assert!(clear_out.contains("cleared"));
+        assert_eq!(
+            storage::load_scoped_session_metadata(&alpha_scope, "main")
+                .unwrap()
+                .message_count,
+            0
+        );
+        assert_eq!(
+            storage::load_scoped_session_metadata(&beta_scope, "main")
+                .unwrap()
+                .message_count,
+            8
+        );
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let save_path = tempdir.path().join("main-session.txt");
+        let save_cmd = format!("/save {}", save_path.display());
+        let save_out = handler.handle(&save_cmd, "main").await.unwrap().unwrap();
+        assert!(save_out.contains("Session saved"));
+        assert_eq!(
+            std::fs::read_to_string(&save_path).unwrap(),
+            "alpha history\n"
+        );
+
+        let delete_out = handler
+            .handle("/session delete main", "active")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(delete_out.contains("Deleted session"));
+        assert_eq!(alpha_deleted.lock().unwrap().as_slice(), ["main"]);
+        assert!(beta_deleted.lock().unwrap().is_empty());
+        assert!(storage::load_scoped_session_metadata(&alpha_scope, "main").is_err());
+        assert!(!storage::scoped_session_history_file(&alpha_scope, "main")
+            .unwrap()
+            .exists());
+        assert_eq!(
+            storage::load_scoped_session_metadata(&beta_scope, "main")
+                .unwrap()
+                .message_count,
+            8
+        );
+        assert_eq!(
+            std::fs::read_to_string(
+                storage::scoped_session_history_file(&beta_scope, "main").unwrap()
+            )
+            .unwrap(),
+            "beta history\n"
+        );
+
+        storage::delete_scoped_session(&beta_scope, "main").unwrap();
     }
 
     #[test]

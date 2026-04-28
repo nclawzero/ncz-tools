@@ -515,8 +515,16 @@ pub async fn run(
     // `TurnChunk::Finished(Err(_))`; the worker itself never panics
     // the whole process.
     let worker_app = Arc::clone(&app);
+    let worker_workspace_key = {
+        let locked = app.lock().await;
+        locked
+            .active_workspace()
+            .and_then(|workspace| local_storage_scope_for_workspace(workspace).ok())
+            .map(|scope| scope.identity())
+            .unwrap_or_else(|| workspace_name.clone())
+    };
     let mut worker_sessions = HashMap::from([(
-        workspace_name.clone(),
+        worker_workspace_key,
         WorkerSessionBinding::from_session(&session),
     )]);
     let fallback_session_name = session.name.clone();
@@ -696,11 +704,11 @@ pub async fn run(
                         match session_result {
                             Ok(session) => {
                                 command_session_id = session.id.clone();
-                                match current_workspace_name(&worker_app).await {
-                                    Ok(workspace_name) => {
+                                match current_workspace_binding_key(&worker_app).await {
+                                    Ok(workspace_key) => {
                                         remember_worker_session(
                                             &mut worker_sessions,
-                                            workspace_name,
+                                            workspace_key,
                                             &session,
                                         );
                                         session_switched = true;
@@ -980,6 +988,26 @@ async fn load_session_picker_sessions_for_worker(
     Ok((active_workspace, sessions))
 }
 
+fn local_storage_scope_for_workspace(
+    workspace: &crate::cli::workspace::Workspace,
+) -> Result<storage::LocalWorkspaceScope> {
+    storage::workspace_scope(
+        workspace.config.backend.as_str(),
+        &workspace.config.name,
+        workspace.config.id.as_deref(),
+    )
+}
+
+async fn local_storage_scope_for_active_workspace(
+    app: &Arc<Mutex<App>>,
+) -> Result<storage::LocalWorkspaceScope> {
+    let guard = app.lock().await;
+    let workspace = guard
+        .active_workspace()
+        .ok_or_else(|| anyhow::anyhow!("no active workspace"))?;
+    local_storage_scope_for_workspace(workspace)
+}
+
 fn session_picker_workspace_for_active_workspace(
     workspace: &crate::cli::workspace::Workspace,
 ) -> SessionPickerWorkspace {
@@ -1042,6 +1070,12 @@ async fn current_workspace_name(app: &Arc<Mutex<App>>) -> Result<String> {
         .ok_or_else(|| anyhow::anyhow!("no active workspace"))
 }
 
+async fn current_workspace_binding_key(app: &Arc<Mutex<App>>) -> Result<String> {
+    Ok(local_storage_scope_for_active_workspace(app)
+        .await?
+        .identity())
+}
+
 async fn status_snapshot_for_worker(app: &Arc<Mutex<App>>) -> Option<(String, String)> {
     let (workspace, client) = {
         let guard = app.lock().await;
@@ -1059,10 +1093,13 @@ async fn remembered_session_id_for_active_workspace(
     fallback_session_name: &str,
 ) -> String {
     match current_workspace_name(app).await {
-        Ok(workspace_name) => sessions
-            .get(&workspace_name)
-            .map(|binding| binding.id.clone())
-            .unwrap_or_else(|| fallback_session_name.to_string()),
+        Ok(_) => match current_workspace_binding_key(app).await {
+            Ok(workspace_key) => sessions
+                .get(&workspace_key)
+                .map(|binding| binding.id.clone())
+                .unwrap_or_else(|| fallback_session_name.to_string()),
+            Err(_) => fallback_session_name.to_string(),
+        },
         Err(_) => fallback_session_name.to_string(),
     }
 }
@@ -1073,10 +1110,13 @@ async fn active_worker_session_delete_target(
     sessions: &mut HashMap<String, WorkerSessionBinding>,
 ) -> Option<String> {
     let target = session_delete_target(cmdline)?.to_string();
-    let (workspace_name, client) = {
+    let (workspace_key, client) = {
         let guard = app.lock().await;
         let workspace = guard.active_workspace()?;
-        (workspace.config.name.clone(), workspace.client.clone())
+        let workspace_key = local_storage_scope_for_workspace(workspace)
+            .ok()?
+            .identity();
+        (workspace_key, workspace.client.clone())
     };
     let backend_sessions = match client {
         Some(client) => client.lock().await.list_sessions().await.ok(),
@@ -1085,7 +1125,7 @@ async fn active_worker_session_delete_target(
 
     active_worker_session_delete_target_for_workspace(
         &target,
-        &workspace_name,
+        &workspace_key,
         sessions,
         backend_sessions.as_deref(),
     )
@@ -1163,19 +1203,19 @@ async fn ensure_session_for_active_workspace(
     sessions: &mut HashMap<String, WorkerSessionBinding>,
     fallback_session_name: &str,
 ) -> Result<String> {
-    let workspace_name = current_workspace_name(app).await?;
-    if let Some(binding) = sessions.get(&workspace_name).cloned() {
+    let workspace_key = current_workspace_binding_key(app).await?;
+    if let Some(binding) = sessions.get(&workspace_key).cloned() {
         if let Ok(session) = load_session_for_worker(app, &binding.id).await {
-            remember_worker_session(sessions, workspace_name, &session);
+            remember_worker_session(sessions, workspace_key, &session);
             return Ok(session.id);
         }
         let session = resolve_or_create_session_for_worker(app, &binding.name).await?;
-        remember_worker_session(sessions, workspace_name, &session);
+        remember_worker_session(sessions, workspace_key, &session);
         return Ok(session.id);
     }
 
     let session = resolve_or_create_session_for_worker(app, fallback_session_name).await?;
-    remember_worker_session(sessions, workspace_name, &session);
+    remember_worker_session(sessions, workspace_key, &session);
     Ok(session.id)
 }
 
@@ -1210,7 +1250,7 @@ async fn resolve_or_create_session_for_worker(
     }
 
     let session = client.lock().await.create_session(session_name).await?;
-    save_worker_session_metadata_best_effort(&session);
+    save_worker_session_metadata_best_effort(app, &session).await;
     Ok(session)
 }
 
@@ -1224,25 +1264,39 @@ async fn create_new_session_for_worker(
     }
     .ok_or_else(|| anyhow::anyhow!("no active workspace client"))?;
 
-    create_session_for_worker_client(&client, session_name).await
-}
-
-async fn create_session_for_worker_client(
-    client: &Arc<Mutex<Box<dyn crate::cli::agent::AgentClient + Send + Sync>>>,
-    session_name: &str,
-) -> Result<Session> {
     let session = client.lock().await.create_session(session_name).await?;
-    save_worker_session_metadata_best_effort(&session);
+    save_worker_session_metadata_best_effort(app, &session).await;
     Ok(session)
 }
 
-fn save_worker_session_metadata_best_effort(session: &Session) -> bool {
-    save_worker_session_metadata_best_effort_with(session, storage::save_session_metadata)
+async fn save_worker_session_metadata_best_effort(
+    app: &Arc<Mutex<App>>,
+    session: &Session,
+) -> bool {
+    let scope = match local_storage_scope_for_active_workspace(app).await {
+        Ok(scope) => scope,
+        Err(e) => {
+            warn!(
+                "backend session '{}' was created, but active workspace scope was unavailable: {e}",
+                session.id
+            );
+            return false;
+        }
+    };
+    save_worker_session_metadata_best_effort_with(
+        &scope,
+        session,
+        storage::save_scoped_session_metadata,
+    )
 }
 
-fn save_worker_session_metadata_best_effort_with<F>(session: &Session, save: F) -> bool
+fn save_worker_session_metadata_best_effort_with<F>(
+    scope: &storage::LocalWorkspaceScope,
+    session: &Session,
+    save: F,
+) -> bool
 where
-    F: FnOnce(&storage::SessionMetadata) -> Result<()>,
+    F: FnOnce(&storage::LocalWorkspaceScope, &storage::SessionMetadata) -> Result<()>,
 {
     let metadata = storage::SessionMetadata {
         id: session.id.clone(),
@@ -1254,7 +1308,7 @@ where
         last_active: Utc::now().to_rfc3339(),
     };
     if storage::is_safe_session_id(&metadata.id) {
-        if let Err(e) = save(&metadata) {
+        if let Err(e) = save(scope, &metadata) {
             warn!(
                 "backend session '{}' was created, but local metadata save failed: {e}",
                 metadata.id
@@ -1353,8 +1407,10 @@ fn command_session_preflight(cmdline: &str) -> CommandSessionPreflight {
     let subcommand = parts.next();
 
     match command {
-        "/info" | "/status" => CommandSessionPreflight::BeforeDispatch,
-        "/session" if matches!(subcommand, Some("info")) => CommandSessionPreflight::BeforeDispatch,
+        "/info" | "/status" | "/clear" | "/save" => CommandSessionPreflight::BeforeDispatch,
+        "/session" if matches!(subcommand, Some("info") | Some("delete")) => {
+            CommandSessionPreflight::BeforeDispatch
+        }
         "/workspace" | "/workspaces"
             if matches!(subcommand, Some("switch")) && parts.next().is_some() =>
         {
@@ -4136,6 +4192,18 @@ mod tests {
             CommandSessionPreflight::BeforeDispatch
         );
         assert_eq!(
+            command_session_preflight("/session delete Research"),
+            CommandSessionPreflight::BeforeDispatch
+        );
+        assert_eq!(
+            command_session_preflight("/clear"),
+            CommandSessionPreflight::BeforeDispatch
+        );
+        assert_eq!(
+            command_session_preflight("/save out.txt"),
+            CommandSessionPreflight::BeforeDispatch
+        );
+        assert_eq!(
             command_session_preflight("/workspace switch prod"),
             CommandSessionPreflight::AfterWorkspaceSwitch
         );
@@ -4243,8 +4311,9 @@ mod tests {
             model: "m".to_string(),
             provider: "p".to_string(),
         };
+        let scope = storage::workspace_scope("zeroclaw", "default", None).unwrap();
 
-        let saved = save_worker_session_metadata_best_effort_with(&session, |_| {
+        let saved = save_worker_session_metadata_best_effort_with(&scope, &session, |_, _| {
             Err(anyhow::anyhow!("disk full"))
         });
 

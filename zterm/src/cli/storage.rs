@@ -19,9 +19,99 @@ pub fn sessions_dir() -> Result<PathBuf> {
     Ok(config_dir()?.join("sessions"))
 }
 
+/// Workspace-scoped sessions directory: ~/.zeroclaw/sessions/workspaces
+pub fn workspace_sessions_dir() -> Result<PathBuf> {
+    Ok(sessions_dir()?.join("workspaces"))
+}
+
 /// Input history file: ~/.zeroclaw/input_history.jsonl
 pub fn history_file() -> Result<PathBuf> {
     Ok(config_dir()?.join("input_history.jsonl"))
+}
+
+/// Local zterm storage scope for backend session files.
+///
+/// `SessionMetadata.id` remains the backend `Session.id`; this scope
+/// is only the local filesystem namespace that prevents two active
+/// workspaces from sharing metadata/history when their backends both
+/// use the same session id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalWorkspaceScope {
+    backend: String,
+    namespace: Option<String>,
+    name: Option<String>,
+    id: Option<String>,
+}
+
+impl LocalWorkspaceScope {
+    pub fn new(
+        backend: impl Into<String>,
+        namespace: Option<String>,
+        name: Option<String>,
+        id: Option<String>,
+    ) -> Result<Self> {
+        let scope = Self {
+            backend: backend.into(),
+            namespace,
+            name,
+            id,
+        };
+        if scope.backend.trim().is_empty()
+            || scope
+                .namespace
+                .as_deref()
+                .map(|value| value.trim().is_empty())
+                .unwrap_or(false)
+            || scope
+                .name
+                .as_deref()
+                .map(|value| value.trim().is_empty())
+                .unwrap_or(false)
+            || scope
+                .id
+                .as_deref()
+                .map(|value| value.trim().is_empty())
+                .unwrap_or(false)
+        {
+            return Err(anyhow!("invalid empty local workspace storage scope"));
+        }
+        Ok(scope)
+    }
+
+    pub fn identity(&self) -> String {
+        let mut parts = vec![format!("backend={}", self.backend)];
+        if let Some(namespace) = &self.namespace {
+            parts.push(format!("namespace={namespace}"));
+        }
+        if let Some(name) = &self.name {
+            parts.push(format!("workspace={name}"));
+        }
+        if let Some(id) = &self.id {
+            parts.push(format!("workspace_id={id}"));
+        }
+        parts.join(";")
+    }
+
+    fn path_component(&self) -> String {
+        encode_path_component(&self.identity())
+    }
+}
+
+pub fn workspace_scope(
+    backend: &str,
+    workspace_name: &str,
+    workspace_id: Option<&str>,
+) -> Result<LocalWorkspaceScope> {
+    let namespace = match workspace_id {
+        Some(id) => format!("backend={backend};workspace_id={id}"),
+        None => format!("backend={backend};workspace={workspace_name}"),
+    };
+    LocalWorkspaceScope::new(
+        backend,
+        Some(namespace),
+        Some(workspace_name.to_string()),
+        workspace_id.map(str::to_string),
+    )
 }
 
 /// Session directory: ~/.zeroclaw/sessions/{session_id}
@@ -56,6 +146,33 @@ pub fn session_history_file(session_id: &str) -> Result<PathBuf> {
     Ok(session_dir(session_id)?.join("history.jsonl"))
 }
 
+/// Workspace-scoped session directory:
+/// ~/.zeroclaw/sessions/workspaces/{scope}/{session_id}
+pub fn scoped_session_dir(scope: &LocalWorkspaceScope, session_id: &str) -> Result<PathBuf> {
+    if !is_safe_session_id(session_id) {
+        return Err(anyhow!("unsafe session id for local storage"));
+    }
+    Ok(workspace_sessions_dir()?
+        .join(scope.path_component())
+        .join(session_id))
+}
+
+/// Workspace-scoped metadata file.
+pub fn scoped_session_metadata_file(
+    scope: &LocalWorkspaceScope,
+    session_id: &str,
+) -> Result<PathBuf> {
+    Ok(scoped_session_dir(scope, session_id)?.join("meta.json"))
+}
+
+/// Workspace-scoped session history file.
+pub fn scoped_session_history_file(
+    scope: &LocalWorkspaceScope,
+    session_id: &str,
+) -> Result<PathBuf> {
+    Ok(scoped_session_dir(scope, session_id)?.join("history.jsonl"))
+}
+
 /// Ensure config directory exists
 pub fn ensure_config_dir() -> Result<()> {
     let dir = config_dir()?;
@@ -77,6 +194,15 @@ pub fn ensure_sessions_dir() -> Result<()> {
 /// Ensure session directory exists
 pub fn ensure_session_dir(session_id: &str) -> Result<()> {
     let dir = session_dir(session_id)?;
+    if !dir.exists() {
+        fs::create_dir_all(&dir)?;
+    }
+    Ok(())
+}
+
+/// Ensure workspace-scoped session directory exists.
+pub fn ensure_scoped_session_dir(scope: &LocalWorkspaceScope, session_id: &str) -> Result<()> {
+    let dir = scoped_session_dir(scope, session_id)?;
     if !dir.exists() {
         fs::create_dir_all(&dir)?;
     }
@@ -117,6 +243,26 @@ pub fn load_session_metadata(session_id: &str) -> Result<SessionMetadata> {
     Ok(metadata)
 }
 
+/// Load workspace-scoped session metadata from file.
+pub fn load_scoped_session_metadata(
+    scope: &LocalWorkspaceScope,
+    session_id: &str,
+) -> Result<SessionMetadata> {
+    if !is_safe_session_id(session_id) {
+        return Err(anyhow!("unsafe session id for local metadata load"));
+    }
+
+    let file = scoped_session_metadata_file(scope, session_id)?;
+    let content =
+        fs::read_to_string(&file).map_err(|e| anyhow!("Failed to read session metadata: {}", e))?;
+    let metadata: SessionMetadata = serde_json::from_str(&content)
+        .map_err(|e| anyhow!("Failed to parse session metadata: {}", e))?;
+    if !is_safe_session_id(&metadata.id) {
+        return Err(anyhow!("unsafe session id in local metadata"));
+    }
+    Ok(metadata)
+}
+
 /// Save session metadata to file
 pub fn save_session_metadata(metadata: &SessionMetadata) -> Result<()> {
     if !is_safe_session_id(&metadata.id) {
@@ -125,6 +271,22 @@ pub fn save_session_metadata(metadata: &SessionMetadata) -> Result<()> {
 
     ensure_session_dir(&metadata.id)?;
     let file = session_metadata_file(&metadata.id)?;
+    let content = serde_json::to_string_pretty(&metadata)?;
+    fs::write(&file, content).map_err(|e| anyhow!("Failed to write session metadata: {}", e))?;
+    Ok(())
+}
+
+/// Save workspace-scoped session metadata to file.
+pub fn save_scoped_session_metadata(
+    scope: &LocalWorkspaceScope,
+    metadata: &SessionMetadata,
+) -> Result<()> {
+    if !is_safe_session_id(&metadata.id) {
+        return Err(anyhow!("unsafe session id for local metadata save"));
+    }
+
+    ensure_scoped_session_dir(scope, &metadata.id)?;
+    let file = scoped_session_metadata_file(scope, &metadata.id)?;
     let content = serde_json::to_string_pretty(&metadata)?;
     fs::write(&file, content).map_err(|e| anyhow!("Failed to write session metadata: {}", e))?;
     Ok(())
@@ -174,6 +336,32 @@ pub fn list_sessions() -> Result<Vec<SessionMetadata>> {
     Ok(sessions)
 }
 
+/// List sessions for one local workspace scope.
+pub fn list_scoped_sessions(scope: &LocalWorkspaceScope) -> Result<Vec<SessionMetadata>> {
+    let scoped_dir = workspace_sessions_dir()?.join(scope.path_component());
+    let mut sessions = Vec::new();
+
+    if !scoped_dir.exists() {
+        return Ok(sessions);
+    }
+
+    for entry in fs::read_dir(&scoped_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+
+        if path.is_dir() {
+            if let Some(session_id) = path.file_name().and_then(|n| n.to_str()) {
+                if let Ok(metadata) = load_scoped_session_metadata(scope, session_id) {
+                    sessions.push(metadata);
+                }
+            }
+        }
+    }
+
+    sessions.sort_by(|a, b| b.last_active.cmp(&a.last_active));
+    Ok(sessions)
+}
+
 /// Delete a session and all its files
 pub fn delete_session(session_id: &str) -> Result<()> {
     if !is_safe_session_id(session_id) {
@@ -181,6 +369,19 @@ pub fn delete_session(session_id: &str) -> Result<()> {
     }
 
     let dir = session_dir(session_id)?;
+    if dir.exists() {
+        fs::remove_dir_all(&dir).map_err(|e| anyhow!("Failed to delete session: {}", e))?;
+    }
+    Ok(())
+}
+
+/// Delete a workspace-scoped local session and all its files.
+pub fn delete_scoped_session(scope: &LocalWorkspaceScope, session_id: &str) -> Result<()> {
+    if !is_safe_session_id(session_id) {
+        return Err(anyhow!("unsafe session id for local deletion"));
+    }
+
+    let dir = scoped_session_dir(scope, session_id)?;
     if dir.exists() {
         fs::remove_dir_all(&dir).map_err(|e| anyhow!("Failed to delete session: {}", e))?;
     }
@@ -260,6 +461,19 @@ fn extract_toml_value(content: &str, key: &str) -> Option<String> {
     None
 }
 
+fn encode_path_component(value: &str) -> String {
+    let mut out = String::new();
+    for byte in value.bytes() {
+        match byte {
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'.' | b'_' | b'-' => {
+                out.push(byte as char);
+            }
+            _ => out.push_str(&format!("~{byte:02X}")),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -303,6 +517,16 @@ mod tests {
         }
     }
 
+    fn scope(name: &str) -> LocalWorkspaceScope {
+        LocalWorkspaceScope::new(
+            "zeroclaw",
+            Some(format!("backend=zeroclaw;workspace={name}")),
+            Some(name.to_string()),
+            None,
+        )
+        .unwrap()
+    }
+
     #[test]
     fn unsafe_session_id_paths_fail_before_joining_sessions_dir() {
         assert!(session_dir("../owned").is_err());
@@ -321,5 +545,75 @@ mod tests {
             !escaped_path.exists(),
             "unsafe metadata write escaped the sessions directory"
         );
+    }
+
+    #[test]
+    fn scoped_metadata_history_clear_and_delete_do_not_cross_contaminate() {
+        let suffix = uuid::Uuid::new_v4();
+        let alpha = scope(&format!("alpha-{suffix}"));
+        let beta = scope(&format!("beta-{suffix}"));
+        let mut alpha_meta = metadata("main");
+        alpha_meta.name = "Alpha main".to_string();
+        alpha_meta.message_count = 3;
+        let mut beta_meta = metadata("main");
+        beta_meta.name = "Beta main".to_string();
+        beta_meta.message_count = 9;
+
+        save_scoped_session_metadata(&alpha, &alpha_meta).unwrap();
+        save_scoped_session_metadata(&beta, &beta_meta).unwrap();
+        fs::write(
+            scoped_session_history_file(&alpha, "main").unwrap(),
+            "alpha history\n",
+        )
+        .unwrap();
+        fs::write(
+            scoped_session_history_file(&beta, "main").unwrap(),
+            "beta history\n",
+        )
+        .unwrap();
+
+        let mut cleared_alpha = load_scoped_session_metadata(&alpha, "main").unwrap();
+        cleared_alpha.message_count = 0;
+        save_scoped_session_metadata(&alpha, &cleared_alpha).unwrap();
+
+        assert_eq!(
+            load_scoped_session_metadata(&alpha, "main")
+                .unwrap()
+                .message_count,
+            0
+        );
+        assert_eq!(
+            load_scoped_session_metadata(&beta, "main")
+                .unwrap()
+                .message_count,
+            9
+        );
+        assert_eq!(
+            fs::read_to_string(scoped_session_history_file(&alpha, "main").unwrap()).unwrap(),
+            "alpha history\n"
+        );
+        assert_eq!(
+            fs::read_to_string(scoped_session_history_file(&beta, "main").unwrap()).unwrap(),
+            "beta history\n"
+        );
+
+        delete_scoped_session(&alpha, "main").unwrap();
+
+        assert!(load_scoped_session_metadata(&alpha, "main").is_err());
+        assert!(!scoped_session_history_file(&alpha, "main")
+            .unwrap()
+            .exists());
+        assert_eq!(
+            load_scoped_session_metadata(&beta, "main")
+                .unwrap()
+                .message_count,
+            9
+        );
+        assert_eq!(
+            fs::read_to_string(scoped_session_history_file(&beta, "main").unwrap()).unwrap(),
+            "beta history\n"
+        );
+
+        delete_scoped_session(&beta, "main").unwrap();
     }
 }

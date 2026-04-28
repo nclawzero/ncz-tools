@@ -81,6 +81,18 @@ impl ReplLoop {
             .ok_or_else(|| anyhow::anyhow!("no active workspace"))
     }
 
+    async fn current_storage_scope(&self) -> Result<storage::LocalWorkspaceScope> {
+        let app = self.app.lock().await;
+        let workspace = app
+            .active_workspace()
+            .ok_or_else(|| anyhow::anyhow!("no active workspace"))?;
+        storage::workspace_scope(
+            workspace.config.backend.as_str(),
+            &workspace.config.name,
+            workspace.config.id.as_deref(),
+        )
+    }
+
     fn remember_active_workspace_session(&mut self, workspace_name: String, session: &Session) {
         self.workspace_sessions.insert(
             workspace_name,
@@ -108,7 +120,8 @@ impl ReplLoop {
             LegacySessionResolution::Existing(session) => Ok(session),
             LegacySessionResolution::Create => {
                 let session = active_client.lock().await.create_session(target).await?;
-                if let Err(e) = save_legacy_session_metadata(&session) {
+                let scope = self.current_storage_scope().await?;
+                if let Err(e) = save_legacy_session_metadata(&scope, &session) {
                     warn!(
                         "could not save local metadata for newly created session {}: {}",
                         session.id, e
@@ -159,7 +172,8 @@ impl ReplLoop {
             LegacySessionResolution::Existing(session) => session,
             LegacySessionResolution::Create => {
                 let session = active_client.lock().await.create_session(target).await?;
-                if let Err(e) = save_legacy_session_metadata(&session) {
+                let scope = self.current_storage_scope().await?;
+                if let Err(e) = save_legacy_session_metadata(&scope, &session) {
                     warn!(
                         "could not save local metadata for newly created session {}: {}",
                         session.id, e
@@ -448,14 +462,15 @@ impl ReplLoop {
     /// Update session metadata
     async fn update_session_metadata(&self) -> Result<()> {
         // For now, just update the last_active time
-        let metadata = storage::load_session_metadata(&self.session.id)?;
+        let scope = self.current_storage_scope().await?;
+        let metadata = storage::load_scoped_session_metadata(&scope, &self.session.id)?;
 
         let updated = crate::cli::storage::SessionMetadata {
             last_active: Utc::now().to_rfc3339(),
             ..metadata
         };
 
-        storage::save_session_metadata(&updated)?;
+        storage::save_scoped_session_metadata(&scope, &updated)?;
         Ok(())
     }
 }
@@ -618,7 +633,10 @@ fn ambiguous_legacy_session_error(
     anyhow::anyhow!("ambiguous {label} '{requested}'; use an explicit id. Candidates: {candidates}")
 }
 
-fn save_legacy_session_metadata(session: &Session) -> Result<()> {
+fn save_legacy_session_metadata(
+    scope: &storage::LocalWorkspaceScope,
+    session: &Session,
+) -> Result<()> {
     let metadata = storage::SessionMetadata {
         id: session.id.clone(),
         name: session.name.clone(),
@@ -630,7 +648,7 @@ fn save_legacy_session_metadata(session: &Session) -> Result<()> {
     };
 
     if storage::is_safe_session_id(&metadata.id) {
-        storage::save_session_metadata(&metadata)?;
+        storage::save_scoped_session_metadata(scope, &metadata)?;
     } else {
         warn!(
             "not saving local metadata for unsafe session id: {}",
