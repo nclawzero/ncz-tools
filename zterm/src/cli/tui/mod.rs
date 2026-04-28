@@ -71,11 +71,7 @@ pub async fn run(
     // pairing block below are irrelevant and would spuriously fail
     // against port 8888 defaults. Synthesized (single-workspace) mode
     // keeps pairing as-is.
-    let has_multi_workspace = crate::cli::workspace::AppConfig::default_path()
-        .ok()
-        .and_then(|p| crate::cli::workspace::AppConfig::load(&p).ok())
-        .map(|cfg| !cfg.workspaces.is_empty())
-        .unwrap_or(false);
+    let has_multi_workspace = has_configured_workspaces()?;
 
     // If no token, consult the gateway's `require_pairing` flag before
     // attempting the interactive pairing flow. Zeroclaw gateways with
@@ -275,6 +271,12 @@ pub async fn run(
     Ok(())
 }
 
+fn has_configured_workspaces() -> Result<bool> {
+    let path = crate::cli::workspace::AppConfig::default_path()?;
+    let cfg = crate::cli::workspace::AppConfig::load(&path)?;
+    Ok(!cfg.workspaces.is_empty())
+}
+
 /// Load existing session or create new one. Goes through
 /// the trait-boxed active-workspace client so openclaw and
 /// zeroclaw backends both work here.
@@ -405,7 +407,7 @@ mod tests {
     use super::*;
     use crate::cli::agent::{AgentClient, StreamSink};
     use crate::cli::client::{Config, Model, Provider};
-    use std::sync::{Arc, Mutex as StdMutex};
+    use std::sync::{Arc, Mutex as StdMutex, OnceLock};
     use tokio::sync::Mutex;
 
     #[derive(Clone)]
@@ -501,6 +503,80 @@ mod tests {
 
     fn boxed_client(fake: BootFakeClient) -> Arc<Mutex<Box<dyn AgentClient + Send + Sync>>> {
         Arc::new(Mutex::new(Box::new(fake)))
+    }
+
+    fn env_lock() -> &'static StdMutex<()> {
+        static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| StdMutex::new(()))
+    }
+
+    struct EnvGuard {
+        key: &'static str,
+        prior: Option<std::ffi::OsString>,
+    }
+
+    impl EnvGuard {
+        fn set_path(key: &'static str, value: &std::path::Path) -> Self {
+            let prior = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, prior }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.prior {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn boot_returns_workspace_state_error_before_legacy_pairing_token_write() {
+        let _env = env_lock().lock().unwrap();
+        let home = tempfile::TempDir::new().unwrap();
+        let zterm_config_dir = tempfile::TempDir::new().unwrap();
+        let _home_guard = EnvGuard::set_path("HOME", home.path());
+        let _zterm_config_guard = EnvGuard::set_path("ZTERM_CONFIG_DIR", zterm_config_dir.path());
+
+        let legacy_config_dir = home.path().join(".zeroclaw");
+        std::fs::create_dir_all(&legacy_config_dir).unwrap();
+        let legacy_config_path = legacy_config_dir.join("config.toml");
+        std::fs::write(
+            &legacy_config_path,
+            r#"
+[gateway]
+url = "http://127.0.0.1:1"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            zterm_config_dir.path().join("config.toml"),
+            r#"
+[[workspaces]]
+name = "oc"
+backend = "openclaw"
+url = "ws://example.invalid"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            zterm_config_dir.path().join("workspace-state.toml"),
+            "openclaw_workspaces = [",
+        )
+        .unwrap();
+
+        let err = run(Some("main".to_string()), None, None, None, true)
+            .await
+            .unwrap_err();
+        let msg = format!("{err:#}");
+
+        assert!(msg.contains("parsing zterm workspace state"));
+        assert!(!std::fs::read_to_string(&legacy_config_path)
+            .unwrap()
+            .contains("token"));
     }
 
     #[tokio::test]

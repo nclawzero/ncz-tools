@@ -55,13 +55,17 @@ pub struct TurnUsage {
 
 impl TurnUsage {
     pub fn used_tokens(&self) -> Option<u64> {
-        self.total_tokens
-            .or_else(|| match (self.input_tokens, self.output_tokens) {
-                (Some(input), Some(output)) => Some(input + output),
-                (Some(input), None) => Some(input),
-                (None, Some(output)) => Some(output),
-                (None, None) => None,
-            })
+        if let Some(total) = self.total_tokens {
+            return Some(total);
+        }
+
+        match (self.input_tokens, self.output_tokens) {
+            (Some(u64::MAX), _) | (_, Some(u64::MAX)) => None,
+            (Some(input), Some(output)) => Some(input.saturating_add(output)),
+            (Some(input), None) => Some(input),
+            (None, Some(output)) => Some(output),
+            (None, None) => None,
+        }
     }
 
     pub fn budget_pct(&self) -> Option<u8> {
@@ -314,5 +318,46 @@ mod tests {
 
         assert_eq!(usage.used_tokens(), Some(1250));
         assert_eq!(usage.budget_pct(), Some(15));
+    }
+
+    #[test]
+    fn usage_total_tokens_max_is_preserved() {
+        let value = serde_json::json!({
+            "input_tokens": u64::MAX,
+            "output_tokens": 1,
+            "total_tokens": u64::MAX
+        });
+
+        let usage = TurnUsage::from_json(&value).unwrap();
+
+        assert_eq!(usage.used_tokens(), Some(u64::MAX));
+    }
+
+    #[test]
+    fn usage_without_total_drops_max_part_counts() {
+        let input_max = serde_json::json!({
+            "input_tokens": u64::MAX,
+            "output_tokens": 1
+        });
+        let output_max = serde_json::json!({
+            "input_tokens": 1,
+            "output_tokens": u64::MAX
+        });
+
+        assert_eq!(TurnUsage::from_json(&input_max), None);
+        assert_eq!(TurnUsage::from_json(&output_max), None);
+    }
+
+    #[test]
+    fn usage_parsed_total_tokens_takes_precedence_over_saturating_parts() {
+        let value = serde_json::json!({
+            "input_tokens": u64::MAX,
+            "output_tokens": u64::MAX,
+            "total_tokens": u64::MAX - 1
+        });
+
+        let usage = TurnUsage::from_json(&value).unwrap();
+
+        assert_eq!(usage.used_tokens(), Some(u64::MAX - 1));
     }
 }
