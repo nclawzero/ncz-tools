@@ -59,7 +59,7 @@ use crate::cli::agent::{
     SessionPickerListResult, SessionPickerWorkspace, StreamSink, TurnChunk, TurnUsage,
 };
 use crate::cli::client::Session;
-use crate::cli::commands::CommandHandler;
+use crate::cli::commands::{tokenize_slash_command, CommandHandler};
 use crate::cli::storage;
 use crate::cli::tui::delighters;
 use crate::cli::tui::themes;
@@ -688,17 +688,17 @@ pub async fn run(
                     }
                     let mut session_switched = false;
                     if let Some(session_action) = session_action(&cmdline) {
-                        let target_session = session_action.target();
-                        let action_label = match session_action {
+                        let target_session = session_action.target().to_string();
+                        let action_label = match &session_action {
                             SessionAction::Switch { .. } => "switch session to",
                             SessionAction::Create { .. } => "create session",
                         };
                         let session_result = match session_action {
                             SessionAction::Switch { target } => {
-                                resolve_or_create_session_for_worker(&worker_app, target).await
+                                resolve_or_create_session_for_worker(&worker_app, &target).await
                             }
                             SessionAction::Create { target } => {
-                                create_new_session_for_worker(&worker_app, target).await
+                                create_new_session_for_worker(&worker_app, &target).await
                             }
                         };
                         match session_result {
@@ -1109,7 +1109,7 @@ async fn active_worker_session_delete_target(
     app: &Arc<Mutex<App>>,
     sessions: &mut HashMap<String, WorkerSessionBinding>,
 ) -> Option<String> {
-    let target = session_delete_target(cmdline)?.to_string();
+    let target = session_delete_target(cmdline)?;
     let (workspace_key, client) = {
         let guard = app.lock().await;
         let workspace = guard.active_workspace()?;
@@ -1400,11 +1400,13 @@ enum CommandSessionPreflight {
 }
 
 fn command_session_preflight(cmdline: &str) -> CommandSessionPreflight {
-    let mut parts = cmdline.split_whitespace();
-    let Some(command) = parts.next() else {
+    let Ok(parts) = tokenize_slash_command(cmdline) else {
         return CommandSessionPreflight::None;
     };
-    let subcommand = parts.next();
+    let Some(command) = parts.first().map(String::as_str) else {
+        return CommandSessionPreflight::None;
+    };
+    let subcommand = parts.get(1).map(String::as_str);
 
     match command {
         "/info" | "/status" | "/clear" | "/save" => CommandSessionPreflight::BeforeDispatch,
@@ -1412,7 +1414,7 @@ fn command_session_preflight(cmdline: &str) -> CommandSessionPreflight {
             CommandSessionPreflight::BeforeDispatch
         }
         "/workspace" | "/workspaces"
-            if matches!(subcommand, Some("switch")) && parts.next().is_some() =>
+            if matches!(subcommand, Some("switch")) && parts.get(2).is_some() =>
         {
             CommandSessionPreflight::AfterWorkspaceSwitch
         }
@@ -1425,57 +1427,55 @@ fn stdout_only_slash_command_block_message(cmdline: &str) -> Option<String> {
     None
 }
 
-fn session_delete_target(cmdline: &str) -> Option<&str> {
-    let mut parts = cmdline.split_whitespace();
-    if parts.next()? != "/session" {
+fn session_delete_target(cmdline: &str) -> Option<String> {
+    let parts = tokenize_slash_command(cmdline).ok()?;
+    if parts.first()?.as_str() != "/session" {
         return None;
     }
-    if parts.next()? != "delete" {
+    if parts.get(1)?.as_str() != "delete" {
         return None;
     }
-    single_remaining_session_target(&mut parts)
+    single_remaining_session_target(&parts[2..])
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SessionAction<'a> {
-    Switch { target: &'a str },
-    Create { target: &'a str },
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SessionAction {
+    Switch { target: String },
+    Create { target: String },
 }
 
-impl<'a> SessionAction<'a> {
-    fn target(self) -> &'a str {
+impl SessionAction {
+    fn target(&self) -> &str {
         match self {
             SessionAction::Switch { target } | SessionAction::Create { target } => target,
         }
     }
 }
 
-fn session_action(cmdline: &str) -> Option<SessionAction<'_>> {
-    let mut parts = cmdline.split_whitespace();
-    if parts.next()? != "/session" {
+fn session_action(cmdline: &str) -> Option<SessionAction> {
+    let parts = tokenize_slash_command(cmdline).ok()?;
+    if parts.first()?.as_str() != "/session" {
         return None;
     }
-    match parts.next()? {
+    match parts.get(1).map(String::as_str)? {
         "list" | "info" | "delete" => None,
         "switch" => Some(SessionAction::Switch {
-            target: single_remaining_session_target(&mut parts)?,
+            target: single_remaining_session_target(&parts[2..])?,
         }),
         "create" => Some(SessionAction::Create {
-            target: single_remaining_session_target(&mut parts)?,
+            target: single_remaining_session_target(&parts[2..])?,
         }),
-        name if parts.next().is_none() => Some(SessionAction::Switch { target: name }),
+        name if parts.len() == 2 => Some(SessionAction::Switch {
+            target: name.to_string(),
+        }),
         _ => None,
     }
 }
 
-fn single_remaining_session_target<'a>(
-    parts: &mut std::str::SplitWhitespace<'a>,
-) -> Option<&'a str> {
-    let target = parts.next()?;
-    if parts.next().is_some() {
-        None
-    } else {
-        Some(target)
+fn single_remaining_session_target(parts: &[String]) -> Option<String> {
+    match parts {
+        [target] if !target.is_empty() => Some(target.clone()),
+        _ => None,
     }
 }
 
@@ -4003,15 +4003,28 @@ mod tests {
     fn session_action_carries_switch_and_create_intent() {
         assert_eq!(
             session_action("/session research"),
-            Some(SessionAction::Switch { target: "research" })
+            Some(SessionAction::Switch {
+                target: "research".to_string()
+            })
         );
         assert_eq!(
             session_action("/session switch research"),
-            Some(SessionAction::Switch { target: "research" })
+            Some(SessionAction::Switch {
+                target: "research".to_string()
+            })
         );
         assert_eq!(
             session_action("/session create scratch"),
-            Some(SessionAction::Create { target: "scratch" })
+            Some(SessionAction::Create {
+                target: "scratch".to_string()
+            })
+        );
+        assert_eq!(session_action("/session switch 'Research"), None);
+        assert_eq!(
+            session_action("/session switch 'Research Notes'"),
+            Some(SessionAction::Switch {
+                target: "Research Notes".to_string()
+            })
         );
         assert_eq!(session_action("/session research notes"), None);
         assert_eq!(session_action("/session switch research notes"), None);
@@ -4041,12 +4054,17 @@ mod tests {
     fn session_delete_target_parses_only_delete_commands() {
         assert_eq!(
             session_delete_target("/session delete sess-123"),
-            Some("sess-123")
+            Some("sess-123".to_string())
         );
         assert_eq!(
             session_delete_target("/session delete Research"),
-            Some("Research")
+            Some("Research".to_string())
         );
+        assert_eq!(
+            session_delete_target("/session delete 'Research Notes'"),
+            Some("Research Notes".to_string())
+        );
+        assert_eq!(session_delete_target("/session delete 'Research"), None);
         assert_eq!(
             session_delete_target("/session delete Research Notes"),
             None
@@ -4194,6 +4212,10 @@ mod tests {
         assert_eq!(
             command_session_preflight("/session delete Research"),
             CommandSessionPreflight::BeforeDispatch
+        );
+        assert_eq!(
+            command_session_preflight("/session delete 'Research"),
+            CommandSessionPreflight::None
         );
         assert_eq!(
             command_session_preflight("/clear"),

@@ -1384,7 +1384,7 @@ fn parse_single_session_target<'a>(
     }
 }
 
-fn tokenize_slash_command(input: &str) -> std::result::Result<Vec<String>, String> {
+pub(crate) fn tokenize_slash_command(input: &str) -> std::result::Result<Vec<String>, String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
     let mut chars = input.chars().peekable();

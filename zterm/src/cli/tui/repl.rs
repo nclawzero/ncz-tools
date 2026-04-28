@@ -6,7 +6,7 @@ use tracing::{info, warn};
 
 use crate::cli::agent::AgentClient;
 use crate::cli::client::Session;
-use crate::cli::commands::CommandHandler;
+use crate::cli::commands::{tokenize_slash_command, CommandHandler};
 use crate::cli::input::InputHistory;
 use crate::cli::storage;
 use crate::cli::theme::Theme;
@@ -154,15 +154,15 @@ impl ReplLoop {
         Ok(session_id)
     }
 
-    async fn apply_legacy_session_action(&mut self, action: LegacySessionAction<'_>) -> Result<()> {
+    async fn apply_legacy_session_action(&mut self, action: LegacySessionAction) -> Result<()> {
         let active_client = self.resolve_active_client().await?;
-        let target = action.target();
+        let target = action.target().to_string();
 
         let resolution = {
             let locked = active_client.lock().await;
             match action {
                 LegacySessionAction::Switch { .. } => {
-                    plan_legacy_session_resolution(target, locked.list_sessions().await)?
+                    plan_legacy_session_resolution(&target, locked.list_sessions().await)?
                 }
                 LegacySessionAction::Create { .. } => LegacySessionResolution::Create,
             }
@@ -171,7 +171,7 @@ impl ReplLoop {
         let session = match resolution {
             LegacySessionResolution::Existing(session) => session,
             LegacySessionResolution::Create => {
-                let session = active_client.lock().await.create_session(target).await?;
+                let session = active_client.lock().await.create_session(&target).await?;
                 let scope = self.current_storage_scope().await?;
                 if let Err(e) = save_legacy_session_metadata(&scope, &session) {
                     warn!(
@@ -475,14 +475,14 @@ impl ReplLoop {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LegacySessionAction<'a> {
-    Switch { target: &'a str },
-    Create { target: &'a str },
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LegacySessionAction {
+    Switch { target: String },
+    Create { target: String },
 }
 
-impl<'a> LegacySessionAction<'a> {
-    fn target(self) -> &'a str {
+impl LegacySessionAction {
+    fn target(&self) -> &str {
         match self {
             LegacySessionAction::Switch { target } | LegacySessionAction::Create { target } => {
                 target
@@ -491,33 +491,31 @@ impl<'a> LegacySessionAction<'a> {
     }
 }
 
-fn legacy_session_action(cmdline: &str) -> Option<LegacySessionAction<'_>> {
-    let mut parts = cmdline.split_whitespace();
-    if parts.next()? != "/session" {
+fn legacy_session_action(cmdline: &str) -> Option<LegacySessionAction> {
+    let parts = tokenize_slash_command(cmdline).ok()?;
+    if parts.first()?.as_str() != "/session" {
         return None;
     }
 
-    match parts.next()? {
+    match parts.get(1).map(String::as_str)? {
         "list" | "info" | "delete" => None,
         "switch" => Some(LegacySessionAction::Switch {
-            target: single_remaining_session_target(&mut parts)?,
+            target: single_remaining_session_target(&parts[2..])?,
         }),
         "create" => Some(LegacySessionAction::Create {
-            target: single_remaining_session_target(&mut parts)?,
+            target: single_remaining_session_target(&parts[2..])?,
         }),
-        name if parts.next().is_none() => Some(LegacySessionAction::Switch { target: name }),
+        name if parts.len() == 2 => Some(LegacySessionAction::Switch {
+            target: name.to_string(),
+        }),
         _ => None,
     }
 }
 
-fn single_remaining_session_target<'a>(
-    parts: &mut std::str::SplitWhitespace<'a>,
-) -> Option<&'a str> {
-    let target = parts.next()?;
-    if parts.next().is_some() {
-        None
-    } else {
-        Some(target)
+fn single_remaining_session_target(parts: &[String]) -> Option<String> {
+    match parts {
+        [target] if !target.is_empty() => Some(target.clone()),
+        _ => None,
     }
 }
 
@@ -529,11 +527,13 @@ enum CommandSessionPreflight {
 }
 
 fn command_session_preflight(cmdline: &str) -> CommandSessionPreflight {
-    let mut parts = cmdline.split_whitespace();
-    let Some(command) = parts.next() else {
+    let Ok(parts) = tokenize_slash_command(cmdline) else {
         return CommandSessionPreflight::None;
     };
-    let subcommand = parts.next();
+    let Some(command) = parts.first().map(String::as_str) else {
+        return CommandSessionPreflight::None;
+    };
+    let subcommand = parts.get(1).map(String::as_str);
 
     match command {
         "/info" | "/status" | "/clear" | "/save" => CommandSessionPreflight::BeforeDispatch,
@@ -541,7 +541,7 @@ fn command_session_preflight(cmdline: &str) -> CommandSessionPreflight {
             CommandSessionPreflight::BeforeDispatch
         }
         "/workspace" | "/workspaces"
-            if matches!(subcommand, Some("switch")) && parts.next().is_some() =>
+            if matches!(subcommand, Some("switch")) && parts.get(2).is_some() =>
         {
             CommandSessionPreflight::AfterWorkspaceSwitch
         }
@@ -550,15 +550,15 @@ fn command_session_preflight(cmdline: &str) -> CommandSessionPreflight {
 }
 
 fn workspace_switch_target(cmdline: &str) -> Option<String> {
-    let mut parts = cmdline.split_whitespace();
-    let command = parts.next()?;
+    let parts = tokenize_slash_command(cmdline).ok()?;
+    let command = parts.first()?.as_str();
     if !matches!(command, "/workspace" | "/workspaces") {
         return None;
     }
-    if parts.next()? != "switch" {
+    if parts.get(1)?.as_str() != "switch" {
         return None;
     }
-    let target = parts.collect::<Vec<_>>().join(" ");
+    let target = parts.get(2..)?.join(" ");
     if target.is_empty() {
         None
     } else {
@@ -680,15 +680,28 @@ mod tests {
     fn legacy_session_action_parses_only_switch_create_and_bare() {
         assert_eq!(
             legacy_session_action("/session research"),
-            Some(LegacySessionAction::Switch { target: "research" })
+            Some(LegacySessionAction::Switch {
+                target: "research".to_string()
+            })
         );
         assert_eq!(
             legacy_session_action("/session switch research"),
-            Some(LegacySessionAction::Switch { target: "research" })
+            Some(LegacySessionAction::Switch {
+                target: "research".to_string()
+            })
         );
         assert_eq!(
             legacy_session_action("/session create scratch"),
-            Some(LegacySessionAction::Create { target: "scratch" })
+            Some(LegacySessionAction::Create {
+                target: "scratch".to_string()
+            })
+        );
+        assert_eq!(legacy_session_action("/session switch 'Research"), None);
+        assert_eq!(
+            legacy_session_action("/session switch 'Research Notes'"),
+            Some(LegacySessionAction::Switch {
+                target: "Research Notes".to_string()
+            })
         );
         assert_eq!(legacy_session_action("/session research notes"), None);
         assert_eq!(
@@ -700,6 +713,10 @@ mod tests {
         assert_eq!(legacy_session_action("/session info"), None);
         assert_eq!(legacy_session_action("/session delete research"), None);
         assert_eq!(legacy_session_action("/session switch"), None);
+        assert_eq!(
+            command_session_preflight("/session delete 'Research"),
+            CommandSessionPreflight::None
+        );
     }
 
     #[test]
@@ -925,5 +942,80 @@ mod tests {
         assert!(out.contains("Cannot delete active session"));
         assert!(beta_deleted.lock().unwrap().is_empty());
         assert!(alpha_deleted.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn legacy_repl_malformed_quoted_session_switch_does_not_rebind() {
+        let submitted = Arc::new(StdMutex::new(Vec::new()));
+        let deleted = Arc::new(StdMutex::new(Vec::new()));
+        let chat = session("chat-session", "chat");
+        let research = session("research-session", "Research");
+        let app = Arc::new(Mutex::new(App {
+            workspaces: vec![workspace(
+                0,
+                "alpha",
+                vec![chat.clone(), research],
+                Arc::clone(&submitted),
+                Arc::clone(&deleted),
+            )],
+            active: 0,
+            shared_mnemos: None,
+            config_path: PathBuf::from("test-config.toml"),
+        }));
+        let mut repl = ReplLoop::new(
+            Arc::clone(&app),
+            chat,
+            "model".to_string(),
+            "provider".to_string(),
+        )
+        .unwrap();
+
+        let out = repl
+            .handle_slash_command("/session switch 'Research")
+            .await
+            .expect("malformed command should be handled by CommandHandler")
+            .expect("parse error should be displayed");
+
+        assert!(out.contains("Could not parse command"));
+        assert!(out.contains("unterminated"));
+        assert_eq!(repl.session.id, "chat-session");
+        assert_eq!(repl.session.name, "chat");
+    }
+
+    #[tokio::test]
+    async fn legacy_repl_quoted_session_switch_rebinds_to_single_target() {
+        let submitted = Arc::new(StdMutex::new(Vec::new()));
+        let deleted = Arc::new(StdMutex::new(Vec::new()));
+        let chat = session("chat-session", "chat");
+        let research_notes = session("research-notes-session", "Research Notes");
+        let app = Arc::new(Mutex::new(App {
+            workspaces: vec![workspace(
+                0,
+                "alpha",
+                vec![chat, research_notes],
+                Arc::clone(&submitted),
+                Arc::clone(&deleted),
+            )],
+            active: 0,
+            shared_mnemos: None,
+            config_path: PathBuf::from("test-config.toml"),
+        }));
+        let mut repl = ReplLoop::new(
+            Arc::clone(&app),
+            session("chat-session", "chat"),
+            "model".to_string(),
+            "provider".to_string(),
+        )
+        .unwrap();
+
+        let out = repl
+            .handle_slash_command("/session switch 'Research Notes'")
+            .await
+            .expect("quoted command should switch")
+            .expect("switch should report active session");
+
+        assert_eq!(out, "✅ Active backend session: Research Notes\n");
+        assert_eq!(repl.session.id, "research-notes-session");
+        assert_eq!(repl.session.name, "Research Notes");
     }
 }

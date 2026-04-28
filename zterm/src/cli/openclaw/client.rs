@@ -635,24 +635,45 @@ impl OpenClawClient {
         }
 
         // Stage 2: fire the turn.
-        let ack = self.rpc_sessions_send(key, message, opts).await?;
-        let run_id = Some(ack.run_id.clone());
+        let ack = match self.rpc_sessions_send(key, message, opts).await {
+            Ok(ack) => ack,
+            Err(e) => {
+                self.unsubscribe_session_messages_best_effort(key).await;
+                return Err(e);
+            }
+        };
+        let expected_run_id = ack.run_id.clone();
+        let run_id = Some(expected_run_id.clone());
 
         // Stage 3: take event_rx for the collect loop.
-        let mut event_rx = self
+        let event_rx = self
             .event_rx
             .take()
-            .ok_or_else(|| anyhow::anyhow!("openclaw: event_rx already taken"))?;
+            .ok_or_else(|| anyhow::anyhow!("openclaw: event_rx already taken"));
+        let mut event_rx = match event_rx {
+            Ok(event_rx) => event_rx,
+            Err(e) => {
+                self.unsubscribe_session_messages_best_effort(key).await;
+                return Err(e);
+            }
+        };
 
         let mut turn = super::handshake::TurnResult {
             run_id,
             ..Default::default()
         };
-        let collect_res = collect_turn_result(&mut event_rx, key, timeout, &mut turn).await;
+        let collect_res =
+            collect_turn_result(&mut event_rx, key, &expected_run_id, timeout, &mut turn).await;
 
         self.event_rx = Some(event_rx);
 
         // Stage 4: unsubscribe (best effort).
+        self.unsubscribe_session_messages_best_effort(key).await;
+
+        collect_res.map(|_| turn)
+    }
+
+    async fn unsubscribe_session_messages_best_effort(&self, key: &str) {
         if let Err(e) = self
             .send_request(
                 "sessions.messages.unsubscribe",
@@ -662,8 +683,6 @@ impl OpenClawClient {
         {
             tracing::debug!("openclaw: sessions.messages.unsubscribe error (ignored): {e}");
         }
-
-        collect_res.map(|_| turn)
     }
 
     /// Fire `sessions.delete` — remove a session from the store.
@@ -878,6 +897,7 @@ async fn collect_assistant_message(
 async fn collect_turn_result(
     event_rx: &mut tokio::sync::mpsc::Receiver<super::wire::EventFrame>,
     session_key: &str,
+    expected_run_id: &str,
     timeout: std::time::Duration,
     turn: &mut super::handshake::TurnResult,
 ) -> anyhow::Result<()> {
@@ -925,6 +945,21 @@ async fn collect_turn_result(
         if role != "assistant" {
             continue;
         }
+        match session_message_run_id(payload, message) {
+            Some(run_id) if run_id == expected_run_id => {}
+            Some(run_id) => {
+                tracing::debug!(
+                    "openclaw: ignoring stale assistant message for session {session_key}: runId {run_id} != expected {expected_run_id}"
+                );
+                continue;
+            }
+            None => {
+                tracing::debug!(
+                    "openclaw: ignoring assistant message for session {session_key} without runId; expected {expected_run_id}"
+                );
+                continue;
+            }
+        }
 
         let content = match message.get("content") {
             Some(v) => super::handshake::AssistantContent::parse(v),
@@ -948,6 +983,18 @@ async fn collect_turn_result(
             turn.tool_results.len()
         );
     }
+}
+
+fn session_message_run_id<'a>(
+    payload: &'a serde_json::Value,
+    message: &'a serde_json::Value,
+) -> Option<&'a str> {
+    message
+        .get("runId")
+        .and_then(|v| v.as_str())
+        .or_else(|| payload.get("runId").and_then(|v| v.as_str()))
+        .or_else(|| message.get("run_id").and_then(|v| v.as_str()))
+        .or_else(|| payload.get("run_id").and_then(|v| v.as_str()))
 }
 
 /// Filter + include options for `OpenClawClient::rpc_sessions_list`.
@@ -1418,6 +1465,276 @@ mod tests {
             alpha,
             stable_session_key("backend=openclaw;workspace=alpha", "Research")
         );
+    }
+
+    fn assistant_event(
+        session_key: &str,
+        run_id: &str,
+        text: &str,
+    ) -> super::super::wire::EventFrame {
+        super::super::wire::EventFrame {
+            event: "session.message".to_string(),
+            payload: Some(serde_json::json!({
+                "sessionKey": session_key,
+                "runId": run_id,
+                "message": {
+                    "role": "assistant",
+                    "runId": run_id,
+                    "content": [{ "type": "text", "text": text }]
+                }
+            })),
+            seq: None,
+            state_version: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn rich_send_collect_ignores_stale_same_session_run_events() {
+        let pending = PendingRequests::new();
+        let (outbound_tx, mut outbound_rx) = mpsc::channel::<RequestFrame>(OUTBOUND_CAPACITY);
+        let (event_tx, event_rx) = mpsc::channel::<super::super::wire::EventFrame>(EVENT_CAPACITY);
+        let mut client = OpenClawClient {
+            pending: pending.clone(),
+            outbound_tx: Some(outbound_tx),
+            event_rx: Some(event_rx),
+            connected: Arc::new(AtomicBool::new(true)),
+            hello_ok: None,
+            stream_sink: None,
+            session_namespace: DEFAULT_SESSION_NAMESPACE.to_string(),
+            session_namespace_aliases: Vec::new(),
+            read_task: None,
+            write_task: None,
+        };
+
+        let collect_task = tokio::spawn(async move {
+            client
+                .rpc_sessions_send_and_collect_rich(
+                    "session-a",
+                    "hello",
+                    SessionsSendOpts::default(),
+                    Duration::from_secs(1),
+                )
+                .await
+        });
+
+        let subscribe = outbound_rx
+            .recv()
+            .await
+            .expect("subscribe request should be sent");
+        assert_eq!(subscribe.method, "sessions.messages.subscribe");
+        pending
+            .resolve(ResponseFrame {
+                id: subscribe.id,
+                ok: true,
+                payload: Some(serde_json::json!({})),
+                error: None,
+            })
+            .await;
+
+        let send = outbound_rx
+            .recv()
+            .await
+            .expect("send request should be sent");
+        assert_eq!(send.method, "sessions.send");
+        event_tx
+            .send(assistant_event("session-a", "old-run", "stale"))
+            .await
+            .expect("stale event should queue");
+        pending
+            .resolve(ResponseFrame {
+                id: send.id,
+                ok: true,
+                payload: Some(serde_json::json!({
+                    "runId": "current-run",
+                    "interruptedActiveRun": false
+                })),
+                error: None,
+            })
+            .await;
+        event_tx
+            .send(assistant_event("session-a", "current-run", "current"))
+            .await
+            .expect("current event should queue");
+
+        let unsubscribe = outbound_rx
+            .recv()
+            .await
+            .expect("unsubscribe request should be sent");
+        assert_eq!(unsubscribe.method, "sessions.messages.unsubscribe");
+        pending
+            .resolve(ResponseFrame {
+                id: unsubscribe.id,
+                ok: true,
+                payload: Some(serde_json::json!({})),
+                error: None,
+            })
+            .await;
+
+        let turn = collect_task
+            .await
+            .expect("collect task should join")
+            .expect("current run should collect");
+        assert_eq!(turn.run_id.as_deref(), Some("current-run"));
+        assert_eq!(turn.text, "current");
+    }
+
+    #[tokio::test]
+    async fn rich_send_collect_unsubscribes_after_send_failure() {
+        let pending = PendingRequests::new();
+        let (outbound_tx, mut outbound_rx) = mpsc::channel::<RequestFrame>(OUTBOUND_CAPACITY);
+        let (_event_tx, event_rx) = mpsc::channel::<super::super::wire::EventFrame>(EVENT_CAPACITY);
+        let mut client = OpenClawClient {
+            pending: pending.clone(),
+            outbound_tx: Some(outbound_tx),
+            event_rx: Some(event_rx),
+            connected: Arc::new(AtomicBool::new(true)),
+            hello_ok: None,
+            stream_sink: None,
+            session_namespace: DEFAULT_SESSION_NAMESPACE.to_string(),
+            session_namespace_aliases: Vec::new(),
+            read_task: None,
+            write_task: None,
+        };
+
+        let collect_task = tokio::spawn(async move {
+            client
+                .rpc_sessions_send_and_collect_rich(
+                    "session-a",
+                    "hello",
+                    SessionsSendOpts::default(),
+                    Duration::from_secs(1),
+                )
+                .await
+        });
+
+        let subscribe = outbound_rx
+            .recv()
+            .await
+            .expect("subscribe request should be sent");
+        pending
+            .resolve(ResponseFrame {
+                id: subscribe.id,
+                ok: true,
+                payload: Some(serde_json::json!({})),
+                error: None,
+            })
+            .await;
+
+        let send = outbound_rx
+            .recv()
+            .await
+            .expect("send request should be sent");
+        assert_eq!(send.method, "sessions.send");
+        pending
+            .resolve(ResponseFrame {
+                id: send.id,
+                ok: false,
+                payload: None,
+                error: Some(super::super::wire::ErrorBody {
+                    code: "BOOM".to_string(),
+                    message: "send failed".to_string(),
+                    details: None,
+                }),
+            })
+            .await;
+
+        let unsubscribe = outbound_rx
+            .recv()
+            .await
+            .expect("unsubscribe request should be sent after send failure");
+        assert_eq!(unsubscribe.method, "sessions.messages.unsubscribe");
+        pending
+            .resolve(ResponseFrame {
+                id: unsubscribe.id,
+                ok: true,
+                payload: Some(serde_json::json!({})),
+                error: None,
+            })
+            .await;
+
+        let err = collect_task
+            .await
+            .expect("collect task should join")
+            .expect_err("send failure should propagate");
+        assert!(err.to_string().contains("send failed"));
+    }
+
+    #[tokio::test]
+    async fn rich_send_collect_unsubscribes_when_event_rx_unavailable() {
+        let pending = PendingRequests::new();
+        let (outbound_tx, mut outbound_rx) = mpsc::channel::<RequestFrame>(OUTBOUND_CAPACITY);
+        let mut client = OpenClawClient {
+            pending: pending.clone(),
+            outbound_tx: Some(outbound_tx),
+            event_rx: None,
+            connected: Arc::new(AtomicBool::new(true)),
+            hello_ok: None,
+            stream_sink: None,
+            session_namespace: DEFAULT_SESSION_NAMESPACE.to_string(),
+            session_namespace_aliases: Vec::new(),
+            read_task: None,
+            write_task: None,
+        };
+
+        let collect_task = tokio::spawn(async move {
+            client
+                .rpc_sessions_send_and_collect_rich(
+                    "session-a",
+                    "hello",
+                    SessionsSendOpts::default(),
+                    Duration::from_secs(1),
+                )
+                .await
+        });
+
+        let subscribe = outbound_rx
+            .recv()
+            .await
+            .expect("subscribe request should be sent");
+        pending
+            .resolve(ResponseFrame {
+                id: subscribe.id,
+                ok: true,
+                payload: Some(serde_json::json!({})),
+                error: None,
+            })
+            .await;
+
+        let send = outbound_rx
+            .recv()
+            .await
+            .expect("send request should be sent");
+        pending
+            .resolve(ResponseFrame {
+                id: send.id,
+                ok: true,
+                payload: Some(serde_json::json!({
+                    "runId": "current-run",
+                    "interruptedActiveRun": false
+                })),
+                error: None,
+            })
+            .await;
+
+        let unsubscribe = outbound_rx
+            .recv()
+            .await
+            .expect("unsubscribe request should be sent after event_rx failure");
+        assert_eq!(unsubscribe.method, "sessions.messages.unsubscribe");
+        pending
+            .resolve(ResponseFrame {
+                id: unsubscribe.id,
+                ok: true,
+                payload: Some(serde_json::json!({})),
+                error: None,
+            })
+            .await;
+
+        let err = collect_task
+            .await
+            .expect("collect task should join")
+            .expect_err("event_rx failure should propagate");
+        assert!(err.to_string().contains("event_rx already taken"));
     }
 
     #[tokio::test]
