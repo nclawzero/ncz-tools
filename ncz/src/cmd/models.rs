@@ -665,7 +665,7 @@ fn parse_models_response(body: &str) -> Result<Vec<provider_state::ModelDeclarat
         Some(&value)
     } else if let Some(data) = value.get("data") {
         Some(data)
-    } else { value.get("models").map(|models| models) })
+    } else { value.get("models") })
     .ok_or_else(|| {
         NczError::Precondition(
             "model catalog response did not include a data or models array".to_string(),

@@ -299,6 +299,7 @@ struct RollbackOutcome {
     stop_warnings: Vec<String>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn recover_after_switch_failure(
     ctx: &Context,
     paths: &Paths,

@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -292,7 +292,7 @@ pub fn validate_name(name: &str) -> Result<(), NczError> {
     Ok(())
 }
 
-fn write_declaration(path: &PathBuf, declaration: &McpDeclaration) -> Result<(), NczError> {
+fn write_declaration(path: &Path, declaration: &McpDeclaration) -> Result<(), NczError> {
     let body = serde_json::to_vec_pretty(declaration)?;
     let mut body_with_newline = body;
     body_with_newline.push(b'\n');
