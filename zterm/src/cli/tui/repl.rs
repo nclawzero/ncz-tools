@@ -1,5 +1,6 @@
 use anyhow::Result;
 use chrono::Utc;
+use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
 use tracing::{info, warn};
 
@@ -20,12 +21,20 @@ pub struct ReplLoop {
     /// turn. Supports runtime /workspace switch (chunk D-3b).
     app: Arc<Mutex<crate::cli::workspace::App>>,
     session: Session,
+    workspace_sessions: HashMap<String, ReplSessionBinding>,
+    fallback_session_name: String,
     reader: io::BufReader<io::Stdin>,
     model: String,
     provider: String,
     history: InputHistory,
     command_handler: CommandHandler,
     status_bar: StatusBar,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReplSessionBinding {
+    id: String,
+    name: String,
 }
 
 impl ReplLoop {
@@ -40,10 +49,13 @@ impl ReplLoop {
         let history = InputHistory::load_from_file()?;
         let command_handler = CommandHandler::new(app.clone());
         let status_bar = StatusBar::new(model.clone(), provider.clone(), session.name.clone());
+        let fallback_session_name = session.name.clone();
 
         Ok(Self {
             app,
             session,
+            workspace_sessions: HashMap::new(),
+            fallback_session_name,
             reader: io::BufReader::new(io::stdin()),
             model,
             provider,
@@ -60,6 +72,73 @@ impl ReplLoop {
         app.active_workspace()
             .and_then(|w| w.client.clone())
             .ok_or_else(|| anyhow::anyhow!("no active workspace with an activated client"))
+    }
+
+    async fn current_workspace_name(&self) -> Result<String> {
+        let app = self.app.lock().await;
+        app.active_workspace()
+            .map(|w| w.config.name.clone())
+            .ok_or_else(|| anyhow::anyhow!("no active workspace"))
+    }
+
+    fn remember_active_workspace_session(&mut self, workspace_name: String, session: &Session) {
+        self.workspace_sessions.insert(
+            workspace_name,
+            ReplSessionBinding {
+                id: session.id.clone(),
+                name: session.name.clone(),
+            },
+        );
+    }
+
+    async fn load_active_workspace_session(&self, session_id: &str) -> Result<Session> {
+        let active_client = self.resolve_active_client().await?;
+        let locked = active_client.lock().await;
+        locked.load_session(session_id).await
+    }
+
+    async fn resolve_or_create_active_workspace_session(&self, target: &str) -> Result<Session> {
+        let active_client = self.resolve_active_client().await?;
+        let resolution = {
+            let locked = active_client.lock().await;
+            plan_legacy_session_resolution(target, locked.list_sessions().await)?
+        };
+
+        match resolution {
+            LegacySessionResolution::Existing(session) => Ok(session),
+            LegacySessionResolution::Create => {
+                let session = active_client.lock().await.create_session(target).await?;
+                if let Err(e) = save_legacy_session_metadata(&session) {
+                    warn!(
+                        "could not save local metadata for newly created session {}: {}",
+                        session.id, e
+                    );
+                }
+                Ok(session)
+            }
+        }
+    }
+
+    async fn ensure_session_for_active_workspace(&mut self) -> Result<String> {
+        let workspace_name = self.current_workspace_name().await?;
+        let session = if let Some(binding) = self.workspace_sessions.get(&workspace_name).cloned() {
+            match self.load_active_workspace_session(&binding.id).await {
+                Ok(session) => session,
+                Err(_) => {
+                    self.resolve_or_create_active_workspace_session(&binding.name)
+                        .await?
+                }
+            }
+        } else {
+            self.resolve_or_create_active_workspace_session(&self.fallback_session_name)
+                .await?
+        };
+
+        let session_id = session.id.clone();
+        self.session = session.clone();
+        self.status_bar.set_session(self.session.name.clone());
+        self.remember_active_workspace_session(workspace_name, &session);
+        Ok(session_id)
     }
 
     async fn apply_legacy_session_action(&mut self, action: LegacySessionAction<'_>) -> Result<()> {
@@ -92,6 +171,9 @@ impl ReplLoop {
 
         self.session = session;
         self.status_bar.set_session(self.session.name.clone());
+        let workspace_name = self.current_workspace_name().await?;
+        let session = self.session.clone();
+        self.remember_active_workspace_session(workspace_name, &session);
         Ok(())
     }
 
@@ -184,6 +266,16 @@ impl ReplLoop {
             );
             io::stdout().flush()?;
 
+            let session_id = match self.ensure_session_for_active_workspace().await {
+                Ok(session_id) => session_id,
+                Err(e) => {
+                    ui::print_error(
+                        "could not prepare session for active workspace",
+                        Some(&e.to_string()),
+                    );
+                    continue;
+                }
+            };
             let active_client = match self.resolve_active_client().await {
                 Ok(c) => c,
                 Err(e) => {
@@ -193,7 +285,7 @@ impl ReplLoop {
             };
             let turn_res = {
                 let mut guard = active_client.lock().await;
-                guard.submit_turn(&self.session.id, &input).await
+                guard.submit_turn(&session_id, &input).await
             };
             match turn_res {
                 Ok(_response) => {
@@ -471,6 +563,11 @@ fn save_legacy_session_metadata(session: &Session) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::agent::{AgentClient, StreamSink};
+    use crate::cli::client::{Config, Model, Provider};
+    use crate::cli::workspace::{App, Backend, Workspace, WorkspaceConfig};
+    use std::path::PathBuf;
+    use std::sync::Mutex as StdMutex;
 
     fn session(id: &str, name: &str) -> Session {
         Session {
@@ -521,5 +618,146 @@ mod tests {
             LegacySessionResolution::Existing(session) => assert_eq!(session.id, "sess-123"),
             LegacySessionResolution::Create => panic!("expected existing session resolution"),
         }
+    }
+
+    #[derive(Clone)]
+    struct FakeWorkspaceClient {
+        sessions: Vec<Session>,
+        submitted: Arc<StdMutex<Vec<(String, String)>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentClient for FakeWorkspaceClient {
+        async fn health(&self) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+
+        async fn get_config(&self) -> anyhow::Result<Config> {
+            Ok(Config {
+                agent: Default::default(),
+            })
+        }
+
+        async fn put_config(&self, _config: &Config) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn list_providers(&self) -> anyhow::Result<Vec<Provider>> {
+            Ok(Vec::new())
+        }
+
+        async fn get_models(&self, _provider: &str) -> anyhow::Result<Vec<Model>> {
+            Ok(Vec::new())
+        }
+
+        async fn list_provider_models(&self, _provider: &str) -> anyhow::Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+
+        async fn list_sessions(&self) -> anyhow::Result<Vec<Session>> {
+            Ok(self.sessions.clone())
+        }
+
+        async fn create_session(&self, name: &str) -> anyhow::Result<Session> {
+            Ok(session(&format!("created-{name}"), name))
+        }
+
+        async fn load_session(&self, session_id: &str) -> anyhow::Result<Session> {
+            self.sessions
+                .iter()
+                .find(|session| session.id == session_id)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("session not found"))
+        }
+
+        async fn delete_session(&self, _session_id: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn submit_turn(&mut self, session_id: &str, message: &str) -> anyhow::Result<String> {
+            self.submitted
+                .lock()
+                .unwrap()
+                .push((session_id.to_string(), message.to_string()));
+            Ok(String::new())
+        }
+
+        fn set_stream_sink(&mut self, _sink: Option<StreamSink>) {}
+    }
+
+    fn workspace(
+        id: usize,
+        name: &str,
+        sessions: Vec<Session>,
+        submitted: Arc<StdMutex<Vec<(String, String)>>>,
+    ) -> Workspace {
+        let fake = FakeWorkspaceClient {
+            sessions,
+            submitted,
+        };
+        let boxed: Box<dyn AgentClient + Send + Sync> = Box::new(fake);
+        Workspace {
+            id,
+            config: WorkspaceConfig {
+                id: None,
+                name: name.to_string(),
+                backend: Backend::Zeroclaw,
+                url: format!("http://{name}.example"),
+                token_env: None,
+                token: None,
+                label: None,
+                namespace_aliases: Vec::new(),
+            },
+            client: Some(Arc::new(Mutex::new(boxed))),
+            cron: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn repl_workspace_switch_rebinds_session_before_next_turn() {
+        let alpha_submitted = Arc::new(StdMutex::new(Vec::new()));
+        let beta_submitted = Arc::new(StdMutex::new(Vec::new()));
+        let alpha = session("alpha-session", "chat");
+        let beta = session("beta-session", "chat");
+        let app = Arc::new(Mutex::new(App {
+            workspaces: vec![
+                workspace(
+                    0,
+                    "alpha",
+                    vec![alpha.clone()],
+                    Arc::clone(&alpha_submitted),
+                ),
+                workspace(1, "beta", vec![beta.clone()], Arc::clone(&beta_submitted)),
+            ],
+            active: 0,
+            shared_mnemos: None,
+            config_path: PathBuf::from("test-config.toml"),
+        }));
+        let mut repl = ReplLoop::new(
+            Arc::clone(&app),
+            alpha,
+            "model".to_string(),
+            "provider".to_string(),
+        )
+        .unwrap();
+
+        repl.ensure_session_for_active_workspace().await.unwrap();
+        app.lock().await.active = 1;
+        let session_id = repl.ensure_session_for_active_workspace().await.unwrap();
+        assert_eq!(session_id, "beta-session");
+
+        let active_client = repl.resolve_active_client().await.unwrap();
+        active_client
+            .lock()
+            .await
+            .submit_turn(&repl.session.id, "hello beta")
+            .await
+            .unwrap();
+
+        assert!(alpha_submitted.lock().unwrap().is_empty());
+        assert_eq!(
+            beta_submitted.lock().unwrap().as_slice(),
+            &[("beta-session".to_string(), "hello beta".to_string())]
+        );
     }
 }

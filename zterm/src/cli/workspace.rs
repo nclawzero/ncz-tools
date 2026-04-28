@@ -173,13 +173,8 @@ impl AppConfig {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading zterm config from {}", path.display()))?;
         let mut cfg = Self::parse(&text)?;
-        if migrate_openclaw_workspace_ids(&mut cfg) {
-            cfg.validate()?;
-            let migrated = toml::to_string_pretty(&cfg)
-                .with_context(|| "serializing migrated zterm config TOML")?;
-            std::fs::write(path, migrated)
-                .with_context(|| format!("writing migrated zterm config to {}", path.display()))?;
-        }
+        apply_openclaw_workspace_state(path, &mut cfg)?;
+        cfg.validate()?;
         Ok(cfg)
     }
 
@@ -193,9 +188,10 @@ impl AppConfig {
     /// Enforce: every workspace has a unique name; `active` (if
     /// set) matches one of them.
     pub fn validate(&self) -> Result<()> {
-        use std::collections::HashSet;
+        use std::collections::{HashMap, HashSet};
         let mut seen: HashSet<&str> = HashSet::new();
         let mut seen_ids: HashSet<&str> = HashSet::new();
+        let mut seen_openclaw_namespaces: HashMap<String, String> = HashMap::new();
         for w in &self.workspaces {
             if !seen.insert(w.name.as_str()) {
                 return Err(anyhow!(
@@ -209,6 +205,22 @@ impl AppConfig {
                 }
                 if !seen_ids.insert(id) {
                     return Err(anyhow!("workspace id '{}' appears more than once", id));
+                }
+            }
+            if w.backend == Backend::Openclaw {
+                for namespace in openclaw_primary_and_alias_namespaces(w) {
+                    if let Some(existing) =
+                        seen_openclaw_namespaces.insert(namespace.clone(), w.name.clone())
+                    {
+                        if existing != w.name {
+                            return Err(anyhow!(
+                                "openclaw session namespace '{}' is used by both workspace '{}' and '{}'",
+                                namespace,
+                                existing,
+                                w.name
+                            ));
+                        }
+                    }
                 }
             }
         }
@@ -410,7 +422,6 @@ fn openclaw_session_namespace_aliases(config: &WorkspaceConfig) -> Vec<String> {
     for alias in &config.namespace_aliases {
         push_unique_namespace(&mut aliases, alias.trim());
     }
-    push_unique_namespace(&mut aliases, &openclaw_legacy_session_namespace(config));
     let primary = openclaw_session_namespace(config);
     aliases.retain(|alias| alias != &primary);
     aliases
@@ -422,33 +433,277 @@ fn push_unique_namespace(namespaces: &mut Vec<String>, namespace: &str) {
     }
 }
 
-fn migrate_openclaw_workspace_ids(cfg: &mut AppConfig) -> bool {
-    let mut changed = false;
+fn openclaw_primary_and_alias_namespaces(config: &WorkspaceConfig) -> Vec<String> {
+    let mut namespaces = vec![openclaw_session_namespace(config)];
+    for alias in &config.namespace_aliases {
+        push_unique_namespace(&mut namespaces, alias.trim());
+    }
+    namespaces
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct WorkspaceState {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    openclaw_workspaces: Vec<OpenClawWorkspaceState>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct OpenClawWorkspaceState {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    index: Option<usize>,
+    name: String,
+    url: String,
+    id: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    identity_aliases: Vec<OpenClawWorkspaceIdentity>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    namespace_aliases: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct OpenClawWorkspaceIdentity {
+    name: String,
+    url: String,
+}
+
+fn workspace_state_path_for_config(config_path: &Path) -> PathBuf {
+    config_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("workspace-state.toml")
+}
+
+fn load_workspace_state(path: &Path) -> Result<WorkspaceState> {
+    if !path.exists() {
+        return Ok(WorkspaceState::default());
+    }
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("reading zterm workspace state from {}", path.display()))?;
+    toml::from_str(&text)
+        .with_context(|| format!("parsing zterm workspace state from {}", path.display()))
+}
+
+fn save_workspace_state(path: &Path, state: &WorkspaceState) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating zterm state dir {}", parent.display()))?;
+    }
+    let body =
+        toml::to_string_pretty(state).with_context(|| "serializing zterm workspace state TOML")?;
+    let tmp_path = path.with_extension("toml.tmp");
+    std::fs::write(&tmp_path, body)
+        .with_context(|| format!("writing zterm workspace state {}", tmp_path.display()))?;
+    std::fs::rename(&tmp_path, path).with_context(|| {
+        format!(
+            "atomically replacing zterm workspace state {}",
+            path.display()
+        )
+    })
+}
+
+fn apply_openclaw_workspace_state(config_path: &Path, cfg: &mut AppConfig) -> Result<()> {
+    let state_path = workspace_state_path_for_config(config_path);
+    let mut state = load_workspace_state(&state_path)?;
+    let mut state_changed = false;
+    let mut claimed_state_entries = std::collections::HashSet::new();
+    let mut openclaw_index = 0usize;
+
     for workspace in &mut cfg.workspaces {
         if workspace.backend != Backend::Openclaw {
             continue;
         }
-        let legacy_namespace = openclaw_legacy_session_namespace(workspace);
-        if workspace
+        let workspace_index = openclaw_index;
+        openclaw_index += 1;
+
+        if let Some(id) = workspace
             .id
             .as_deref()
             .map(str::trim)
-            .unwrap_or("")
-            .is_empty()
+            .filter(|id| !id.is_empty())
+            .map(str::to_string)
         {
-            workspace.id = Some(format!("ws_{}", uuid::Uuid::new_v4().simple()));
-            changed = true;
+            if let Some(entry_idx) = state
+                .openclaw_workspaces
+                .iter()
+                .position(|entry| entry.id == id)
+            {
+                if !claimed_state_entries.insert(entry_idx) {
+                    return Err(anyhow!(
+                        "openclaw workspace state entry {} matched more than one workspace",
+                        entry_idx
+                    ));
+                }
+                let entry = &state.openclaw_workspaces[entry_idx];
+                for alias in &entry.namespace_aliases {
+                    push_unique_namespace(&mut workspace.namespace_aliases, alias.trim());
+                }
+            }
+            continue;
         }
-        if !workspace
-            .namespace_aliases
-            .iter()
-            .any(|alias| alias == &legacy_namespace)
-        {
-            workspace.namespace_aliases.push(legacy_namespace);
-            changed = true;
+
+        if let Some(entry_idx) = find_openclaw_workspace_state_entry(
+            &state,
+            workspace,
+            workspace_index,
+            &claimed_state_entries,
+        )? {
+            if !claimed_state_entries.insert(entry_idx) {
+                return Err(anyhow!(
+                    "openclaw workspace state entry {} matched more than one workspace",
+                    entry_idx
+                ));
+            }
+            let entry = &mut state.openclaw_workspaces[entry_idx];
+            workspace.id = Some(entry.id.clone());
+            for alias in &entry.namespace_aliases {
+                push_unique_namespace(&mut workspace.namespace_aliases, alias.trim());
+            }
+            state_changed |= refresh_openclaw_workspace_state_entry(
+                entry,
+                workspace_index,
+                &workspace.name,
+                &workspace.url,
+            );
+            continue;
+        }
+
+        let legacy_namespace = openclaw_legacy_session_namespace(workspace);
+        let entry = OpenClawWorkspaceState {
+            index: Some(workspace_index),
+            name: workspace.name.clone(),
+            url: workspace.url.clone(),
+            id: format!("ws_{}", uuid::Uuid::new_v4().simple()),
+            identity_aliases: Vec::new(),
+            namespace_aliases: vec![legacy_namespace],
+        };
+        let mut next_state = state.clone();
+        next_state.openclaw_workspaces.push(entry.clone());
+        match save_workspace_state(&state_path, &next_state) {
+            Ok(()) => {
+                state = next_state;
+                workspace.id = Some(entry.id);
+                for alias in &entry.namespace_aliases {
+                    push_unique_namespace(&mut workspace.namespace_aliases, alias.trim());
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "could not persist generated openclaw workspace id for '{}': {e}; \
+                     staying on legacy name+url namespace",
+                    workspace.name
+                );
+            }
         }
     }
+    if state_changed {
+        if let Err(e) = save_workspace_state(&state_path, &state) {
+            tracing::warn!("could not persist updated openclaw workspace state aliases: {e}");
+        }
+    }
+    Ok(())
+}
+
+fn normalize_workspace_url(url: &str) -> String {
+    url.trim().trim_end_matches('/').to_string()
+}
+
+fn find_openclaw_workspace_state_entry(
+    state: &WorkspaceState,
+    workspace: &WorkspaceConfig,
+    workspace_index: usize,
+    claimed_state_entries: &std::collections::HashSet<usize>,
+) -> Result<Option<usize>> {
+    let identity_matches: Vec<usize> = state
+        .openclaw_workspaces
+        .iter()
+        .enumerate()
+        .filter(|(idx, entry)| {
+            !claimed_state_entries.contains(idx)
+                && openclaw_workspace_state_identity_matches(entry, workspace)
+        })
+        .map(|(idx, _)| idx)
+        .collect();
+    if identity_matches.len() > 1 {
+        return Err(anyhow!(
+            "openclaw workspace '{}' matches multiple persisted workspace-state entries",
+            workspace.name
+        ));
+    }
+    if let Some(idx) = identity_matches.into_iter().next() {
+        return Ok(Some(idx));
+    }
+
+    Ok(state
+        .openclaw_workspaces
+        .iter()
+        .enumerate()
+        .find(|(idx, entry)| {
+            !claimed_state_entries.contains(idx) && entry.index == Some(workspace_index)
+        })
+        .map(|(idx, _)| idx))
+}
+
+fn openclaw_workspace_state_identity_matches(
+    entry: &OpenClawWorkspaceState,
+    workspace: &WorkspaceConfig,
+) -> bool {
+    openclaw_workspace_identity_matches(&entry.name, &entry.url, workspace)
+        || entry.identity_aliases.iter().any(|identity| {
+            openclaw_workspace_identity_matches(&identity.name, &identity.url, workspace)
+        })
+}
+
+fn openclaw_workspace_identity_matches(name: &str, url: &str, workspace: &WorkspaceConfig) -> bool {
+    name == workspace.name
+        && normalize_workspace_url(url) == normalize_workspace_url(&workspace.url)
+}
+
+fn refresh_openclaw_workspace_state_entry(
+    entry: &mut OpenClawWorkspaceState,
+    workspace_index: usize,
+    workspace_name: &str,
+    workspace_url: &str,
+) -> bool {
+    let mut changed = false;
+    if entry.index != Some(workspace_index) {
+        entry.index = Some(workspace_index);
+        changed = true;
+    }
+    if !openclaw_workspace_identity_values_match(
+        &entry.name,
+        &entry.url,
+        workspace_name,
+        workspace_url,
+    ) {
+        let previous = OpenClawWorkspaceIdentity {
+            name: entry.name.clone(),
+            url: entry.url.clone(),
+        };
+        if !entry.identity_aliases.iter().any(|identity| {
+            openclaw_workspace_identity_values_match(
+                &identity.name,
+                &identity.url,
+                &previous.name,
+                &previous.url,
+            )
+        }) {
+            entry.identity_aliases.push(previous);
+        }
+        entry.name = workspace_name.to_string();
+        entry.url = workspace_url.to_string();
+        changed = true;
+    }
     changed
+}
+
+fn openclaw_workspace_identity_values_match(
+    left_name: &str,
+    left_url: &str,
+    right_name: &str,
+    right_url: &str,
+) -> bool {
+    left_name == right_name
+        && normalize_workspace_url(left_url) == normalize_workspace_url(right_url)
 }
 
 /// Canonical path for zterm's openclaw device key. Shared across
@@ -717,31 +972,83 @@ url = "http://a"
     }
 
     #[test]
-    fn load_migrates_openclaw_workspace_id_and_legacy_namespace_alias() {
+    fn load_persists_openclaw_workspace_id_in_state_without_rewriting_config() {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("config.toml");
-        std::fs::write(
-            &path,
-            r#"
+        let original = r#"
+# user comment that must survive load
 [[workspaces]]
 name = "alpha"
 backend = "openclaw"
 url = "ws://old.example"
-"#,
-        )
-        .unwrap();
+"#;
+        std::fs::write(&path, original).unwrap();
 
         let cfg = AppConfig::load(&path).unwrap();
         let workspace = &cfg.workspaces[0];
-        let id = workspace.id.as_deref().expect("migration should assign id");
+        let id = workspace
+            .id
+            .as_deref()
+            .expect("state migration should assign id");
         assert!(id.starts_with("ws_"));
         assert!(workspace
             .namespace_aliases
             .iter()
             .any(|alias| { alias == "backend=openclaw;workspace=alpha;url=ws://old.example" }));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        assert!(workspace_state_path_for_config(&path).exists());
 
         let reloaded = AppConfig::load(&path).unwrap();
         assert_eq!(reloaded.workspaces[0].id.as_deref(), Some(id));
+    }
+
+    #[test]
+    fn state_backed_openclaw_id_survives_rename_and_url_edit_without_new_legacy_alias() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        let original = r#"
+[[workspaces]]
+name = "alpha"
+backend = "openclaw"
+url = "ws://old.example"
+"#;
+        std::fs::write(&path, original).unwrap();
+
+        let cfg = AppConfig::load(&path).unwrap();
+        let id = cfg.workspaces[0].id.clone().unwrap();
+        let old_namespace = "backend=openclaw;workspace=alpha;url=ws://old.example";
+        assert!(cfg.workspaces[0]
+            .namespace_aliases
+            .iter()
+            .any(|alias| alias == old_namespace));
+
+        let renamed = r#"
+[[workspaces]]
+name = "renamed"
+backend = "openclaw"
+url = "ws://new.example"
+"#;
+        std::fs::write(&path, renamed).unwrap();
+
+        let reloaded = AppConfig::load(&path).unwrap();
+        let workspace = &reloaded.workspaces[0];
+        assert_eq!(workspace.id.as_deref(), Some(id.as_str()));
+        assert!(workspace
+            .namespace_aliases
+            .iter()
+            .any(|alias| alias == old_namespace));
+        assert!(!workspace
+            .namespace_aliases
+            .iter()
+            .any(|alias| alias == "backend=openclaw;workspace=renamed;url=ws://new.example"));
+
+        let state = load_workspace_state(&workspace_state_path_for_config(&path)).unwrap();
+        let entry = state
+            .openclaw_workspaces
+            .iter()
+            .find(|entry| entry.id == id)
+            .expect("state entry for generated id");
+        assert_eq!(entry.namespace_aliases, vec![old_namespace.to_string()]);
     }
 
     #[test]
@@ -767,9 +1074,52 @@ url = "ws://old.example"
         assert!(aliases
             .iter()
             .any(|alias| alias == "backend=openclaw;workspace=alpha;url=ws://old.example"));
-        assert!(aliases
+        assert!(!aliases
             .iter()
             .any(|alias| alias == "backend=openclaw;workspace=renamed;url=ws://new.example"));
+    }
+
+    #[test]
+    fn parse_rejects_openclaw_alias_vs_alias_collision() {
+        let text = r#"
+[[workspaces]]
+name = "alpha"
+backend = "openclaw"
+url = "ws://a"
+namespace_aliases = ["backend=openclaw;workspace=legacy;url=ws://shared"]
+
+[[workspaces]]
+name = "beta"
+backend = "openclaw"
+url = "ws://b"
+namespace_aliases = ["backend=openclaw;workspace=legacy;url=ws://shared"]
+"#;
+        let err = AppConfig::parse(text).unwrap_err();
+        assert!(err.to_string().contains("openclaw session namespace"));
+        assert!(err.to_string().contains("alpha"));
+        assert!(err.to_string().contains("beta"));
+    }
+
+    #[test]
+    fn parse_rejects_openclaw_primary_vs_alias_collision() {
+        let text = r#"
+[[workspaces]]
+id = "ws_alpha"
+name = "alpha"
+backend = "openclaw"
+url = "ws://a"
+
+[[workspaces]]
+id = "ws_beta"
+name = "beta"
+backend = "openclaw"
+url = "ws://b"
+namespace_aliases = ["backend=openclaw;workspace_id=ws_alpha"]
+"#;
+        let err = AppConfig::parse(text).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("backend=openclaw;workspace_id=ws_alpha"));
     }
 
     #[test]
