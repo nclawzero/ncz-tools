@@ -87,30 +87,30 @@ pub fn switch_agent(
 
     systemd::daemon_reload(ctx.runner)?;
 
+    // Quadlet-generated services live under /run/systemd/generator/ and are
+    // marked transient; `systemctl enable` rejects them. Boot-time persistence
+    // is owned by the [Install] section in each `.container` file (only
+    // zeroclaw.container ships with [Install]). set-agent therefore only
+    // toggles runtime via stop/start and does not touch enable/disable.
     for agent_name in agent::AGENTS {
         if *agent_name != target {
             let unit = agent::service_for(agent_name);
             let _ = systemd::stop(ctx.runner, &unit);
-            let _ = systemd::disable(ctx.runner, &unit);
         }
     }
 
     let service = agent::service_for(target);
-    systemd::enable(ctx.runner, &service)?;
     systemd::start(ctx.runner, &service)?;
 
     let port = agent::port_for(target)
         .ok_or_else(|| NczError::Usage(format!("unknown agent: {target}")))?;
     if !common::probe_local_health(ctx.runner, port, health_timeout_secs)? {
         let _ = systemd::stop(ctx.runner, &service);
-        let _ = systemd::disable(ctx.runner, &service);
         if agent::AGENTS.contains(&current.as_str())
             && current != target
             && paths.agent_quadlet(&current).is_file()
         {
-            let current_service = agent::service_for(&current);
-            let _ = systemd::enable(ctx.runner, &current_service);
-            let _ = systemd::start(ctx.runner, &current_service);
+            let _ = systemd::start(ctx.runner, &agent::service_for(&current));
         }
         return Err(NczError::Precondition(format!(
             "health probe failed for {target}; rolled back to {current}"
@@ -207,22 +207,7 @@ mod tests {
         );
         runner.expect(
             "sudo",
-            &["systemctl", "disable", "openclaw.service"],
-            out(0, "", ""),
-        );
-        runner.expect(
-            "sudo",
             &["systemctl", "stop", "hermes.service"],
-            out(0, "", ""),
-        );
-        runner.expect(
-            "sudo",
-            &["systemctl", "disable", "hermes.service"],
-            out(0, "", ""),
-        );
-        runner.expect(
-            "sudo",
-            &["systemctl", "enable", "zeroclaw.service"],
             out(0, "", ""),
         );
         runner.expect(
