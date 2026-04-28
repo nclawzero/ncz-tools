@@ -139,16 +139,18 @@ struct TypewriterState {
     pos: usize,
     last_emit: Instant,
     after_lines: Vec<String>,
+    current_line: usize,
     completed: bool,
 }
 
 impl TypewriterState {
-    fn new(text: impl Into<String>, after_lines: Vec<String>) -> Self {
+    fn new(text: impl Into<String>, after_lines: Vec<String>, current_line: usize) -> Self {
         Self {
             chars: text.into().chars().collect(),
             pos: 0,
             last_emit: Instant::now(),
             after_lines,
+            current_line,
             completed: false,
         }
     }
@@ -164,23 +166,31 @@ impl TypewriterState {
         }
 
         let mut lines = lines.borrow_mut();
-        if lines.is_empty() {
+        if self.current_line > lines.len() {
+            self.current_line = lines.len();
+        }
+        if self.current_line == lines.len() {
             lines.push(String::new());
         }
 
         for _ in 0..due {
             let Some(ch) = self.chars.get(self.pos).copied() else {
                 self.completed = true;
-                lines.push(String::new());
-                lines.extend(self.after_lines.drain(..));
+                self.current_line += 1;
+                lines.insert(self.current_line, String::new());
+                for line in self.after_lines.drain(..) {
+                    self.current_line += 1;
+                    lines.insert(self.current_line, line);
+                }
                 return;
             };
             self.pos += 1;
             self.last_emit += TYPEWRITER_INTERVAL;
             if ch == '\n' {
-                lines.push(String::new());
-            } else if let Some(last) = lines.last_mut() {
-                last.push(ch);
+                self.current_line += 1;
+                lines.insert(self.current_line, String::new());
+            } else if let Some(line) = lines.get_mut(self.current_line) {
+                line.push(ch);
             }
         }
     }
@@ -192,8 +202,13 @@ fn start_typewriter(
     text: String,
     after_lines: Vec<String>,
 ) {
-    lines.borrow_mut().push(String::new());
-    *state = Some(TypewriterState::new(text, after_lines));
+    let current_line = {
+        let mut lines = lines.borrow_mut();
+        let current_line = lines.len();
+        lines.push(String::new());
+        current_line
+    };
+    *state = Some(TypewriterState::new(text, after_lines, current_line));
 }
 
 fn typewriter_chars_due(elapsed: Duration, interval: Duration) -> usize {
@@ -1108,7 +1123,7 @@ fn run_blocking(
     let welcome_lines = initial_chat_lines(&workspace_name, &model, &provider, welcome_back);
     let mut typewriter_state = None;
     let initial_lines = if let Some(text) = connect_splash {
-        let state = TypewriterState::new(text, welcome_lines);
+        let state = TypewriterState::new(text, welcome_lines, 0);
         typewriter_state = Some(state);
         vec![String::new()]
     } else {
@@ -2670,6 +2685,40 @@ mod tests {
             typewriter_chars_due(Duration::from_millis(95), TYPEWRITER_INTERVAL),
             3
         );
+    }
+
+    #[test]
+    fn typewriter_keeps_splash_lines_before_prompt_appended_mid_stream() {
+        let lines = Rc::new(RefCell::new(vec![String::new()]));
+        let mut writer = TypewriterState::new(
+            "ab\ncd",
+            vec!["workspace: default".to_string(), "model: test".to_string()],
+            0,
+        );
+
+        writer.last_emit = Instant::now() - Duration::from_millis(90);
+        writer.tick(&lines);
+        {
+            let mut lines = lines.borrow_mut();
+            lines.push("> hello".to_string());
+            lines.push(String::new());
+        }
+
+        writer.last_emit = Instant::now() - Duration::from_millis(300);
+        writer.tick(&lines);
+
+        let expected = vec![
+            "ab".to_string(),
+            "cd".to_string(),
+            String::new(),
+            "workspace: default".to_string(),
+            "model: test".to_string(),
+            "> hello".to_string(),
+            String::new(),
+        ];
+
+        assert!(writer.completed);
+        assert_eq!(lines.borrow().clone(), expected);
     }
 
     #[test]

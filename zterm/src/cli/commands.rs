@@ -274,7 +274,6 @@ impl CommandHandler {
                                         ));
                                     }
                                 } else {
-                                    let _ = storage::delete_session(&target.id);
                                     out.push_str(&format!(
                                         "✅ Deleted session: {display} ({})\n",
                                         target.id
@@ -1243,6 +1242,10 @@ fn choose_delete_session_target(
     backend_sessions: Option<&[Session]>,
     local_sessions: &[storage::SessionMetadata],
 ) -> Result<DeleteSessionTarget> {
+    if backend_sessions.is_none() {
+        return choose_delete_session_target_without_backend(requested, local_sessions);
+    }
+
     if let Some(sessions) = backend_sessions {
         let exact_backend: Vec<&Session> = sessions
             .iter()
@@ -1273,11 +1276,7 @@ fn choose_delete_session_target(
         .collect();
     match exact_local.as_slice() {
         [metadata] => {
-            return Ok(DeleteSessionTarget {
-                id: metadata.id.clone(),
-                name: metadata.name.clone(),
-                local_id: Some(metadata.id.clone()),
-            });
+            return local_delete_target(metadata);
         }
         [] => {}
         _ => {
@@ -1316,19 +1315,7 @@ fn choose_delete_session_target(
     }
 
     if let Some(metadata) = local_name_matches.first() {
-        return Ok(DeleteSessionTarget {
-            id: metadata.id.clone(),
-            name: metadata.name.clone(),
-            local_id: Some(metadata.id.clone()),
-        });
-    }
-
-    if backend_sessions.is_none() {
-        return Ok(DeleteSessionTarget {
-            id: requested.to_string(),
-            name: requested.to_string(),
-            local_id: None,
-        });
+        return local_delete_target(metadata);
     }
 
     Err(anyhow!(
@@ -1336,10 +1323,48 @@ fn choose_delete_session_target(
     ))
 }
 
+fn choose_delete_session_target_without_backend(
+    requested: &str,
+    local_sessions: &[storage::SessionMetadata],
+) -> Result<DeleteSessionTarget> {
+    let exact_local: Vec<&storage::SessionMetadata> = local_sessions
+        .iter()
+        .filter(|metadata| metadata.id == requested)
+        .collect();
+
+    match exact_local.as_slice() {
+        [metadata] => local_delete_target(metadata),
+        [] => Err(anyhow!(
+            "backend sessions unavailable; refusing to delete without an exact safe local session id"
+        )),
+        _ => Err(ambiguous_delete_target_error(
+            requested,
+            Vec::new(),
+            exact_local,
+        )),
+    }
+}
+
+fn local_delete_target(metadata: &storage::SessionMetadata) -> Result<DeleteSessionTarget> {
+    if !storage::is_safe_session_id(&metadata.id) {
+        return Err(anyhow!(
+            "unsafe local session id '{}'; refusing local cleanup",
+            metadata.id
+        ));
+    }
+
+    Ok(DeleteSessionTarget {
+        id: metadata.id.clone(),
+        name: metadata.name.clone(),
+        local_id: Some(metadata.id.clone()),
+    })
+}
+
 fn unique_local_id_match(local_sessions: &[storage::SessionMetadata], id: &str) -> Option<String> {
     let mut matches = local_sessions
         .iter()
         .filter(|metadata| metadata.id == id)
+        .filter(|metadata| storage::is_safe_session_id(&metadata.id))
         .map(|metadata| metadata.id.clone());
     let first = matches.next()?;
     if matches.next().is_none() {
@@ -1571,10 +1596,45 @@ mod tests {
     }
 
     #[test]
-    fn delete_resolver_allows_raw_id_when_backend_list_unavailable() {
-        let target = super::choose_delete_session_target("raw-id", None, &[]).unwrap();
+    fn delete_resolver_allows_exact_safe_local_id_when_backend_list_unavailable() {
+        let local = vec![metadata("local-123", "Planning")];
+        let target = super::choose_delete_session_target("local-123", None, &local).unwrap();
 
-        assert_eq!(target.id, "raw-id");
+        assert_eq!(target.id, "local-123");
+        assert_eq!(target.local_id.as_deref(), Some("local-123"));
+    }
+
+    #[test]
+    fn delete_resolver_fails_closed_on_raw_id_when_backend_list_unavailable() {
+        let err = super::choose_delete_session_target("raw-id", None, &[]).unwrap_err();
+
+        assert!(err.to_string().contains("backend sessions unavailable"));
+    }
+
+    #[test]
+    fn delete_resolver_fails_closed_on_local_name_when_backend_list_unavailable() {
+        let local = vec![metadata("local-123", "Planning")];
+        let err = super::choose_delete_session_target("Planning", None, &local).unwrap_err();
+
+        assert!(err.to_string().contains("backend sessions unavailable"));
+    }
+
+    #[test]
+    fn delete_resolver_rejects_unsafe_local_id_when_backend_list_unavailable() {
+        let local = vec![metadata("../owned", "Planning")];
+        let err = super::choose_delete_session_target("../owned", None, &local).unwrap_err();
+
+        assert!(err.to_string().contains("unsafe local session id"));
+    }
+
+    #[test]
+    fn delete_resolver_does_not_cleanup_unsafe_backend_id_match() {
+        let backend = vec![session("../owned", "Research")];
+        let local = vec![metadata("../owned", "Research")];
+        let target = super::choose_delete_session_target("../owned", Some(&backend), &local)
+            .expect("backend id can be sent to backend but not used for local cleanup");
+
+        assert_eq!(target.id, "../owned");
         assert_eq!(target.local_id, None);
     }
 

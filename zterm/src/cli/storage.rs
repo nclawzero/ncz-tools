@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 
 /// Configuration directory: ~/.zeroclaw
 pub fn config_dir() -> Result<PathBuf> {
@@ -27,6 +27,20 @@ pub fn history_file() -> Result<PathBuf> {
 /// Session directory: ~/.zeroclaw/sessions/{session_id}
 pub fn session_dir(session_id: &str) -> Result<PathBuf> {
     Ok(sessions_dir()?.join(session_id))
+}
+
+/// True when a session id is a single local filesystem path component.
+pub fn is_safe_session_id(session_id: &str) -> bool {
+    if session_id.is_empty()
+        || session_id.contains('/')
+        || session_id.contains('\\')
+        || session_id.contains('\0')
+    {
+        return false;
+    }
+
+    let mut components = Path::new(session_id).components();
+    matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none()
 }
 
 /// Session metadata: ~/.zeroclaw/sessions/{session_id}/meta.json
@@ -148,6 +162,10 @@ pub fn list_sessions() -> Result<Vec<SessionMetadata>> {
 
 /// Delete a session and all its files
 pub fn delete_session(session_id: &str) -> Result<()> {
+    if !is_safe_session_id(session_id) {
+        return Err(anyhow!("unsafe session id for local deletion"));
+    }
+
     let dir = session_dir(session_id)?;
     if dir.exists() {
         fs::remove_dir_all(&dir).map_err(|e| anyhow!("Failed to delete session: {}", e))?;
@@ -244,5 +262,18 @@ mod tests {
         let _ = ensure_sessions_dir();
         assert!(config_dir().is_ok());
         assert!(sessions_dir().is_ok());
+    }
+
+    #[test]
+    fn safe_session_ids_are_single_path_components() {
+        assert!(is_safe_session_id("sess-123"));
+        assert!(is_safe_session_id("2026.04.28_alpha"));
+
+        assert!(!is_safe_session_id(""));
+        assert!(!is_safe_session_id("."));
+        assert!(!is_safe_session_id(".."));
+        assert!(!is_safe_session_id("../owned"));
+        assert!(!is_safe_session_id("nested/session"));
+        assert!(!is_safe_session_id("nested\\session"));
     }
 }
