@@ -1327,22 +1327,18 @@ fn choose_delete_session_target_without_backend(
     requested: &str,
     local_sessions: &[storage::SessionMetadata],
 ) -> Result<DeleteSessionTarget> {
-    let exact_local: Vec<&storage::SessionMetadata> = local_sessions
+    let exact_local_count = local_sessions
         .iter()
         .filter(|metadata| metadata.id == requested)
-        .collect();
-
-    match exact_local.as_slice() {
-        [metadata] => local_delete_target(metadata),
-        [] => Err(anyhow!(
-            "backend sessions unavailable; refusing to delete without an exact safe local session id"
-        )),
-        _ => Err(ambiguous_delete_target_error(
-            requested,
-            Vec::new(),
-            exact_local,
-        )),
-    }
+        .count();
+    let hint = if exact_local_count == 0 {
+        "no matching local metadata was trusted"
+    } else {
+        "local metadata is not trusted for backend deletes"
+    };
+    Err(anyhow!(
+        "backend sessions unavailable; refusing backend delete while target cannot be verified against the active backend ({hint})"
+    ))
 }
 
 fn local_delete_target(metadata: &storage::SessionMetadata) -> Result<DeleteSessionTarget> {
@@ -1596,12 +1592,14 @@ mod tests {
     }
 
     #[test]
-    fn delete_resolver_allows_exact_safe_local_id_when_backend_list_unavailable() {
+    fn delete_resolver_fails_closed_on_exact_local_id_when_backend_list_unavailable() {
         let local = vec![metadata("local-123", "Planning")];
-        let target = super::choose_delete_session_target("local-123", None, &local).unwrap();
+        let err = super::choose_delete_session_target("local-123", None, &local).unwrap_err();
 
-        assert_eq!(target.id, "local-123");
-        assert_eq!(target.local_id.as_deref(), Some("local-123"));
+        assert!(err.to_string().contains("backend sessions unavailable"));
+        assert!(err
+            .to_string()
+            .contains("local metadata is not trusted for backend deletes"));
     }
 
     #[test]
@@ -1620,9 +1618,9 @@ mod tests {
     }
 
     #[test]
-    fn delete_resolver_rejects_unsafe_local_id_when_backend_list_unavailable() {
+    fn delete_resolver_rejects_unsafe_local_id_when_backend_list_available() {
         let local = vec![metadata("../owned", "Planning")];
-        let err = super::choose_delete_session_target("../owned", None, &local).unwrap_err();
+        let err = super::choose_delete_session_target("../owned", Some(&[]), &local).unwrap_err();
 
         assert!(err.to_string().contains("unsafe local session id"));
     }
