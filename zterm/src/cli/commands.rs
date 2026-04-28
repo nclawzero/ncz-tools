@@ -217,36 +217,27 @@ impl CommandHandler {
     ) -> Result<Option<String>> {
         let mut out = String::new();
         match subcommand {
-            Some("list") => match storage::list_sessions() {
-                Ok(sessions) => {
-                    if sessions.is_empty() {
-                        out.push_str("\n📋 Sessions: (none yet)\n");
-                        out.push_str("  Create one with: /session <name>\n");
-                    } else {
-                        out.push_str(&format!("\n📋 Sessions ({}):\n", sessions.len()));
-                        for (i, session) in sessions.iter().enumerate() {
-                            out.push_str(&format!(
-                                "  {}. {} ({})\n",
-                                i + 1,
-                                session.name,
-                                &session.id[..8.min(session.id.len())]
-                            ));
-                            out.push_str(&format!(
-                                "     Model: {}/{}\n",
-                                session.provider, session.model
-                            ));
-                            out.push_str(&format!(
-                                "     Messages: {}, Last active: {}\n",
-                                session.message_count,
-                                &session.last_active[..10.min(session.last_active.len())]
-                            ));
-                        }
+            Some("list") => {
+                let Some(client) = self.current_agent_client().await else {
+                    out.push_str("❌ Could not list sessions: no active workspace client\n");
+                    out.push('\n');
+                    return Ok(Some(out));
+                };
+
+                let list_result = {
+                    let locked = client.lock().await;
+                    locked.list_sessions().await
+                };
+                match list_result {
+                    Ok(sessions) => {
+                        let local_sessions = storage::list_sessions().unwrap_or_default();
+                        out.push_str(&format_backend_session_list(&sessions, &local_sessions));
+                    }
+                    Err(e) => {
+                        out.push_str(&format!("❌ Could not list active backend sessions: {e}\n"));
                     }
                 }
-                Err(e) => {
-                    out.push_str(&format!("❌ Could not list sessions: {e}\n"));
-                }
-            },
+            }
             Some("delete") => {
                 let name = args.first().copied().unwrap_or("");
                 if name.is_empty() {
@@ -293,29 +284,36 @@ impl CommandHandler {
                     }
                 }
             }
-            Some("info") => match storage::load_session_metadata(session_id) {
-                Ok(metadata) => {
-                    out.push_str("\n📊 Current Session:\n");
-                    out.push_str(&format!("  Name:      {}\n", metadata.name));
-                    out.push_str(&format!("  ID:        {}\n", metadata.id));
-                    out.push_str(&format!(
-                        "  Model:     {}/{}\n",
-                        metadata.provider, metadata.model
-                    ));
-                    out.push_str(&format!("  Messages:  {}\n", metadata.message_count));
-                    out.push_str(&format!(
-                        "  Created:   {}\n",
-                        &metadata.created_at[..10.min(metadata.created_at.len())]
-                    ));
-                    out.push_str(&format!(
-                        "  Last used: {}\n",
-                        &metadata.last_active[..10.min(metadata.last_active.len())]
-                    ));
+            Some("info") => {
+                let Some(client) = self.current_agent_client().await else {
+                    out.push_str(
+                        "❌ Failed to load active backend session: no active workspace client\n",
+                    );
+                    out.push('\n');
+                    return Ok(Some(out));
+                };
+
+                let load_result = {
+                    let locked = client.lock().await;
+                    locked.load_session(session_id).await
+                };
+                match load_result {
+                    Ok(session) => {
+                        let local_metadata = storage::load_session_metadata(&session.id)
+                            .ok()
+                            .filter(|metadata| metadata.id == session.id);
+                        out.push_str(&format_backend_session_info(
+                            &session,
+                            local_metadata.as_ref(),
+                        ));
+                    }
+                    Err(e) => {
+                        out.push_str(&format!(
+                            "❌ Failed to load active backend session '{session_id}': {e}\n"
+                        ));
+                    }
                 }
-                Err(e) => {
-                    out.push_str(&format!("❌ Failed to load session: {e}\n"));
-                }
-            },
+            }
             Some("switch") | Some("create") => {
                 let Some(session_name) = args.first().copied().filter(|s| !s.is_empty()) else {
                     out.push_str(&format!(
@@ -325,26 +323,12 @@ impl CommandHandler {
                     out.push('\n');
                     return Ok(Some(out));
                 };
-                out.push_str(&format!("🔄 Active session: '{session_name}'\n"));
-                if let Ok(metadata) = load_session_metadata_by_id_or_name(session_name) {
-                    out.push_str(&format!(
-                        "   Found: {}/{}, {} messages\n",
-                        metadata.provider, metadata.model, metadata.message_count
-                    ));
-                } else {
-                    out.push_str("   Created for future turns\n");
-                }
+                out.push_str(&format!("🔄 Active backend session: '{session_name}'\n"));
             }
             Some(session_name) => {
-                out.push_str(&format!("🔄 Switching to session: '{session_name}'\n"));
-                if let Ok(metadata) = load_session_metadata_by_id_or_name(session_name) {
-                    out.push_str(&format!(
-                        "   Found: {}/{}, {} messages\n",
-                        metadata.provider, metadata.model, metadata.message_count
-                    ));
-                } else {
-                    out.push_str("   Created for future turns\n");
-                }
+                out.push_str(&format!(
+                    "🔄 Switching to backend session: '{session_name}'\n"
+                ));
             }
             None => {
                 out.push_str("Usage: /session list         (show all sessions)\n");
@@ -1197,14 +1181,85 @@ impl CommandHandler {
     }
 }
 
-fn load_session_metadata_by_id_or_name(session: &str) -> Result<storage::SessionMetadata> {
-    if let Ok(metadata) = storage::load_session_metadata(session) {
-        return Ok(metadata);
+fn format_backend_session_list(
+    sessions: &[Session],
+    local_sessions: &[storage::SessionMetadata],
+) -> String {
+    let mut out = String::new();
+    if sessions.is_empty() {
+        out.push_str("\n📋 Sessions: (none yet)\n");
+        out.push_str("  Create one with: /session <name>\n");
+        return out;
     }
-    storage::list_sessions()?
-        .into_iter()
-        .find(|metadata| metadata.id == session || metadata.name == session)
-        .ok_or_else(|| anyhow!("session metadata not found: {session}"))
+
+    out.push_str(&format!("\n📋 Sessions ({}):\n", sessions.len()));
+    for (i, session) in sessions.iter().enumerate() {
+        out.push_str(&format!(
+            "  {}. {} ({})\n",
+            i + 1,
+            session.name,
+            short_session_id(&session.id)
+        ));
+        out.push_str(&format!("     ID:    {}\n", session.id));
+        out.push_str(&format!(
+            "     Model: {}/{}\n",
+            session.provider, session.model
+        ));
+        if let Some(metadata) = exact_local_metadata(local_sessions, &session.id) {
+            out.push_str(&format!(
+                "     Cached metadata: {} messages, last active {}\n",
+                metadata.message_count,
+                short_date(&metadata.last_active)
+            ));
+        }
+    }
+    out
+}
+
+fn format_backend_session_info(
+    session: &Session,
+    local_metadata: Option<&storage::SessionMetadata>,
+) -> String {
+    let mut out = String::new();
+    out.push_str("\n📊 Current Session:\n");
+    out.push_str(&format!("  Name:      {}\n", session.name));
+    out.push_str(&format!("  ID:        {}\n", session.id));
+    out.push_str(&format!(
+        "  Model:     {}/{}\n",
+        session.provider, session.model
+    ));
+
+    if let Some(metadata) = local_metadata.filter(|metadata| metadata.id == session.id) {
+        out.push_str(&format!(
+            "  Cached metadata: {} messages\n",
+            metadata.message_count
+        ));
+        out.push_str(&format!(
+            "  Cached created:  {}\n",
+            short_date(&metadata.created_at)
+        ));
+        out.push_str(&format!(
+            "  Cached last use: {}\n",
+            short_date(&metadata.last_active)
+        ));
+    }
+
+    out
+}
+
+fn exact_local_metadata<'a>(
+    local_sessions: &'a [storage::SessionMetadata],
+    id: &str,
+) -> Option<&'a storage::SessionMetadata> {
+    local_sessions.iter().find(|metadata| metadata.id == id)
+}
+
+fn short_session_id(id: &str) -> &str {
+    &id[..8.min(id.len())]
+}
+
+fn short_date(value: &str) -> &str {
+    &value[..10.min(value.len())]
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1492,6 +1547,68 @@ mod tests {
         assert!(out.contains("[memory-abcde]"));
         assert!(out.contains("(work) short note"));
         assert!(out.ends_with('\n'));
+    }
+
+    #[test]
+    fn backend_session_list_formats_backend_rows_with_matching_cached_metadata() {
+        let backend = vec![session("sess-123456789", "Research")];
+        let mut matching = metadata("sess-123456789", "Stale Local Name");
+        matching.message_count = 7;
+        matching.last_active = "2026-04-27T12:34:56Z".to_string();
+        let local_sessions = vec![matching];
+
+        let out = super::format_backend_session_list(&backend, &local_sessions);
+
+        assert!(out.contains("📋 Sessions (1):"));
+        assert!(out.contains("Research (sess-123)"));
+        assert!(out.contains("ID:    sess-123456789"));
+        assert!(out.contains("Model: p/m"));
+        assert!(out.contains("Cached metadata: 7 messages, last active 2026-04-27"));
+        assert!(!out.contains("Stale Local Name"));
+    }
+
+    #[test]
+    fn backend_session_list_suppresses_local_only_metadata() {
+        let backend = vec![session("sess-backend", "Backend Only")];
+        let local_sessions = vec![metadata("local-only", "Local Only")];
+
+        let out = super::format_backend_session_list(&backend, &local_sessions);
+
+        assert!(out.contains("Backend Only"));
+        assert!(!out.contains("Local Only"));
+        assert!(!out.contains("local-only"));
+        assert!(!out.contains("Cached metadata"));
+    }
+
+    #[test]
+    fn backend_session_info_merges_only_exact_cached_metadata() {
+        let backend = session("sess-info", "Current");
+        let mut matching = metadata("sess-info", "Cached Name");
+        matching.message_count = 3;
+        matching.created_at = "2026-01-02T00:00:00Z".to_string();
+        matching.last_active = "2026-04-28T00:00:00Z".to_string();
+
+        let out = super::format_backend_session_info(&backend, Some(&matching));
+
+        assert!(out.contains("Name:      Current"));
+        assert!(out.contains("ID:        sess-info"));
+        assert!(out.contains("Model:     p/m"));
+        assert!(out.contains("Cached metadata: 3 messages"));
+        assert!(out.contains("Cached created:  2026-01-02"));
+        assert!(out.contains("Cached last use: 2026-04-28"));
+        assert!(!out.contains("Cached Name"));
+    }
+
+    #[test]
+    fn backend_session_info_ignores_mismatched_cached_metadata() {
+        let backend = session("sess-info", "Current");
+        let local_only = metadata("local-only", "Local Only");
+
+        let out = super::format_backend_session_info(&backend, Some(&local_only));
+
+        assert!(out.contains("Name:      Current"));
+        assert!(!out.contains("Cached metadata"));
+        assert!(!out.contains("Local Only"));
     }
 
     fn session(id: &str, name: &str) -> Session {

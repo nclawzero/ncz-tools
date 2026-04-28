@@ -26,7 +26,6 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use chrono::Utc;
-use tokio::runtime::Handle;
 use tokio::sync::{mpsc, Mutex};
 use tracing::{info, warn};
 
@@ -721,11 +720,9 @@ pub async fn run(
         }
     });
 
-    let runtime_handle = Handle::current();
     let blocking_app = Arc::clone(&app);
     tokio::task::spawn_blocking(move || {
         run_blocking(
-            runtime_handle,
             blocking_app,
             session,
             model,
@@ -1105,7 +1102,6 @@ fn session_switch_target(cmdline: &str) -> Option<&str> {
 
 #[allow(clippy::too_many_arguments)]
 fn run_blocking(
-    runtime_handle: Handle,
     app: Arc<Mutex<App>>,
     session: Session,
     model: String,
@@ -1266,7 +1262,6 @@ fn run_blocking(
     input_line.borrow_mut().set_focus(true);
 
     run_event_loop(
-        &runtime_handle,
         &mut tapp,
         chat_lines,
         input_data,
@@ -1430,7 +1425,6 @@ fn refresh_status_line(
 
 #[allow(clippy::too_many_arguments)]
 fn run_event_loop(
-    runtime_handle: &Handle,
     app: &mut Application,
     chat_lines: Rc<RefCell<Vec<String>>>,
     input_data: Rc<RefCell<String>>,
@@ -1716,7 +1710,6 @@ fn run_event_loop(
         if event.what == EventType::Command {
             redraw(app, &input_line);
             handle_command(
-                runtime_handle,
                 app,
                 event.command,
                 &chat_lines,
@@ -1961,7 +1954,6 @@ fn redraw(app: &mut Application, input_line: &Rc<RefCell<InputLine>>) {
 
 #[allow(clippy::too_many_arguments)]
 fn handle_command(
-    runtime_handle: &Handle,
     app: &mut Application,
     command: u16,
     chat_lines: &Rc<RefCell<Vec<String>>>,
@@ -2096,37 +2088,13 @@ fn handle_command(
             );
         }
         CMD_SESSION_OPEN => {
-            let sessions =
-                match session_picker_entries_from_active_backend(runtime_handle, shared_app) {
-                    Ok(sessions) => sessions,
-                    Err(e) => {
-                        let message = format!("[error] could not list backend sessions: {e}");
-                        chat_lines.borrow_mut().push(message.clone());
-                        chat_lines.borrow_mut().push(String::new());
-                        status_state.set_toast(message);
-                        return;
-                    }
-                };
-            if sessions.is_empty() {
-                dispatch_command(
-                    "/session list",
-                    chat_lines,
-                    req_tx,
-                    status_state,
-                    response_in_flight,
-                );
-                return;
-            }
-            if let Some(selected_name) = run_session_picker(app, &sessions) {
-                let cmdline = format!("/session {selected_name}");
-                dispatch_command(
-                    &cmdline,
-                    chat_lines,
-                    req_tx,
-                    status_state,
-                    response_in_flight,
-                );
-            }
+            dispatch_command(
+                "/session list",
+                chat_lines,
+                req_tx,
+                status_state,
+                response_in_flight,
+            );
         }
         _ => {}
     }
@@ -2367,46 +2335,6 @@ struct WorkspacePickerEntry {
     active: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct SessionPickerEntry {
-    name: String,
-    id: String,
-    model: String,
-    last_active: String,
-}
-
-fn session_picker_entries_from_active_backend(
-    runtime_handle: &Handle,
-    shared_app: &Arc<Mutex<App>>,
-) -> Result<Vec<SessionPickerEntry>> {
-    runtime_handle.block_on(async {
-        let client = {
-            let guard = shared_app.lock().await;
-            guard.active_workspace().and_then(|w| w.client.clone())
-        }
-        .ok_or_else(|| anyhow::anyhow!("no active workspace client"))?;
-
-        let locked = client.lock().await;
-        let sessions = locked
-            .list_sessions()
-            .await
-            .map_err(|e| anyhow::anyhow!("active backend session listing failed: {e}"))?;
-        Ok(session_picker_entries_from_backend_sessions(&sessions))
-    })
-}
-
-fn session_picker_entries_from_backend_sessions(sessions: &[Session]) -> Vec<SessionPickerEntry> {
-    sessions
-        .iter()
-        .map(|s| SessionPickerEntry {
-            name: s.name.clone(),
-            id: s.id.clone(),
-            model: format!("{}/{}", s.provider, s.model),
-            last_active: "-".to_string(),
-        })
-        .collect()
-}
-
 /// Theme color editor modal (E-8b MVP).
 ///
 /// Presents a small framed dialog stuck at the top-right corner so
@@ -2597,40 +2525,6 @@ fn run_workspace_picker(app: &mut Application, entries: &[WorkspacePickerEntry])
     }
     let idx = selected.checked_sub(CMD_WS_SELECT_BASE)? as usize;
     entries.get(idx).map(|e| e.name.clone())
-}
-
-/// Present a modal picker of backend-known sessions.
-///
-/// This intentionally reuses `MenuBox`, matching the existing
-/// workspace picker. It dispatches back to `/session <name>` so
-/// session behavior remains owned by `CommandHandler`.
-fn run_session_picker(app: &mut Application, entries: &[SessionPickerEntry]) -> Option<String> {
-    use turbo_vision::core::geometry::Point;
-
-    const CMD_SESSION_SELECT_BASE: u16 = 1400;
-
-    let items: Vec<MenuItem> = entries
-        .iter()
-        .enumerate()
-        .map(|(i, e)| {
-            let short_id = &e.id[..8.min(e.id.len())];
-            let last = &e.last_active[..10.min(e.last_active.len())];
-            let label = format!(" {}  ({})  {}  {}", e.name, short_id, e.model, last);
-            MenuItem::with_shortcut(&label, CMD_SESSION_SELECT_BASE + i as u16, 0, "", 0)
-        })
-        .collect();
-
-    let (tw, th) = app.terminal.size();
-    let position = Point::new((tw / 2) - 30, (th / 3).max(3));
-    let menu = turbo_vision::core::menu_data::Menu::from_items(items);
-    let mut menu_box = MenuBox::new(position, menu);
-    let selected = menu_box.execute(&mut app.terminal);
-
-    if selected == 0 {
-        return None;
-    }
-    let idx = selected.checked_sub(CMD_SESSION_SELECT_BASE)? as usize;
-    entries.get(idx).map(|e| e.id.clone())
 }
 
 /// Custom read-only scrolling text view over a shared `Vec<String>`
@@ -3217,26 +3111,6 @@ mod tests {
                 panic!("expected create plan, got existing session {}", session.id)
             }
         }
-    }
-
-    #[test]
-    fn session_picker_entries_are_mapped_from_backend_sessions_only() {
-        let sessions = vec![Session {
-            id: "backend-id".to_string(),
-            name: "Backend Research".to_string(),
-            model: "gpt-test".to_string(),
-            provider: "openai".to_string(),
-        }];
-
-        assert_eq!(
-            session_picker_entries_from_backend_sessions(&sessions),
-            vec![SessionPickerEntry {
-                id: "backend-id".to_string(),
-                name: "Backend Research".to_string(),
-                model: "openai/gpt-test".to_string(),
-                last_active: "-".to_string(),
-            }]
-        );
     }
 
     #[test]
