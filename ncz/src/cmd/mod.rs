@@ -10,11 +10,14 @@ use crate::error::NczError;
 
 mod common;
 
+pub mod api;
 pub mod channel;
 pub mod health;
 pub mod inspect;
 pub mod integrity;
 pub mod logs;
+pub mod mcp;
+pub mod models;
 pub mod pause;
 pub mod providers;
 pub mod restart;
@@ -35,7 +38,10 @@ pub fn dispatch(command: Command, ctx: &Context) -> Result<i32, NczError> {
         Command::Pause { agent } => pause::run(ctx, agent.as_deref()),
         Command::Resume { agent } => resume::run(ctx, agent.as_deref()),
         Command::Version => version::run(ctx),
+        Command::Api { action } => api::run(ctx, action),
         Command::Providers { action } => providers::run(ctx, action),
+        Command::Models { action } => models::run(ctx, action),
+        Command::Mcp { action } => mcp::run(ctx, action),
         Command::Sandbox { action } => sandbox::run(ctx, action),
         Command::Integrity => integrity::run(ctx),
         Command::Update { check } => update::run(ctx, check),

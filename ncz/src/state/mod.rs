@@ -10,9 +10,12 @@
 //! Reads do not lock.
 
 pub mod agent;
+pub mod agent_env;
 pub mod channel;
+pub mod mcp;
 pub mod providers;
 pub mod quadlet;
+pub mod url;
 
 use std::fs::{self, File};
 use std::io::Write;
@@ -51,8 +54,17 @@ impl Paths {
     pub fn primary_provider(&self) -> PathBuf {
         self.etc_dir.join("primary-provider")
     }
+    pub fn agent_env(&self) -> PathBuf {
+        self.etc_dir.join("agent-env")
+    }
     pub fn providers_dir(&self) -> PathBuf {
         self.etc_dir.join("providers.d")
+    }
+    pub fn mcp_dir(&self) -> PathBuf {
+        self.etc_dir.join("mcp.d")
+    }
+    pub fn agent_env_override(&self, agent: &str) -> PathBuf {
+        self.etc_dir.join(agent).join(".env")
     }
     pub fn agent_config_dir(&self) -> PathBuf {
         self.etc_dir.join("agents")
