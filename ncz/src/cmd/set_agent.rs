@@ -95,7 +95,7 @@ pub fn switch_agent(
     for agent_name in agent::AGENTS {
         if *agent_name != target {
             let unit = agent::service_for(agent_name);
-            let _ = systemd::stop(ctx.runner, &unit);
+            systemd::stop(ctx.runner, &unit)?;
         }
     }
 
@@ -164,6 +164,38 @@ mod tests {
         .unwrap();
     }
 
+    fn expect_unit_state(
+        runner: &FakeRunner,
+        unit: &str,
+        load_state: &str,
+        active_state: &str,
+        sub_state: &str,
+    ) {
+        runner.expect(
+            "systemctl",
+            &[
+                "show",
+                unit,
+                "--property=LoadState",
+                "--property=ActiveState",
+                "--property=SubState",
+            ],
+            out(
+                0,
+                &format!(
+                    "LoadState={load_state}\nActiveState={active_state}\nSubState={sub_state}\n"
+                ),
+                "",
+            ),
+        );
+    }
+
+    fn expect_stop_success(runner: &FakeRunner, unit: &str) {
+        expect_unit_state(runner, unit, "loaded", "active", "running");
+        runner.expect("sudo", &["systemctl", "stop", unit], out(0, "", ""));
+        expect_unit_state(runner, unit, "loaded", "inactive", "dead");
+    }
+
     fn expect_running_probe(runner: &FakeRunner) {
         runner.expect(
             "systemctl",
@@ -200,16 +232,8 @@ mod tests {
             out(0, "", ""),
         );
         runner.expect("sudo", &["systemctl", "daemon-reload"], out(0, "", ""));
-        runner.expect(
-            "sudo",
-            &["systemctl", "stop", "openclaw.service"],
-            out(0, "", ""),
-        );
-        runner.expect(
-            "sudo",
-            &["systemctl", "stop", "hermes.service"],
-            out(0, "", ""),
-        );
+        expect_stop_success(&runner, "openclaw.service");
+        expect_stop_success(&runner, "hermes.service");
         runner.expect(
             "sudo",
             &["systemctl", "start", "zeroclaw.service"],
@@ -237,5 +261,43 @@ mod tests {
 
         let err = switch_agent(&ctx(&runner), &paths, "zeroclaw", 1).unwrap_err();
         assert!(matches!(err, NczError::Precondition(_)));
+    }
+
+    #[test]
+    fn set_agent_error_path_rejects_failed_stop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        fs::create_dir_all(&paths.etc_dir).unwrap();
+        fs::write(paths.agent_state(), "openclaw\n").unwrap();
+        write_quadlet(&paths, "zeroclaw", "localhost/zeroclaw:latest");
+
+        let runner = FakeRunner::new();
+        runner.expect("systemctl", &["--version"], out(0, "systemd 255\n", ""));
+        runner.expect("podman", &["--version"], out(0, "podman 5\n", ""));
+        expect_running_probe(&runner);
+        runner.expect(
+            "podman",
+            &["image", "exists", "localhost/zeroclaw:latest"],
+            out(0, "", ""),
+        );
+        runner.expect("sudo", &["systemctl", "daemon-reload"], out(0, "", ""));
+        expect_unit_state(&runner, "openclaw.service", "loaded", "active", "running");
+        runner.expect(
+            "sudo",
+            &["systemctl", "stop", "openclaw.service"],
+            out(1, "", "operation failed"),
+        );
+        expect_unit_state(&runner, "openclaw.service", "loaded", "active", "running");
+
+        let err = switch_agent(&ctx(&runner), &paths, "zeroclaw", 1).unwrap_err();
+        assert!(matches!(err, NczError::Exec { .. }));
+        assert_eq!(agent::read(&paths).unwrap(), "openclaw");
+        assert!(!runner
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|call| call == "sudo systemctl start zeroclaw.service"));
+        runner.assert_done();
     }
 }

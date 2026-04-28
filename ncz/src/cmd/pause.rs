@@ -66,22 +66,51 @@ mod tests {
         }
     }
 
+    fn expect_unit_state(
+        runner: &FakeRunner,
+        unit: &str,
+        load_state: &str,
+        active_state: &str,
+        sub_state: &str,
+    ) {
+        runner.expect(
+            "systemctl",
+            &[
+                "show",
+                unit,
+                "--property=LoadState",
+                "--property=ActiveState",
+                "--property=SubState",
+            ],
+            out(
+                0,
+                &format!(
+                    "LoadState={load_state}\nActiveState={active_state}\nSubState={sub_state}\n"
+                ),
+                "",
+            ),
+        );
+    }
+
     #[test]
     fn pause_happy_path_stops_named_agent() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = test_paths(tmp.path());
         let runner = FakeRunner::new();
         runner.expect("systemctl", &["--version"], out(0, "systemd 255\n", ""));
+        expect_unit_state(&runner, "hermes.service", "loaded", "active", "running");
         runner.expect(
             "sudo",
             &["systemctl", "stop", "hermes.service"],
             out(0, "", ""),
         );
+        expect_unit_state(&runner, "hermes.service", "loaded", "inactive", "dead");
 
         let report = pause(&ctx(&runner), &paths, Some("hermes")).unwrap();
         assert_eq!(report.schema_version, 1);
         assert_eq!(report.agent, "hermes");
         assert!(report.paused);
+        runner.assert_done();
     }
 
     #[test]
@@ -92,5 +121,24 @@ mod tests {
 
         let err = pause(&ctx(&runner), &paths, Some("hermes")).unwrap_err();
         assert!(matches!(err, NczError::MissingDep(_)));
+    }
+
+    #[test]
+    fn pause_error_path_reports_failed_stop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        let runner = FakeRunner::new();
+        runner.expect("systemctl", &["--version"], out(0, "systemd 255\n", ""));
+        expect_unit_state(&runner, "hermes.service", "loaded", "active", "running");
+        runner.expect(
+            "sudo",
+            &["systemctl", "stop", "hermes.service"],
+            out(1, "", "operation failed"),
+        );
+        expect_unit_state(&runner, "hermes.service", "loaded", "active", "running");
+
+        let err = pause(&ctx(&runner), &paths, Some("hermes")).unwrap_err();
+        assert!(matches!(err, NczError::Exec { .. }));
+        runner.assert_done();
     }
 }
