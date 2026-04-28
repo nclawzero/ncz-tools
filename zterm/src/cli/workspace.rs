@@ -743,6 +743,45 @@ fn save_workspace_state(path: &Path, state: &WorkspaceState) -> Result<()> {
     Ok(())
 }
 
+fn save_app_config(path: &Path, cfg: &AppConfig) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating zterm config dir {}", parent.display()))?;
+    }
+    let body = toml::to_string_pretty(cfg).with_context(|| "serializing zterm config TOML")?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("config.toml");
+    let tmp_path = path.with_file_name(format!(
+        ".{file_name}.{}.tmp",
+        uuid::Uuid::new_v4().simple()
+    ));
+    {
+        let mut tmp_file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)
+            .with_context(|| format!("creating zterm config {}", tmp_path.display()))?;
+        tmp_file
+            .write_all(body.as_bytes())
+            .with_context(|| format!("writing zterm config {}", tmp_path.display()))?;
+        tmp_file
+            .sync_all()
+            .with_context(|| format!("syncing zterm config {}", tmp_path.display()))?;
+    }
+    std::fs::rename(&tmp_path, path)
+        .with_context(|| format!("atomically replacing zterm config {}", path.display()))?;
+    if let Some(parent) = path.parent() {
+        if let Ok(parent_dir) = File::open(parent) {
+            parent_dir
+                .sync_all()
+                .with_context(|| format!("syncing zterm config dir {}", parent.display()))?;
+        }
+    }
+    Ok(())
+}
+
 fn apply_openclaw_workspace_state(config_path: &Path, cfg: &mut AppConfig) -> Result<()> {
     if !cfg
         .workspaces
@@ -756,6 +795,7 @@ fn apply_openclaw_workspace_state(config_path: &Path, cfg: &mut AppConfig) -> Re
     let _state_lock = lock_workspace_state(&state_path)?;
     let mut state = load_workspace_state(&state_path)?;
     let mut state_changed = false;
+    let mut config_changed = false;
     let mut claimed_state_entries = std::collections::HashSet::new();
     let configured_openclaw_identities = configured_openclaw_workspace_identities(cfg);
     let mut openclaw_index = 0usize;
@@ -804,6 +844,7 @@ fn apply_openclaw_workspace_state(config_path: &Path, cfg: &mut AppConfig) -> Re
             }
             let entry = &mut state.openclaw_workspaces[entry_idx];
             workspace.id = Some(entry.id.clone());
+            config_changed = true;
             for alias in &entry.namespace_aliases {
                 push_unique_namespace(&mut workspace.namespace_aliases, alias.trim());
             }
@@ -840,11 +881,12 @@ fn apply_openclaw_workspace_state(config_path: &Path, cfg: &mut AppConfig) -> Re
         }
 
         let legacy_namespace = openclaw_legacy_session_namespace(workspace);
+        let generated_id = format!("ws_{}", uuid::Uuid::new_v4().simple());
         let entry = OpenClawWorkspaceState {
             index: Some(workspace_index),
             name: workspace.name.clone(),
             url: workspace.url.clone(),
-            id: format!("ws_{}", uuid::Uuid::new_v4().simple()),
+            id: generated_id.clone(),
             identity_aliases: Vec::new(),
             namespace_aliases: vec![legacy_namespace],
         };
@@ -880,7 +922,7 @@ fn apply_openclaw_workspace_state(config_path: &Path, cfg: &mut AppConfig) -> Re
                     state = verified_state;
                     tracing::warn!(
                         "generated openclaw workspace id for '{}' was not present after persisting {}; \
-                         staying on legacy name+url namespace",
+                         falling back to primary config durability",
                         workspace.name,
                         state_path.display()
                     );
@@ -889,16 +931,27 @@ fn apply_openclaw_workspace_state(config_path: &Path, cfg: &mut AppConfig) -> Re
             Err(e) => {
                 tracing::warn!(
                     "could not persist generated openclaw workspace id for '{}': {e}; \
-                     staying on legacy name+url namespace",
+                     falling back to primary config durability",
                     workspace.name
                 );
             }
         }
+        if workspace.id.is_none() {
+            workspace.id = Some(generated_id);
+        }
+        for alias in &entry.namespace_aliases {
+            push_unique_namespace(&mut workspace.namespace_aliases, alias.trim());
+        }
+        config_changed = true;
     }
     if state_changed {
         if let Err(e) = save_workspace_state(&state_path, &state) {
             tracing::warn!("could not persist updated openclaw workspace state aliases: {e}");
         }
+    }
+    if config_changed {
+        cfg.validate()?;
+        save_app_config(config_path, cfg)?;
     }
     Ok(())
 }
@@ -1305,11 +1358,10 @@ url = "http://a"
     }
 
     #[test]
-    fn load_persists_openclaw_workspace_id_in_state_without_rewriting_config() {
+    fn load_persists_openclaw_workspace_id_in_primary_config() {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("config.toml");
         let original = r#"
-# user comment that must survive load
 [[workspaces]]
 name = "alpha"
 backend = "openclaw"
@@ -1328,11 +1380,42 @@ url = "ws://old.example"
             .namespace_aliases
             .iter()
             .any(|alias| { alias == "backend=openclaw;workspace=alpha;url=ws://old.example" }));
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
         assert!(workspace_state_path_for_config(&path).exists());
+        let saved_config = std::fs::read_to_string(&path).unwrap();
+        assert!(saved_config.contains(&format!("id = \"{id}\"")));
 
         let reloaded = AppConfig::load(&path).unwrap();
         assert_eq!(reloaded.workspaces[0].id.as_deref(), Some(id));
+    }
+
+    #[test]
+    fn generated_openclaw_workspace_id_survives_lost_state_sidecar() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[[workspaces]]
+name = "alpha"
+backend = "openclaw"
+url = "ws://old.example"
+"#,
+        )
+        .unwrap();
+
+        let cfg = AppConfig::load(&path).unwrap();
+        let id = cfg.workspaces[0].id.clone().unwrap();
+        let namespace = openclaw_session_namespace(&cfg.workspaces[0]);
+        assert_eq!(namespace, format!("backend=openclaw;workspace_id={id}"));
+
+        std::fs::remove_file(workspace_state_path_for_config(&path)).unwrap();
+
+        let reloaded = AppConfig::load(&path).unwrap();
+        assert_eq!(reloaded.workspaces[0].id.as_deref(), Some(id.as_str()));
+        assert_eq!(
+            openclaw_session_namespace(&reloaded.workspaces[0]),
+            namespace
+        );
     }
 
     #[test]

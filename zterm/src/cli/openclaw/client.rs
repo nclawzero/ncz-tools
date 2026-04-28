@@ -1170,18 +1170,24 @@ impl AgentClient for OpenClawClient {
 
     async fn list_sessions(&self) -> anyhow::Result<Vec<Session>> {
         let limit = 200;
-        let result = self
-            .rpc_sessions_list(SessionsListOpts {
-                limit: Some(limit),
-                ..Default::default()
-            })
-            .await?;
-        ensure_session_list_not_truncated(&result, limit)?;
-        Ok(self
-            .namespaced_session_rows(result.sessions)
-            .into_iter()
-            .map(row_into_session)
-            .collect())
+        let mut sessions = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for namespace in self.session_namespaces() {
+            let result = self
+                .rpc_sessions_list(SessionsListOpts {
+                    limit: Some(limit),
+                    search: Some(session_key_prefix(namespace)),
+                    ..Default::default()
+                })
+                .await?;
+            ensure_session_list_not_truncated(&result, limit)?;
+            for row in self.namespaced_session_rows(result.sessions) {
+                if seen.insert(row.key.clone()) {
+                    sessions.push(row_into_session(row));
+                }
+            }
+        }
+        Ok(sessions)
     }
 
     async fn create_session(&self, name: &str) -> anyhow::Result<Session> {
@@ -1318,9 +1324,10 @@ impl OpenClawClient {
     }
 
     fn session_key_belongs_to_session_namespace(&self, key: &str, label: &str) -> bool {
-        self.session_namespaces()
-            .into_iter()
-            .any(|namespace| key == stable_session_key(namespace, label))
+        self.session_namespaces().into_iter().any(|namespace| {
+            key == stable_session_key(namespace, label)
+                || key == legacy_stable_session_key(namespace, label)
+        })
     }
 
     fn session_namespaces(&self) -> Vec<&str> {
@@ -1361,6 +1368,33 @@ fn ensure_session_list_not_truncated(
 }
 
 fn stable_session_key(namespace: &str, label: &str) -> String {
+    let slug = session_label_slug(label);
+    let digest = session_key_digest(namespace, label);
+    format!("{}{slug}-{}", session_key_prefix(namespace), &digest[..16])
+}
+
+fn legacy_stable_session_key(namespace: &str, label: &str) -> String {
+    let slug = session_label_slug(label);
+    let digest = session_key_digest(namespace, label);
+    format!("zterm-{slug}-{}", &digest[..16])
+}
+
+fn session_key_prefix(namespace: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(namespace.trim().as_bytes());
+    let digest = hex_lower(&hasher.finalize());
+    format!("zterm-ns-{}-", &digest[..12])
+}
+
+fn session_key_digest(namespace: &str, label: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(namespace.trim().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(label.as_bytes());
+    hex_lower(&hasher.finalize())
+}
+
+fn session_label_slug(label: &str) -> String {
     let mut slug = String::new();
     let mut last_dash = false;
     for ch in label.trim().chars() {
@@ -1389,14 +1423,7 @@ fn stable_session_key(namespace: &str, label: &str) -> String {
 
     let slug = slug.trim_matches('-');
     let slug = if slug.is_empty() { "session" } else { slug };
-    let slug: String = slug.chars().take(40).collect();
-
-    let mut hasher = Sha256::new();
-    hasher.update(namespace.trim().as_bytes());
-    hasher.update(b"\0");
-    hasher.update(label.as_bytes());
-    let digest = hex_lower(&hasher.finalize());
-    format!("zterm-{slug}-{}", &digest[..16])
+    slug.chars().take(40).collect()
 }
 
 fn hex_lower(bytes: &[u8]) -> String {
@@ -1450,7 +1477,8 @@ mod tests {
         let second = stable_session_key("workspace:alpha", "Research Notes");
 
         assert_eq!(first, second);
-        assert!(first.starts_with("zterm-research-notes-"));
+        assert!(first.starts_with(&session_key_prefix("workspace:alpha")));
+        assert!(first.contains("research-notes"));
         assert!(!first.contains(' '));
         assert_ne!(first, stable_session_key("workspace:alpha", "Research"));
     }
@@ -1465,6 +1493,17 @@ mod tests {
             alpha,
             stable_session_key("backend=openclaw;workspace=alpha", "Research")
         );
+        assert_ne!(
+            session_key_prefix("backend=openclaw;workspace=alpha"),
+            session_key_prefix("backend=openclaw;workspace=beta")
+        );
+    }
+
+    #[test]
+    fn namespace_match_accepts_legacy_hashed_session_keys() {
+        let client = tests_support_new_fake(PendingRequests::new(), None, true);
+        let legacy_key = legacy_stable_session_key(DEFAULT_SESSION_NAMESPACE, "Research");
+        assert!(client.session_key_belongs_to_session_namespace(&legacy_key, "Research"));
     }
 
     fn assistant_event(
@@ -2173,9 +2212,38 @@ mod tests {
             .recv()
             .await
             .expect("list request should be sent");
+        let primary_search = session_key_prefix(primary_namespace);
+        assert_eq!(
+            list_req.params.as_ref().unwrap()["search"].as_str(),
+            Some(primary_search.as_str())
+        );
         pending
             .resolve(ResponseFrame {
                 id: list_req.id,
+                ok: true,
+                payload: Some(serde_json::json!({
+                    "ts": 1,
+                    "path": "sessions.jsonl",
+                    "count": 0,
+                    "defaults": {},
+                    "sessions": []
+                })),
+                error: None,
+            })
+            .await;
+
+        let alias_req = outbound_rx
+            .recv()
+            .await
+            .expect("alias list request should be sent");
+        let alias_search = session_key_prefix(legacy_namespace);
+        assert_eq!(
+            alias_req.params.as_ref().unwrap()["search"].as_str(),
+            Some(alias_search.as_str())
+        );
+        pending
+            .resolve(ResponseFrame {
+                id: alias_req.id,
                 ok: true,
                 payload: Some(serde_json::json!({
                     "ts": 1,
@@ -2202,6 +2270,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_sessions_filters_by_active_namespace_before_global_cap() {
+        let pending = PendingRequests::new();
+        let (outbound_tx, mut outbound_rx) = mpsc::channel::<RequestFrame>(OUTBOUND_CAPACITY);
+        let mut client = tests_support_new_fake(pending.clone(), Some(outbound_tx), true);
+        let active_namespace = "backend=openclaw;workspace_id=ws_active";
+        let foreign_namespace = "backend=openclaw;workspace_id=ws_foreign";
+        client.set_session_namespace(active_namespace);
+
+        let foreign_sessions: Vec<_> = (0..250)
+            .map(|idx| {
+                let label = format!("Foreign {idx}");
+                serde_json::json!({
+                    "key": stable_session_key(foreign_namespace, &label),
+                    "kind": "direct",
+                    "label": label
+                })
+            })
+            .collect();
+        assert!(foreign_sessions.len() > 200);
+
+        let active_one = stable_session_key(active_namespace, "Research");
+        let active_two = stable_session_key(active_namespace, "Planning");
+        let list_task = tokio::spawn(async move { client.list_sessions().await });
+        let list_req = outbound_rx
+            .recv()
+            .await
+            .expect("list request should be sent");
+        assert_eq!(list_req.method, "sessions.list");
+        assert_eq!(list_req.params.as_ref().unwrap()["limit"], 200);
+        let active_search = session_key_prefix(active_namespace);
+        assert_eq!(
+            list_req.params.as_ref().unwrap()["search"].as_str(),
+            Some(active_search.as_str())
+        );
+
+        pending
+            .resolve(ResponseFrame {
+                id: list_req.id,
+                ok: true,
+                payload: Some(serde_json::json!({
+                    "ts": 1,
+                    "path": "sessions.jsonl",
+                    "count": 2,
+                    "defaults": {},
+                    "sessions": [
+                        { "key": active_one, "kind": "direct", "label": "Research" },
+                        { "key": active_two, "kind": "direct", "label": "Planning" }
+                    ]
+                })),
+                error: None,
+            })
+            .await;
+
+        let sessions = list_task
+            .await
+            .expect("list task should join")
+            .expect("active namespace list should not fail on foreign global cap");
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0].name, "Research");
+        assert_eq!(sessions[1].name, "Planning");
+    }
+
+    #[tokio::test]
     async fn list_sessions_fails_closed_when_sessions_list_hits_cap() {
         let pending = PendingRequests::new();
         let (outbound_tx, mut outbound_rx) = mpsc::channel::<RequestFrame>(OUTBOUND_CAPACITY);
@@ -2214,6 +2345,11 @@ mod tests {
             .expect("list request should be sent");
         assert_eq!(list_req.method, "sessions.list");
         assert_eq!(list_req.params.as_ref().unwrap()["limit"], 200);
+        let default_search = session_key_prefix(DEFAULT_SESSION_NAMESPACE);
+        assert_eq!(
+            list_req.params.as_ref().unwrap()["search"].as_str(),
+            Some(default_search.as_str())
+        );
 
         let sessions: Vec<_> = (0..200)
             .map(|idx| {

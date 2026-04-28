@@ -1248,6 +1248,13 @@ fn format_config_output(config: Result<String>) -> String {
 }
 
 fn redact_config_secrets(content: &str) -> String {
+    if let Ok(mut parsed) = toml::from_str::<toml::Value>(content) {
+        redact_toml_value(&mut parsed);
+        if let Ok(redacted) = toml::to_string_pretty(&parsed) {
+            return redacted;
+        }
+    }
+
     let mut out = String::with_capacity(content.len());
     let mut skip_until_multiline_secret: Option<&'static str> = None;
 
@@ -1267,6 +1274,26 @@ fn redact_config_secrets(content: &str) -> String {
     }
 
     out
+}
+
+fn redact_toml_value(value: &mut toml::Value) {
+    match value {
+        toml::Value::Table(table) => {
+            for (key, child) in table.iter_mut() {
+                if is_sensitive_config_key(key) {
+                    *child = toml::Value::String(CONFIG_SECRET_MASK.to_string());
+                } else {
+                    redact_toml_value(child);
+                }
+            }
+        }
+        toml::Value::Array(items) => {
+            for item in items {
+                redact_toml_value(item);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn split_line_ending(raw_line: &str) -> (&str, &str) {
@@ -2397,6 +2424,25 @@ api_key = "persisted-api-key"
         assert!(out.contains("api_key = \"***REDACTED***\""));
         assert!(!out.contains("persisted-token-value"));
         assert!(!out.contains("persisted-api-key"));
+    }
+
+    #[test]
+    fn config_output_masks_inline_table_secrets() {
+        let out = super::format_config_output(Ok(r#"
+gateway = { url = "ws://gateway.example", token = "inline-token-value" }
+provider = { name = "openai", api_key = "inline-provider-api-key" }
+
+[providers]
+openai = { model = "gpt", api_key = "inline-api-key" }
+"#
+        .to_string()));
+
+        assert!(out.contains("***REDACTED***"));
+        assert!(out.contains("ws://gateway.example"));
+        assert!(out.contains("model = \"gpt\""));
+        assert!(!out.contains("inline-token-value"));
+        assert!(!out.contains("inline-provider-api-key"));
+        assert!(!out.contains("inline-api-key"));
     }
 
     #[tokio::test]
