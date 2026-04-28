@@ -121,6 +121,7 @@ const INPUT_UNDO_DEPTH: usize = 64;
 /// legacy rustyline REPL's `cli::streaming::SPINNER_FRAMES` without
 /// taking a cross-module dependency.
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const SPINNER_INTERVAL: Duration = Duration::from_millis(80);
 
 /// How long a status-line toast (e.g. palette confirmation after
 /// Ctrl-P) remains visible. ~1s is long enough to read but short
@@ -209,8 +210,8 @@ impl StatusState {
         if self.turn_start.is_none() {
             return;
         }
-        if self.last_spinner_tick.elapsed() >= Duration::from_millis(80) {
-            self.spinner_frame = (self.spinner_frame + 1) % SPINNER_FRAMES.len();
+        if should_advance_spinner(self.last_spinner_tick.elapsed()) {
+            self.spinner_frame = next_spinner_frame(self.spinner_frame, SPINNER_FRAMES.len());
             self.last_spinner_tick = Instant::now();
         }
     }
@@ -273,6 +274,17 @@ impl StatusState {
             self.elapsed_mmss()
         )
     }
+}
+
+fn should_advance_spinner(elapsed: Duration) -> bool {
+    elapsed >= SPINNER_INTERVAL
+}
+
+fn next_spinner_frame(current: usize, frame_count: usize) -> usize {
+    if frame_count == 0 {
+        return 0;
+    }
+    (current + 1) % frame_count
 }
 
 fn render_ctx_usage(usage: Option<TurnUsage>) -> String {
@@ -1875,6 +1887,19 @@ mod tests {
         assert_eq!(
             render_ctx_usage(Some(usage)),
             "ctx 2000/8000 (25%) [###-------]"
+        );
+    }
+
+    #[test]
+    fn spinner_advances_only_after_interval_and_wraps() {
+        assert!(!should_advance_spinner(
+            SPINNER_INTERVAL - Duration::from_millis(1)
+        ));
+        assert!(should_advance_spinner(SPINNER_INTERVAL));
+        assert_eq!(next_spinner_frame(0, SPINNER_FRAMES.len()), 1);
+        assert_eq!(
+            next_spinner_frame(SPINNER_FRAMES.len() - 1, SPINNER_FRAMES.len()),
+            0
         );
     }
 }

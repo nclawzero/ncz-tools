@@ -184,7 +184,7 @@ pub const PRESETS: &[Theme] = &[BORLAND, PFS, MONO, AMBER, GREEN];
 // dep and re-copy.
 #[rustfmt::skip]
 const BORLAND_PALETTE: [u8; 63] = [
-    0x71, 0x70, 0x78, 0x74, 0x20, 0x28, 0x24, 0x17, // 1-8 desktop
+    0x71, 0x70, 0x78, 0x74, 0xC1, 0x28, 0x24, 0x17, // 1-8 desktop
     0x1F, 0x1A, 0x31, 0x31, 0x1E, 0x71, 0x00,       // 9-15 menu + status
     0x30, 0x3F, 0x3A, 0x13, 0x13, 0x3E, 0x21, 0x00, // 16-23 cyan window
     0x70, 0x7F, 0x7A, 0x13, 0x13, 0x70, 0x7F, 0x00, // 24-31 gray window
@@ -215,7 +215,7 @@ pub const BORLAND: Theme = Theme {
 // switch, which is the point.
 #[rustfmt::skip]
 const PFS_PALETTE: [u8; 63] = [
-    0x17, 0x70, 0x7E, 0x7E, 0x20, 0x2E, 0x24, 0x17, // 1-8  desktop + menu normal/select
+    0x17, 0x70, 0x7E, 0x7E, 0xC1, 0x2E, 0x24, 0x17, // 1-8  desktop + menu normal/select
     0x1F, 0x1A, 0x31, 0x31, 0x1E, 0x71, 0x00,       // 9-15 menu + status
     0x30, 0x3F, 0x3E, 0x1E, 0x1E, 0x3E, 0x21, 0x00, // 16-23 cyan window — yellow selection bar
     0x70, 0x7F, 0x7E, 0x1E, 0x1E, 0x70, 0x7F, 0x00, // 24-31 gray window
@@ -316,6 +316,9 @@ pub const GREEN: Theme = Theme {
 mod tests {
     use super::*;
 
+    const MENU_SELECTED_APP_SLOT: usize = 4; // CP_MENU_BAR selected -> app palette index 5.
+    const CORAL_ACTIVE_MENU_ATTR: u8 = 0xC1; // dark navy on LightRed (salmon/coral).
+
     #[test]
     fn every_preset_has_63_bytes() {
         for theme in PRESETS {
@@ -381,5 +384,14 @@ mod tests {
         // whatever's in the theme.toml without normalizing.
         let upper = PRESETS[0].name.to_ascii_uppercase();
         assert_eq!(next_preset(&upper).name, PRESETS[1].name);
+    }
+
+    #[test]
+    fn color_themes_use_coral_active_menu_slot() {
+        assert_eq!(
+            BORLAND.palette[MENU_SELECTED_APP_SLOT],
+            CORAL_ACTIVE_MENU_ATTR
+        );
+        assert_eq!(PFS.palette[MENU_SELECTED_APP_SLOT], CORAL_ACTIVE_MENU_ATTR);
     }
 }
