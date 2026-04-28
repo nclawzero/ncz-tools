@@ -9,7 +9,9 @@ pub mod apt;
 pub mod podman;
 pub mod systemd;
 
-use std::process::Command;
+use std::io::{self, Read};
+use std::process::{Command, Stdio};
+use std::thread;
 
 use crate::error::NczError;
 
@@ -28,6 +30,22 @@ impl ProcessOutput {
 
 pub trait CommandRunner: Send + Sync {
     fn run(&self, cmd: &str, args: &[&str]) -> Result<ProcessOutput, NczError>;
+
+    fn run_stdout_limited(
+        &self,
+        cmd: &str,
+        args: &[&str],
+        stdout_limit_bytes: usize,
+    ) -> Result<ProcessOutput, NczError> {
+        let output = self.run(cmd, args)?;
+        if output.stdout.len() > stdout_limit_bytes {
+            return Err(NczError::Exec {
+                cmd: cmd.into(),
+                msg: format!("stdout exceeded {stdout_limit_bytes} bytes"),
+            });
+        }
+        Ok(output)
+    }
 
     /// Blocking GET against `http://127.0.0.1:<port><path>` for health
     /// probes. Default impl uses `ureq`. Override in fakes.
@@ -80,6 +98,97 @@ impl CommandRunner for RealRunner {
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
         })
     }
+
+    fn run_stdout_limited(
+        &self,
+        cmd: &str,
+        args: &[&str],
+        stdout_limit_bytes: usize,
+    ) -> Result<ProcessOutput, NczError> {
+        const STDERR_LIMIT_BYTES: usize = 64 * 1024;
+
+        let mut child = Command::new(cmd)
+            .args(args)
+            .env("LANG", "C")
+            .env("LC_ALL", "C")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| NczError::Exec {
+                cmd: cmd.into(),
+                msg: e.to_string(),
+            })?;
+
+        let stdout = child.stdout.take().ok_or_else(|| NczError::Exec {
+            cmd: cmd.into(),
+            msg: "failed to capture stdout".to_string(),
+        })?;
+        let stderr = child.stderr.take().ok_or_else(|| NczError::Exec {
+            cmd: cmd.into(),
+            msg: "failed to capture stderr".to_string(),
+        })?;
+
+        let stdout_handle = thread::spawn(move || read_capped(stdout, stdout_limit_bytes));
+        let stderr_handle = thread::spawn(move || read_capped(stderr, STDERR_LIMIT_BYTES));
+        let status = child.wait().map_err(|e| NczError::Exec {
+            cmd: cmd.into(),
+            msg: e.to_string(),
+        })?;
+
+        let (stdout, stdout_truncated) = join_reader(stdout_handle)?;
+        let (stderr, stderr_truncated) = join_reader(stderr_handle)?;
+        if stdout_truncated {
+            return Err(NczError::Exec {
+                cmd: cmd.into(),
+                msg: format!("stdout exceeded {stdout_limit_bytes} bytes"),
+            });
+        }
+
+        let mut stderr = String::from_utf8_lossy(&stderr).into_owned();
+        if stderr_truncated {
+            stderr.push_str("\n[stderr truncated]\n");
+        }
+
+        Ok(ProcessOutput {
+            status: status.code().unwrap_or(-1),
+            stdout: String::from_utf8_lossy(&stdout).into_owned(),
+            stderr,
+        })
+    }
+}
+
+fn read_capped<R: Read>(mut reader: R, limit: usize) -> io::Result<(Vec<u8>, bool)> {
+    let mut out = Vec::with_capacity(limit.min(8192));
+    let mut buf = [0_u8; 8192];
+    let mut truncated = false;
+
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        if out.len() < limit {
+            let remaining = limit - out.len();
+            let take = remaining.min(n);
+            out.extend_from_slice(&buf[..take]);
+            if take < n {
+                truncated = true;
+            }
+        } else {
+            truncated = true;
+        }
+    }
+
+    Ok((out, truncated))
+}
+
+fn join_reader(
+    handle: thread::JoinHandle<io::Result<(Vec<u8>, bool)>>,
+) -> Result<(Vec<u8>, bool), NczError> {
+    handle
+        .join()
+        .map_err(|_| NczError::Io(io::Error::new(io::ErrorKind::Other, "reader thread panicked")))?
+        .map_err(NczError::Io)
 }
 
 #[cfg(test)]
@@ -92,6 +201,7 @@ pub(crate) mod fake {
     /// register expectations and assert on call order.
     pub struct FakeRunner {
         pub responses: Mutex<HashMap<String, VecDeque<ProcessOutput>>>,
+        pub prefix_responses: Mutex<Vec<(String, VecDeque<ProcessOutput>)>>,
         pub http_responses: Mutex<HashMap<String, VecDeque<u16>>>,
         repeatable: Mutex<HashSet<String>>,
         http_repeatable: Mutex<HashSet<String>>,
@@ -103,6 +213,7 @@ pub(crate) mod fake {
         pub fn new() -> Self {
             Self {
                 responses: Mutex::new(HashMap::new()),
+                prefix_responses: Mutex::new(Vec::new()),
                 http_responses: Mutex::new(HashMap::new()),
                 repeatable: Mutex::new(HashSet::new()),
                 http_repeatable: Mutex::new(HashSet::new()),
@@ -119,6 +230,15 @@ pub(crate) mod fake {
                 .entry(key)
                 .or_default()
                 .push_back(reply);
+        }
+
+        #[allow(dead_code)]
+        pub fn expect_prefix(&self, cmd: &str, args_prefix: &[&str], reply: ProcessOutput) {
+            let key = format!("{} {}", cmd, args_prefix.join(" "));
+            self.prefix_responses
+                .lock()
+                .unwrap()
+                .push((key, VecDeque::from([reply])));
         }
 
         #[allow(dead_code)]
@@ -177,6 +297,14 @@ pub(crate) mod fake {
                     .map(|(key, _)| key.clone()),
             );
             pending.sort();
+            pending.extend(
+                self.prefix_responses
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(_, replies)| !replies.is_empty())
+                    .map(|(key, _)| format!("{key}*")),
+            );
             let unexpected = self.unexpected.lock().unwrap().clone();
             assert!(
                 unexpected.is_empty(),
@@ -200,6 +328,16 @@ pub(crate) mod fake {
             self.calls.lock().unwrap().push(key.clone());
             let mut responses = self.responses.lock().unwrap();
             let Some(replies) = responses.get_mut(&key) else {
+                drop(responses);
+                let mut prefix_responses = self.prefix_responses.lock().unwrap();
+                if let Some((_, replies)) = prefix_responses
+                    .iter_mut()
+                    .find(|(prefix, replies)| key.starts_with(prefix) && !replies.is_empty())
+                {
+                    return replies
+                        .pop_front()
+                        .ok_or_else(|| self.unexpected_call(cmd, key));
+                }
                 return Err(self.unexpected_call(cmd, key));
             };
             if self.repeatable.lock().unwrap().contains(&key) {
