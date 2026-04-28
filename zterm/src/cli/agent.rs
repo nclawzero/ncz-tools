@@ -159,6 +159,12 @@ pub enum TurnChunk {
     /// without a fresh usage report (new turn, workspace/session/model
     /// switch). Chat renderers should ignore this chunk.
     ClearUsage,
+    /// UI-only status update emitted after command-driven context
+    /// changes. Chat renderers should ignore this chunk.
+    Status {
+        workspace: Option<String>,
+        model: Option<String>,
+    },
     /// The turn has completed — either with the full response text, or
     /// with an error. Emitted exactly once per submit. The UI should
     /// treat anything after this as a protocol bug.
@@ -200,6 +206,13 @@ pub trait AgentClient: Send + Sync {
     async fn get_models(&self, provider: &str) -> Result<Vec<Model>>;
 
     async fn list_provider_models(&self, provider: &str) -> Result<Vec<String>>;
+
+    /// Human-readable model label for lightweight UI status updates.
+    /// Backends with mutable local model selection should override
+    /// this; pure backend-default clients can use the generic label.
+    fn current_model_label(&self) -> String {
+        "backend default".to_string()
+    }
 
     // ---------- sessions ----------
 

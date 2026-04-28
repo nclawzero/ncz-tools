@@ -1050,6 +1050,10 @@ impl AgentClient for OpenClawClient {
             .collect())
     }
 
+    fn current_model_label(&self) -> String {
+        "openclaw default".to_string()
+    }
+
     async fn list_sessions(&self) -> anyhow::Result<Vec<Session>> {
         let result = self
             .rpc_sessions_list(SessionsListOpts {

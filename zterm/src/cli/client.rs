@@ -999,6 +999,10 @@ impl crate::cli::agent::AgentClient for ZeroclawClient {
         ZeroclawClient::list_provider_models(self, provider).await
     }
 
+    fn current_model_label(&self) -> String {
+        self.current_model_key()
+    }
+
     async fn list_sessions(&self) -> Result<Vec<Session>> {
         ZeroclawClient::list_sessions(self).await
     }

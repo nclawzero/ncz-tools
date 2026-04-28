@@ -5,8 +5,8 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use crate::cli::agent::AgentClient;
-use crate::cli::client::Session;
 use crate::cli::client::ZeroclawClient;
+use crate::cli::client::{Model, Provider, Session};
 use crate::cli::input::InputHistory;
 use crate::cli::storage;
 use crate::cli::ui;
@@ -182,29 +182,30 @@ impl CommandHandler {
 
     /// Handle /info command.
     ///
-    /// Returns the session block as a `String` so the TUI can
-    /// render it in the chat pane. Falls back to an empty-output
-    /// frame when no session metadata is on disk — the rustyline
-    /// REPL treated that as a no-op, so we mirror by returning
-    /// `Some("")`.
+    /// Returns the active backend session block as a `String` so
+    /// the TUI can render it in the chat pane. Local metadata is
+    /// merged only when it exactly matches the backend session id.
     async fn handle_info(&self, session_id: &str) -> Result<Option<String>> {
-        match storage::load_session_metadata(session_id) {
-            Ok(metadata) => Ok(Some(format!(
-                "\n📋 Session Information:\n  \
-                  ID:        {}\n  \
-                  Name:      {}\n  \
-                  Model:     {}\n  \
-                  Provider:  {}\n  \
-                  Created:   {}\n  \
-                  Messages:  {}\n",
-                metadata.id,
-                metadata.name,
-                metadata.model,
-                metadata.provider,
-                metadata.created_at,
-                metadata.message_count,
+        let Some(client) = self.current_agent_client().await else {
+            return Ok(Some(
+                "❌ Failed to load active backend session: no active workspace client\n"
+                    .to_string(),
+            ));
+        };
+
+        let load_result = {
+            let locked = client.lock().await;
+            locked.load_session(session_id).await
+        };
+        match load_result {
+            Ok(session) => {
+                let local_sessions = storage::list_sessions().unwrap_or_default();
+                let local_metadata = exact_local_metadata(&local_sessions, &session.id);
+                Ok(Some(format_backend_session_info(&session, local_metadata)))
+            }
+            Err(e) => Ok(Some(format!(
+                "❌ Failed to load active backend session '{session_id}': {e}\n"
             ))),
-            Err(_) => Ok(Some(String::new())),
         }
     }
 
@@ -778,40 +779,35 @@ impl CommandHandler {
     }
 
     async fn handle_providers(&self) -> Result<Option<String>> {
-        // List provider backends advertised by the live daemon's
-        // `[providers.models.*]` config (e.g. `gemini`,
-        // `openai_compat`). Static "40+ providers" copy is gone —
-        // it was both factually wrong (the daemon only exposes the
-        // backends configured in its TOML) and contained hardcoded
-        // brand strings. Falls back gracefully when no zeroclaw backend is
-        // active or the fetch fails.
-        let mut out = String::from("\n🤖 Configured Providers:\n");
-        match self.current_cron().await {
-            Some(c) => {
-                if c.model_list().is_empty() {
-                    let _ = c.refresh_models().await;
+        let Some(client) = self.current_agent_client().await else {
+            return Ok(Some(
+                "\n🤖 Configured Providers:\n  (no active workspace client)\n\n".to_string(),
+            ));
+        };
+
+        let rows = {
+            let locked = client.lock().await;
+            let providers = match locked.list_providers().await {
+                Ok(providers) => providers,
+                Err(e) => {
+                    return Ok(Some(format!(
+                        "\n🤖 Configured Providers:\n  ❌ Failed to list providers: {e}\n\n"
+                    )));
                 }
-                let models = c.model_list();
-                if models.is_empty() {
-                    out.push_str(
-                        "  (none — /api/config returned no [providers.models.*] entries)\n",
-                    );
-                } else {
-                    let mut backends: std::collections::BTreeSet<String> = Default::default();
-                    for m in &models {
-                        backends.insert(m.provider.clone());
-                    }
-                    for b in backends {
-                        out.push_str(&format!("    • {}\n", b));
-                    }
-                }
+            };
+
+            let mut rows = Vec::new();
+            for provider in providers {
+                let models = locked
+                    .list_provider_models(&provider.id)
+                    .await
+                    .map_err(|e| e.to_string());
+                rows.push((provider, models));
             }
-            None => {
-                out.push_str("  (no active zeroclaw workspace)\n");
-            }
-        }
-        out.push('\n');
-        Ok(Some(out))
+            rows
+        };
+
+        Ok(Some(format_provider_list(&rows)))
     }
 
     async fn handle_models(
@@ -819,39 +815,36 @@ impl CommandHandler {
         subcommand: Option<&str>,
         args: &[&str],
     ) -> Result<Option<String>> {
-        let cron = self.current_cron().await;
         match subcommand {
             Some("list") | None => {
-                let mut out = String::from("\n📋 Available Models (from /api/config):\n\n");
-                match cron {
-                    Some(c) => {
-                        if c.model_list().is_empty() {
-                            let _ = c.refresh_models().await;
+                let Some(client) = self.current_agent_client().await else {
+                    return Ok(Some(
+                        "\n📋 Available Models:\n\n  (no active workspace client)\n\n"
+                            .to_string(),
+                    ));
+                };
+                let (active, rows) = {
+                    let locked = client.lock().await;
+                    let active = locked.current_model_label();
+                    let providers = match locked.list_providers().await {
+                        Ok(providers) => providers,
+                        Err(e) => {
+                            return Ok(Some(format!(
+                                "\n📋 Available Models:\n\n  ❌ Failed to list providers: {e}\n\n"
+                            )));
                         }
-                        let list = c.model_list();
-                        if list.is_empty() {
-                            out.push_str(
-                                "  (none — /api/config returned no [providers.models.*])\n",
-                            );
-                        } else {
-                            let active = c.current_model_key();
-                            for m in &list {
-                                let marker = if m.key == active { "*" } else { " " };
-                                out.push_str(&format!(
-                                    "  {} {:<10}  ({} → {})\n",
-                                    marker, m.key, m.provider, m.model
-                                ));
-                            }
-                            out.push_str(&format!(
-                                "\n  active: {}\n  use: /models set <key>\n",
-                                active
-                            ));
-                        }
+                    };
+                    let mut rows = Vec::new();
+                    for provider in providers {
+                        let models = locked
+                            .get_models(&provider.id)
+                            .await
+                            .map_err(|e| e.to_string());
+                        rows.push((provider, models));
                     }
-                    None => out.push_str("  (no active zeroclaw workspace)\n"),
-                }
-                out.push('\n');
-                Ok(Some(out))
+                    (active, rows)
+                };
+                Ok(Some(format_model_list(&rows, &active)))
             }
             Some("set") => {
                 let key = args.first().copied().unwrap_or("").trim().to_string();
@@ -861,7 +854,7 @@ impl CommandHandler {
                             .to_string(),
                     ));
                 }
-                match cron {
+                match self.current_cron().await {
                     Some(c) => {
                         if c.model_list().is_empty() {
                             let _ = c.refresh_models().await;
@@ -874,11 +867,11 @@ impl CommandHandler {
                         }
                     }
                     None => Ok(Some(
-                        "/models set requires an active zeroclaw workspace\n".to_string(),
+                        "/models set is only supported for zeroclaw workspaces; the active backend does not expose zterm-side model switching\n".to_string(),
                     )),
                 }
             }
-            Some("refresh") => match cron {
+            Some("refresh") => match self.current_cron().await {
                 Some(c) => match c.refresh_models().await {
                     Ok(list) => Ok(Some(format!(
                         "✅ Refreshed model list ({} entries)\n",
@@ -887,28 +880,38 @@ impl CommandHandler {
                     Err(e) => Ok(Some(format!("❌ Failed to refresh /api/config: {e}\n"))),
                 },
                 None => Ok(Some(
-                    "/models refresh requires an active zeroclaw workspace\n".to_string(),
+                    "/models refresh is only supported for zeroclaw workspaces; this backend lists models live\n".to_string(),
                 )),
             },
-            Some("status") => match cron {
-                Some(c) => {
-                    let active = c.current_model_key();
-                    let entry = c.model_list().into_iter().find(|m| m.key == active);
-                    let mut out = String::from("\n📊 Current Model:\n");
-                    out.push_str(&format!("  key:      {}\n", active));
-                    if let Some(m) = entry {
-                        out.push_str(&format!("  provider: {}\n", m.provider));
-                        out.push_str(&format!("  model:    {}\n", m.model));
-                    } else {
-                        out.push_str("  (not in /api/config; daemon may reject this key)\n");
+            Some("status") => {
+                let Some(client) = self.current_agent_client().await else {
+                    return Ok(Some(
+                        "\n📊 Current Model:\n  (no active workspace client)\n\n".to_string(),
+                    ));
+                };
+                let (active, rows) = {
+                    let locked = client.lock().await;
+                    let active = locked.current_model_label();
+                    let providers = match locked.list_providers().await {
+                        Ok(providers) => providers,
+                        Err(e) => {
+                            return Ok(Some(format!(
+                                "\n📊 Current Model:\n  active: {active}\n  ❌ Failed to list providers: {e}\n\n"
+                            )));
+                        }
+                    };
+                    let mut rows = Vec::new();
+                    for provider in providers {
+                        let models = locked
+                            .get_models(&provider.id)
+                            .await
+                            .map_err(|e| e.to_string());
+                        rows.push((provider, models));
                     }
-                    out.push('\n');
-                    Ok(Some(out))
-                }
-                None => Ok(Some(
-                    "/models status requires an active zeroclaw workspace\n".to_string(),
-                )),
-            },
+                    (active, rows)
+                };
+                Ok(Some(format_model_status(&rows, &active)))
+            }
             _ => Ok(Some(
                 "Usage: /models list|set <key>|refresh|status\n".to_string(),
             )),
@@ -1247,6 +1250,121 @@ fn format_backend_session_info(
     out
 }
 
+fn format_provider_list(rows: &[(Provider, std::result::Result<Vec<String>, String>)]) -> String {
+    let mut out = String::from("\n🤖 Configured Providers:\n");
+    if rows.is_empty() {
+        out.push_str("  (none advertised by active backend)\n\n");
+        return out;
+    }
+
+    for (provider, models) in rows {
+        out.push_str(&format!("  • {}\n", provider_display(provider)));
+        match models {
+            Ok(models) if models.is_empty() => {
+                out.push_str("    models: (none advertised)\n");
+            }
+            Ok(models) => {
+                out.push_str(&format!("    models: {}\n", models.join(", ")));
+            }
+            Err(e) => {
+                out.push_str(&format!("    models: ❌ failed to list: {e}\n"));
+            }
+        }
+    }
+    out.push('\n');
+    out
+}
+
+fn format_model_list(
+    rows: &[(Provider, std::result::Result<Vec<Model>, String>)],
+    active: &str,
+) -> String {
+    let mut out = String::from("\n📋 Available Models:\n\n");
+    if rows.is_empty() {
+        out.push_str("  (none advertised by active backend)\n\n");
+        return out;
+    }
+
+    for (provider, models) in rows {
+        out.push_str(&format!("  {}\n", provider_display(provider)));
+        match models {
+            Ok(models) if models.is_empty() => {
+                out.push_str("    (none advertised)\n");
+            }
+            Ok(models) => {
+                for model in models {
+                    let marker = if provider.id == active || model.id == active {
+                        "*"
+                    } else {
+                        " "
+                    };
+                    out.push_str(&format!("    {marker} {}\n", model.id));
+                }
+            }
+            Err(e) => {
+                out.push_str(&format!("    ❌ failed to list models: {e}\n"));
+            }
+        }
+    }
+    out.push_str(&format!("\n  active: {active}\n"));
+    out.push_str("  use: /models set <key> (zeroclaw workspaces only)\n\n");
+    out
+}
+
+fn format_model_status(
+    rows: &[(Provider, std::result::Result<Vec<Model>, String>)],
+    active: &str,
+) -> String {
+    let mut out = String::from("\n📊 Current Model:\n");
+    out.push_str(&format!("  active: {active}\n"));
+
+    let mut matched = false;
+    for (provider, models) in rows {
+        if provider.id == active {
+            matched = true;
+            out.push_str(&format!("  provider: {}\n", provider_display(provider)));
+            if let Ok(models) = models {
+                if models.is_empty() {
+                    out.push_str("  models:   (none advertised)\n");
+                } else {
+                    out.push_str(&format!(
+                        "  models:   {}\n",
+                        models
+                            .iter()
+                            .map(|m| m.id.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                }
+            }
+            break;
+        }
+
+        if let Ok(models) = models {
+            if let Some(model) = models.iter().find(|model| model.id == active) {
+                matched = true;
+                out.push_str(&format!("  provider: {}\n", provider_display(provider)));
+                out.push_str(&format!("  model:    {}\n", model.id));
+                break;
+            }
+        }
+    }
+
+    if !matched {
+        out.push_str("  selection: backend-managed or not present in advertised models\n");
+    }
+    out.push('\n');
+    out
+}
+
+fn provider_display(provider: &Provider) -> String {
+    if provider.name == provider.id || provider.name.is_empty() {
+        provider.id.clone()
+    } else {
+        format!("{} ({})", provider.name, provider.id)
+    }
+}
+
 fn exact_local_metadata<'a>(
     local_sessions: &'a [storage::SessionMetadata],
     id: &str,
@@ -1470,7 +1588,7 @@ fn format_memory_list(memories: &[serde_json::Value]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::cli::client::Session;
+    use crate::cli::client::{Model, Provider, Session};
     use crate::cli::storage::SessionMetadata;
 
     /// Mirror the parts→(command, subcommand, args) slicing used by the
@@ -1621,6 +1739,49 @@ mod tests {
         assert!(!out.contains("Local Only"));
     }
 
+    #[test]
+    fn provider_list_formats_model_ids_and_model_failures() {
+        let rows = vec![
+            (
+                provider("openclaw"),
+                Ok(vec!["fast".to_string(), "deep".to_string()]),
+            ),
+            (provider("broken"), Err("backend unavailable".to_string())),
+        ];
+
+        let out = super::format_provider_list(&rows);
+
+        assert!(out.contains("🤖 Configured Providers:"));
+        assert!(out.contains("• openclaw"));
+        assert!(out.contains("models: fast, deep"));
+        assert!(out.contains("models: ❌ failed to list: backend unavailable"));
+    }
+
+    #[test]
+    fn model_list_marks_active_provider_key() {
+        let rows = vec![(
+            provider("primary"),
+            Ok(vec![model("gemini-flash-latest", "primary")]),
+        )];
+
+        let out = super::format_model_list(&rows, "primary");
+
+        assert!(out.contains("📋 Available Models:"));
+        assert!(out.contains("primary"));
+        assert!(out.contains("* gemini-flash-latest"));
+        assert!(out.contains("active: primary"));
+    }
+
+    #[test]
+    fn model_status_reports_backend_managed_selection_when_not_advertised() {
+        let rows = vec![(provider("openclaw"), Ok(vec![model("fast", "openclaw")]))];
+
+        let out = super::format_model_status(&rows, "openclaw default");
+
+        assert!(out.contains("active: openclaw default"));
+        assert!(out.contains("backend-managed"));
+    }
+
     fn session(id: &str, name: &str) -> Session {
         Session {
             id: id.to_string(),
@@ -1639,6 +1800,25 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".to_string(),
             message_count: 0,
             last_active: "2026-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    fn provider(id: &str) -> Provider {
+        Provider {
+            id: id.to_string(),
+            name: id.to_string(),
+            requires_key: false,
+            api_key_env: None,
+        }
+    }
+
+    fn model(id: &str, provider: &str) -> Model {
+        Model {
+            id: id.to_string(),
+            display_name: id.to_string(),
+            provider: provider.to_string(),
+            context_window: None,
+            supports_reasoning: false,
         }
     }
 

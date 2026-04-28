@@ -236,9 +236,9 @@ struct StatusState {
     /// try-locking the shared `App`; falls back to this cached
     /// value when the worker is holding the mutex.
     workspace: String,
-    /// Model name as snapshotted at boot. Updating in real time
-    /// would require the agent client to surface the `model`
-    /// field from turn responses — plumbed in a later slice.
+    /// Last known active model label. Refreshed through lightweight
+    /// `TurnChunk::Status` frames after command-driven context
+    /// changes.
     model: String,
     /// Instant the most recent turn was submitted. While `Some`
     /// the elapsed counter is live; cleared on `Finished` and the
@@ -342,6 +342,25 @@ impl StatusState {
 
     fn clear_usage(&mut self) {
         self.usage = None;
+    }
+
+    fn apply_status(&mut self, workspace: Option<String>, model: Option<String>) {
+        let mut changed = false;
+        if let Some(workspace) = workspace {
+            if self.workspace != workspace {
+                self.workspace = workspace;
+                changed = true;
+            }
+        }
+        if let Some(model) = model {
+            if self.model != model {
+                self.model = model;
+                changed = true;
+            }
+        }
+        if changed {
+            self.clear_usage();
+        }
     }
 
     /// Current elapsed duration: live while a turn is in flight,
@@ -708,6 +727,16 @@ pub async fn run(
                             ) {
                                 let _ = worker_sink.send(TurnChunk::ClearUsage);
                             }
+                            if workspace_switched || model_switched {
+                                if let Some((workspace, model)) =
+                                    status_snapshot_for_worker(&worker_app).await
+                                {
+                                    let _ = worker_sink.send(TurnChunk::Status {
+                                        workspace: Some(workspace),
+                                        model: Some(model),
+                                    });
+                                }
+                            }
                             let _ = worker_sink.send(TurnChunk::Finished(Ok(String::new())));
                         }
                         Ok(None) => {
@@ -910,6 +939,17 @@ async fn current_workspace_name(app: &Arc<Mutex<App>>) -> Result<String> {
         .active_workspace()
         .map(|w| w.config.name.clone())
         .ok_or_else(|| anyhow::anyhow!("no active workspace"))
+}
+
+async fn status_snapshot_for_worker(app: &Arc<Mutex<App>>) -> Option<(String, String)> {
+    let (workspace, client) = {
+        let guard = app.lock().await;
+        let workspace = guard.active_workspace()?;
+        (workspace.config.name.clone(), workspace.client.clone()?)
+    };
+
+    let model = client.lock().await.current_model_label();
+    Some((workspace, model))
 }
 
 async fn remembered_session_id_for_active_workspace(
@@ -1978,6 +2018,9 @@ fn drain_stream_events(
                     TurnChunk::ClearUsage => {
                         status_state.clear_usage();
                     }
+                    TurnChunk::Status { workspace, model } => {
+                        status_state.apply_status(workspace.clone(), model.clone());
+                    }
                     TurnChunk::Finished(result) => {
                         if result.is_err() {
                             saw_error = true;
@@ -2076,6 +2119,7 @@ fn apply_chunk(chunk: TurnChunk, chat_lines: &Rc<RefCell<Vec<String>>>) {
         TurnChunk::Typewriter(_) => {}
         TurnChunk::Usage(_) => {}
         TurnChunk::ClearUsage => {}
+        TurnChunk::Status { .. } => {}
         TurnChunk::Finished(Ok(_)) => {
             lines.push(String::new());
         }
@@ -2839,6 +2883,44 @@ mod tests {
             &mut response_in_flight
         ));
 
+        assert!(state.usage.is_none());
+        assert!(lines.borrow().is_empty());
+        assert!(response_in_flight);
+    }
+
+    #[test]
+    fn status_chunk_updates_workspace_and_model_without_chat_output() {
+        let mut state = StatusState::new(
+            "old".to_string(),
+            "primary".to_string(),
+            "borland".to_string(),
+            false,
+        );
+        state.usage = Some(TurnUsage {
+            total_tokens: Some(2_000),
+            context_window: Some(8_000),
+            ..Default::default()
+        });
+        let lines = Rc::new(RefCell::new(Vec::new()));
+        let mut typewriter_state = None;
+        let mut response_in_flight = true;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tx.send(TurnChunk::Status {
+            workspace: Some("new".to_string()),
+            model: Some("consult".to_string()),
+        })
+        .unwrap();
+
+        assert!(!drain_stream_events(
+            &mut rx,
+            &lines,
+            &mut state,
+            &mut typewriter_state,
+            &mut response_in_flight
+        ));
+
+        assert_eq!(state.workspace, "new");
+        assert_eq!(state.model, "consult");
         assert!(state.usage.is_none());
         assert!(lines.borrow().is_empty());
         assert!(response_in_flight);
