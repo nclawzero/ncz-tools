@@ -514,41 +514,58 @@ pub async fn run(
                         let _ = worker_sink.send(TurnChunk::Finished(Ok(String::new())));
                         continue;
                     }
-                    let is_workspace_switch = is_workspace_switch_command(&cmdline);
-                    let command_session_id = match ensure_session_for_active_workspace(
+                    let preflight = command_session_preflight(&cmdline);
+                    let workspace_before_dispatch =
+                        if preflight == CommandSessionPreflight::AfterWorkspaceSwitch {
+                            current_workspace_name(&worker_app).await.ok()
+                        } else {
+                            None
+                        };
+                    let mut command_session_id = remembered_session_id_for_active_workspace(
                         &worker_app,
-                        &mut worker_sessions,
+                        &worker_sessions,
                         &fallback_session_name,
                     )
-                    .await
-                    {
-                        Ok(session_id) => session_id,
-                        Err(e) => {
-                            let _ = worker_sink.send(TurnChunk::Finished(Err(format!(
-                                "could not prepare session for active workspace: {e}"
-                            ))));
-                            continue;
-                        }
-                    };
+                    .await;
+                    if preflight == CommandSessionPreflight::BeforeDispatch {
+                        command_session_id = match ensure_session_for_active_workspace(
+                            &worker_app,
+                            &mut worker_sessions,
+                            &fallback_session_name,
+                        )
+                        .await
+                        {
+                            Ok(session_id) => session_id,
+                            Err(e) => {
+                                let _ = worker_sink.send(TurnChunk::Finished(Err(format!(
+                                    "could not prepare session for active workspace: {e}"
+                                ))));
+                                continue;
+                            }
+                        };
+                    }
                     if let Some(target_session) = session_switch_target(&cmdline) {
                         match resolve_or_create_session_for_worker(&worker_app, target_session)
                             .await
                         {
-                            Ok(session) => match current_workspace_name(&worker_app).await {
-                                Ok(workspace_name) => {
-                                    remember_worker_session(
-                                        &mut worker_sessions,
-                                        workspace_name,
-                                        &session,
-                                    );
-                                }
-                                Err(e) => {
-                                    let _ = worker_sink.send(TurnChunk::Finished(Err(format!(
+                            Ok(session) => {
+                                command_session_id = session.id.clone();
+                                match current_workspace_name(&worker_app).await {
+                                    Ok(workspace_name) => {
+                                        remember_worker_session(
+                                            &mut worker_sessions,
+                                            workspace_name,
+                                            &session,
+                                        );
+                                    }
+                                    Err(e) => {
+                                        let _ = worker_sink.send(TurnChunk::Finished(Err(format!(
                                             "could not bind session `{target_session}` to workspace: {e}"
                                         ))));
-                                    continue;
+                                        continue;
+                                    }
                                 }
-                            },
+                            }
                             Err(e) => {
                                 let _ = worker_sink.send(TurnChunk::Finished(Err(format!(
                                     "could not switch session to `{target_session}`: {e}"
@@ -563,31 +580,34 @@ pub async fn run(
                     {
                         Ok(Some(text)) => {
                             let _ = worker_sink.send(TurnChunk::Token(text));
-                            if is_workspace_switch {
-                                install_stream_sink_on_active_client(
-                                    &worker_app,
-                                    worker_sink.clone(),
-                                )
-                                .await;
-                                if let Err(e) = ensure_session_for_active_workspace(
-                                    &worker_app,
-                                    &mut worker_sessions,
-                                    &fallback_session_name,
-                                )
-                                .await
-                                {
-                                    let _ = worker_sink.send(TurnChunk::Finished(Err(format!(
-                                        "workspace switched, but session setup failed: {e}"
-                                    ))));
-                                    continue;
-                                }
+                            if preflight == CommandSessionPreflight::AfterWorkspaceSwitch {
                                 let switched_workspace = {
                                     let guard = worker_app.lock().await;
                                     guard.active_workspace().map(|w| w.config.name.clone())
                                 };
-                                if let Some(name) = switched_workspace {
-                                    let splash = connect_splash_for_workspace(&name);
-                                    let _ = worker_sink.send(TurnChunk::Typewriter(splash));
+                                if switched_workspace != workspace_before_dispatch {
+                                    install_stream_sink_on_active_client(
+                                        &worker_app,
+                                        worker_sink.clone(),
+                                    )
+                                    .await;
+                                    if let Err(e) = ensure_session_for_active_workspace(
+                                        &worker_app,
+                                        &mut worker_sessions,
+                                        &fallback_session_name,
+                                    )
+                                    .await
+                                    {
+                                        let _ =
+                                            worker_sink.send(TurnChunk::Finished(Err(format!(
+                                                "workspace switched, but session setup failed: {e}"
+                                            ))));
+                                        continue;
+                                    }
+                                    if let Some(name) = switched_workspace {
+                                        let splash = connect_splash_for_workspace(&name);
+                                        let _ = worker_sink.send(TurnChunk::Typewriter(splash));
+                                    }
                                 }
                             }
                             let _ = worker_sink.send(TurnChunk::Finished(Ok(String::new())));
@@ -706,6 +726,20 @@ async fn current_workspace_name(app: &Arc<Mutex<App>>) -> Result<String> {
         .ok_or_else(|| anyhow::anyhow!("no active workspace"))
 }
 
+async fn remembered_session_id_for_active_workspace(
+    app: &Arc<Mutex<App>>,
+    sessions: &HashMap<String, WorkerSessionBinding>,
+    fallback_session_name: &str,
+) -> String {
+    match current_workspace_name(app).await {
+        Ok(workspace_name) => sessions
+            .get(&workspace_name)
+            .map(|binding| binding.id.clone())
+            .unwrap_or_else(|| fallback_session_name.to_string()),
+        Err(_) => fallback_session_name.to_string(),
+    }
+}
+
 async fn ensure_session_for_active_workspace(
     app: &Arc<Mutex<App>>,
     sessions: &mut HashMap<String, WorkerSessionBinding>,
@@ -751,7 +785,7 @@ async fn resolve_or_create_session_for_worker(
     {
         let locked = client.lock().await;
         if let Ok(sessions) = locked.list_sessions().await {
-            if let Some(session) = find_session_by_id_or_name(&sessions, session_name) {
+            if let Some(session) = choose_worker_session_by_id_or_name(&sessions, session_name)? {
                 return Ok(session.clone());
             }
         }
@@ -781,10 +815,53 @@ async fn resolve_or_create_session_for_worker(
     Ok(session)
 }
 
-fn find_session_by_id_or_name<'a>(sessions: &'a [Session], requested: &str) -> Option<&'a Session> {
-    sessions
+fn choose_worker_session_by_id_or_name<'a>(
+    sessions: &'a [Session],
+    requested: &str,
+) -> Result<Option<&'a Session>> {
+    let id_matches: Vec<&Session> = sessions
         .iter()
-        .find(|session| session.id == requested || session.name == requested)
+        .filter(|session| session.id == requested)
+        .collect();
+    match id_matches.as_slice() {
+        [session] => return Ok(Some(*session)),
+        [] => {}
+        _ => {
+            return Err(ambiguous_worker_session_error(
+                requested,
+                "backend session id",
+                id_matches,
+            ));
+        }
+    }
+
+    let name_matches: Vec<&Session> = sessions
+        .iter()
+        .filter(|session| session.name == requested)
+        .collect();
+    match name_matches.as_slice() {
+        [session] => Ok(Some(*session)),
+        [] => Ok(None),
+        _ => Err(ambiguous_worker_session_error(
+            requested,
+            "session name",
+            name_matches,
+        )),
+    }
+}
+
+fn ambiguous_worker_session_error(
+    requested: &str,
+    label: &str,
+    candidates: Vec<&Session>,
+) -> anyhow::Error {
+    let candidates = candidates
+        .iter()
+        .map(|session| format!("backend id={} name={}", session.id, session.name))
+        .collect::<Vec<_>>()
+        .join("; ");
+
+    anyhow::anyhow!("ambiguous {label} '{requested}'; use an explicit id. Candidates: {candidates}")
 }
 
 fn load_session_metadata_by_id_or_name(session: &str) -> Result<storage::SessionMetadata> {
@@ -797,11 +874,30 @@ fn load_session_metadata_by_id_or_name(session: &str) -> Result<storage::Session
         .ok_or_else(|| anyhow::anyhow!("session metadata not found: {session}"))
 }
 
-fn is_workspace_switch_command(cmdline: &str) -> bool {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommandSessionPreflight {
+    None,
+    BeforeDispatch,
+    AfterWorkspaceSwitch,
+}
+
+fn command_session_preflight(cmdline: &str) -> CommandSessionPreflight {
     let mut parts = cmdline.split_whitespace();
-    matches!(parts.next(), Some("/workspace" | "/workspaces"))
-        && matches!(parts.next(), Some("switch"))
-        && parts.next().is_some()
+    let Some(command) = parts.next() else {
+        return CommandSessionPreflight::None;
+    };
+    let subcommand = parts.next();
+
+    match command {
+        "/info" | "/status" => CommandSessionPreflight::BeforeDispatch,
+        "/session" if matches!(subcommand, Some("info")) => CommandSessionPreflight::BeforeDispatch,
+        "/workspace" | "/workspaces"
+            if matches!(subcommand, Some("switch")) && parts.next().is_some() =>
+        {
+            CommandSessionPreflight::AfterWorkspaceSwitch
+        }
+        _ => CommandSessionPreflight::None,
+    }
 }
 
 fn stdout_only_slash_command_block_message(cmdline: &str) -> Option<String> {
@@ -2415,10 +2511,59 @@ mod tests {
 
     #[test]
     fn workspace_switch_detection_requires_target() {
-        assert!(is_workspace_switch_command("/workspace switch prod"));
-        assert!(is_workspace_switch_command("/workspaces switch prod"));
-        assert!(!is_workspace_switch_command("/workspace switch"));
-        assert!(!is_workspace_switch_command("/workspace list"));
+        assert_eq!(
+            command_session_preflight("/workspace switch prod"),
+            CommandSessionPreflight::AfterWorkspaceSwitch
+        );
+        assert_eq!(
+            command_session_preflight("/workspaces switch prod"),
+            CommandSessionPreflight::AfterWorkspaceSwitch
+        );
+        assert_eq!(
+            command_session_preflight("/workspace switch"),
+            CommandSessionPreflight::None
+        );
+        assert_eq!(
+            command_session_preflight("/workspace list"),
+            CommandSessionPreflight::None
+        );
+    }
+
+    #[test]
+    fn command_session_preflight_is_limited_to_session_dependent_commands() {
+        for cmdline in [
+            "/help",
+            "/workspace list",
+            "/workspace info",
+            "/session list",
+            "/session switch research",
+            "/session research",
+            "/models list",
+            "/memory stats",
+        ] {
+            assert_eq!(
+                command_session_preflight(cmdline),
+                CommandSessionPreflight::None,
+                "{cmdline}"
+            );
+        }
+
+        assert_eq!(
+            command_session_preflight("/info"),
+            CommandSessionPreflight::BeforeDispatch
+        );
+        assert_eq!(
+            command_session_preflight("/status"),
+            CommandSessionPreflight::BeforeDispatch
+        );
+        assert_eq!(
+            command_session_preflight("/session info"),
+            CommandSessionPreflight::BeforeDispatch
+        );
+        assert_eq!(
+            command_session_preflight("/workspace switch prod"),
+            CommandSessionPreflight::AfterWorkspaceSwitch
+        );
     }
 
     #[test]
@@ -2468,5 +2613,55 @@ mod tests {
 
         assert_eq!(bindings["alpha"].id, "alpha-id");
         assert_eq!(bindings["beta"].id, "beta-id");
+    }
+
+    #[test]
+    fn session_switch_resolver_prefers_exact_backend_id_over_duplicate_names() {
+        let sessions = vec![
+            Session {
+                id: "sess-123".to_string(),
+                name: "Research".to_string(),
+                model: "m".to_string(),
+                provider: "p".to_string(),
+            },
+            Session {
+                id: "sess-456".to_string(),
+                name: "Research".to_string(),
+                model: "m".to_string(),
+                provider: "p".to_string(),
+            },
+        ];
+
+        let resolved = choose_worker_session_by_id_or_name(&sessions, "sess-456")
+            .expect("id lookup should not be ambiguous")
+            .expect("id should resolve");
+
+        assert_eq!(resolved.id, "sess-456");
+    }
+
+    #[test]
+    fn session_switch_resolver_fails_closed_on_duplicate_backend_names() {
+        let sessions = vec![
+            Session {
+                id: "sess-123".to_string(),
+                name: "Research".to_string(),
+                model: "m".to_string(),
+                provider: "p".to_string(),
+            },
+            Session {
+                id: "sess-456".to_string(),
+                name: "Research".to_string(),
+                model: "m".to_string(),
+                provider: "p".to_string(),
+            },
+        ];
+
+        let err = choose_worker_session_by_id_or_name(&sessions, "Research").unwrap_err();
+        let msg = err.to_string();
+
+        assert!(msg.contains("ambiguous session name 'Research'"));
+        assert!(msg.contains("sess-123"));
+        assert!(msg.contains("sess-456"));
+        assert!(msg.contains("explicit id"));
     }
 }
