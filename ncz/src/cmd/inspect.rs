@@ -217,6 +217,11 @@ fn collect_etc_files(paths: &Paths, show_secrets: bool) -> Result<Vec<EtcFileRep
         let redacted_path = common::redact_path(&file);
         let lines = if redacted_path {
             vec!["[redacted path]".to_string()]
+        } else if is_agent_env_file(paths, &file) {
+            fs::read_to_string(&file)?
+                .lines()
+                .map(|line| redact_agent_env_line(line, show_secrets))
+                .collect()
         } else {
             fs::read_to_string(&file)?
                 .lines()
@@ -230,6 +235,27 @@ fn collect_etc_files(paths: &Paths, show_secrets: bool) -> Result<Vec<EtcFileRep
         });
     }
     Ok(reports)
+}
+
+fn is_agent_env_file(paths: &Paths, file: &Path) -> bool {
+    file == paths.agent_env()
+        || agent::AGENTS
+            .iter()
+            .any(|agent_name| file == paths.agent_env_override(agent_name))
+}
+
+fn redact_agent_env_line(line: &str, show_secrets: bool) -> String {
+    if show_secrets {
+        return line.to_string();
+    }
+    let trimmed = line.trim_start();
+    if trimmed.is_empty() || trimmed.starts_with('#') {
+        return line.to_string();
+    }
+    let Some((left, _)) = line.split_once('=') else {
+        return line.to_string();
+    };
+    format!("{left}=***")
 }
 
 fn collect_files_recursive(
@@ -297,6 +323,51 @@ mod tests {
         assert_eq!(report.schema_version, 1);
         assert_eq!(report.recent_logs[0].lines[0], "password=***");
         assert_eq!(report.etc_files[0].lines[0], "token=***");
+    }
+
+    #[test]
+    fn inspect_redacts_agent_env_values_for_arbitrary_keys() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        fs::create_dir_all(paths.agent_env_override("hermes").parent().unwrap()).unwrap();
+        fs::write(paths.agent_env(), "FOO=plain\nOPENAI_KEY=secret\n").unwrap();
+        fs::write(paths.agent_env_override("hermes"), "BAR=override\n").unwrap();
+
+        let files = collect_etc_files(&paths, false).unwrap();
+
+        let shared = files
+            .iter()
+            .find(|file| file.path == paths.agent_env().display().to_string())
+            .unwrap();
+        assert_eq!(shared.lines, vec!["FOO=***", "OPENAI_KEY=***"]);
+        let scoped = files
+            .iter()
+            .find(|file| file.path == paths.agent_env_override("hermes").display().to_string())
+            .unwrap();
+        assert_eq!(scoped.lines, vec!["BAR=***"]);
+    }
+
+    #[test]
+    fn inspect_redacts_legacy_provider_key_fields() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        fs::create_dir_all(paths.providers_dir()).unwrap();
+        fs::write(
+            paths.providers_dir().join("local.env"),
+            "KEY=sk-live\nOPENAI_KEY=sk-openai\nNAME=local\n",
+        )
+        .unwrap();
+
+        let files = collect_etc_files(&paths, false).unwrap();
+
+        let provider = files
+            .iter()
+            .find(|file| file.path == paths.providers_dir().join("local.env").display().to_string())
+            .unwrap();
+        assert_eq!(
+            provider.lines,
+            vec!["KEY=***", "OPENAI_KEY=***", "NAME=local"]
+        );
     }
 
     #[test]

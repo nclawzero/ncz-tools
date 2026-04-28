@@ -136,6 +136,10 @@ pub fn redact_line(line: &str, show_secrets: bool) -> String {
         return line.to_string();
     }
 
+    if let Some(redacted) = redact_secret_assignment(line) {
+        return redacted;
+    }
+
     let lower = line.to_ascii_lowercase();
     for needle in [
         "authorization",
@@ -162,6 +166,66 @@ pub fn redact_line(line: &str, show_secrets: bool) -> String {
         }
     }
     line.to_string()
+}
+
+fn redact_secret_assignment(line: &str) -> Option<String> {
+    for (idx, ch) in line.char_indices() {
+        if ch != '=' && ch != ':' {
+            continue;
+        }
+        let field = secret_field_candidate(&line[..idx]);
+        if field.is_empty() || !is_secret_field_name(field) {
+            continue;
+        }
+        let after_separator = idx + ch.len_utf8();
+        let value_start = line[after_separator..]
+            .char_indices()
+            .find_map(|(offset, ch)| {
+                if ch.is_whitespace() {
+                    None
+                } else {
+                    Some(after_separator + offset)
+                }
+            })
+            .unwrap_or(line.len());
+        if value_start == line.len() {
+            continue;
+        }
+        return Some(format!("{}***", &line[..value_start]));
+    }
+    None
+}
+
+fn secret_field_candidate(prefix: &str) -> &str {
+    let trimmed = prefix.trim_end();
+    let start = trimmed
+        .char_indices()
+        .rev()
+        .find_map(|(idx, ch)| {
+            if ch.is_whitespace() || matches!(ch, '{' | '[' | ',') {
+                Some(idx + ch.len_utf8())
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0);
+    trimmed[start..].trim_matches(|ch| ch == '"' || ch == '\'')
+}
+
+fn is_secret_field_name(name: &str) -> bool {
+    let name = name
+        .trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_' && ch != '-')
+        .to_ascii_lowercase();
+    name == "key"
+        || name.contains("token")
+        || name.contains("secret")
+        || name.contains("password")
+        || name.contains("authorization")
+        || name.contains("api_key")
+        || name.contains("api-key")
+        || name.contains("apikey")
+        || name.ends_with("_key")
+        || name.ends_with("-key")
 }
 
 pub fn mask_secret_value(value: &str, show_secrets: bool) -> String {
