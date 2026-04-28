@@ -26,6 +26,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use chrono::Utc;
+use tokio::runtime::Handle;
 use tokio::sync::{mpsc, Mutex};
 use tracing::{info, warn};
 
@@ -720,9 +721,11 @@ pub async fn run(
         }
     });
 
+    let runtime_handle = Handle::current();
     let blocking_app = Arc::clone(&app);
     tokio::task::spawn_blocking(move || {
         run_blocking(
+            runtime_handle,
             blocking_app,
             session,
             model,
@@ -933,23 +936,13 @@ async fn resolve_or_create_session_for_worker(
     }
     .ok_or_else(|| anyhow::anyhow!("no active workspace client"))?;
 
-    {
+    let resolution = {
         let locked = client.lock().await;
-        if let Ok(sessions) = locked.list_sessions().await {
-            if let Some(session) = choose_worker_session_by_id_or_name(&sessions, session_name)? {
-                return Ok(session.clone());
-            }
-        }
+        plan_worker_session_resolution(session_name, locked.list_sessions().await)?
+    };
 
-        if let Ok(session) = locked.load_session(session_name).await {
-            return Ok(session);
-        }
-
-        if let Ok(metadata) = load_session_metadata_by_id_or_name(session_name) {
-            if let Ok(session) = locked.load_session(&metadata.id).await {
-                return Ok(session);
-            }
-        }
+    if let WorkerSessionResolution::Existing(session) = resolution {
+        return Ok(session);
     }
 
     let session = client.lock().await.create_session(session_name).await?;
@@ -971,6 +964,24 @@ async fn resolve_or_create_session_for_worker(
         );
     }
     Ok(session)
+}
+
+#[derive(Debug)]
+enum WorkerSessionResolution {
+    Existing(Session),
+    Create,
+}
+
+fn plan_worker_session_resolution(
+    requested: &str,
+    list_result: Result<Vec<Session>>,
+) -> Result<WorkerSessionResolution> {
+    let sessions = list_result
+        .map_err(|e| anyhow::anyhow!("could not list sessions from active backend: {e}"))?;
+    match choose_worker_session_by_id_or_name(&sessions, requested)? {
+        Some(session) => Ok(WorkerSessionResolution::Existing(session.clone())),
+        None => Ok(WorkerSessionResolution::Create),
+    }
 }
 
 fn choose_worker_session_by_id_or_name<'a>(
@@ -1020,16 +1031,6 @@ fn ambiguous_worker_session_error(
         .join("; ");
 
     anyhow::anyhow!("ambiguous {label} '{requested}'; use an explicit id. Candidates: {candidates}")
-}
-
-fn load_session_metadata_by_id_or_name(session: &str) -> Result<storage::SessionMetadata> {
-    if let Ok(metadata) = storage::load_session_metadata(session) {
-        return Ok(metadata);
-    }
-    storage::list_sessions()?
-        .into_iter()
-        .find(|metadata| metadata.id == session || metadata.name == session)
-        .ok_or_else(|| anyhow::anyhow!("session metadata not found: {session}"))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1104,6 +1105,7 @@ fn session_switch_target(cmdline: &str) -> Option<&str> {
 
 #[allow(clippy::too_many_arguments)]
 fn run_blocking(
+    runtime_handle: Handle,
     app: Arc<Mutex<App>>,
     session: Session,
     model: String,
@@ -1264,6 +1266,7 @@ fn run_blocking(
     input_line.borrow_mut().set_focus(true);
 
     run_event_loop(
+        &runtime_handle,
         &mut tapp,
         chat_lines,
         input_data,
@@ -1427,6 +1430,7 @@ fn refresh_status_line(
 
 #[allow(clippy::too_many_arguments)]
 fn run_event_loop(
+    runtime_handle: &Handle,
     app: &mut Application,
     chat_lines: Rc<RefCell<Vec<String>>>,
     input_data: Rc<RefCell<String>>,
@@ -1712,6 +1716,7 @@ fn run_event_loop(
         if event.what == EventType::Command {
             redraw(app, &input_line);
             handle_command(
+                runtime_handle,
                 app,
                 event.command,
                 &chat_lines,
@@ -1954,7 +1959,9 @@ fn redraw(app: &mut Application, input_line: &Rc<RefCell<InputLine>>) {
     let _ = app.terminal.flush();
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_command(
+    runtime_handle: &Handle,
     app: &mut Application,
     command: u16,
     chat_lines: &Rc<RefCell<Vec<String>>>,
@@ -2089,7 +2096,17 @@ fn handle_command(
             );
         }
         CMD_SESSION_OPEN => {
-            let sessions = snapshot_sessions();
+            let sessions =
+                match session_picker_entries_from_active_backend(runtime_handle, shared_app) {
+                    Ok(sessions) => sessions,
+                    Err(e) => {
+                        let message = format!("[error] could not list backend sessions: {e}");
+                        chat_lines.borrow_mut().push(message.clone());
+                        chat_lines.borrow_mut().push(String::new());
+                        status_state.set_toast(message);
+                        return;
+                    }
+                };
             if sessions.is_empty() {
                 dispatch_command(
                     "/session list",
@@ -2350,7 +2367,7 @@ struct WorkspacePickerEntry {
     active: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct SessionPickerEntry {
     name: String,
     id: String,
@@ -2358,15 +2375,34 @@ struct SessionPickerEntry {
     last_active: String,
 }
 
-fn snapshot_sessions() -> Vec<SessionPickerEntry> {
-    storage::list_sessions()
-        .unwrap_or_default()
-        .into_iter()
+fn session_picker_entries_from_active_backend(
+    runtime_handle: &Handle,
+    shared_app: &Arc<Mutex<App>>,
+) -> Result<Vec<SessionPickerEntry>> {
+    runtime_handle.block_on(async {
+        let client = {
+            let guard = shared_app.lock().await;
+            guard.active_workspace().and_then(|w| w.client.clone())
+        }
+        .ok_or_else(|| anyhow::anyhow!("no active workspace client"))?;
+
+        let locked = client.lock().await;
+        let sessions = locked
+            .list_sessions()
+            .await
+            .map_err(|e| anyhow::anyhow!("active backend session listing failed: {e}"))?;
+        Ok(session_picker_entries_from_backend_sessions(&sessions))
+    })
+}
+
+fn session_picker_entries_from_backend_sessions(sessions: &[Session]) -> Vec<SessionPickerEntry> {
+    sessions
+        .iter()
         .map(|s| SessionPickerEntry {
-            name: s.name,
-            id: s.id,
+            name: s.name.clone(),
+            id: s.id.clone(),
             model: format!("{}/{}", s.provider, s.model),
-            last_active: s.last_active,
+            last_active: "-".to_string(),
         })
         .collect()
 }
@@ -2563,7 +2599,7 @@ fn run_workspace_picker(app: &mut Application, entries: &[WorkspacePickerEntry])
     entries.get(idx).map(|e| e.name.clone())
 }
 
-/// Present a modal picker of locally-known sessions.
+/// Present a modal picker of backend-known sessions.
 ///
 /// This intentionally reuses `MenuBox`, matching the existing
 /// workspace picker. It dispatches back to `/session <name>` so
@@ -3157,6 +3193,50 @@ mod tests {
 
         assert_eq!(bindings["alpha"].id, "alpha-id");
         assert_eq!(bindings["beta"].id, "beta-id");
+    }
+
+    #[test]
+    fn worker_session_resolution_fails_closed_when_backend_listing_fails() {
+        let err =
+            plan_worker_session_resolution("Research", Err(anyhow::anyhow!("backend unavailable")))
+                .unwrap_err();
+        let msg = err.to_string();
+
+        assert!(msg.contains("could not list sessions from active backend"));
+        assert!(msg.contains("backend unavailable"));
+    }
+
+    #[test]
+    fn worker_session_resolution_creates_only_after_successful_absent_listing() {
+        let resolution = plan_worker_session_resolution("Research", Ok(Vec::new()))
+            .expect("successful empty backend listing should permit create");
+
+        match resolution {
+            WorkerSessionResolution::Create => {}
+            WorkerSessionResolution::Existing(session) => {
+                panic!("expected create plan, got existing session {}", session.id)
+            }
+        }
+    }
+
+    #[test]
+    fn session_picker_entries_are_mapped_from_backend_sessions_only() {
+        let sessions = vec![Session {
+            id: "backend-id".to_string(),
+            name: "Backend Research".to_string(),
+            model: "gpt-test".to_string(),
+            provider: "openai".to_string(),
+        }];
+
+        assert_eq!(
+            session_picker_entries_from_backend_sessions(&sessions),
+            vec![SessionPickerEntry {
+                id: "backend-id".to_string(),
+                name: "Backend Research".to_string(),
+                model: "openai/gpt-test".to_string(),
+                last_active: "-".to_string(),
+            }]
+        );
     }
 
     #[test]
