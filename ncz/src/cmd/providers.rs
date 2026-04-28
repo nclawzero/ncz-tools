@@ -307,16 +307,10 @@ pub fn add(
     let _lock = state::acquire_lock(&paths.lock_path)?;
     if input.force {
         let aliases = provider_state::removal_aliases(paths, &declaration.name)?;
-        let secret_bearing_replacements =
-            provider_state::secret_bearing_replacement_files(paths, &declaration.name)?;
-        if !secret_bearing_replacements.is_empty() {
-            require_agent_env_credential(paths, &declaration).map_err(|_| {
-                NczError::Precondition(format!(
-                    "legacy provider {} contains an inline credential; set {} in agent-env before --force",
-                    secret_bearing_replacements.join(", "),
-                    declaration.key_env
-                ))
-            })?;
+        let inline_replacements =
+            provider_state::inline_credential_replacements(paths, &declaration.name)?;
+        if !inline_replacements.is_empty() {
+            require_replacement_credentials_preserved(paths, &inline_replacements)?;
         }
         let primary_references = primary_references(paths, &aliases)?;
         if let Some((primary, path)) = primary_references
@@ -538,6 +532,25 @@ fn require_agent_env_credential(
     )))
 }
 
+fn require_replacement_credentials_preserved(
+    paths: &Paths,
+    replacements: &[provider_state::InlineCredentialReplacement],
+) -> Result<(), NczError> {
+    let entries = agent_env::read(paths)?;
+    for replacement in replacements {
+        let preserved = entries
+            .iter()
+            .any(|entry| entry.key == replacement.key_env && entry.value == replacement.secret);
+        if !preserved {
+            return Err(NczError::Precondition(format!(
+                "legacy provider {} contains an inline credential for {}; set the same value in agent-env before --force",
+                replacement.file, replacement.key_env
+            )));
+        }
+    }
+    Ok(())
+}
+
 struct FileSnapshot {
     path: PathBuf,
     body: Option<Vec<u8>>,
@@ -703,7 +716,7 @@ mod tests {
         assert!(!paths.providers_dir().join("local.env").exists());
         assert_eq!(
             fs::read_to_string(paths.agent_env()).unwrap(),
-            "LOCAL_API_KEY=abc\n"
+            "LOCAL_API_KEY=abc\nNCZ_PROVIDER_BINDING_6C6F63616C=\"LOCAL_API_KEY http://127.0.0.1:8080\"\n"
         );
     }
 
@@ -820,7 +833,7 @@ mod tests {
         assert!(!paths.providers_dir().join("local.env").exists());
         assert_eq!(
             fs::read_to_string(paths.agent_env()).unwrap(),
-            "LOCAL_API_KEY=legacy\n"
+            "LOCAL_API_KEY=legacy\nNCZ_PROVIDER_BINDING_6C6F63616C=\"LOCAL_API_KEY http://127.0.0.1:8080\"\n"
         );
     }
 
@@ -1205,6 +1218,39 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(err, NczError::Precondition(_)));
+        assert_eq!(fs::read_to_string(legacy_file).unwrap(), legacy);
+        assert!(!paths.providers_dir().join("local.json").exists());
+    }
+
+    #[test]
+    fn providers_add_force_rejects_mismatched_legacy_inline_credential() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        fs::create_dir_all(paths.providers_dir()).unwrap();
+        fs::create_dir_all(&paths.etc_dir).unwrap();
+        fs::write(paths.agent_env(), "LOCAL_API_KEY=different\n").unwrap();
+        let legacy_file = paths.providers_dir().join("local.env");
+        let legacy =
+            "PROVIDER_NAME=local\nPROVIDER_URL=http://127.0.0.1:8080\nMODEL=mini\nAPI_KEY=old-secret\n";
+        fs::write(&legacy_file, legacy).unwrap();
+        let runner = FakeRunner::new();
+
+        let err = run_with_paths(
+            &ctx(&runner),
+            &paths,
+            ProvidersAction::Add {
+                name: "local".to_string(),
+                url: "http://127.0.0.1:8080".to_string(),
+                model: "new".to_string(),
+                key_env: "LOCAL_API_KEY".to_string(),
+                provider_type: "openai-compat".to_string(),
+                health_path: "/health".to_string(),
+                force: true,
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, NczError::Precondition(message) if message.contains("same value in agent-env")));
         assert_eq!(fs::read_to_string(legacy_file).unwrap(), legacy);
         assert!(!paths.providers_dir().join("local.json").exists());
     }

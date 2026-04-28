@@ -44,6 +44,7 @@ pub struct ApiMutationReport {
     pub changed: bool,
     pub shared_file: String,
     pub agent_override_files: Vec<String>,
+    pub provider_bindings: Vec<String>,
     pub restart_required: bool,
     pub restart_agents: Vec<String>,
 }
@@ -67,6 +68,9 @@ impl Render for ApiMutationReport {
         }
         for path in &self.agent_override_files {
             writeln!(w, "override: {path}")?;
+        }
+        for provider in &self.provider_bindings {
+            writeln!(w, "provider binding: {provider}")?;
         }
         if self.restart_required {
             writeln!(w, "restart required: {}", self.restart_agents.join(","))?;
@@ -95,6 +99,7 @@ pub fn run_with_paths(
             value_env,
             value_stdin,
             agents,
+            providers,
         } => Ok(ApiReport::Mutate(upsert(
             ctx,
             paths,
@@ -102,6 +107,7 @@ pub fn run_with_paths(
             &key,
             &resolve_value(value.as_deref(), value_env.as_deref(), value_stdin)?,
             &agents,
+            &providers,
         )?)),
         ApiAction::Set {
             key,
@@ -109,6 +115,7 @@ pub fn run_with_paths(
             value_env,
             value_stdin,
             agents,
+            providers,
         } => Ok(ApiReport::Mutate(upsert(
             ctx,
             paths,
@@ -116,6 +123,7 @@ pub fn run_with_paths(
             &key,
             &resolve_value(value.as_deref(), value_env.as_deref(), value_stdin)?,
             &agents,
+            &providers,
         )?)),
         ApiAction::Remove { key, force } => Ok(ApiReport::Mutate(remove(paths, &key, force)?)),
     }
@@ -135,13 +143,18 @@ fn upsert(
     key: &str,
     value: &str,
     agents: &[String],
+    providers: &[String],
 ) -> Result<ApiMutationReport, NczError> {
     agent_env::validate_key(key)?;
     agent_env::validate_value(value)?;
     for agent in agents {
         common::validate_agent(agent)?;
     }
+    for provider in providers {
+        provider_state::validate_name(provider)?;
+    }
     let _lock = state::acquire_lock(&paths.lock_path)?;
+    let provider_bindings = resolve_provider_bindings(paths, key, providers)?;
     let mut target_paths: Vec<PathBuf> = vec![paths.agent_env()];
     target_paths.extend(agents.iter().map(|agent| paths.agent_env_override(agent)));
     let snapshots = snapshot_paths(&target_paths)?;
@@ -154,6 +167,11 @@ fn upsert(
                 changed = true;
             }
             agent_override_files.push(paths.agent_env_override(agent_name).display().to_string());
+        }
+        for binding in &provider_bindings {
+            if agent_env::set_provider_binding(paths, &binding.provider, key, &binding.url)? {
+                changed = true;
+            }
         }
         Ok(changed)
     })();
@@ -173,9 +191,41 @@ fn upsert(
         changed,
         shared_file: paths.agent_env().display().to_string(),
         agent_override_files,
+        provider_bindings: provider_bindings
+            .into_iter()
+            .map(|binding| binding.provider)
+            .collect(),
         restart_required: true,
         restart_agents: restart_agents(),
     })
+}
+
+struct ProviderBinding {
+    provider: String,
+    url: String,
+}
+
+fn resolve_provider_bindings(
+    paths: &Paths,
+    key: &str,
+    providers: &[String],
+) -> Result<Vec<ProviderBinding>, NczError> {
+    let mut bindings = Vec::new();
+    for provider in providers {
+        let record = provider_state::read(paths, provider)?
+            .ok_or_else(|| NczError::Usage(format!("unknown provider: {provider}")))?;
+        if record.declaration.key_env != key {
+            return Err(NczError::Usage(format!(
+                "provider {provider} references credential {}; cannot bind {key}",
+                record.declaration.key_env
+            )));
+        }
+        bindings.push(ProviderBinding {
+            provider: record.declaration.name,
+            url: record.declaration.url,
+        });
+    }
+    Ok(bindings)
 }
 
 fn resolve_value(
@@ -236,11 +286,30 @@ fn remove(paths: &Paths, key: &str, force: bool) -> Result<ApiMutationReport, Nc
             references.join(", ")
         )));
     }
-    let target_paths = vec![paths.agent_env()];
+    let mut target_paths = vec![paths.agent_env()];
+    target_paths.extend(
+        agent::AGENTS
+            .iter()
+            .map(|agent_name| paths.agent_env_override(agent_name)),
+    );
     let snapshots = snapshot_paths(&target_paths)?;
 
-    let result = agent_env::remove(paths, key);
-    let changed = match result {
+    let result = (|| -> Result<(bool, Vec<String>, Vec<String>), NczError> {
+        let removed_key = agent_env::remove(paths, key)?;
+        let removed_bindings = agent_env::remove_provider_bindings_for_key(paths, key)?;
+        let mut removed_overrides = Vec::new();
+        for agent_name in agent::AGENTS {
+            if agent_env::remove_override(paths, agent_name, key)? {
+                removed_overrides.push(paths.agent_env_override(agent_name).display().to_string());
+            }
+        }
+        Ok((
+            removed_key || !removed_bindings.is_empty() || !removed_overrides.is_empty(),
+            removed_bindings,
+            removed_overrides,
+        ))
+    })();
+    let (changed, provider_bindings, agent_override_files) = match result {
         Ok(result) => result,
         Err(err) => {
             restore_snapshots(&snapshots)?;
@@ -254,7 +323,8 @@ fn remove(paths: &Paths, key: &str, force: bool) -> Result<ApiMutationReport, Nc
         value: None,
         changed,
         shared_file: paths.agent_env().display().to_string(),
-        agent_override_files: Vec::new(),
+        agent_override_files,
+        provider_bindings,
         restart_required: changed,
         restart_agents: if changed {
             restart_agents()
@@ -385,6 +455,7 @@ mod tests {
                 value_env: Some("NCZ_TEST_SHARED_API_SECRET".to_string()),
                 value_stdin: false,
                 agents: Vec::new(),
+                providers: Vec::new(),
             },
         )
         .unwrap();
@@ -404,6 +475,50 @@ mod tests {
     }
 
     #[test]
+    fn api_add_binds_credential_to_provider_for_live_discovery() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        fs::create_dir_all(paths.providers_dir()).unwrap();
+        fs::create_dir_all(&paths.etc_dir).unwrap();
+        fs::write(
+            paths.providers_dir().join("together.json"),
+            r#"{"schema_version":1,"name":"together","url":"https://api.example.test","model":"m","key_env":"TOGETHER_API_KEY","type":"openai-compat","health_path":"/health"}"#,
+        )
+        .unwrap();
+        env::set_var("NCZ_TEST_BOUND_API_SECRET", "secret");
+        let runner = FakeRunner::new();
+
+        let report = run_with_paths(
+            &ctx(&runner),
+            &paths,
+            ApiAction::Add {
+                key: "TOGETHER_API_KEY".to_string(),
+                value: None,
+                value_env: Some("NCZ_TEST_BOUND_API_SECRET".to_string()),
+                value_stdin: false,
+                agents: Vec::new(),
+                providers: vec!["together".to_string()],
+            },
+        )
+        .unwrap();
+
+        let ApiReport::Mutate(report) = report else {
+            panic!("expected mutation report");
+        };
+        assert_eq!(report.provider_bindings, vec!["together"]);
+        let entries = agent_env::read(&paths).unwrap();
+        assert!(
+            agent_env::provider_binding_matches(
+                &entries,
+                "together",
+                "TOGETHER_API_KEY",
+                "https://api.example.test"
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
     fn api_add_writes_agent_override_stubs() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = test_paths(tmp.path());
@@ -420,6 +535,7 @@ mod tests {
                 value_env: Some("NCZ_TEST_SCOPED_API_SECRET".to_string()),
                 value_stdin: false,
                 agents: vec!["zeroclaw".to_string(), "hermes".to_string()],
+                providers: Vec::new(),
             },
         )
         .unwrap();
@@ -461,6 +577,7 @@ mod tests {
                 value_env: Some("NCZ_TEST_SCOPED_REPLACE_API_SECRET".to_string()),
                 value_stdin: false,
                 agents: vec!["hermes".to_string()],
+                providers: Vec::new(),
             },
         )
         .unwrap();
@@ -512,7 +629,7 @@ mod tests {
     }
 
     #[test]
-    fn api_remove_leaves_agent_overrides_untouched() {
+    fn api_remove_revokes_agent_override_copy() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = test_paths(tmp.path());
         fs::create_dir_all(paths.agent_env_override("hermes").parent().unwrap()).unwrap();
@@ -542,13 +659,16 @@ mod tests {
         assert_eq!(report.restart_agents, restart_agents());
         assert_eq!(
             fs::read_to_string(paths.agent_env_override("hermes")).unwrap(),
-            "TOGETHER_API_KEY=override\nOTHER=1\n"
+            "OTHER=1\n"
         );
-        assert!(report.agent_override_files.is_empty());
+        assert_eq!(
+            report.agent_override_files,
+            vec![paths.agent_env_override("hermes").display().to_string()]
+        );
     }
 
     #[test]
-    fn api_remove_reports_unchanged_for_override_only_key() {
+    fn api_remove_revokes_override_only_key() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = test_paths(tmp.path());
         fs::create_dir_all(paths.agent_env_override("hermes").parent().unwrap()).unwrap();
@@ -572,12 +692,15 @@ mod tests {
         let ApiReport::Mutate(report) = report else {
             panic!("expected mutation report");
         };
-        assert!(!report.changed);
-        assert!(!report.restart_required);
-        assert!(report.agent_override_files.is_empty());
+        assert!(report.changed);
+        assert!(report.restart_required);
+        assert_eq!(
+            report.agent_override_files,
+            vec![paths.agent_env_override("hermes").display().to_string()]
+        );
         assert_eq!(
             fs::read_to_string(paths.agent_env_override("hermes")).unwrap(),
-            "TOGETHER_API_KEY=override\n"
+            ""
         );
     }
 
@@ -721,6 +844,7 @@ mod tests {
                 value_env: None,
                 value_stdin: false,
                 agents: vec!["not-an-agent".to_string()],
+                providers: Vec::new(),
             },
         )
         .unwrap_err();
@@ -747,6 +871,7 @@ mod tests {
                 value_env: Some("NCZ_TEST_ROLLBACK_API_SECRET".to_string()),
                 value_stdin: false,
                 agents: vec!["hermes".to_string(), "zeroclaw".to_string()],
+                providers: Vec::new(),
             },
         )
         .unwrap_err();

@@ -116,6 +116,9 @@ pub enum ApiAction {
         /// compatibility stubs for future per-agent credential routing.
         #[arg(long, value_delimiter = ',')]
         agents: Vec<String>,
+        /// Bind this credential to existing providers for live model discovery.
+        #[arg(long, value_delimiter = ',')]
+        providers: Vec<String>,
     },
     /// Remove a key from the shared agent environment.
     Remove {
@@ -143,6 +146,9 @@ pub enum ApiAction {
         /// compatibility stubs for future per-agent credential routing.
         #[arg(long, value_delimiter = ',')]
         agents: Vec<String>,
+        /// Bind this credential to existing providers for live model discovery.
+        #[arg(long, value_delimiter = ',')]
+        providers: Vec<String>,
     },
 }
 

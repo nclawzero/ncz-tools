@@ -16,6 +16,7 @@ ncz api add TOGETHER_API_KEY "$TOGETHER_API_KEY"
 ncz api add TOGETHER_API_KEY --value-env TOGETHER_API_KEY
 printf '%s' "$OPENAI_API_KEY" | ncz api set OPENAI_API_KEY --value-stdin
 ncz api set OPENAI_API_KEY env:OPENAI_API_KEY --agents=zeroclaw,hermes
+ncz api set TOGETHER_API_KEY env:TOGETHER_API_KEY --providers=together
 ncz api remove TOGETHER_API_KEY
 ncz api remove OLD_KEY --force
 ```
@@ -32,7 +33,10 @@ agent units to apply or revoke the credential at runtime. `api remove` refuses t
 delete a key still referenced by provider or MCP declarations unless `--force` is
 specified. Values are written as systemd-compatible `EnvironmentFile=`
 assignments; opaque secrets with spaces or symbols are quoted automatically.
-Newline and NUL bytes are rejected.
+Newline and NUL bytes are rejected. `--providers=name,...` records a non-secret
+approval binding for existing provider declarations that reference the same
+`key_env`; live model discovery will not send a shared `agent-env` credential to
+a provider unless that provider name, key, and URL match the approval record.
 
 ### Providers
 
@@ -77,8 +81,11 @@ ncz models discover together
 `models discover` refreshes
 `/etc/nclawzero/providers.d/<name>.models.json` with the current catalog and a
 timestamp by calling the provider's OpenAI-compatible `/v1/models` endpoint.
-When a provider uses an `agent-env` credential, discovery refuses plaintext
-remote HTTP endpoints; use HTTPS or a loopback URL for local providers.
+When a provider uses an `agent-env` credential, live catalog requests require an
+approval binding created with `ncz api set KEY --providers=name` and refuse
+plaintext remote HTTP endpoints; use HTTPS or a loopback URL for local
+providers. Static `models` entries and cached discovery data remain usable when
+the live catalog is down or the credential is unavailable.
 
 ### MCP Servers
 

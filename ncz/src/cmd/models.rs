@@ -93,13 +93,16 @@ struct Catalog {
 #[derive(Debug)]
 enum ModelQueryError {
     Config(String),
+    Credential(String),
     Runtime(String),
 }
 
 impl std::fmt::Display for ModelQueryError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ModelQueryError::Config(msg) | ModelQueryError::Runtime(msg) => f.write_str(msg),
+            ModelQueryError::Config(msg)
+            | ModelQueryError::Credential(msg)
+            | ModelQueryError::Runtime(msg) => f.write_str(msg),
         }
     }
 }
@@ -378,7 +381,7 @@ fn load_catalog(ctx: &Context, paths: &Paths, record: &provider_state::ProviderR
                 configured_missing: false,
             };
         }
-        Err(ModelQueryError::Runtime(_)) => {}
+        Err(ModelQueryError::Credential(_)) | Err(ModelQueryError::Runtime(_)) => {}
     }
 
     if !provider.models.is_empty() {
@@ -397,7 +400,7 @@ fn load_catalog(ctx: &Context, paths: &Paths, record: &provider_state::ProviderR
                 models: ensure_configured_model(cache.models, provider),
                 healthy: false,
                 degraded: true,
-                include_unhealthy_by_default: false,
+                include_unhealthy_by_default: true,
                 configured_missing: false,
             };
         }
@@ -501,10 +504,11 @@ fn provider_secret(
     let provider = &record.declaration;
     let entries = agent_env::read(paths).map_err(|err| ModelQueryError::Config(err.to_string()))?;
     if let Some(value) = find_secret(&entries, &provider.key_env) {
+        require_provider_binding(&entries, provider)?;
         return Ok(value);
     }
     record.inline_secret.clone().ok_or_else(|| {
-        ModelQueryError::Config(format!(
+        ModelQueryError::Credential(format!(
             "missing provider credential {} in agent-env or legacy provider file",
             provider.key_env
         ))
@@ -540,6 +544,7 @@ fn provider_credential_fingerprint(
     let provider = &record.declaration;
     let entries = agent_env::read(paths).map_err(|err| ModelQueryError::Config(err.to_string()))?;
     if let Some(value) = find_secret(&entries, &provider.key_env) {
+        require_provider_binding(&entries, provider)?;
         return Ok(ProviderCredentialFingerprint {
             value,
             source: CredentialSourceFingerprint::AgentEnv(file_fingerprint(&paths.agent_env())?),
@@ -551,9 +556,24 @@ fn provider_credential_fingerprint(
             source: CredentialSourceFingerprint::InlineProvider(file_fingerprint(&record.path)?),
         });
     }
-    Err(ModelQueryError::Config(format!(
+    Err(ModelQueryError::Credential(format!(
         "missing provider credential {} in agent-env or legacy provider file",
         provider.key_env
+    )))
+}
+
+fn require_provider_binding(
+    entries: &[agent_env::AgentEnvEntry],
+    provider: &provider_state::ProviderDeclaration,
+) -> Result<(), ModelQueryError> {
+    if agent_env::provider_binding_matches(entries, &provider.name, &provider.key_env, &provider.url)
+        .map_err(|err| ModelQueryError::Config(err.to_string()))?
+    {
+        return Ok(());
+    }
+    Err(ModelQueryError::Credential(format!(
+        "provider credential {} is not bound to provider {}; run `ncz api set {} --providers={}` to approve live discovery",
+        provider.key_env, provider.name, provider.key_env, provider.name
     )))
 }
 
@@ -700,6 +720,27 @@ mod tests {
     fn write_secret(paths: &Paths) {
         fs::create_dir_all(&paths.etc_dir).unwrap();
         fs::write(paths.agent_env(), "EXAMPLE_API_KEY=secret\n").unwrap();
+        if let Some(url) = provider_url_for_test(paths) {
+            agent_env::set_provider_binding(
+                paths,
+                "example",
+                "EXAMPLE_API_KEY",
+                &url,
+            )
+            .unwrap();
+        }
+    }
+
+    fn provider_url_for_test(paths: &Paths) -> Option<String> {
+        if let Ok(Some(record)) = provider_state::read(paths, "example") {
+            return Some(record.declaration.url);
+        }
+        let body = fs::read_to_string(paths.providers_dir().join("example.json")).ok()?;
+        let value: serde_json::Value = serde_json::from_str(&body).ok()?;
+        value
+            .get("url")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
     }
 
     struct RotatingCredentialRunner {
@@ -815,7 +856,7 @@ mod tests {
     }
 
     #[test]
-    fn models_status_treats_missing_credential_as_down_even_with_static_models() {
+    fn models_status_uses_static_models_when_credential_is_missing() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = test_paths(tmp.path());
         write_provider(
@@ -826,9 +867,99 @@ mod tests {
 
         let report = status(&ctx(&runner), &paths, None).unwrap();
 
-        assert_eq!(report.models.len(), 1);
-        assert_eq!(report.models[0].id, "small");
-        assert_eq!(report.models[0].status, "down");
+        assert_eq!(report.models.len(), 2);
+        assert!(report
+            .models
+            .iter()
+            .any(|model| model.id == "small" && model.status == "degraded"));
+        assert!(report
+            .models
+            .iter()
+            .any(|model| model.id == "large" && model.status == "degraded"));
+    }
+
+    #[test]
+    fn models_list_uses_cache_when_credential_is_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        write_provider(
+            &paths,
+            r#"{"schema_version":1,"name":"example","url":"https://api.example.test","model":"small","key_env":"EXAMPLE_API_KEY","type":"openai-compat","health_path":"/health"}"#,
+        );
+        provider_state::write_model_cache(
+            &paths,
+            &provider_state::ProviderModelCache {
+                schema_version: 1,
+                provider: "example".to_string(),
+                fetched_at: "1".to_string(),
+                models: vec![
+                    provider_state::ModelDeclaration {
+                        id: "small".to_string(),
+                        context_length: Some(8192),
+                    },
+                    provider_state::ModelDeclaration {
+                        id: "large".to_string(),
+                        context_length: Some(200000),
+                    },
+                ],
+            },
+        )
+        .unwrap();
+        let runner = FakeRunner::new();
+
+        let report = list(&ctx(&runner), &paths, None, false).unwrap();
+
+        assert_eq!(report.models.len(), 2);
+        assert!(report
+            .models
+            .iter()
+            .any(|model| model.id == "large" && model.context_length == Some(200000)));
+        assert!(report.models.iter().all(|model| !model.healthy));
+    }
+
+    #[test]
+    fn models_list_uses_cache_when_live_catalog_is_down() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        write_provider(
+            &paths,
+            r#"{"schema_version":1,"name":"example","url":"https://api.example.test","model":"small","key_env":"EXAMPLE_API_KEY","type":"openai-compat","health_path":"/health"}"#,
+        );
+        write_secret(&paths);
+        provider_state::write_model_cache(
+            &paths,
+            &provider_state::ProviderModelCache {
+                schema_version: 1,
+                provider: "example".to_string(),
+                fetched_at: "1".to_string(),
+                models: vec![
+                    provider_state::ModelDeclaration {
+                        id: "small".to_string(),
+                        context_length: Some(8192),
+                    },
+                    provider_state::ModelDeclaration {
+                        id: "large".to_string(),
+                        context_length: Some(200000),
+                    },
+                ],
+            },
+        )
+        .unwrap();
+        let runner = FakeRunner::new();
+        runner.expect_prefix(
+            "curl",
+            &["-q", "-fsS", "--noproxy", "*", "--proxy"],
+            out(7, "", "down\n"),
+        );
+
+        let report = list(&ctx(&runner), &paths, None, false).unwrap();
+
+        assert_eq!(report.models.len(), 2);
+        assert!(report
+            .models
+            .iter()
+            .any(|model| model.id == "large" && model.context_length == Some(200000)));
+        assert!(report.models.iter().all(|model| !model.healthy));
     }
 
     #[test]
@@ -915,7 +1046,7 @@ mod tests {
         assert!(!paths.providers_dir().join("example.env").exists());
         assert_eq!(
             fs::read_to_string(paths.agent_env()).unwrap(),
-            "EXAMPLE_API_KEY=legacy\n"
+            "EXAMPLE_API_KEY=legacy\nNCZ_PROVIDER_BINDING_6578616D706C65=\"EXAMPLE_API_KEY http://127.0.0.1:8080/v1\"\n"
         );
     }
 

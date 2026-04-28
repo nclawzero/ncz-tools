@@ -6,6 +6,7 @@
 //! hand-edited files.
 
 use std::fs;
+use std::fmt::Write as _;
 use std::io;
 use std::path::Path;
 
@@ -13,6 +14,8 @@ use serde::Serialize;
 
 use crate::error::NczError;
 use crate::state::{self, Paths};
+
+const PROVIDER_BINDING_PREFIX: &str = "NCZ_PROVIDER_BINDING_";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentEnvEntry {
@@ -41,6 +44,7 @@ pub fn redacted_list(
 ) -> Result<Vec<RedactedAgentEnvEntry>, NczError> {
     Ok(read(paths)?
         .into_iter()
+        .filter(|entry| !entry.key.starts_with(PROVIDER_BINDING_PREFIX))
         .map(|entry| RedactedAgentEnvEntry {
             key: entry.key,
             set: true,
@@ -78,6 +82,59 @@ pub fn remove(paths: &Paths, key: &str) -> Result<bool, NczError> {
     remove_path(&paths.agent_env(), key)
 }
 
+pub fn set_provider_binding(
+    paths: &Paths,
+    provider: &str,
+    key_env: &str,
+    url: &str,
+) -> Result<bool, NczError> {
+    validate_key(key_env)?;
+    validate_value(url)?;
+    if url.contains(' ') {
+        return Err(NczError::Usage(format!(
+            "provider URL for {provider} cannot contain spaces"
+        )));
+    }
+    let binding_key = provider_binding_key(provider)?;
+    let binding_value = format!("{key_env} {url}");
+    set_path(&paths.agent_env(), &binding_key, &binding_value)
+}
+
+pub fn provider_binding_matches(
+    entries: &[AgentEnvEntry],
+    provider: &str,
+    key_env: &str,
+    url: &str,
+) -> Result<bool, NczError> {
+    let binding_key = provider_binding_key(provider)?;
+    Ok(entries.iter().any(|entry| {
+        entry.key == binding_key
+            && parse_provider_binding_value(&entry.value)
+                .is_some_and(|(bound_key_env, bound_url)| bound_key_env == key_env && bound_url == url)
+    }))
+}
+
+pub fn remove_provider_bindings_for_key(
+    paths: &Paths,
+    key_env: &str,
+) -> Result<Vec<String>, NczError> {
+    validate_key(key_env)?;
+    let entries = read(paths)?;
+    let mut removed = Vec::new();
+    for entry in entries {
+        if !entry.key.starts_with(PROVIDER_BINDING_PREFIX) {
+            continue;
+        }
+        let Some((bound_key_env, _)) = parse_provider_binding_value(&entry.value) else {
+            continue;
+        };
+        if bound_key_env == key_env && remove_path(&paths.agent_env(), &entry.key)? {
+            removed.push(provider_from_binding_key(&entry.key).unwrap_or(entry.key));
+        }
+    }
+    Ok(removed)
+}
+
 pub fn remove_override(paths: &Paths, agent: &str, key: &str) -> Result<bool, NczError> {
     remove_path(&paths.agent_env_override(agent), key)
 }
@@ -96,6 +153,50 @@ pub fn validate_key(key: &str) -> Result<(), NczError> {
         return Err(NczError::Usage(format!("invalid environment key: {key}")));
     }
     Ok(())
+}
+
+fn provider_binding_key(provider: &str) -> Result<String, NczError> {
+    validate_provider_binding_name(provider)?;
+    let mut key = String::from(PROVIDER_BINDING_PREFIX);
+    for byte in provider.as_bytes() {
+        let _ = write!(&mut key, "{byte:02X}");
+    }
+    Ok(key)
+}
+
+fn provider_from_binding_key(key: &str) -> Option<String> {
+    let hex = key.strip_prefix(PROVIDER_BINDING_PREFIX)?;
+    if hex.is_empty() || hex.len() % 2 != 0 {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    for idx in (0..hex.len()).step_by(2) {
+        let byte = u8::from_str_radix(&hex[idx..idx + 2], 16).ok()?;
+        bytes.push(byte);
+    }
+    String::from_utf8(bytes).ok()
+}
+
+fn validate_provider_binding_name(provider: &str) -> Result<(), NczError> {
+    if provider.is_empty()
+        || provider.starts_with('.')
+        || provider.ends_with(".models")
+        || provider.contains("..")
+        || !provider
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+    {
+        return Err(NczError::Usage(format!("invalid provider name: {provider}")));
+    }
+    Ok(())
+}
+
+fn parse_provider_binding_value(value: &str) -> Option<(&str, &str)> {
+    let (key_env, url) = value.split_once(' ')?;
+    if key_env.is_empty() || url.is_empty() || url.contains(' ') {
+        return None;
+    }
+    Some((key_env, url))
 }
 
 fn read_path(path: &Path) -> Result<Vec<AgentEnvEntry>, NczError> {

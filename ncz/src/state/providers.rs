@@ -56,6 +56,13 @@ pub struct ProviderModelCache {
     pub models: Vec<ModelDeclaration>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InlineCredentialReplacement {
+    pub file: String,
+    pub key_env: String,
+    pub secret: String,
+}
+
 #[derive(Debug)]
 struct ParsedProvider {
     declaration: ProviderDeclaration,
@@ -181,8 +188,31 @@ fn migrate_legacy_inner(paths: &Paths, migrations: &[LegacyMigration]) -> Result
     let mut canonical_declarations: BTreeMap<String, ProviderDeclaration> = BTreeMap::new();
     for migration in migrations {
         if let Some(secret) = &migration.inline_secret {
-            if !agent_env_has_non_empty(paths, &migration.declaration.key_env)? {
-                agent_env::set(paths, &migration.declaration.key_env, secret)?;
+            match agent_env_value(paths, &migration.declaration.key_env)? {
+                Some(existing) if existing == *secret => {
+                    agent_env::set_provider_binding(
+                        paths,
+                        &migration.declaration.name,
+                        &migration.declaration.key_env,
+                        &migration.declaration.url,
+                    )?;
+                }
+                Some(_) => {
+                    return Err(NczError::Precondition(format!(
+                        "legacy provider {} inline credential conflicts with existing {}; leaving legacy provider file in place",
+                        migration.path.display(),
+                        migration.declaration.key_env
+                    )));
+                }
+                None => {
+                    agent_env::set(paths, &migration.declaration.key_env, secret)?;
+                    agent_env::set_provider_binding(
+                        paths,
+                        &migration.declaration.name,
+                        &migration.declaration.key_env,
+                        &migration.declaration.url,
+                    )?;
+                }
             }
         }
 
@@ -227,10 +257,11 @@ fn migrate_legacy_inner(paths: &Paths, migrations: &[LegacyMigration]) -> Result
     Ok(())
 }
 
-fn agent_env_has_non_empty(paths: &Paths, key: &str) -> Result<bool, NczError> {
+fn agent_env_value(paths: &Paths, key: &str) -> Result<Option<String>, NczError> {
     Ok(agent_env::read(paths)?
         .into_iter()
-        .any(|entry| entry.key == key && !entry.value.is_empty()))
+        .find(|entry| entry.key == key && !entry.value.is_empty())
+        .map(|entry| entry.value))
 }
 
 fn preflight_provider_files(files: &[PathBuf]) -> Result<(), NczError> {
@@ -474,15 +505,34 @@ pub fn secret_bearing_replacement_files(
     paths: &Paths,
     name: &str,
 ) -> Result<Vec<String>, NczError> {
-    let mut files = Vec::new();
+    Ok(inline_credential_replacements(paths, name)?
+        .into_iter()
+        .map(|replacement| replacement.file)
+        .collect())
+}
+
+pub fn inline_credential_replacements(
+    paths: &Paths,
+    name: &str,
+) -> Result<Vec<InlineCredentialReplacement>, NczError> {
+    let mut replacements = Vec::new();
     for path in matching_provider_files(paths, name)? {
         let body = fs::read_to_string(&path)?;
         let ext = path.extension().and_then(OsStr::to_str).unwrap_or("");
-        if legacy_file_has_inline_secret(&body, ext)? {
-            files.push(path.display().to_string());
+        let fallback_name = path
+            .file_stem()
+            .and_then(OsStr::to_str)
+            .unwrap_or(name)
+            .to_string();
+        if let Some((key_env, secret)) = inline_credential_for_path(&body, ext, &fallback_name)? {
+            replacements.push(InlineCredentialReplacement {
+                file: path.display().to_string(),
+                key_env,
+                secret,
+            });
         }
     }
-    Ok(files)
+    Ok(replacements)
 }
 
 pub fn credential_references(paths: &Paths, key: &str) -> Result<Vec<String>, NczError> {
@@ -934,14 +984,37 @@ fn parse_env(body: &str, fallback_name: String) -> ParsedProvider {
     }
 }
 
-fn legacy_file_has_inline_secret(body: &str, ext: &str) -> Result<bool, NczError> {
+fn inline_credential_for_path(
+    body: &str,
+    ext: &str,
+    fallback_name: &str,
+) -> Result<Option<(String, String)>, NczError> {
     if ext == "json" {
         let value: Value = serde_json::from_str(body)?;
-        return Ok(json_inline_secret_field(&value).is_some());
+        if value.get("schema_version").is_some() {
+            return Ok(canonical_json_inline_credential(&value, fallback_name));
+        }
+        let parsed = parse_legacy_json(value, fallback_name.to_string());
+        return Ok(parsed
+            .inline_secret
+            .map(|secret| (parsed.declaration.key_env, secret)));
     }
-    Ok(env_pairs(body)
-        .iter()
-        .any(|(key, value)| secret_field_name(key) && !value.is_empty()))
+    let parsed = parse_env(body, fallback_name.to_string());
+    Ok(parsed
+        .inline_secret
+        .map(|secret| (parsed.declaration.key_env, secret)))
+}
+
+fn canonical_json_inline_credential(value: &Value, fallback_name: &str) -> Option<(String, String)> {
+    let field = json_inline_secret_field(value)?;
+    let secret = value.get(field)?.as_str()?.to_string();
+    let key_env = value
+        .get("key_env")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| legacy_secret_json_key(fallback_name, field));
+    Some((key_env, secret))
 }
 
 fn json_inline_secret_field(value: &Value) -> Option<&str> {
@@ -957,6 +1030,9 @@ fn json_inline_secret_field(value: &Value) -> Option<&str> {
 
 fn secret_field_name(name: &str) -> bool {
     let name = name.to_ascii_lowercase();
+    if key_env_metadata_field(&name) {
+        return false;
+    }
     name == "key"
         || name.contains("token")
         || name.contains("secret")
@@ -967,6 +1043,21 @@ fn secret_field_name(name: &str) -> bool {
         || name.contains("apikey")
         || name.ends_with("_key")
         || name.ends_with("-key")
+}
+
+fn key_env_metadata_field(name: &str) -> bool {
+    matches!(
+        name,
+        "key_env"
+            | "keyenv"
+            | "api_key_env"
+            | "api-key-env"
+            | "apikey_env"
+            | "token_env"
+            | "auth_env"
+            | "authorization_env"
+    ) || name.ends_with("_env")
+        || name.ends_with("-env")
 }
 
 fn env_pairs(body: &str) -> Vec<(String, String)> {
@@ -1411,6 +1502,44 @@ mod tests {
     }
 
     #[test]
+    fn read_all_treats_legacy_env_key_env_as_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        fs::create_dir_all(paths.providers_dir()).unwrap();
+        fs::write(
+            paths.providers_dir().join("local.env"),
+            "PROVIDER_NAME=local\nPROVIDER_URL=http://127.0.0.1:8080\nMODEL=mini\nAPI_KEY_ENV=LOCAL_API_KEY\nTOKEN_ENV=IGNORED_TOKEN_KEY\n",
+        )
+        .unwrap();
+
+        let records = read_all(&paths).unwrap();
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].declaration.key_env, "LOCAL_API_KEY");
+        assert!(records[0].inline_secret.is_none());
+        assert!(!paths.agent_env().exists());
+    }
+
+    #[test]
+    fn read_all_treats_legacy_json_key_env_as_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        fs::create_dir_all(paths.providers_dir()).unwrap();
+        fs::write(
+            paths.providers_dir().join("local.json"),
+            r#"{"provider":"local","base_url":"http://127.0.0.1:8080","default_model":"mini","api_key_env":"LOCAL_API_KEY","token_env":"IGNORED_TOKEN_KEY"}"#,
+        )
+        .unwrap();
+
+        let records = read_all(&paths).unwrap();
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].declaration.key_env, "LOCAL_API_KEY");
+        assert!(records[0].inline_secret.is_none());
+        assert!(!paths.agent_env().exists());
+    }
+
+    #[test]
     fn read_all_does_not_migrate_legacy_secret_over_existing_agent_env() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = test_paths(tmp.path());
@@ -1431,6 +1560,54 @@ mod tests {
         assert_eq!(
             fs::read_to_string(paths.agent_env()).unwrap(),
             "LOCAL_API_KEY=different\n"
+        );
+    }
+
+    #[test]
+    fn migrate_legacy_rejects_inline_secret_mismatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        fs::create_dir_all(paths.providers_dir()).unwrap();
+        fs::create_dir_all(&paths.etc_dir).unwrap();
+        fs::write(paths.agent_env(), "LOCAL_API_KEY=different\n").unwrap();
+        fs::write(
+            paths.providers_dir().join("local.env"),
+            "PROVIDER_NAME=local\nPROVIDER_URL=http://127.0.0.1:8080\nMODEL=mini\nAPI_KEY=secret\n",
+        )
+        .unwrap();
+
+        let err = migrate_legacy(&paths).unwrap_err();
+
+        assert!(matches!(err, NczError::Precondition(message) if message.contains("conflicts with existing LOCAL_API_KEY")));
+        assert!(paths.providers_dir().join("local.env").exists());
+        assert!(!paths.providers_dir().join("local.json").exists());
+        assert_eq!(
+            fs::read_to_string(paths.agent_env()).unwrap(),
+            "LOCAL_API_KEY=different\n"
+        );
+    }
+
+    #[test]
+    fn migrate_legacy_binds_matching_existing_secret() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        fs::create_dir_all(paths.providers_dir()).unwrap();
+        fs::create_dir_all(&paths.etc_dir).unwrap();
+        fs::write(paths.agent_env(), "LOCAL_API_KEY=secret\n").unwrap();
+        fs::write(
+            paths.providers_dir().join("local.env"),
+            "PROVIDER_NAME=local\nPROVIDER_URL=http://127.0.0.1:8080\nMODEL=mini\nAPI_KEY=secret\n",
+        )
+        .unwrap();
+
+        let migrated = migrate_legacy(&paths).unwrap();
+
+        assert_eq!(migrated, vec![paths.providers_dir().join("local.json")]);
+        assert!(paths.providers_dir().join("local.json").exists());
+        assert!(!paths.providers_dir().join("local.env").exists());
+        assert_eq!(
+            fs::read_to_string(paths.agent_env()).unwrap(),
+            "LOCAL_API_KEY=secret\nNCZ_PROVIDER_BINDING_6C6F63616C=\"LOCAL_API_KEY http://127.0.0.1:8080\"\n"
         );
     }
 

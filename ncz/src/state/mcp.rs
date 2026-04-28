@@ -213,11 +213,25 @@ fn is_secret_command_name(name: &str) -> bool {
         .to_ascii_lowercase();
     matches!(
         name.as_str(),
-        "token" | "key" | "secret" | "password" | "authorization" | "bearer"
+        "auth"
+            | "api"
+            | "access"
+            | "token"
+            | "key"
+            | "secret"
+            | "password"
+            | "credential"
+            | "credentials"
+            | "authorization"
+            | "bearer"
     ) || name.contains("token")
+        || name.contains("auth")
+        || name.contains("access")
+        || name.contains("credential")
         || name.contains("secret")
         || name.contains("password")
         || name.contains("authorization")
+        || name == "apikey"
         || name.contains("api_key")
         || name.contains("api-key")
         || name.ends_with("_key")
@@ -282,7 +296,12 @@ fn write_declaration(path: &PathBuf, declaration: &McpDeclaration) -> Result<(),
     let body = serde_json::to_vec_pretty(declaration)?;
     let mut body_with_newline = body;
     body_with_newline.push(b'\n');
-    state::atomic_write(path, &body_with_newline, 0o644)
+    let mode = if declaration.transport == "stdio" {
+        0o600
+    } else {
+        0o644
+    };
+    state::atomic_write(path, &body_with_newline, mode)
 }
 
 fn matching_files(paths: &Paths, name: &str) -> Result<Vec<PathBuf>, NczError> {
@@ -372,7 +391,7 @@ mod tests {
                 .permissions()
                 .mode()
                 & 0o777,
-            0o644
+            0o600
         );
     }
 
@@ -459,6 +478,10 @@ mod tests {
             "env TOKEN=secret mcp-server",
             "env MCP_TOKEN=secret mcp-server",
             "OPENAI_API_KEY=secret mcp-server",
+            "AUTH=secret mcp-server",
+            "mcp-server --auth sk-live",
+            "mcp-server --access sk-live",
+            "mcp-server --api sk-live",
             "mcp-server \"--token=secret\"",
             "mcp-server -H Authorization:Bearer-secret",
             "mcp-server -H 'X-Key: sk-live'",
