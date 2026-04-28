@@ -151,6 +151,21 @@ impl ZeroclawClient {
         self.stream_sink = sink;
     }
 
+    fn session_url(&self, session_id: &str) -> Result<Url> {
+        Self::session_url_for_base(&self.base_url, session_id)
+    }
+
+    fn session_url_for_base(base_url: &str, session_id: &str) -> Result<Url> {
+        let mut url = Url::parse(base_url)
+            .map_err(|e| anyhow!("Failed to parse zeroclaw base URL: {}", e))?;
+        url.set_query(None);
+        url.set_fragment(None);
+        url.path_segments_mut()
+            .map_err(|_| anyhow!("zeroclaw base URL cannot be used as a base URL"))?
+            .extend(["api", "sessions", session_id]);
+        Ok(url)
+    }
+
     /// Fetch `[providers.models.*]` from the daemon's `/api/config`
     /// and replace this client's cached model list. Called once at
     /// boot from `tui::run`. Failure is non-fatal — the cached list
@@ -767,10 +782,10 @@ impl ZeroclawClient {
 
     /// Load specific session
     pub async fn load_session(&self, session_id: &str) -> Result<Session> {
-        let url = format!("{}/api/sessions/{}", self.base_url, session_id);
+        let url = self.session_url(session_id)?;
         let res = self
             .http_client
-            .get(&url)
+            .get(url)
             .bearer_auth(&self.token)
             .send()
             .await
@@ -788,10 +803,10 @@ impl ZeroclawClient {
 
     /// Delete a session
     pub async fn delete_session(&self, session_id: &str) -> Result<()> {
-        let url = format!("{}/api/sessions/{}", self.base_url, session_id);
+        let url = self.session_url(session_id)?;
         let res = self
             .http_client
-            .delete(&url)
+            .delete(url)
             .bearer_auth(&self.token)
             .send()
             .await
@@ -1131,6 +1146,28 @@ fallback = "gemini"
         assert_eq!(parsed.scheme(), "wss");
         assert_eq!(parsed.path(), "/ws/chat");
         assert!(parsed.query_pairs().all(|(key, _)| key.as_ref() != "token"));
+    }
+
+    #[test]
+    fn session_url_encodes_session_id_as_one_path_segment() {
+        assert_eq!(
+            ZeroclawClient::session_url_for_base("https://example.test", "../owned")
+                .unwrap()
+                .as_str(),
+            "https://example.test/api/sessions/..%2Fowned"
+        );
+        assert_eq!(
+            ZeroclawClient::session_url_for_base("https://example.test", "a/b")
+                .unwrap()
+                .as_str(),
+            "https://example.test/api/sessions/a%2Fb"
+        );
+        assert_eq!(
+            ZeroclawClient::session_url_for_base("https://example.test", "x?y")
+                .unwrap()
+                .as_str(),
+            "https://example.test/api/sessions/x%3Fy"
+        );
     }
 
     #[test]

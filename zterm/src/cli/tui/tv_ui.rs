@@ -579,6 +579,15 @@ pub async fn run(
                         let _ = worker_sink.send(TurnChunk::Finished(Ok(String::new())));
                         continue;
                     }
+                    if let Some(target) =
+                        active_worker_session_delete_target(&cmdline, &worker_app, &worker_sessions)
+                            .await
+                    {
+                        let _ = worker_sink.send(TurnChunk::Finished(Err(format!(
+                            "cannot delete active session `{target}`; switch to another session before deleting it"
+                        ))));
+                        continue;
+                    }
                     let preflight = command_session_preflight(&cmdline);
                     let workspace_before_dispatch =
                         if preflight == CommandSessionPreflight::AfterWorkspaceSwitch {
@@ -917,6 +926,28 @@ async fn remembered_session_id_for_active_workspace(
     }
 }
 
+async fn active_worker_session_delete_target(
+    cmdline: &str,
+    app: &Arc<Mutex<App>>,
+    sessions: &HashMap<String, WorkerSessionBinding>,
+) -> Option<String> {
+    let workspace_name = current_workspace_name(app).await.ok()?;
+    active_worker_session_delete_target_for_workspace(cmdline, &workspace_name, sessions)
+}
+
+fn active_worker_session_delete_target_for_workspace(
+    cmdline: &str,
+    workspace_name: &str,
+    sessions: &HashMap<String, WorkerSessionBinding>,
+) -> Option<String> {
+    let target = session_delete_target(cmdline)?;
+    let binding = sessions.get(workspace_name)?;
+    if binding.id == target || binding.name == target {
+        return Some(target.to_string());
+    }
+    None
+}
+
 async fn ensure_session_for_active_workspace(
     app: &Arc<Mutex<App>>,
     sessions: &mut HashMap<String, WorkerSessionBinding>,
@@ -1174,6 +1205,17 @@ fn stdout_only_slash_command_block_message(cmdline: &str) -> Option<String> {
     Some(format!(
         "Command `{command}` is not available in the full-screen TUI yet because it still writes only to stdout. No action was taken. Use `--legacy-repl` for this command, or use `/help` to see TUI-ready commands."
     ))
+}
+
+fn session_delete_target(cmdline: &str) -> Option<&str> {
+    let mut parts = cmdline.split_whitespace();
+    if parts.next()? != "/session" {
+        return None;
+    }
+    if parts.next()? != "delete" {
+        return None;
+    }
+    parts.next()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3144,6 +3186,69 @@ mod tests {
         assert_eq!(session_action("/session list"), None);
         assert_eq!(session_action("/session info"), None);
         assert_eq!(session_action("/workspace switch prod"), None);
+    }
+
+    #[test]
+    fn session_delete_target_parses_only_delete_commands() {
+        assert_eq!(
+            session_delete_target("/session delete sess-123"),
+            Some("sess-123")
+        );
+        assert_eq!(
+            session_delete_target("/session delete Research"),
+            Some("Research")
+        );
+        assert_eq!(session_delete_target("/session switch Research"), None);
+        assert_eq!(session_delete_target("/workspace switch prod"), None);
+        assert_eq!(session_delete_target("/session delete"), None);
+    }
+
+    #[test]
+    fn active_worker_session_delete_target_matches_active_binding_id_or_name() {
+        let mut bindings = HashMap::new();
+        remember_worker_session(
+            &mut bindings,
+            "default".to_string(),
+            &Session {
+                id: "sess-123".to_string(),
+                name: "Research".to_string(),
+                model: "m".to_string(),
+                provider: "p".to_string(),
+            },
+        );
+
+        assert_eq!(
+            active_worker_session_delete_target_for_workspace(
+                "/session delete sess-123",
+                "default",
+                &bindings
+            ),
+            Some("sess-123".to_string())
+        );
+        assert_eq!(
+            active_worker_session_delete_target_for_workspace(
+                "/session delete Research",
+                "default",
+                &bindings
+            ),
+            Some("Research".to_string())
+        );
+        assert_eq!(
+            active_worker_session_delete_target_for_workspace(
+                "/session delete other",
+                "default",
+                &bindings
+            ),
+            None
+        );
+        assert_eq!(
+            active_worker_session_delete_target_for_workspace(
+                "/session delete sess-123",
+                "other-workspace",
+                &bindings
+            ),
+            None
+        );
     }
 
     #[test]
