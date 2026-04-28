@@ -240,10 +240,12 @@ struct StatusState {
     /// Token usage from the latest turn that reported it. Rendered
     /// as the `ctx used/total (%)` segment in the status line.
     usage: Option<TurnUsage>,
+    /// Whether terminal bell should ring on error frames.
+    beep_on_error: bool,
 }
 
 impl StatusState {
-    fn new(workspace: String, model: String, current_theme: String) -> Self {
+    fn new(workspace: String, model: String, current_theme: String, beep_on_error: bool) -> Self {
         Self {
             workspace,
             model,
@@ -254,6 +256,7 @@ impl StatusState {
             toast: None,
             current_theme,
             usage: None,
+            beep_on_error,
         }
     }
 
@@ -384,6 +387,14 @@ fn token_budget_bar(pct: u8, width: usize) -> String {
         "#".repeat(filled),
         "-".repeat(width.saturating_sub(filled))
     )
+}
+
+fn parse_beep_toggle(arg: &str) -> Option<bool> {
+    match arg.trim().to_ascii_lowercase().as_str() {
+        "beep on" | "beep true" | "beep 1" => Some(true),
+        "beep off" | "beep false" | "beep 0" => Some(false),
+        _ => None,
+    }
 }
 
 /// Entry point from `cli::tui::run` when `--legacy-repl` is not set.
@@ -643,6 +654,17 @@ fn run_blocking(
     tapp.set_palette(Some(persisted_palette));
     info!("tv_ui: applied persisted theme '{}'", persisted_name);
 
+    let welcome_back = match delighters::record_launch() {
+        Ok((_, quote)) => quote,
+        Err(e) => {
+            warn!("welcome-back state update failed: {e}");
+            None
+        }
+    };
+    let beep_on_error = delighters::default_state_path()
+        .map(|path| delighters::load_state(&path).beep_on_error)
+        .unwrap_or(false);
+
     // Live status state. The status line is rebuilt on every
     // redraw tick by `refresh_status_line` rather than built once
     // here, so the elapsed counter and workspace label stay
@@ -651,6 +673,7 @@ fn run_blocking(
         workspace_name.clone(),
         model.clone(),
         persisted_name.clone(),
+        beep_on_error,
     );
     let initial_status_line = build_status_line(w, h, &status_state);
     tapp.set_status_line(initial_status_line);
@@ -659,13 +682,6 @@ fn run_blocking(
     // event loop is single-threaded; the custom ChatPane view reads
     // the buffer during its draw pass, and the event loop writes to
     // it on Enter.
-    let welcome_back = match delighters::record_launch() {
-        Ok((_, quote)) => quote,
-        Err(e) => {
-            warn!("welcome-back state update failed: {e}");
-            None
-        }
-    };
     let welcome_lines = initial_chat_lines(&workspace_name, &model, &provider, welcome_back);
     let mut typewriter_state = None;
     let initial_lines = if let Some(text) = connect_splash {
@@ -969,7 +985,11 @@ fn run_event_loop(
         // *before* redrawing, so new tokens are visible this frame.
         // Also lets the status-state timer observe `Finished` frames
         // inline with the rest of the UI update.
-        drain_stream_events(event_rx, &chat_lines, status_state, typewriter_state);
+        let error_frame =
+            drain_stream_events(event_rx, &chat_lines, status_state, typewriter_state);
+        if error_frame && status_state.beep_on_error {
+            let _ = app.terminal.beep();
+        }
         if let Some(writer) = typewriter_state.as_mut() {
             writer.tick(&chat_lines);
         }
@@ -1131,6 +1151,7 @@ fn run_event_loop(
                         &chat_lines,
                         app,
                         &mut status_state.current_theme,
+                        &mut status_state.beep_on_error,
                     );
                     status_state.set_toast(format!("Command: {submitted}"));
                     // `continue` skips desktop.handle_event +
@@ -1309,7 +1330,8 @@ fn drain_stream_events(
     chat_lines: &Rc<RefCell<Vec<String>>>,
     status_state: &mut StatusState,
     typewriter_state: &mut Option<TypewriterState>,
-) {
+) -> bool {
+    let mut saw_error = false;
     loop {
         match event_rx.try_recv() {
             Ok(chunk) => {
@@ -1317,7 +1339,10 @@ fn drain_stream_events(
                     TurnChunk::Usage(usage) => {
                         status_state.usage = Some(*usage);
                     }
-                    TurnChunk::Finished(_) => {
+                    TurnChunk::Finished(result) => {
+                        if result.is_err() {
+                            saw_error = true;
+                        }
                         status_state.end_turn();
                     }
                     TurnChunk::Typewriter(text) => {
@@ -1334,6 +1359,7 @@ fn drain_stream_events(
             Err(mpsc::error::TryRecvError::Disconnected) => break,
         }
     }
+    saw_error
 }
 
 /// Apply a single streamed chunk to the chat buffer.
@@ -1481,7 +1507,13 @@ fn handle_command(
         cmd if (CMD_THEME_BASE..CMD_THEME_BASE + themes::PRESETS.len() as u16).contains(&cmd) => {
             let idx = (cmd - CMD_THEME_BASE) as usize;
             if let Some(theme) = themes::PRESETS.get(idx) {
-                handle_theme_command(theme.name, chat_lines, app, &mut status_state.current_theme);
+                handle_theme_command(
+                    theme.name,
+                    chat_lines,
+                    app,
+                    &mut status_state.current_theme,
+                    &mut status_state.beep_on_error,
+                );
                 status_state.set_toast(format!("Command: /theme {}", theme.name));
             }
         }
@@ -1584,8 +1616,26 @@ fn handle_theme_command(
     chat_lines: &Rc<RefCell<Vec<String>>>,
     app: &mut Application,
     current_theme: &mut String,
+    beep_on_error: &mut bool,
 ) {
     let arg = rest.trim();
+    if let Some(enabled) = parse_beep_toggle(arg) {
+        let mut lines = chat_lines.borrow_mut();
+        match delighters::set_beep_on_error(enabled) {
+            Ok(_) => {
+                *beep_on_error = enabled;
+                lines.push(format!(
+                    "🔔 theme beep: {}",
+                    if enabled { "on" } else { "off" }
+                ));
+            }
+            Err(e) => {
+                lines.push(format!("[theme] beep setting not persisted: {e}"));
+            }
+        }
+        lines.push(String::new());
+        return;
+    }
     match arg {
         "" | "list" => {
             let mut lines = chat_lines.borrow_mut();
@@ -1594,8 +1644,8 @@ fn handle_theme_command(
                 lines.push(format!("  {:<8} {}", theme.name, theme.display_name));
             }
             lines.push(
-                "Apply via `/theme <name>`; edit with `/theme edit`; presets also live in \
-                 the slash popup."
+                "Apply via `/theme <name>`; edit with `/theme edit`; toggle bell with \
+                 `/theme beep on|off`."
                     .to_string(),
             );
             lines.push(String::new());
@@ -2105,5 +2155,12 @@ mod tests {
             typewriter_chars_due(Duration::from_millis(95), TYPEWRITER_INTERVAL),
             3
         );
+    }
+
+    #[test]
+    fn parses_theme_beep_toggle() {
+        assert_eq!(parse_beep_toggle("beep on"), Some(true));
+        assert_eq!(parse_beep_toggle("BEEP OFF"), Some(false));
+        assert_eq!(parse_beep_toggle("amber"), None);
     }
 }

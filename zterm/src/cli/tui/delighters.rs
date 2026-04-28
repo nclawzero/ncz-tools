@@ -128,6 +128,22 @@ pub fn record_launch_at(path: &Path) -> std::io::Result<(u64, Option<String>)> {
     Ok((launches, welcome_quote_for_launch(launches)))
 }
 
+pub fn set_beep_on_error(enabled: bool) -> std::io::Result<ZtermState> {
+    let Some(path) = default_state_path() else {
+        return Err(std::io::Error::other(
+            "no home directory; cannot persist zterm state",
+        ));
+    };
+    set_beep_on_error_at(&path, enabled)
+}
+
+pub fn set_beep_on_error_at(path: &Path, enabled: bool) -> std::io::Result<ZtermState> {
+    let mut state = load_state(path);
+    state.beep_on_error = enabled;
+    save_state(path, &state)?;
+    Ok(state)
+}
+
 pub fn is_welcome_milestone(launches: u64) -> bool {
     launches == 5 || launches == 10 || (launches >= 25 && launches % 25 == 0)
 }
@@ -184,6 +200,19 @@ mod tests {
         let state = load_state(&path);
         assert_eq!(state.launches, 2);
         assert!(!state.beep_on_error);
+    }
+
+    #[test]
+    fn beep_toggle_persists_without_resetting_launches() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("state.toml");
+
+        record_launch_at(&path).unwrap();
+        let state = set_beep_on_error_at(&path, true).unwrap();
+
+        assert_eq!(state.launches, 1);
+        assert!(state.beep_on_error);
+        assert!(load_state(&path).beep_on_error);
     }
 
     #[test]
