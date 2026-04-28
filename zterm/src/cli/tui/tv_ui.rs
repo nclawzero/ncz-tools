@@ -22,6 +22,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use chrono::Utc;
 use tokio::sync::{mpsc, Mutex};
 use tracing::{info, warn};
 
@@ -54,6 +55,7 @@ use turbo_vision::views::window::WindowBuilder;
 use crate::cli::agent::TurnChunk;
 use crate::cli::client::Session;
 use crate::cli::commands::CommandHandler;
+use crate::cli::storage;
 use crate::cli::tui::themes;
 use crate::cli::workspace::App;
 
@@ -66,19 +68,16 @@ enum WorkerRequest {
     /// Streaming chunks flow back through the sink installed on the
     /// client at startup.
     Turn(String),
-    /// Dispatch a slash command (e.g. `/help`, `/info`) through the
-    /// shared `CommandHandler`. Any `Ok(Some(text))` return is
-    /// forwarded to the UI as a single `TurnChunk::Token` +
-    /// `Finished(Ok)`; `Ok(None)` maps to a Finished(Ok("")) since
-    /// the handler printed to stdout (TUI-mode output for those
-    /// handlers is not yet hooked up — E-3 covers `/help` and
-    /// `/info` only).
+    /// Dispatch a slash command (e.g. `/help`, `/models list`)
+    /// through the shared `CommandHandler`. Structured
+    /// `Ok(Some(text))` output is forwarded to the chat pane; any
+    /// legacy stdout-only command still gets a small advisory frame.
     Command(String),
 }
 
-// Custom commands. CMD_HELP and CMD_ABOUT are wired to the real
-// CommandHandler in E-3; the remainder are still stubs that become
-// native modal pickers in E-5.
+// Custom commands. Menu and slash-popup entries route through the
+// shared `CommandHandler` where a backend action exists; purely
+// visual TUI concerns (theme presets/editing) stay local.
 const CMD_HELP: u16 = 1001;
 const CMD_ABOUT: u16 = 1002;
 const CMD_WORKSPACE_LIST: u16 = 1003;
@@ -87,6 +86,12 @@ const CMD_MODELS_LIST: u16 = 1005;
 const CMD_MEMORY_SEARCH: u16 = 1006;
 const CMD_SESSION_NEW: u16 = 1007;
 const CMD_SESSION_OPEN: u16 = 1008;
+const CMD_PROVIDERS_LIST: u16 = 1009;
+const CMD_MCP_STATUS: u16 = 1010;
+const CMD_WORKSPACE_INFO: u16 = 1011;
+const CMD_MODELS_STATUS: u16 = 1012;
+const CMD_MEMORY_STATS: u16 = 1013;
+const CMD_SESSION_LIST: u16 = 1014;
 /// Slash-popup theme entries occupy `[CMD_THEME_BASE, +PRESETS.len())`.
 /// The selected index is mapped back to `themes::PRESETS[i]` on
 /// return so palette application lives in one place
@@ -354,14 +359,10 @@ pub async fn run(
                 }
                 WorkerRequest::Command(cmdline) => {
                     // Route slash commands through the shared
-                    // `CommandHandler`. In E-3 only `/help` and
-                    // `/info` are refactored to return their
-                    // output as a `String`; the others still
-                    // println! to stdout (invisible under the TUI
-                    // alt-screen). For those we emit an advisory
-                    // Finished with a placeholder note — E-5
-                    // replaces those handlers with native modal
-                    // pickers.
+                    // `CommandHandler`. v0.3.1 refactors the TV
+                    // menu/popup command paths to return structured
+                    // strings; legacy stdout-only commands still get
+                    // an advisory rather than silently disappearing.
                     match worker_cmd_handler
                         .handle(&cmdline, &worker_session_id)
                         .await
@@ -595,6 +596,7 @@ fn build_menu_bar(w: i16) -> MenuBar {
         Menu::from_items(vec![
             MenuItem::with_shortcut("~N~ew session", CMD_SESSION_NEW, 0, "", 0),
             MenuItem::with_shortcut("~O~pen session", CMD_SESSION_OPEN, 0, "", 0),
+            MenuItem::with_shortcut("~L~ist sessions", CMD_SESSION_LIST, 0, "", 0),
             MenuItem::separator(),
             MenuItem::with_shortcut("E~x~it", CM_QUIT, 0, "Alt+X", 0),
         ]),
@@ -609,30 +611,27 @@ fn build_menu_bar(w: i16) -> MenuBar {
         "~W~orkspace",
         Menu::from_items(vec![
             MenuItem::with_shortcut("~L~ist", CMD_WORKSPACE_LIST, 0, "", 0),
+            MenuItem::with_shortcut("~I~nfo", CMD_WORKSPACE_INFO, 0, "", 0),
             MenuItem::with_shortcut("~S~witch…", CMD_WORKSPACE_SWITCH, 0, "", 0),
         ]),
     );
 
     let model_menu = SubMenu::new(
         "~M~odel",
-        Menu::from_items(vec![MenuItem::with_shortcut(
-            "~L~ist",
-            CMD_MODELS_LIST,
-            0,
-            "",
-            0,
-        )]),
+        Menu::from_items(vec![
+            MenuItem::with_shortcut("~L~ist", CMD_MODELS_LIST, 0, "", 0),
+            MenuItem::with_shortcut("~S~tatus", CMD_MODELS_STATUS, 0, "", 0),
+            MenuItem::with_shortcut("~P~roviders", CMD_PROVIDERS_LIST, 0, "", 0),
+        ]),
     );
 
     let memory_menu = SubMenu::new(
         "Me~m~ory",
-        Menu::from_items(vec![MenuItem::with_shortcut(
-            "~S~earch…",
-            CMD_MEMORY_SEARCH,
-            0,
-            "",
-            0,
-        )]),
+        Menu::from_items(vec![
+            MenuItem::with_shortcut("~R~ecent", CMD_MEMORY_SEARCH, 0, "", 0),
+            MenuItem::with_shortcut("~S~tats", CMD_MEMORY_STATS, 0, "", 0),
+            MenuItem::with_shortcut("~M~CP status", CMD_MCP_STATUS, 0, "", 0),
+        ]),
     );
 
     let help_menu = SubMenu::new(
@@ -905,6 +904,7 @@ fn run_event_loop(
                         app,
                         &mut status_state.current_theme,
                     );
+                    status_state.set_toast(format!("Command: {submitted}"));
                     // `continue` skips desktop.handle_event +
                     // command dispatch for this tick; the Enter
                     // was fully consumed.
@@ -916,6 +916,7 @@ fn run_event_loop(
                 let request = if is_turn {
                     WorkerRequest::Turn(submitted)
                 } else {
+                    status_state.set_toast(format!("Command: {submitted}"));
                     WorkerRequest::Command(submitted)
                 };
                 // Only agent turns drive the elapsed counter —
@@ -1013,6 +1014,13 @@ fn run_slash_popup(app: &mut Application) -> u16 {
             0,
         ),
         MenuItem::with_shortcut(
+            "Workspace ~i~nfo",
+            CMD_WORKSPACE_INFO,
+            0,
+            "/workspace info",
+            0,
+        ),
+        MenuItem::with_shortcut(
             "Workspace ~s~witch…",
             CMD_WORKSPACE_SWITCH,
             0,
@@ -1020,15 +1028,14 @@ fn run_slash_popup(app: &mut Application) -> u16 {
             0,
         ),
         MenuItem::with_shortcut("~M~odel list", CMD_MODELS_LIST, 0, "/models list", 0),
-        MenuItem::with_shortcut(
-            "Memor~y~ search…",
-            CMD_MEMORY_SEARCH,
-            0,
-            "/memory search",
-            0,
-        ),
+        MenuItem::with_shortcut("Model s~t~atus", CMD_MODELS_STATUS, 0, "/models status", 0),
+        MenuItem::with_shortcut("~P~roviders list", CMD_PROVIDERS_LIST, 0, "/providers", 0),
+        MenuItem::with_shortcut("Memor~y~ recent", CMD_MEMORY_SEARCH, 0, "/memory list", 0),
+        MenuItem::with_shortcut("Memory s~t~ats", CMD_MEMORY_STATS, 0, "/memory stats", 0),
+        MenuItem::with_shortcut("~M~CP status", CMD_MCP_STATUS, 0, "/mcp status", 0),
         MenuItem::separator(),
-        MenuItem::with_shortcut("Session ~n~ew", CMD_SESSION_NEW, 0, "/session new", 0),
+        MenuItem::with_shortcut("Session ~l~ist", CMD_SESSION_LIST, 0, "/session list", 0),
+        MenuItem::with_shortcut("Session ~n~ew", CMD_SESSION_NEW, 0, "/session <new>", 0),
         MenuItem::with_shortcut("Session ~o~pen", CMD_SESSION_OPEN, 0, "/session open", 0),
         MenuItem::separator(),
     ];
@@ -1184,17 +1191,27 @@ fn handle_command(
                 }
             }
         }
-        // Commands whose CommandHandler implementations already
-        // return `Ok(Some(String))` — they route cleanly through
-        // the worker and their output appends into the chat pane.
-        CMD_HELP | CMD_ABOUT | CMD_WORKSPACE_LIST => {
+        // Commands whose CommandHandler implementations return
+        // `Ok(Some(String))` route cleanly through the worker and
+        // append into the chat pane.
+        CMD_HELP | CMD_ABOUT | CMD_WORKSPACE_LIST | CMD_WORKSPACE_INFO | CMD_MODELS_LIST
+        | CMD_MODELS_STATUS | CMD_PROVIDERS_LIST | CMD_MEMORY_SEARCH | CMD_MEMORY_STATS
+        | CMD_MCP_STATUS | CMD_SESSION_LIST => {
             let cmdline = match command {
                 CMD_HELP => "/help",
                 CMD_ABOUT => "/info",
                 CMD_WORKSPACE_LIST => "/workspace list",
+                CMD_WORKSPACE_INFO => "/workspace info",
+                CMD_MODELS_LIST => "/models list",
+                CMD_MODELS_STATUS => "/models status",
+                CMD_PROVIDERS_LIST => "/providers",
+                CMD_MEMORY_SEARCH => "/memory list",
+                CMD_MEMORY_STATS => "/memory stats",
+                CMD_MCP_STATUS => "/mcp status",
+                CMD_SESSION_LIST => "/session list",
                 _ => return,
             };
-            dispatch_command(cmdline, chat_lines, req_tx);
+            dispatch_command(cmdline, chat_lines, req_tx, status_state);
         }
         // E-5: Workspace switch opens a modal picker populated from
         // the current App state. On selection, dispatch
@@ -1214,7 +1231,7 @@ fn handle_command(
             }
             if let Some(selected_name) = run_workspace_picker(app, &workspaces) {
                 let cmdline = format!("/workspace switch {selected_name}");
-                dispatch_command(&cmdline, chat_lines, req_tx);
+                dispatch_command(&cmdline, chat_lines, req_tx, status_state);
             }
         }
         // Theme preset slots from the slash popup. Map the id back
@@ -1225,24 +1242,24 @@ fn handle_command(
             let idx = (cmd - CMD_THEME_BASE) as usize;
             if let Some(theme) = themes::PRESETS.get(idx) {
                 handle_theme_command(theme.name, chat_lines, app, &mut status_state.current_theme);
+                status_state.set_toast(format!("Command: /theme {}", theme.name));
             }
         }
-        // Still-pending native pickers. Their CommandHandler
-        // implementations are stdout-driven so they'd render as
-        // "(stdout renderer lands in a later slice…)" placeholders
-        // if we routed them through the worker; the explicit menu
-        // feedback here is more useful.
-        CMD_MODELS_LIST | CMD_MEMORY_SEARCH | CMD_SESSION_NEW | CMD_SESSION_OPEN => {
-            let label = match command {
-                CMD_MODELS_LIST => "Model › List",
-                CMD_MEMORY_SEARCH => "Memory › Search…",
-                CMD_SESSION_NEW => "File › New session",
-                CMD_SESSION_OPEN => "File › Open session",
-                _ => "?",
-            };
-            let mut lines = chat_lines.borrow_mut();
-            lines.push(format!("[menu] {label} — native picker still pending"));
-            lines.push(String::new());
+        CMD_SESSION_NEW => {
+            let name = format!("session-{}", Utc::now().format("%Y%m%d-%H%M%S"));
+            let cmdline = format!("/session {name}");
+            dispatch_command(&cmdline, chat_lines, req_tx, status_state);
+        }
+        CMD_SESSION_OPEN => {
+            let sessions = snapshot_sessions();
+            if sessions.is_empty() {
+                dispatch_command("/session list", chat_lines, req_tx, status_state);
+                return;
+            }
+            if let Some(selected_name) = run_session_picker(app, &sessions) {
+                let cmdline = format!("/session {selected_name}");
+                dispatch_command(&cmdline, chat_lines, req_tx, status_state);
+            }
         }
         _ => {}
     }
@@ -1413,7 +1430,9 @@ fn dispatch_command(
     cmdline: &str,
     chat_lines: &Rc<RefCell<Vec<String>>>,
     req_tx: &mpsc::Sender<WorkerRequest>,
+    status_state: &mut StatusState,
 ) {
+    status_state.set_toast(format!("Command: {cmdline}"));
     {
         let mut lines = chat_lines.borrow_mut();
         lines.push(format!("> {cmdline}"));
@@ -1454,6 +1473,27 @@ struct WorkspacePickerEntry {
     label: String,
     backend: String,
     active: bool,
+}
+
+#[derive(Debug, Clone)]
+struct SessionPickerEntry {
+    name: String,
+    id: String,
+    model: String,
+    last_active: String,
+}
+
+fn snapshot_sessions() -> Vec<SessionPickerEntry> {
+    storage::list_sessions()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|s| SessionPickerEntry {
+            name: s.name,
+            id: s.id,
+            model: format!("{}/{}", s.provider, s.model),
+            last_active: s.last_active,
+        })
+        .collect()
 }
 
 /// Theme color editor modal (E-8b MVP).
@@ -1645,6 +1685,40 @@ fn run_workspace_picker(app: &mut Application, entries: &[WorkspacePickerEntry])
         return None;
     }
     let idx = selected.checked_sub(CMD_WS_SELECT_BASE)? as usize;
+    entries.get(idx).map(|e| e.name.clone())
+}
+
+/// Present a modal picker of locally-known sessions.
+///
+/// This intentionally reuses `MenuBox`, matching the existing
+/// workspace picker. It dispatches back to `/session <name>` so
+/// session behavior remains owned by `CommandHandler`.
+fn run_session_picker(app: &mut Application, entries: &[SessionPickerEntry]) -> Option<String> {
+    use turbo_vision::core::geometry::Point;
+
+    const CMD_SESSION_SELECT_BASE: u16 = 1400;
+
+    let items: Vec<MenuItem> = entries
+        .iter()
+        .enumerate()
+        .map(|(i, e)| {
+            let short_id = &e.id[..8.min(e.id.len())];
+            let last = &e.last_active[..10.min(e.last_active.len())];
+            let label = format!(" {}  ({})  {}  {}", e.name, short_id, e.model, last);
+            MenuItem::with_shortcut(&label, CMD_SESSION_SELECT_BASE + i as u16, 0, "", 0)
+        })
+        .collect();
+
+    let (tw, th) = app.terminal.size();
+    let position = Point::new((tw / 2) - 30, (th / 3).max(3));
+    let menu = turbo_vision::core::menu_data::Menu::from_items(items);
+    let mut menu_box = MenuBox::new(position, menu);
+    let selected = menu_box.execute(&mut app.terminal);
+
+    if selected == 0 {
+        return None;
+    }
+    let idx = selected.checked_sub(CMD_SESSION_SELECT_BASE)? as usize;
     entries.get(idx).map(|e| e.name.clone())
 }
 

@@ -100,18 +100,15 @@ impl CommandHandler {
             }
             "/history" => self.handle_history().await,
             "/config" => self.handle_config().await,
-            "/session" => self.handle_session(subcommand, args).await,
+            "/session" => self.handle_session(session_id, subcommand, args).await,
+            "/mcp" => self.handle_mcp(subcommand).await,
 
             // Completion
             "/completions" => self.handle_completions(subcommand).await,
 
-            _ => {
-                ui::print_error(
-                    &format!("Unknown command: {}", command),
-                    Some("Type /help for available commands"),
-                );
-                Ok(None)
-            }
+            _ => Ok(Some(format!(
+                "❌ Unknown command: {command}\n   Type /help for available commands\n"
+            ))),
         }
     }
 
@@ -202,83 +199,100 @@ impl CommandHandler {
     /// Handle /session command with full CRUD
     async fn handle_session(
         &self,
+        session_id: &str,
         subcommand: Option<&str>,
         args: &[&str],
     ) -> Result<Option<String>> {
+        let mut out = String::new();
         match subcommand {
             Some("list") => match storage::list_sessions() {
                 Ok(sessions) => {
                     if sessions.is_empty() {
-                        println!("\n📋 Sessions: (none yet)");
-                        println!("  Create one with: /session <name>");
+                        out.push_str("\n📋 Sessions: (none yet)\n");
+                        out.push_str("  Create one with: /session <name>\n");
                     } else {
-                        println!("\n📋 Sessions ({}):", sessions.len());
+                        out.push_str(&format!("\n📋 Sessions ({}):\n", sessions.len()));
                         for (i, session) in sessions.iter().enumerate() {
-                            println!("  {}. {} ({})", i + 1, session.name, &session.id[..8]);
-                            println!("     Model: {}/{}", session.provider, session.model);
-                            println!(
-                                "     Messages: {}, Last active: {}",
+                            out.push_str(&format!(
+                                "  {}. {} ({})\n",
+                                i + 1,
+                                session.name,
+                                &session.id[..8.min(session.id.len())]
+                            ));
+                            out.push_str(&format!(
+                                "     Model: {}/{}\n",
+                                session.provider, session.model
+                            ));
+                            out.push_str(&format!(
+                                "     Messages: {}, Last active: {}\n",
                                 session.message_count,
-                                &session.last_active[..10]
-                            );
+                                &session.last_active[..10.min(session.last_active.len())]
+                            ));
                         }
                     }
-                    println!();
                 }
                 Err(e) => {
-                    ui::print_error("Could not list sessions", Some(&e.to_string()));
+                    out.push_str(&format!("❌ Could not list sessions: {e}\n"));
                 }
             },
             Some("delete") => {
                 let name = args.first().copied().unwrap_or("");
                 if name.is_empty() {
-                    ui::print_error("Usage: /session delete <name>", None);
+                    out.push_str("Usage: /session delete <name>\n");
                 } else {
                     match storage::delete_session(name) {
                         Ok(_) => {
-                            ui::print_success(&format!("✅ Deleted session: {}", name));
+                            out.push_str(&format!("✅ Deleted session: {name}\n"));
                         }
                         Err(e) => {
-                            ui::print_error("Failed to delete session", Some(&e.to_string()));
+                            out.push_str(&format!("❌ Failed to delete session: {e}\n"));
                         }
                     }
                 }
             }
-            Some("info") => match storage::load_session_metadata("main") {
+            Some("info") => match storage::load_session_metadata(session_id) {
                 Ok(metadata) => {
-                    println!("\n📊 Current Session:");
-                    println!("  Name:      {}", metadata.name);
-                    println!("  ID:        {}", metadata.id);
-                    println!("  Model:     {}/{}", metadata.provider, metadata.model);
-                    println!("  Messages:  {}", metadata.message_count);
-                    println!("  Created:   {}", &metadata.created_at[..10]);
-                    println!("  Last used: {}", &metadata.last_active[..10]);
-                    println!();
+                    out.push_str("\n📊 Current Session:\n");
+                    out.push_str(&format!("  Name:      {}\n", metadata.name));
+                    out.push_str(&format!("  ID:        {}\n", metadata.id));
+                    out.push_str(&format!(
+                        "  Model:     {}/{}\n",
+                        metadata.provider, metadata.model
+                    ));
+                    out.push_str(&format!("  Messages:  {}\n", metadata.message_count));
+                    out.push_str(&format!(
+                        "  Created:   {}\n",
+                        &metadata.created_at[..10.min(metadata.created_at.len())]
+                    ));
+                    out.push_str(&format!(
+                        "  Last used: {}\n",
+                        &metadata.last_active[..10.min(metadata.last_active.len())]
+                    ));
                 }
                 Err(e) => {
-                    ui::print_error("Failed to load session", Some(&e.to_string()));
+                    out.push_str(&format!("❌ Failed to load session: {e}\n"));
                 }
             },
             Some(session_name) => {
-                println!("🔄 Switching to session: '{}'", session_name);
+                out.push_str(&format!("🔄 Switching to session: '{session_name}'\n"));
                 if let Ok(metadata) = storage::load_session_metadata(session_name) {
-                    println!(
-                        "   Found: {}/{}, {} messages",
+                    out.push_str(&format!(
+                        "   Found: {}/{}, {} messages\n",
                         metadata.provider, metadata.model, metadata.message_count
-                    );
+                    ));
                 } else {
-                    println!("   (New session - will be created on first message)");
+                    out.push_str("   (New session - will be created on first message)\n");
                 }
-                println!();
             }
             None => {
-                println!("Usage: /session list         (show all sessions)");
-                println!("       /session <name>      (switch or create)");
-                println!("       /session info        (current session details)");
-                println!("       /session delete <n>  (remove session)");
+                out.push_str("Usage: /session list         (show all sessions)\n");
+                out.push_str("       /session <name>      (switch or create)\n");
+                out.push_str("       /session info        (current session details)\n");
+                out.push_str("       /session delete <n>  (remove session)\n");
             }
         }
-        Ok(None)
+        out.push('\n');
+        Ok(Some(out))
     }
 
     /// Handle /history command
@@ -422,54 +436,51 @@ impl CommandHandler {
             None => ("help", &[] as &[&str]),
         };
 
+        let mut out = String::new();
         match sub {
             "search" => {
                 let (query, limit) = parse_search_args(rest);
                 if query.is_empty() {
-                    ui::print_error("Usage: /memory search <query> [limit]", None);
-                    return Ok(None);
+                    return Ok(Some("Usage: /memory search <query> [limit]\n".to_string()));
                 }
-                println!("\n🔎 MNEMOS search: {}", query);
+                out.push_str(&format!("\n🔎 MNEMOS search: {query}\n"));
                 let res = match self.current_mnemos().await {
                     Some(m) => m.search(&query, limit).await,
                     None => Ok(Vec::new()),
                 };
                 match res {
                     Ok(memories) if !memories.is_empty() => {
-                        print_memory_list(&memories);
+                        out.push_str(&format_memory_list(&memories));
                     }
-                    Ok(_) => println!("  (no matches)"),
-                    Err(_) => ui::print_error(
-                        "MNEMOS unavailable",
-                        Some("check MNEMOS_URL / MNEMOS_TOKEN"),
-                    ),
+                    Ok(_) => out.push_str("  (no matches)\n"),
+                    Err(_) => {
+                        out.push_str("❌ MNEMOS unavailable\n");
+                        out.push_str("   check MNEMOS_URL / MNEMOS_TOKEN\n");
+                    }
                 }
-                println!();
             }
             "list" | "recent" => {
                 let limit = rest
                     .first()
                     .and_then(|s| s.parse::<usize>().ok())
                     .unwrap_or(10);
-                println!("\n📚 Recent memories (limit {}):", limit);
+                out.push_str(&format!("\n📚 Recent memories (limit {limit}):\n"));
                 let res = match self.current_mnemos().await {
                     Some(m) => m.list(limit).await,
                     None => Ok(Vec::new()),
                 };
                 match res {
                     Ok(memories) if !memories.is_empty() => {
-                        print_memory_list(&memories);
+                        out.push_str(&format_memory_list(&memories));
                     }
-                    Ok(_) => println!("  (MNEMOS empty or not configured)"),
-                    Err(_) => ui::print_error("MNEMOS unavailable", None),
+                    Ok(_) => out.push_str("  (MNEMOS empty or not configured)\n"),
+                    Err(_) => out.push_str("❌ MNEMOS unavailable\n"),
                 }
-                println!();
             }
             "get" => {
                 let id = rest.join(" ");
                 if id.is_empty() {
-                    ui::print_error("Usage: /memory get <id>", None);
-                    return Ok(None);
+                    return Ok(Some("Usage: /memory get <id>\n".to_string()));
                 }
                 let res = match self.current_mnemos().await {
                     Some(m) => m.get(&id).await,
@@ -477,30 +488,30 @@ impl CommandHandler {
                 };
                 match res {
                     Ok(Some(mem)) => {
-                        println!("\n📖 Memory [{}]", id);
+                        out.push_str(&format!("\n📖 Memory [{id}]\n"));
                         if let Some(cat) = mem.get("category").and_then(|v| v.as_str()) {
-                            println!("  category: {}", cat);
+                            out.push_str(&format!("  category: {cat}\n"));
                         }
                         if let Some(content) = mem.get("content").and_then(|v| v.as_str()) {
-                            println!();
-                            println!("{}", content);
+                            out.push('\n');
+                            out.push_str(content);
+                            out.push('\n');
                         }
-                        println!();
                     }
-                    Ok(None) => ui::print_error("Memory not found", Some(&id)),
+                    Ok(None) => out.push_str(&format!("❌ Memory not found: {id}\n")),
                     Err(_) => {
-                        ui::print_error("MNEMOS unavailable", Some("check MNEMOS connection"))
+                        out.push_str("❌ MNEMOS unavailable\n   check MNEMOS connection\n");
                     }
                 }
             }
             "post" | "add" => {
                 let (content, category) = parse_post_args(rest);
                 if content.is_empty() {
-                    ui::print_error(
-                        "Usage: /memory post <content> [--category <cat>]",
-                        Some("Example: /memory post \"shipped zterm CI cleanup\" --category work"),
-                    );
-                    return Ok(None);
+                    return Ok(Some(
+                        "Usage: /memory post <content> [--category <cat>]\n\
+                         Example: /memory post \"shipped zterm CI cleanup\" --category work\n"
+                            .to_string(),
+                    ));
                 }
                 let res = match self.current_mnemos().await {
                     Some(m) => m.create(&content, category.as_deref()).await,
@@ -515,16 +526,15 @@ impl CommandHandler {
                             .and_then(|v| v.as_str())
                             .map(|s| s.to_string())
                             .unwrap_or_else(|| "(unknown id)".to_string());
-                        ui::print_success(&format!("📝 Memory saved: {}", id));
+                        out.push_str(&format!("📝 Memory saved: {id}\n"));
                     }
-                    Err(e) => ui::print_error("Failed to save memory", Some(&e.to_string())),
+                    Err(e) => out.push_str(&format!("❌ Failed to save memory: {e}\n")),
                 }
             }
             "delete" | "rm" => {
                 let id = rest.join(" ");
                 if id.is_empty() {
-                    ui::print_error("Usage: /memory delete <id>", None);
-                    return Ok(None);
+                    return Ok(Some("Usage: /memory delete <id>\n".to_string()));
                 }
                 let res = match self.current_mnemos().await {
                     Some(m) => m.delete(&id).await,
@@ -533,42 +543,47 @@ impl CommandHandler {
                     )),
                 };
                 match res {
-                    Ok(()) => ui::print_success(&format!("🗑️  Deleted memory {}", id)),
-                    Err(e) => ui::print_error("Delete failed", Some(&e.to_string())),
+                    Ok(()) => out.push_str(&format!("🗑️  Deleted memory {id}\n")),
+                    Err(e) => out.push_str(&format!("❌ Delete failed: {e}\n")),
                 }
             }
             "stats" => {
-                println!("\n📊 Memory Statistics:");
+                out.push_str("\n📊 Memory Statistics:\n");
                 let res = match self.current_mnemos().await {
                     Some(m) => m.stats().await,
                     None => Ok(serde_json::json!({ "status": "not_configured" })),
                 };
                 match res {
                     Ok(stats) => {
-                        println!(
-                            "{}",
-                            serde_json::to_string_pretty(&stats).unwrap_or_default()
-                        );
+                        out.push_str(&serde_json::to_string_pretty(&stats).unwrap_or_default());
+                        out.push('\n');
                     }
-                    Err(_) => println!("  (MNEMOS unavailable)"),
+                    Err(_) => out.push_str("  (MNEMOS unavailable)\n"),
                 }
-                println!();
             }
             _ => {
-                println!("Usage:");
-                println!("  /memory search <query> [limit]    — semantic/full-text search");
-                println!("  /memory list [limit]              — recent memories (alias: recent)");
-                println!("  /memory get <id>                  — fetch one by id");
-                println!("  /memory post <content> [--category <cat>]");
-                println!("                                    — save a new memory (alias: add)");
-                println!("  /memory delete <id>               — remove one by id (alias: rm)");
-                println!("  /memory stats                     — MNEMOS storage / categories");
-                println!();
-                println!("  Tip: '/memory <query>' (no subcommand) runs a search.");
-                println!("  Configure with MNEMOS_URL + MNEMOS_TOKEN in env / .env.");
+                out.push_str("Usage:\n");
+                out.push_str("  /memory search <query> [limit]    — semantic/full-text search\n");
+                out.push_str(
+                    "  /memory list [limit]              — recent memories (alias: recent)\n",
+                );
+                out.push_str("  /memory get <id>                  — fetch one by id\n");
+                out.push_str("  /memory post <content> [--category <cat>]\n");
+                out.push_str(
+                    "                                    — save a new memory (alias: add)\n",
+                );
+                out.push_str(
+                    "  /memory delete <id>               — remove one by id (alias: rm)\n",
+                );
+                out.push_str(
+                    "  /memory stats                     — MNEMOS storage / categories\n\n",
+                );
+                out.push_str("  Tip: '/memory <query>' (no subcommand) runs a search.\n");
+                out.push_str("  Configure with MNEMOS_URL + MNEMOS_TOKEN in env / .env.\n");
             }
         }
-        Ok(None)
+        out.push('\n');
+        Ok(Some(out))
     }
 
     async fn handle_cron(&self, subcommand: Option<&str>, args: &[&str]) -> Result<Option<String>> {
@@ -793,11 +808,10 @@ impl CommandHandler {
             Some("set") => {
                 let key = args.first().copied().unwrap_or("").trim().to_string();
                 if key.is_empty() {
-                    ui::print_error(
-                        "Usage: /models set <key>",
-                        Some("Run /models list to see available keys"),
-                    );
-                    return Ok(None);
+                    return Ok(Some(
+                        "Usage: /models set <key>\n   Run /models list to see available keys\n"
+                            .to_string(),
+                    ));
                 }
                 match cron {
                     Some(c) => {
@@ -805,39 +819,29 @@ impl CommandHandler {
                             let _ = c.refresh_models().await;
                         }
                         match c.set_current_model(&key) {
-                            Ok(()) => {
-                                ui::print_success(&format!("✅ Active model key: {}", key));
-                                println!("   Future turns will send this key to the daemon.");
-                            }
-                            Err(e) => {
-                                ui::print_error("Failed to set model key", Some(&e.to_string()));
-                            }
+                            Ok(()) => Ok(Some(format!(
+                                "✅ Active model key: {key}\n   Future turns will send this key to the daemon.\n"
+                            ))),
+                            Err(e) => Ok(Some(format!("❌ Failed to set model key: {e}\n"))),
                         }
                     }
-                    None => {
-                        ui::print_error("/models set requires an active zeroclaw workspace", None)
-                    }
+                    None => Ok(Some(
+                        "/models set requires an active zeroclaw workspace\n".to_string(),
+                    )),
                 }
-                Ok(None)
             }
-            Some("refresh") => {
-                match cron {
-                    Some(c) => match c.refresh_models().await {
-                        Ok(list) => ui::print_success(&format!(
-                            "✅ Refreshed model list ({} entries)",
-                            list.len()
-                        )),
-                        Err(e) => {
-                            ui::print_error("Failed to refresh /api/config", Some(&e.to_string()))
-                        }
-                    },
-                    None => ui::print_error(
-                        "/models refresh requires an active zeroclaw workspace",
-                        None,
-                    ),
-                }
-                Ok(None)
-            }
+            Some("refresh") => match cron {
+                Some(c) => match c.refresh_models().await {
+                    Ok(list) => Ok(Some(format!(
+                        "✅ Refreshed model list ({} entries)\n",
+                        list.len()
+                    ))),
+                    Err(e) => Ok(Some(format!("❌ Failed to refresh /api/config: {e}\n"))),
+                },
+                None => Ok(Some(
+                    "/models refresh requires an active zeroclaw workspace\n".to_string(),
+                )),
+            },
             Some("status") => match cron {
                 Some(c) => {
                     let active = c.current_model_key();
@@ -853,16 +857,34 @@ impl CommandHandler {
                     out.push('\n');
                     Ok(Some(out))
                 }
-                None => {
-                    ui::print_error("/models status requires an active zeroclaw workspace", None);
-                    Ok(None)
-                }
+                None => Ok(Some(
+                    "/models status requires an active zeroclaw workspace\n".to_string(),
+                )),
             },
+            _ => Ok(Some(
+                "Usage: /models list|set <key>|refresh|status\n".to_string(),
+            )),
+        }
+    }
+
+    async fn handle_mcp(&self, subcommand: Option<&str>) -> Result<Option<String>> {
+        let action = subcommand.unwrap_or("status");
+        let mut out = String::from("\n🔌 MCP\n");
+        match action {
+            "status" | "list" => {
+                out.push_str(
+                    "  MCP endpoints are not exposed by the active claw-family backend yet.\n",
+                );
+                out.push_str(
+                    "  zterm will surface them here when the daemon advertises an MCP inventory.\n",
+                );
+            }
             _ => {
-                println!("Usage: /models list|set <key>|refresh|status");
-                Ok(None)
+                out.push_str("Usage: /mcp status\n");
             }
         }
+        out.push('\n');
+        Ok(Some(out))
     }
 
     async fn handle_channels(&self, subcommand: Option<&str>) -> Result<Option<String>> {
@@ -1037,27 +1059,26 @@ impl CommandHandler {
             }
             Some("info") => {
                 if let Some(a) = inventory.active() {
-                    println!();
-                    println!("🗂  Active workspace");
-                    println!("   name:      {}", a.name);
+                    let mut out = String::from("\n🗂  Active workspace\n");
+                    out.push_str(&format!("   name:      {}\n", a.name));
                     if let Some(l) = &a.label {
-                        println!("   label:     {}", l);
+                        out.push_str(&format!("   label:     {l}\n"));
                     }
-                    println!("   backend:   {}", a.backend.as_str());
-                    println!("   url:       {}", a.url);
-                    println!(
-                        "   status:    {}",
+                    out.push_str(&format!("   backend:   {}\n", a.backend.as_str()));
+                    out.push_str(&format!("   url:       {}\n", a.url));
+                    out.push_str(&format!(
+                        "   status:    {}\n",
                         if a.activated {
                             "activated"
                         } else {
                             "not yet activated"
                         }
-                    );
-                    println!();
+                    ));
+                    out.push('\n');
+                    Ok(Some(out))
                 } else {
-                    ui::print_error("no active workspace", None);
+                    Ok(Some("❌ no active workspace\n".to_string()))
                 }
-                Ok(None)
             }
             Some("switch") => {
                 let name = args.join(" ");
@@ -1071,11 +1092,10 @@ impl CommandHandler {
                 self.switch_workspace(&name).await
             }
             _ => {
-                println!("Usage:");
-                println!("  /workspace list         — enumerate configured workspaces");
-                println!("  /workspace info         — details of the active workspace");
-                println!("  /workspace switch <name>— change the active workspace");
-                Ok(None)
+                Ok(Some(
+                    "Usage:\n  /workspace list         — enumerate configured workspaces\n  /workspace info         — details of the active workspace\n  /workspace switch <name>— change the active workspace\n"
+                        .to_string(),
+                ))
             }
         }
     }
@@ -1145,7 +1165,8 @@ fn parse_post_args(rest: &[&str]) -> (String, Option<String>) {
     (content_parts.join(" "), category)
 }
 
-fn print_memory_list(memories: &[serde_json::Value]) {
+fn format_memory_list(memories: &[serde_json::Value]) -> String {
+    let mut out = String::new();
     for (i, mem) in memories.iter().enumerate() {
         let id = mem.get("id").and_then(|v| v.as_str()).unwrap_or("?");
         let content = mem.get("content").and_then(|v| v.as_str()).unwrap_or("");
@@ -1158,18 +1179,25 @@ fn print_memory_list(memories: &[serde_json::Value]) {
             ""
         };
         if category.is_empty() {
-            println!("  {}. [{}] {}{}", i + 1, short_id, preview, suffix);
+            out.push_str(&format!(
+                "  {}. [{}] {}{}\n",
+                i + 1,
+                short_id,
+                preview,
+                suffix
+            ));
         } else {
-            println!(
-                "  {}. [{}] ({}) {}{}",
+            out.push_str(&format!(
+                "  {}. [{}] ({}) {}{}\n",
                 i + 1,
                 short_id,
                 category,
                 preview,
                 suffix
-            );
+            ));
         }
     }
+    out
 }
 
 #[cfg(test)]
@@ -1234,5 +1262,20 @@ mod tests {
             .collect();
         let (_, _, args) = split_parts(&parts);
         assert_eq!(args, &["hello", "world", "--category", "work"]);
+    }
+
+    #[test]
+    fn memory_list_formatter_is_structured_for_tui() {
+        let memories = vec![serde_json::json!({
+            "id": "memory-abcdef123456",
+            "category": "work",
+            "content": "short note"
+        })];
+
+        let out = super::format_memory_list(&memories);
+
+        assert!(out.contains("[memory-abcde]"));
+        assert!(out.contains("(work) short note"));
+        assert!(out.ends_with('\n'));
     }
 }
