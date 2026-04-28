@@ -992,12 +992,28 @@ impl CommandHandler {
         args: &[&str],
     ) -> Result<Option<String>> {
         let out = match subcommand {
-            Some("status") => "🛑 Emergency Stop: Disengaged\n\n".to_string(),
+            Some("status") => {
+                "\
+🛑 Emergency Stop: Unknown
+   Status backend is not implemented; treating E-stop state as unsupported until a real backend is wired.
+
+"
+                .to_string()
+            }
             Some("--level") => {
                 let level = args.first().copied().unwrap_or("<level>");
-                format!("  Level: {level} (Phase 7+)\n\n")
+                format!(
+                    "🛑 Emergency Stop: Unsupported\n   Requested level: {level}\n   No E-stop backend is implemented, so zterm did not change hardware or network state.\n\n"
+                )
             }
-            Some("resume") => "  ▶️  Resuming (Phase 7+)\n\n".to_string(),
+            Some("resume") => {
+                "\
+🛑 Emergency Stop: Unsupported
+   No E-stop backend is implemented, so zterm cannot verify or resume E-stop state.
+
+"
+                .to_string()
+            }
             _ => "Usage: /estop status|--level <kill-all|network-kill|...>\n\n".to_string(),
         };
         Ok(Some(out))
@@ -2000,6 +2016,21 @@ mod tests {
                 "{cmdline} should not complete silently"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn estop_status_fails_closed_until_backend_exists() {
+        let handler = super::CommandHandler::new(app_with_fake_client(FakeAgentClient::default()));
+
+        let out = handler
+            .handle("/estop status", "session-for-estop-test")
+            .await
+            .expect("command should not fail")
+            .expect("estop status should return TUI output");
+
+        assert!(out.contains("Emergency Stop: Unknown"));
+        assert!(out.contains("not implemented"));
+        assert!(!out.contains("Disengaged"));
     }
 
     #[tokio::test]

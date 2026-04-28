@@ -506,6 +506,7 @@ fn apply_openclaw_workspace_state(config_path: &Path, cfg: &mut AppConfig) -> Re
     let mut state = load_workspace_state(&state_path)?;
     let mut state_changed = false;
     let mut claimed_state_entries = std::collections::HashSet::new();
+    let configured_openclaw_identities = configured_openclaw_workspace_identities(cfg);
     let mut openclaw_index = 0usize;
 
     for workspace in &mut cfg.workspaces {
@@ -564,6 +565,29 @@ fn apply_openclaw_workspace_state(config_path: &Path, cfg: &mut AppConfig) -> Re
             continue;
         }
 
+        if let Some(entry_idx) = find_plausible_stale_openclaw_workspace_state_entry(
+            &state,
+            workspace_index,
+            &claimed_state_entries,
+            &configured_openclaw_identities,
+        ) {
+            let entry = &state.openclaw_workspaces[entry_idx];
+            return Err(anyhow!(
+                "openclaw workspace '{}' has no explicit id and does not match persisted workspace-state entry {} \
+                 (stored name='{}', url='{}', id='{}'), but that unclaimed entry has the same OpenClaw index ({}). \
+                 Refusing to mint a fresh id because this likely represents a renamed or URL-edited workspace. \
+                 Add `id = \"{}\"` and any needed `namespace_aliases` to the [[workspaces]] entry, or remove the stale entry from {} if this is a new workspace.",
+                workspace.name,
+                entry_idx,
+                entry.name,
+                entry.url,
+                entry.id,
+                workspace_index,
+                entry.id,
+                state_path.display()
+            ));
+        }
+
         let legacy_namespace = openclaw_legacy_session_namespace(workspace);
         let entry = OpenClawWorkspaceState {
             index: Some(workspace_index),
@@ -600,6 +624,14 @@ fn apply_openclaw_workspace_state(config_path: &Path, cfg: &mut AppConfig) -> Re
     Ok(())
 }
 
+fn configured_openclaw_workspace_identities(cfg: &AppConfig) -> Vec<(String, String)> {
+    cfg.workspaces
+        .iter()
+        .filter(|workspace| workspace.backend == Backend::Openclaw)
+        .map(|workspace| (workspace.name.clone(), workspace.url.clone()))
+        .collect()
+}
+
 fn normalize_workspace_url(url: &str) -> String {
     url.trim().trim_end_matches('/').to_string()
 }
@@ -630,6 +662,39 @@ fn find_openclaw_workspace_state_entry(
     }
 
     Ok(None)
+}
+
+fn find_plausible_stale_openclaw_workspace_state_entry(
+    state: &WorkspaceState,
+    workspace_index: usize,
+    claimed_state_entries: &std::collections::HashSet<usize>,
+    configured_openclaw_identities: &[(String, String)],
+) -> Option<usize> {
+    state
+        .openclaw_workspaces
+        .iter()
+        .enumerate()
+        .find(|(idx, entry)| {
+            !claimed_state_entries.contains(idx)
+                && entry.index == Some(workspace_index)
+                && !openclaw_state_entry_matches_any_configured_workspace(
+                    entry,
+                    configured_openclaw_identities,
+                )
+        })
+        .map(|(idx, _)| idx)
+}
+
+fn openclaw_state_entry_matches_any_configured_workspace(
+    entry: &OpenClawWorkspaceState,
+    configured_openclaw_identities: &[(String, String)],
+) -> bool {
+    configured_openclaw_identities.iter().any(|(name, url)| {
+        openclaw_workspace_identity_values_match(&entry.name, &entry.url, name, url)
+            || entry.identity_aliases.iter().any(|identity| {
+                openclaw_workspace_identity_values_match(&identity.name, &identity.url, name, url)
+            })
+    })
 }
 
 fn openclaw_workspace_state_identity_matches(
@@ -992,7 +1057,7 @@ url = "ws://old.example"
     }
 
     #[test]
-    fn state_backed_openclaw_id_does_not_survive_rename_without_config_id() {
+    fn state_backed_openclaw_id_fails_closed_on_rename_without_config_id() {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("config.toml");
         let original = r#"
@@ -1019,21 +1084,14 @@ url = "ws://new.example"
 "#;
         std::fs::write(&path, renamed).unwrap();
 
-        let reloaded = AppConfig::load(&path).unwrap();
-        let workspace = &reloaded.workspaces[0];
-        let new_id = workspace
-            .id
-            .as_deref()
-            .expect("renamed workspace gets fresh id");
-        assert_ne!(new_id, id);
-        assert!(workspace
-            .namespace_aliases
-            .iter()
-            .any(|alias| alias == "backend=openclaw;workspace=renamed;url=ws://new.example"));
-        assert!(!workspace
-            .namespace_aliases
-            .iter()
-            .any(|alias| alias == old_namespace));
+        let err = AppConfig::load(&path).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Refusing to mint a fresh id"));
+        assert!(msg.contains("same OpenClaw index (0)"));
+        assert!(msg.contains(&format!("id='{id}'")));
+        assert!(msg.contains("Add `id = "));
+        assert!(msg.contains("namespace_aliases"));
+        assert!(msg.contains("remove the stale entry"));
 
         let state = load_workspace_state(&workspace_state_path_for_config(&path)).unwrap();
         let old_entry = state
@@ -1042,20 +1100,11 @@ url = "ws://new.example"
             .find(|entry| entry.id == id)
             .expect("old state entry remains unclaimed");
         assert_eq!(old_entry.namespace_aliases, vec![old_namespace.to_string()]);
-        assert!(
-            state
-                .openclaw_workspaces
-                .iter()
-                .any(|entry| entry.id == new_id
-                    && entry.namespace_aliases
-                        == vec![
-                            "backend=openclaw;workspace=renamed;url=ws://new.example".to_string()
-                        ])
-        );
+        assert_eq!(state.openclaw_workspaces.len(), 1);
     }
 
     #[test]
-    fn openclaw_remove_then_add_at_same_index_gets_fresh_state_id() {
+    fn openclaw_remove_then_add_at_same_index_fails_closed() {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("config.toml");
         let original = r#"
@@ -1077,27 +1126,20 @@ url = "ws://new.example"
 "#;
         std::fs::write(&path, replacement).unwrap();
 
-        let reloaded = AppConfig::load(&path).unwrap();
-        let replacement_id = reloaded.workspaces[0].id.as_deref().unwrap();
-        assert_ne!(replacement_id, old_id);
-        assert!(reloaded.workspaces[0]
-            .namespace_aliases
-            .iter()
-            .any(|alias| alias == "backend=openclaw;workspace=beta;url=ws://new.example"));
-        assert!(!reloaded.workspaces[0]
-            .namespace_aliases
-            .iter()
-            .any(|alias| alias == "backend=openclaw;workspace=alpha;url=ws://old.example"));
+        let err = AppConfig::load(&path).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Refusing to mint a fresh id"));
+        assert!(msg.contains("same OpenClaw index (0)"));
+        assert!(msg.contains(&format!("id='{old_id}'")));
+        assert!(msg.contains("Add `id = "));
+        assert!(msg.contains("remove the stale entry"));
 
         let state = load_workspace_state(&workspace_state_path_for_config(&path)).unwrap();
         assert!(state
             .openclaw_workspaces
             .iter()
             .any(|entry| entry.id == old_id));
-        assert!(state
-            .openclaw_workspaces
-            .iter()
-            .any(|entry| entry.id == replacement_id));
+        assert_eq!(state.openclaw_workspaces.len(), 1);
     }
 
     #[test]
