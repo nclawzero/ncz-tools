@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Result};
 use chrono::Utc;
 use std::io::{self, Write};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::cli::client::Session;
 use crate::cli::pairing::PairingManager;
@@ -307,7 +307,14 @@ async fn load_or_create_session(
         message_count: 0,
         last_active: Utc::now().to_rfc3339(),
     };
-    storage::save_session_metadata(&metadata)?;
+    if storage::is_safe_session_id(&metadata.id) {
+        storage::save_session_metadata(&metadata)?;
+    } else {
+        warn!(
+            "not saving local metadata for unsafe session id: {}",
+            metadata.id
+        );
+    }
 
     Ok(session)
 }

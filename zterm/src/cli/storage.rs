@@ -26,6 +26,9 @@ pub fn history_file() -> Result<PathBuf> {
 
 /// Session directory: ~/.zeroclaw/sessions/{session_id}
 pub fn session_dir(session_id: &str) -> Result<PathBuf> {
+    if !is_safe_session_id(session_id) {
+        return Err(anyhow!("unsafe session id for local storage"));
+    }
     Ok(sessions_dir()?.join(session_id))
 }
 
@@ -99,16 +102,27 @@ pub struct SessionMetadata {
 
 /// Load session metadata from file
 pub fn load_session_metadata(session_id: &str) -> Result<SessionMetadata> {
+    if !is_safe_session_id(session_id) {
+        return Err(anyhow!("unsafe session id for local metadata load"));
+    }
+
     let file = session_metadata_file(session_id)?;
     let content =
         fs::read_to_string(&file).map_err(|e| anyhow!("Failed to read session metadata: {}", e))?;
     let metadata: SessionMetadata = serde_json::from_str(&content)
         .map_err(|e| anyhow!("Failed to parse session metadata: {}", e))?;
+    if !is_safe_session_id(&metadata.id) {
+        return Err(anyhow!("unsafe session id in local metadata"));
+    }
     Ok(metadata)
 }
 
 /// Save session metadata to file
 pub fn save_session_metadata(metadata: &SessionMetadata) -> Result<()> {
+    if !is_safe_session_id(&metadata.id) {
+        return Err(anyhow!("unsafe session id for local metadata save"));
+    }
+
     ensure_session_dir(&metadata.id)?;
     let file = session_metadata_file(&metadata.id)?;
     let content = serde_json::to_string_pretty(&metadata)?;
@@ -275,5 +289,37 @@ mod tests {
         assert!(!is_safe_session_id("../owned"));
         assert!(!is_safe_session_id("nested/session"));
         assert!(!is_safe_session_id("nested\\session"));
+    }
+
+    fn metadata(id: &str) -> SessionMetadata {
+        SessionMetadata {
+            id: id.to_string(),
+            name: "Review regression".to_string(),
+            model: "m".to_string(),
+            provider: "p".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            message_count: 0,
+            last_active: "2026-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn unsafe_session_id_paths_fail_before_joining_sessions_dir() {
+        assert!(session_dir("../owned").is_err());
+        assert!(session_metadata_file("../owned").is_err());
+        assert!(session_history_file("../owned").is_err());
+    }
+
+    #[test]
+    fn save_and_load_reject_unsafe_session_ids() {
+        let unsafe_id = format!("../zterm-storage-review-{}", uuid::Uuid::new_v4());
+        let escaped_path = sessions_dir().unwrap().join(&unsafe_id);
+
+        assert!(save_session_metadata(&metadata(&unsafe_id)).is_err());
+        assert!(load_session_metadata(&unsafe_id).is_err());
+        assert!(
+            !escaped_path.exists(),
+            "unsafe metadata write escaped the sessions directory"
+        );
     }
 }

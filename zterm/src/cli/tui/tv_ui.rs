@@ -928,7 +928,14 @@ async fn resolve_or_create_session_for_worker(
         message_count: 0,
         last_active: Utc::now().to_rfc3339(),
     };
-    storage::save_session_metadata(&metadata)?;
+    if storage::is_safe_session_id(&metadata.id) {
+        storage::save_session_metadata(&metadata)?;
+    } else {
+        warn!(
+            "not saving local metadata for unsafe session id: {}",
+            metadata.id
+        );
+    }
     Ok(session)
 }
 

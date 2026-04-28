@@ -977,10 +977,9 @@ fn display_name_for_row(row: &super::handshake::OpenClawSessionRow) -> String {
 }
 
 fn row_into_session(row: super::handshake::OpenClawSessionRow) -> Session {
-    let id = row.session_id.clone().unwrap_or_else(|| row.key.clone());
     let name = display_name_for_row(&row);
     Session {
-        id,
+        id: row.key,
         name,
         model: String::new(),
         provider: String::new(),
@@ -1147,6 +1146,22 @@ mod tests {
         // ZeroclawClient in cli/client.rs.
         fn assert_agent_client<T: crate::cli::agent::AgentClient>() {}
         assert_agent_client::<OpenClawClient>();
+    }
+
+    #[test]
+    fn row_into_session_uses_key_as_canonical_id_not_session_id() {
+        let session = row_into_session(super::super::handshake::OpenClawSessionRow {
+            key: "canonical-key".to_string(),
+            kind: "direct".to_string(),
+            label: Some("Label".to_string()),
+            display_name: None,
+            derived_title: None,
+            updated_at: None,
+            session_id: Some("compat-session-id".to_string()),
+        });
+
+        assert_eq!(session.id, "canonical-key");
+        assert_eq!(session.name, "Label");
     }
 
     #[tokio::test]
