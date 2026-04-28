@@ -693,9 +693,7 @@ mod tests {
             "zeroclaw.service",
             &["openclaw".to_string()],
             1,
-            NczError::Io(std::io::Error::other(
-                "directory fsync failed",
-            )),
+            NczError::Io(std::io::Error::other("directory fsync failed")),
             Some(&AgentStateSnapshot::Present(b"openclaw\n".to_vec())),
         );
 
@@ -732,9 +730,7 @@ mod tests {
             "zeroclaw.service",
             &["openclaw".to_string()],
             1,
-            NczError::Io(std::io::Error::other(
-                "directory fsync failed",
-            )),
+            NczError::Io(std::io::Error::other("directory fsync failed")),
             Some(&AgentStateSnapshot::Present(b"openclaw\n".to_vec())),
         );
 
@@ -784,9 +780,7 @@ mod tests {
             "zeroclaw.service",
             &["openclaw".to_string()],
             1,
-            NczError::Io(std::io::Error::other(
-                "directory fsync failed",
-            )),
+            NczError::Io(std::io::Error::other("directory fsync failed")),
             Some(&AgentStateSnapshot::Present(b"openclaw\n".to_vec())),
         );
 

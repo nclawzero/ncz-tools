@@ -187,11 +187,7 @@ fn join_reader(
 ) -> Result<(Vec<u8>, bool), NczError> {
     handle
         .join()
-        .map_err(|_| {
-            NczError::Io(io::Error::other(
-                "reader thread panicked",
-            ))
-        })?
+        .map_err(|_| NczError::Io(io::Error::other("reader thread panicked")))?
         .map_err(NczError::Io)
 }
 
