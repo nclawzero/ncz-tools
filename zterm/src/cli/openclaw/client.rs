@@ -471,6 +471,7 @@ impl OpenClawClient {
     ) -> anyhow::Result<super::handshake::OpenClawSessionCreateResult> {
         use anyhow::Context;
         let mut params = serde_json::Map::new();
+        let requested_key = opts.key.clone();
         if let Some(v) = opts.key {
             params.insert("key".into(), serde_json::json!(v));
         }
@@ -504,8 +505,20 @@ impl OpenClawClient {
         let payload = res
             .payload
             .ok_or_else(|| anyhow::anyhow!("openclaw: sessions.create response missing payload"))?;
-        serde_json::from_value(payload)
-            .context("openclaw: sessions.create payload did not match SessionCreateResult schema")
+        let created: super::handshake::OpenClawSessionCreateResult = serde_json::from_value(
+            payload,
+        )
+        .context("openclaw: sessions.create payload did not match SessionCreateResult schema")?;
+        if let Some(requested_key) = requested_key {
+            if created.key != requested_key {
+                anyhow::bail!(
+                    "openclaw: sessions.create returned mismatched session key '{}' for requested key '{}'; refusing to bind",
+                    created.key,
+                    requested_key
+                );
+            }
+        }
+        Ok(created)
     }
     /// Fire a chat turn and collect the assistant's reply from the
     /// `session.message` event stream. This is the high-level turn
@@ -1141,13 +1154,12 @@ impl AgentClient for OpenClawClient {
             Err(err) => return Err(err),
         };
         let created_label = created.label.as_deref().unwrap_or(name);
-        if created.key != key
-            && !self.session_key_belongs_to_session_namespace(&created.key, created_label)
-        {
+        if created.key != key {
             anyhow::bail!(
-                "openclaw: sessions.create returned mismatched session key '{}' for requested key '{}'; refusing to bind",
+                "openclaw: sessions.create returned mismatched session key '{}' for requested key '{}' (label '{}'); refusing to bind",
                 created.key,
-                key
+                key,
+                created_label
             );
         }
         Ok(Session {
@@ -1485,6 +1497,51 @@ mod tests {
         assert!(err.to_string().contains("mismatched session key"));
         assert!(err.to_string().contains(&expected_key));
         assert!(err.to_string().contains("foreign-session-key"));
+    }
+
+    #[tokio::test]
+    async fn create_session_rejects_legacy_alias_created_key() {
+        let pending = PendingRequests::new();
+        let (outbound_tx, mut outbound_rx) = mpsc::channel::<RequestFrame>(OUTBOUND_CAPACITY);
+        let mut client = tests_support_new_fake(pending.clone(), Some(outbound_tx), true);
+        let primary_namespace = "backend=openclaw;workspace_id=ws_immutable";
+        let legacy_namespace = "backend=openclaw;workspace=alpha;url=ws://old";
+        client.set_session_namespace(primary_namespace);
+        client.set_session_namespace_aliases([legacy_namespace]);
+        let expected_key = stable_session_key(primary_namespace, "Research");
+        let legacy_key = stable_session_key(legacy_namespace, "Research");
+
+        let create_task = tokio::spawn(async move { client.create_session("Research").await });
+        let req = outbound_rx
+            .recv()
+            .await
+            .expect("create request should be sent");
+
+        assert_eq!(
+            req.params.as_ref().unwrap()["key"].as_str(),
+            Some(expected_key.as_str())
+        );
+
+        pending
+            .resolve(ResponseFrame {
+                id: req.id,
+                ok: true,
+                payload: Some(serde_json::json!({
+                    "key": legacy_key.clone(),
+                    "label": "Research",
+                    "entry": {}
+                })),
+                error: None,
+            })
+            .await;
+
+        let err = create_task
+            .await
+            .expect("create task should join")
+            .expect_err("legacy alias create key must fail closed");
+        assert!(err.to_string().contains("mismatched session key"));
+        assert!(err.to_string().contains(&expected_key));
+        assert!(err.to_string().contains(&legacy_key));
     }
 
     #[tokio::test]

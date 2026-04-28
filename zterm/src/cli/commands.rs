@@ -1057,20 +1057,7 @@ impl CommandHandler {
 
     /// Handle /config command
     async fn handle_config(&self) -> Result<Option<String>> {
-        let mut out = "\n⚙️  Configuration:\n".to_string();
-        match storage::load_config() {
-            Ok(content) => {
-                out.push_str(&content);
-                if !out.ends_with('\n') {
-                    out.push('\n');
-                }
-            }
-            Err(e) => {
-                out.push_str(&format!("❌ Could not load config: {e}\n"));
-            }
-        }
-        out.push('\n');
-        Ok(Some(out))
+        Ok(Some(format_config_output(storage::load_config())))
     }
 
     /// Handle /clear command
@@ -1237,6 +1224,145 @@ impl CommandHandler {
 
         Ok(Some(format!("✅ 🗂  switched to workspace: {name}\n")))
     }
+}
+
+const CONFIG_SECRET_MASK: &str = "***REDACTED***";
+const CONFIG_SECRET_KEY_FRAGMENTS: &[&str] =
+    &["token", "secret", "password", "api_key", "authorization"];
+
+fn format_config_output(config: Result<String>) -> String {
+    let mut out = "\n⚙️  Configuration:\n".to_string();
+    match config {
+        Ok(content) => {
+            out.push_str(&redact_config_secrets(&content));
+            if !out.ends_with('\n') {
+                out.push('\n');
+            }
+        }
+        Err(e) => {
+            out.push_str(&format!("❌ Could not load config: {e}\n"));
+        }
+    }
+    out.push('\n');
+    out
+}
+
+fn redact_config_secrets(content: &str) -> String {
+    let mut out = String::with_capacity(content.len());
+    let mut skip_until_multiline_secret: Option<&'static str> = None;
+
+    for raw_line in content.split_inclusive('\n') {
+        let (line, ending) = split_line_ending(raw_line);
+        if let Some(delimiter) = skip_until_multiline_secret {
+            if line.contains(delimiter) {
+                skip_until_multiline_secret = None;
+            }
+            continue;
+        }
+
+        let (redacted, delimiter) = redact_config_line(line);
+        out.push_str(&redacted);
+        out.push_str(ending);
+        skip_until_multiline_secret = delimiter;
+    }
+
+    out
+}
+
+fn split_line_ending(raw_line: &str) -> (&str, &str) {
+    if let Some(line) = raw_line.strip_suffix("\r\n") {
+        (line, "\r\n")
+    } else if let Some(line) = raw_line.strip_suffix('\n') {
+        (line, "\n")
+    } else {
+        (raw_line, "")
+    }
+}
+
+fn redact_config_line(line: &str) -> (String, Option<&'static str>) {
+    let trimmed = line.trim_start();
+    if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with('[') {
+        return (line.to_string(), None);
+    }
+
+    let Some(eq_idx) = find_unquoted_char(line, '=') else {
+        return (line.to_string(), None);
+    };
+
+    let key = &line[..eq_idx];
+    if !is_sensitive_config_key(key) {
+        return (line.to_string(), None);
+    }
+
+    let rhs = &line[eq_idx + 1..];
+    let value_indent_len = rhs.len() - rhs.trim_start().len();
+    let value_indent = &rhs[..value_indent_len];
+    let value = &rhs[value_indent_len..];
+    let multiline = multiline_secret_delimiter(value);
+    let comment = find_unquoted_char(value, '#')
+        .map(|idx| {
+            let whitespace_before_comment = value[..idx]
+                .chars()
+                .rev()
+                .take_while(|ch| ch.is_whitespace())
+                .map(char::len_utf8)
+                .sum::<usize>();
+            &value[idx - whitespace_before_comment..]
+        })
+        .unwrap_or("");
+    (
+        format!(
+            "{}{}\"{}\"{}",
+            &line[..eq_idx + 1],
+            value_indent,
+            CONFIG_SECRET_MASK,
+            comment
+        ),
+        multiline,
+    )
+}
+
+fn is_sensitive_config_key(key: &str) -> bool {
+    let lower = key.to_ascii_lowercase();
+    CONFIG_SECRET_KEY_FRAGMENTS
+        .iter()
+        .any(|fragment| lower.contains(fragment))
+}
+
+fn multiline_secret_delimiter(value: &str) -> Option<&'static str> {
+    ["\"\"\"", "'''"].into_iter().find(|delimiter| {
+        value.trim_start().starts_with(delimiter) && value.matches(delimiter).count() == 1
+    })
+}
+
+fn find_unquoted_char(input: &str, target: char) -> Option<usize> {
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+
+    for (idx, ch) in input.char_indices() {
+        match quote {
+            Some('"') => {
+                if escaped {
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == '"' {
+                    quote = None;
+                }
+            }
+            Some('\'') => {
+                if ch == '\'' {
+                    quote = None;
+                }
+            }
+            Some(_) => unreachable!(),
+            None if ch == '"' || ch == '\'' => quote = Some(ch),
+            None if ch == target => return Some(idx),
+            None => {}
+        }
+    }
+
+    None
 }
 
 fn parse_single_session_target<'a>(
@@ -2252,6 +2378,25 @@ mod tests {
                 "{cmdline} should not complete silently"
             );
         }
+    }
+
+    #[test]
+    fn config_output_masks_persisted_gateway_token() {
+        let out = super::format_config_output(Ok(r#"[gateway]
+url = "ws://gateway.example"
+token = "persisted-token-value"
+
+[providers.openai]
+api_key = "persisted-api-key"
+"#
+        .to_string()));
+
+        assert!(out.contains("⚙️  Configuration:"));
+        assert!(out.contains("url = \"ws://gateway.example\""));
+        assert!(out.contains("token = \"***REDACTED***\""));
+        assert!(out.contains("api_key = \"***REDACTED***\""));
+        assert!(!out.contains("persisted-token-value"));
+        assert!(!out.contains("persisted-api-key"));
     }
 
     #[tokio::test]

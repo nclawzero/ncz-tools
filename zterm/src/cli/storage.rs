@@ -80,11 +80,19 @@ impl LocalWorkspaceScope {
 
     pub fn identity(&self) -> String {
         let mut parts = vec![format!("backend={}", self.backend)];
+        let has_immutable_workspace_identity = self.id.is_some()
+            || self
+                .namespace
+                .as_deref()
+                .map(|namespace| !namespace.contains("workspace="))
+                .unwrap_or(false);
         if let Some(namespace) = &self.namespace {
             parts.push(format!("namespace={namespace}"));
         }
-        if let Some(name) = &self.name {
-            parts.push(format!("workspace={name}"));
+        if !has_immutable_workspace_identity {
+            if let Some(name) = &self.name {
+                parts.push(format!("workspace={name}"));
+            }
         }
         if let Some(id) = &self.id {
             parts.push(format!("workspace_id={id}"));
@@ -106,10 +114,15 @@ pub fn workspace_scope(
         Some(id) => format!("backend={backend};workspace_id={id}"),
         None => format!("backend={backend};workspace={workspace_name}"),
     };
+    let name = if workspace_id.is_some() {
+        None
+    } else {
+        Some(workspace_name.to_string())
+    };
     LocalWorkspaceScope::new(
         backend,
         Some(namespace),
-        Some(workspace_name.to_string()),
+        name,
         workspace_id.map(str::to_string),
     )
 }
@@ -544,6 +557,21 @@ mod tests {
         assert!(
             !escaped_path.exists(),
             "unsafe metadata write escaped the sessions directory"
+        );
+    }
+
+    #[test]
+    fn id_bearing_workspace_scope_survives_workspace_rename() {
+        let workspace_id = format!("ws_{}", uuid::Uuid::new_v4());
+        let before = workspace_scope("openclaw", "alpha", Some(&workspace_id)).unwrap();
+        let after = workspace_scope("openclaw", "renamed", Some(&workspace_id)).unwrap();
+
+        assert_eq!(before.identity(), after.identity());
+        assert!(!before.identity().contains("alpha"));
+        assert!(!after.identity().contains("renamed"));
+        assert_eq!(
+            scoped_session_history_file(&before, "main").unwrap(),
+            scoped_session_history_file(&after, "main").unwrap()
         );
     }
 
