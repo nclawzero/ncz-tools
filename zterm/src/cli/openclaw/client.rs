@@ -103,6 +103,10 @@ pub struct OpenClawClient {
     /// on server version / advertised method set.
     hello_ok: Option<super::handshake::HelloOk>,
 
+    /// Optional Turbo Vision stream sink. When installed, `submit_turn`
+    /// emits Token/Usage/Finished frames just like `ZeroclawClient`.
+    stream_sink: Option<crate::cli::agent::StreamSink>,
+
     read_task: Option<JoinHandle<()>>,
     write_task: Option<JoinHandle<()>>,
 }
@@ -153,6 +157,7 @@ impl OpenClawClient {
             event_rx: Some(event_rx),
             connected,
             hello_ok: None,
+            stream_sink: None,
             read_task: Some(read_task),
             write_task: Some(write_task),
         })
@@ -862,6 +867,9 @@ async fn collect_turn_result(
         };
 
         turn.merge(&content);
+        turn.usage = crate::cli::agent::TurnUsage::from_json_candidates(message)
+            .or_else(|| crate::cli::agent::TurnUsage::from_json_candidates(payload))
+            .or(turn.usage);
 
         // If this message has text content, it's the terminal
         // assistant reply for the turn — return. Otherwise keep
@@ -941,6 +949,7 @@ pub(super) fn tests_support_new_fake(
         event_rx: Some(event_rx),
         connected: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(connected)),
         hello_ok: None,
+        stream_sink: None,
         read_task: None,
         write_task: None,
     }
@@ -954,7 +963,7 @@ pub(super) fn tests_support_new_fake(
 // list_provider_models (all derive from models.list).
 // =====================================================================
 
-use crate::cli::agent::AgentClient;
+use crate::cli::agent::{AgentClient, StreamSink, TurnChunk};
 use crate::cli::client::{Config, Model, Provider, Session};
 
 const SUBMIT_TURN_DEFAULT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
@@ -1087,16 +1096,42 @@ impl AgentClient for OpenClawClient {
     }
 
     async fn submit_turn(&mut self, session_id: &str, message: &str) -> anyhow::Result<String> {
-        self.rpc_sessions_send_and_collect(
-            session_id,
-            message,
-            SessionsSendOpts {
-                idempotency_key: Some(uuid::Uuid::new_v4().to_string()),
-                ..Default::default()
-            },
-            SUBMIT_TURN_DEFAULT_TIMEOUT,
-        )
-        .await
+        let result = self
+            .rpc_sessions_send_and_collect_rich(
+                session_id,
+                message,
+                SessionsSendOpts {
+                    idempotency_key: Some(uuid::Uuid::new_v4().to_string()),
+                    ..Default::default()
+                },
+                SUBMIT_TURN_DEFAULT_TIMEOUT,
+            )
+            .await;
+
+        match result {
+            Ok(turn) => {
+                if let Some(sink) = &self.stream_sink {
+                    if !turn.text.is_empty() {
+                        let _ = sink.send(TurnChunk::Token(turn.text.clone()));
+                    }
+                    if let Some(usage) = turn.usage {
+                        let _ = sink.send(TurnChunk::Usage(usage));
+                    }
+                    let _ = sink.send(TurnChunk::Finished(Ok(turn.text.clone())));
+                }
+                Ok(turn.text)
+            }
+            Err(e) => {
+                if let Some(sink) = &self.stream_sink {
+                    let _ = sink.send(TurnChunk::Finished(Err(e.to_string())));
+                }
+                Err(e)
+            }
+        }
+    }
+
+    fn set_stream_sink(&mut self, sink: Option<StreamSink>) {
+        self.stream_sink = sink;
     }
 }
 
@@ -1129,6 +1164,7 @@ mod tests {
             event_rx: Some(event_rx),
             connected: Arc::new(AtomicBool::new(false)),
             hello_ok: None,
+            stream_sink: None,
             read_task: None,
             write_task: None,
         };
@@ -1157,6 +1193,7 @@ mod tests {
             event_rx: Some(event_rx),
             connected: Arc::new(AtomicBool::new(true)),
             hello_ok: None,
+            stream_sink: None,
             read_task: None,
             write_task: None,
         };
@@ -1180,6 +1217,7 @@ mod tests {
             event_rx: Some(event_rx),
             connected: Arc::new(AtomicBool::new(true)),
             hello_ok: None,
+            stream_sink: None,
             read_task: None,
             write_task: None,
         };

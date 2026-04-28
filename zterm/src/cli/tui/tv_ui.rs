@@ -52,7 +52,7 @@ use turbo_vision::views::status_line::{StatusItem, StatusLine};
 use turbo_vision::views::view::{write_line_to_terminal, View};
 use turbo_vision::views::window::WindowBuilder;
 
-use crate::cli::agent::TurnChunk;
+use crate::cli::agent::{TurnChunk, TurnUsage};
 use crate::cli::client::Session;
 use crate::cli::commands::CommandHandler;
 use crate::cli::storage;
@@ -165,6 +165,9 @@ struct StatusState {
     /// re-reading `~/.zterm/theme.toml`. Defaults to whatever
     /// `themes::load_persisted` returned at boot.
     current_theme: String,
+    /// Token usage from the latest turn that reported it. Rendered
+    /// as the `ctx used/total (%)` segment in the status line.
+    usage: Option<TurnUsage>,
 }
 
 impl StatusState {
@@ -178,6 +181,7 @@ impl StatusState {
             last_spinner_tick: Instant::now(),
             toast: None,
             current_theme,
+            usage: None,
         }
     }
 
@@ -245,9 +249,9 @@ impl StatusState {
     }
 
     /// Build the status-line content string for the right-most
-    /// segment. `ctx --/--` is a placeholder until an agent client
-    /// surfaces `TurnResult.usage`. The spinner prefix only renders
-    /// while a turn is in flight.
+    /// segment. The spinner prefix only renders while a turn is in
+    /// flight; token usage reflects the latest `TurnChunk::Usage`
+    /// observed from the active backend.
     ///
     /// While a toast is active (set via `set_toast`, e.g. on a
     /// Ctrl-P palette cycle), its text replaces the workspace/model
@@ -261,13 +265,42 @@ impl StatusState {
             None => String::new(),
         };
         format!(
-            "{}{} · {} · ctx --/-- · {} elapsed",
+            "{}{} · {} · {} · {} elapsed",
             lead,
             self.workspace,
             self.model,
+            render_ctx_usage(self.usage),
             self.elapsed_mmss()
         )
     }
+}
+
+fn render_ctx_usage(usage: Option<TurnUsage>) -> String {
+    let Some(usage) = usage else {
+        return "ctx --/--".to_string();
+    };
+    let Some(used) = usage.used_tokens() else {
+        return "ctx --/--".to_string();
+    };
+    match usage.context_window {
+        Some(total) if total > 0 => {
+            let pct = usage.budget_pct().unwrap_or(0);
+            format!("ctx {used}/{total} ({pct}%) {}", token_budget_bar(pct, 10))
+        }
+        _ => format!("ctx {used}/--"),
+    }
+}
+
+fn token_budget_bar(pct: u8, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let filled = ((pct.min(100) as usize * width) + 99) / 100;
+    format!(
+        "[{}{}]",
+        "#".repeat(filled),
+        "-".repeat(width.saturating_sub(filled))
+    )
 }
 
 /// Entry point from `cli::tui::run` when `--legacy-repl` is not set.
@@ -1084,8 +1117,14 @@ fn drain_stream_events(
     loop {
         match event_rx.try_recv() {
             Ok(chunk) => {
-                if matches!(chunk, TurnChunk::Finished(_)) {
-                    status_state.end_turn();
+                match &chunk {
+                    TurnChunk::Usage(usage) => {
+                        status_state.usage = Some(*usage);
+                    }
+                    TurnChunk::Finished(_) => {
+                        status_state.end_turn();
+                    }
+                    TurnChunk::Token(_) => {}
                 }
                 apply_chunk(chunk, chat_lines);
             }
@@ -1120,6 +1159,7 @@ fn apply_chunk(chunk: TurnChunk, chat_lines: &Rc<RefCell<Vec<String>>>) {
                 lines.push(piece.to_string());
             }
         }
+        TurnChunk::Usage(_) => {}
         TurnChunk::Finished(Ok(_)) => {
             lines.push(String::new());
         }
@@ -1810,5 +1850,31 @@ impl View for ChatPane {
 
     fn get_palette(&self) -> Option<Palette> {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn token_budget_bar_clamps_and_sizes() {
+        assert_eq!(token_budget_bar(0, 10), "[----------]");
+        assert_eq!(token_budget_bar(25, 10), "[###-------]");
+        assert_eq!(token_budget_bar(150, 10), "[##########]");
+    }
+
+    #[test]
+    fn ctx_usage_renders_used_total_pct_and_bar() {
+        let usage = TurnUsage {
+            total_tokens: Some(2_000),
+            context_window: Some(8_000),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            render_ctx_usage(Some(usage)),
+            "ctx 2000/8000 (25%) [###-------]"
+        );
     }
 }

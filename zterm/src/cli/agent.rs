@@ -38,6 +38,107 @@ use tokio::sync::mpsc;
 // them into a dedicated `types.rs` alongside the second backend.
 pub use crate::cli::client::{Config, Model, Provider, Session};
 
+/// Token accounting for the most recent completed turn.
+///
+/// Backends disagree on field names (`prompt_tokens` vs.
+/// `input_tokens`, `completion_tokens` vs. `output_tokens`) and not
+/// every response includes the model's context window. This struct
+/// keeps the raw useful pieces while exposing `used_tokens()` and
+/// `context_window` for the Turbo Vision status line.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TurnUsage {
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
+    pub context_window: Option<u64>,
+}
+
+impl TurnUsage {
+    pub fn used_tokens(&self) -> Option<u64> {
+        self.total_tokens
+            .or_else(|| match (self.input_tokens, self.output_tokens) {
+                (Some(input), Some(output)) => Some(input + output),
+                (Some(input), None) => Some(input),
+                (None, Some(output)) => Some(output),
+                (None, None) => None,
+            })
+    }
+
+    pub fn budget_pct(&self) -> Option<u8> {
+        let used = self.used_tokens()?;
+        let total = self.context_window?;
+        if total == 0 {
+            return None;
+        }
+        Some(((used.saturating_mul(100)) / total).min(100) as u8)
+    }
+
+    pub fn from_json(value: &serde_json::Value) -> Option<Self> {
+        let input_tokens = first_u64(
+            value,
+            &[
+                "input_tokens",
+                "prompt_tokens",
+                "promptTokens",
+                "inputTokens",
+            ],
+        );
+        let output_tokens = first_u64(
+            value,
+            &[
+                "output_tokens",
+                "completion_tokens",
+                "completionTokens",
+                "outputTokens",
+            ],
+        );
+        let total_tokens = first_u64(value, &["total_tokens", "totalTokens", "tokens_total"]);
+        let context_window = first_u64(
+            value,
+            &[
+                "context_window",
+                "contextWindow",
+                "context_length",
+                "contextLength",
+                "max_context_tokens",
+                "maxContextTokens",
+            ],
+        );
+
+        let usage = Self {
+            input_tokens,
+            output_tokens,
+            total_tokens,
+            context_window,
+        };
+        usage.used_tokens().map(|_| usage)
+    }
+
+    pub fn from_json_candidates(value: &serde_json::Value) -> Option<Self> {
+        if let Some(usage) = Self::from_json(value) {
+            return Some(usage);
+        }
+        let candidates = [
+            value.get("usage"),
+            value.get("token_usage"),
+            value.get("tokenUsage"),
+            value.get("metrics").and_then(|m| m.get("usage")),
+            value.get("metadata").and_then(|m| m.get("usage")),
+        ];
+        candidates.into_iter().flatten().find_map(Self::from_json)
+    }
+}
+
+fn first_u64(value: &serde_json::Value, keys: &[&str]) -> Option<u64> {
+    keys.iter().find_map(|key| {
+        value.get(*key).and_then(|v| {
+            v.as_u64()
+                .or_else(|| v.as_i64().and_then(|n| u64::try_from(n).ok()))
+                .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
+        })
+    })
+}
+
 /// Streaming chunk emitted by an `AgentClient` during `submit_turn` when a
 /// sink has been installed via `AgentClient::set_stream_sink`. The TUI
 /// consumes these to append tokens into the chat pane as they arrive from
@@ -48,6 +149,9 @@ pub enum TurnChunk {
     /// A streamed token fragment. Concatenating every `Token` in order
     /// yields the same text that legacy stdout mode would have printed.
     Token(String),
+    /// Token accounting for the completed or near-completed turn.
+    /// Emitted when a backend surfaces usage data.
+    Usage(TurnUsage),
     /// The turn has completed — either with the full response text, or
     /// with an error. Emitted exactly once per submit. The UI should
     /// treat anything after this as a protocol bug.
@@ -129,4 +233,38 @@ pub trait AgentClient: Send + Sync {
     /// pick up real sink support in a later slice without widening the
     /// trait again.
     fn set_stream_sink(&mut self, _sink: Option<StreamSink>) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TurnUsage;
+
+    #[test]
+    fn usage_parses_openai_style_fields() {
+        let value = serde_json::json!({
+            "prompt_tokens": 123,
+            "completion_tokens": 45,
+            "total_tokens": 168,
+            "context_window": 4096
+        });
+
+        let usage = TurnUsage::from_json(&value).unwrap();
+
+        assert_eq!(usage.used_tokens(), Some(168));
+        assert_eq!(usage.budget_pct(), Some(4));
+    }
+
+    #[test]
+    fn usage_parses_anthropic_style_fields() {
+        let value = serde_json::json!({
+            "input_tokens": "1000",
+            "output_tokens": 250,
+            "contextWindow": 8000
+        });
+
+        let usage = TurnUsage::from_json(&value).unwrap();
+
+        assert_eq!(usage.used_tokens(), Some(1250));
+        assert_eq!(usage.budget_pct(), Some(15));
+    }
 }

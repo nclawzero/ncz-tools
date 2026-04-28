@@ -9,7 +9,7 @@ use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
 
-use crate::cli::agent::{StreamSink, TurnChunk};
+use crate::cli::agent::{StreamSink, TurnChunk, TurnUsage};
 
 /// One row from the daemon's `[providers.models.<key>]` config table.
 ///
@@ -607,8 +607,12 @@ impl ZeroclawClient {
                         self.emit_token(&full_response)?;
                         streamed = true;
                     }
+                    self.emit_usage(TurnUsage::from_json_candidates(&event));
                     self.emit_finished_ok(full_response.clone(), streamed);
                     return Ok(full_response);
+                }
+                Some("usage") => {
+                    self.emit_usage(TurnUsage::from_json_candidates(&event));
                 }
                 Some("error") => {
                     let msg = event
@@ -681,6 +685,9 @@ impl ZeroclawClient {
 
         match &self.stream_sink {
             Some(sink) => {
+                if let Some(usage) = TurnUsage::from_json_candidates(&json) {
+                    let _ = sink.send(TurnChunk::Usage(usage));
+                }
                 let _ = sink.send(TurnChunk::Token(text.clone()));
                 let _ = sink.send(TurnChunk::Finished(Ok(text.clone())));
             }
@@ -711,6 +718,12 @@ impl ZeroclawClient {
             let _ = sink.send(TurnChunk::Finished(Ok(text)));
         } else if printed_to_stdout {
             println!();
+        }
+    }
+
+    fn emit_usage(&self, usage: Option<TurnUsage>) {
+        if let (Some(sink), Some(usage)) = (&self.stream_sink, usage) {
+            let _ = sink.send(TurnChunk::Usage(usage));
         }
     }
 
