@@ -239,11 +239,9 @@ impl CommandHandler {
                     }
                 }
             }
-            Some("delete") => {
-                let name = args.first().copied().unwrap_or("");
-                if name.is_empty() {
-                    out.push_str("Usage: /session delete <name>\n");
-                } else {
+            Some("delete") => match parse_single_session_target(args, "/session delete <name>") {
+                Err(message) => out.push_str(&message),
+                Ok(name) => {
                     let Some(client) = self.current_agent_client().await else {
                         out.push_str("❌ Failed to delete session: no active workspace client\n");
                         out.push('\n');
@@ -284,7 +282,7 @@ impl CommandHandler {
                         }
                     }
                 }
-            }
+            },
             Some("info") => {
                 let Some(client) = self.current_agent_client().await else {
                     out.push_str(
@@ -316,20 +314,24 @@ impl CommandHandler {
                 }
             }
             Some("switch") | Some("create") => {
-                let Some(session_name) = args.first().copied().filter(|s| !s.is_empty()) else {
-                    out.push_str(&format!(
-                        "Usage: /session {} <name>\n",
-                        subcommand.unwrap_or("switch")
-                    ));
-                    out.push('\n');
-                    return Ok(Some(out));
-                };
-                out.push_str(&format!("🔄 Active backend session: '{session_name}'\n"));
+                let usage = format!("Usage: /session {} <name>", subcommand.unwrap_or("switch"));
+                match parse_single_session_target(args, &usage) {
+                    Ok(session_name) => {
+                        out.push_str(&format!("🔄 Active backend session: '{session_name}'\n"));
+                    }
+                    Err(message) => out.push_str(&message),
+                }
             }
             Some(session_name) => {
-                out.push_str(&format!(
-                    "🔄 Switching to backend session: '{session_name}'\n"
-                ));
+                if args.is_empty() {
+                    out.push_str(&format!(
+                        "🔄 Switching to backend session: '{session_name}'\n"
+                    ));
+                } else {
+                    out.push_str(
+                        "Usage: /session <name>\n❌ Session targets must be a single id/name token; extra tokens were not ignored.\n",
+                    );
+                }
             }
             None => {
                 out.push_str("Usage: /session list         (show all sessions)\n");
@@ -1184,6 +1186,25 @@ impl CommandHandler {
     }
 }
 
+fn parse_single_session_target<'a>(
+    args: &'a [&str],
+    usage: &str,
+) -> std::result::Result<&'a str, String> {
+    match args {
+        [] => Err(format!("{usage}\n")),
+        [target] => {
+            if target.is_empty() {
+                Err(format!("{usage}\n"))
+            } else {
+                Ok(*target)
+            }
+        }
+        [_target, ..] => Err(format!(
+            "{usage}\n❌ Session targets must be a single id/name token; extra tokens were not ignored.\n"
+        )),
+    }
+}
+
 fn format_backend_session_list(
     sessions: &[Session],
     local_sessions: &[storage::SessionMetadata],
@@ -1650,6 +1671,35 @@ mod tests {
             .collect();
         let (_, _, args) = split_parts(&parts);
         assert_eq!(args, &["hello", "world", "--category", "work"]);
+    }
+
+    #[test]
+    fn session_delete_parser_rejects_multiword_or_extra_tokens() {
+        assert_eq!(
+            super::parse_single_session_target(&["Research"], "/session delete <name>").unwrap(),
+            "Research"
+        );
+
+        let err =
+            super::parse_single_session_target(&["Research", "Notes"], "/session delete <name>")
+                .unwrap_err();
+
+        assert!(err.contains("extra tokens were not ignored"));
+        assert!(err.contains("/session delete <name>"));
+    }
+
+    #[test]
+    fn session_switch_create_parser_rejects_extra_tokens() {
+        assert_eq!(
+            super::parse_single_session_target(&["scratch"], "/session create <name>").unwrap(),
+            "scratch"
+        );
+
+        let err =
+            super::parse_single_session_target(&["scratch", "copy"], "/session create <name>")
+                .unwrap_err();
+
+        assert!(err.contains("extra tokens were not ignored"));
     }
 
     #[test]

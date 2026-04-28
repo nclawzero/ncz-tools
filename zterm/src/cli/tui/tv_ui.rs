@@ -1054,11 +1054,6 @@ async fn create_new_session_for_worker(
     }
     .ok_or_else(|| anyhow::anyhow!("no active workspace client"))?;
 
-    {
-        let locked = client.lock().await;
-        plan_worker_session_create(session_name, locked.list_sessions().await)?;
-    }
-
     create_session_for_worker_client(&client, session_name).await
 }
 
@@ -1122,36 +1117,6 @@ fn plan_worker_session_resolution(
         Some(session) => Ok(WorkerSessionResolution::Existing(session.clone())),
         None => Ok(WorkerSessionResolution::Create),
     }
-}
-
-fn plan_worker_session_create(requested: &str, list_result: Result<Vec<Session>>) -> Result<()> {
-    let sessions = list_result
-        .map_err(|e| anyhow::anyhow!("could not list sessions from active backend: {e}"))?;
-
-    let conflicts: Vec<&Session> = sessions
-        .iter()
-        .filter(|session| session.id == requested || session.name == requested)
-        .collect();
-    if conflicts.is_empty() {
-        return Ok(());
-    }
-
-    Err(duplicate_worker_session_create_error(requested, conflicts))
-}
-
-fn duplicate_worker_session_create_error(
-    requested: &str,
-    conflicts: Vec<&Session>,
-) -> anyhow::Error {
-    let candidates = conflicts
-        .iter()
-        .map(|session| format!("backend id={} name={}", session.id, session.name))
-        .collect::<Vec<_>>()
-        .join("; ");
-
-    anyhow::anyhow!(
-        "backend session id/name '{requested}' already exists; refusing explicit create. Candidates: {candidates}"
-    )
 }
 
 fn choose_worker_session_by_id_or_name<'a>(
@@ -1269,7 +1234,7 @@ fn session_delete_target(cmdline: &str) -> Option<&str> {
     if parts.next()? != "delete" {
         return None;
     }
-    parts.next()
+    single_remaining_session_target(&mut parts)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1294,12 +1259,24 @@ fn session_action(cmdline: &str) -> Option<SessionAction<'_>> {
     match parts.next()? {
         "list" | "info" | "delete" => None,
         "switch" => Some(SessionAction::Switch {
-            target: parts.next()?,
+            target: single_remaining_session_target(&mut parts)?,
         }),
         "create" => Some(SessionAction::Create {
-            target: parts.next()?,
+            target: single_remaining_session_target(&mut parts)?,
         }),
-        name => Some(SessionAction::Switch { target: name }),
+        name if parts.next().is_none() => Some(SessionAction::Switch { target: name }),
+        _ => None,
+    }
+}
+
+fn single_remaining_session_target<'a>(
+    parts: &mut std::str::SplitWhitespace<'a>,
+) -> Option<&'a str> {
+    let target = parts.next()?;
+    if parts.next().is_some() {
+        None
+    } else {
+        Some(target)
     }
 }
 
@@ -3286,6 +3263,9 @@ mod tests {
             session_action("/session create scratch"),
             Some(SessionAction::Create { target: "scratch" })
         );
+        assert_eq!(session_action("/session research notes"), None);
+        assert_eq!(session_action("/session switch research notes"), None);
+        assert_eq!(session_action("/session create scratch copy"), None);
         assert_eq!(session_action("/session list"), None);
         assert_eq!(session_action("/session info"), None);
         assert_eq!(session_action("/workspace switch prod"), None);
@@ -3316,6 +3296,10 @@ mod tests {
         assert_eq!(
             session_delete_target("/session delete Research"),
             Some("Research")
+        );
+        assert_eq!(
+            session_delete_target("/session delete Research Notes"),
+            None
         );
         assert_eq!(session_delete_target("/session switch Research"), None);
         assert_eq!(session_delete_target("/workspace switch prod"), None);
@@ -3516,45 +3500,6 @@ mod tests {
             WorkerSessionResolution::Existing(session) => assert_eq!(session.id, "sess-123"),
             WorkerSessionResolution::Create => panic!("expected existing session resolution"),
         }
-    }
-
-    #[test]
-    fn worker_session_create_fails_closed_on_existing_name_or_id() {
-        let sessions = vec![
-            Session {
-                id: "sess-123".to_string(),
-                name: "Research".to_string(),
-                model: "m".to_string(),
-                provider: "p".to_string(),
-            },
-            Session {
-                id: "scratch".to_string(),
-                name: "Scratchpad".to_string(),
-                model: "m".to_string(),
-                provider: "p".to_string(),
-            },
-        ];
-
-        let name_err = plan_worker_session_create("Research", Ok(sessions.clone())).unwrap_err();
-        assert!(name_err.to_string().contains("already exists"));
-        assert!(name_err.to_string().contains("sess-123"));
-
-        let id_err = plan_worker_session_create("scratch", Ok(sessions)).unwrap_err();
-        assert!(id_err.to_string().contains("already exists"));
-        assert!(id_err.to_string().contains("Scratchpad"));
-    }
-
-    #[test]
-    fn worker_session_create_allows_absent_name_after_authoritative_listing() {
-        let sessions = vec![Session {
-            id: "sess-123".to_string(),
-            name: "Research".to_string(),
-            model: "m".to_string(),
-            provider: "p".to_string(),
-        }];
-
-        plan_worker_session_create("Scratch", Ok(sessions))
-            .expect("absent session name should permit explicit create");
     }
 
     #[test]

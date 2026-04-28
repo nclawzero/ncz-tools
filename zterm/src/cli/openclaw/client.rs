@@ -46,6 +46,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use futures::{SinkExt, StreamExt};
+use sha2::{Digest as _, Sha256};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -1065,12 +1066,21 @@ impl AgentClient for OpenClawClient {
     }
 
     async fn create_session(&self, name: &str) -> anyhow::Result<Session> {
-        let created = self
+        let key = stable_session_key(name);
+        let created = match self
             .rpc_sessions_create(SessionsCreateOpts {
+                key: Some(key.clone()),
                 label: Some(name.to_string()),
                 ..Default::default()
             })
-            .await?;
+            .await
+        {
+            Ok(created) => created,
+            Err(err) if is_already_exists_error(&err) => {
+                return self.load_session_key_exact(&key).await;
+            }
+            Err(err) => return Err(err),
+        };
         Ok(Session {
             id: created.key.clone(),
             name: created.label.unwrap_or_else(|| created.key.clone()),
@@ -1138,6 +1148,75 @@ impl AgentClient for OpenClawClient {
     }
 }
 
+impl OpenClawClient {
+    async fn load_session_key_exact(&self, key: &str) -> anyhow::Result<Session> {
+        let result = self
+            .rpc_sessions_list(SessionsListOpts {
+                limit: Some(500),
+                ..Default::default()
+            })
+            .await?;
+        for row in result.sessions {
+            if row.key == key {
+                return Ok(row_into_session(row));
+            }
+        }
+        anyhow::bail!("openclaw: session not found: {key}")
+    }
+}
+
+fn stable_session_key(label: &str) -> String {
+    let mut slug = String::new();
+    let mut last_dash = false;
+    for ch in label.trim().chars() {
+        let mapped = if ch.is_ascii_alphanumeric() {
+            Some(ch.to_ascii_lowercase())
+        } else if matches!(ch, '-' | '_' | '.') {
+            Some(ch)
+        } else if ch.is_whitespace() {
+            Some('-')
+        } else {
+            None
+        };
+
+        if let Some(mapped) = mapped {
+            if mapped == '-' {
+                if last_dash {
+                    continue;
+                }
+                last_dash = true;
+            } else {
+                last_dash = false;
+            }
+            slug.push(mapped);
+        }
+    }
+
+    let slug = slug.trim_matches('-');
+    let slug = if slug.is_empty() { "session" } else { slug };
+    let slug: String = slug.chars().take(40).collect();
+
+    let mut hasher = Sha256::new();
+    hasher.update(label.as_bytes());
+    let digest = hex_lower(&hasher.finalize());
+    format!("zterm-{slug}-{}", &digest[..16])
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn is_already_exists_error(err: &anyhow::Error) -> bool {
+    let msg = err.to_string().to_ascii_lowercase();
+    (msg.contains("already") && msg.contains("exist")) || msg.contains("conflict")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1166,6 +1245,181 @@ mod tests {
 
         assert_eq!(session.id, "canonical-key");
         assert_eq!(session.name, "Label");
+    }
+
+    #[test]
+    fn stable_session_key_is_deterministic_and_sanitized() {
+        let first = stable_session_key("Research Notes");
+        let second = stable_session_key("Research Notes");
+
+        assert_eq!(first, second);
+        assert!(first.starts_with("zterm-research-notes-"));
+        assert!(!first.contains(' '));
+        assert_ne!(first, stable_session_key("Research"));
+    }
+
+    #[tokio::test]
+    async fn create_session_sends_stable_key_with_label() {
+        let pending = PendingRequests::new();
+        let (outbound_tx, mut outbound_rx) = mpsc::channel::<RequestFrame>(OUTBOUND_CAPACITY);
+        let client = tests_support_new_fake(pending.clone(), Some(outbound_tx), true);
+        let expected_key = stable_session_key("Research");
+
+        let create_task = tokio::spawn(async move { client.create_session("Research").await });
+        let req = outbound_rx
+            .recv()
+            .await
+            .expect("create request should be sent");
+
+        assert_eq!(req.method, "sessions.create");
+        assert_eq!(
+            req.params.as_ref().unwrap()["key"].as_str(),
+            Some(expected_key.as_str())
+        );
+        assert_eq!(
+            req.params.as_ref().unwrap()["label"].as_str(),
+            Some("Research")
+        );
+
+        pending
+            .resolve(ResponseFrame {
+                id: req.id,
+                ok: true,
+                payload: Some(serde_json::json!({
+                    "key": expected_key.clone(),
+                    "label": "Research",
+                    "entry": {}
+                })),
+                error: None,
+            })
+            .await;
+
+        let session = create_task
+            .await
+            .expect("create task should join")
+            .expect("create should succeed");
+        assert_eq!(session.id, expected_key);
+        assert_eq!(session.name, "Research");
+    }
+
+    #[tokio::test]
+    async fn create_session_loads_stable_key_when_create_already_exists() {
+        let pending = PendingRequests::new();
+        let (outbound_tx, mut outbound_rx) = mpsc::channel::<RequestFrame>(OUTBOUND_CAPACITY);
+        let client = tests_support_new_fake(pending.clone(), Some(outbound_tx), true);
+        let expected_key = stable_session_key("Research");
+
+        let create_task = tokio::spawn(async move { client.create_session("Research").await });
+        let create_req = outbound_rx
+            .recv()
+            .await
+            .expect("create request should be sent");
+
+        pending
+            .resolve(ResponseFrame {
+                id: create_req.id,
+                ok: false,
+                payload: None,
+                error: Some(super::super::wire::ErrorBody {
+                    code: "ALREADY_EXISTS".to_string(),
+                    message: "session already exists".to_string(),
+                    details: None,
+                }),
+            })
+            .await;
+
+        let list_req = outbound_rx
+            .recv()
+            .await
+            .expect("load_session should list sessions after duplicate create");
+
+        assert_eq!(list_req.method, "sessions.list");
+        assert_eq!(list_req.params.as_ref().unwrap()["limit"], 500);
+
+        pending
+            .resolve(ResponseFrame {
+                id: list_req.id,
+                ok: true,
+                payload: Some(serde_json::json!({
+                    "ts": 1,
+                    "path": "sessions.jsonl",
+                    "count": 1,
+                    "defaults": {},
+                    "sessions": [{
+                        "key": expected_key.clone(),
+                        "kind": "direct",
+                        "label": "Research"
+                    }]
+                })),
+                error: None,
+            })
+            .await;
+
+        let session = create_task
+            .await
+            .expect("create task should join")
+            .expect("duplicate create should load exact stable key");
+        assert_eq!(session.id, expected_key);
+        assert_eq!(session.name, "Research");
+    }
+
+    #[tokio::test]
+    async fn duplicate_create_recovery_requires_exact_session_key() {
+        let pending = PendingRequests::new();
+        let (outbound_tx, mut outbound_rx) = mpsc::channel::<RequestFrame>(OUTBOUND_CAPACITY);
+        let client = tests_support_new_fake(pending.clone(), Some(outbound_tx), true);
+        let expected_key = stable_session_key("Research");
+
+        let create_task = tokio::spawn(async move { client.create_session("Research").await });
+        let create_req = outbound_rx
+            .recv()
+            .await
+            .expect("create request should be sent");
+
+        pending
+            .resolve(ResponseFrame {
+                id: create_req.id,
+                ok: false,
+                payload: None,
+                error: Some(super::super::wire::ErrorBody {
+                    code: "ALREADY_EXISTS".to_string(),
+                    message: "session already exists".to_string(),
+                    details: None,
+                }),
+            })
+            .await;
+
+        let list_req = outbound_rx
+            .recv()
+            .await
+            .expect("load_session should list sessions after duplicate create");
+
+        pending
+            .resolve(ResponseFrame {
+                id: list_req.id,
+                ok: true,
+                payload: Some(serde_json::json!({
+                    "ts": 1,
+                    "path": "sessions.jsonl",
+                    "count": 1,
+                    "defaults": {},
+                    "sessions": [{
+                        "key": "different-key",
+                        "kind": "direct",
+                        "label": "Research",
+                        "sessionId": expected_key
+                    }]
+                })),
+                error: None,
+            })
+            .await;
+
+        let err = create_task
+            .await
+            .expect("create task should join")
+            .expect_err("duplicate recovery must not load a compat sessionId match");
+        assert!(err.to_string().contains("session not found"));
+        assert!(err.to_string().contains(&expected_key));
     }
 
     #[tokio::test]

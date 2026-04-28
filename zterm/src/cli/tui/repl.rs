@@ -72,10 +72,7 @@ impl ReplLoop {
                 LegacySessionAction::Switch { .. } => {
                     plan_legacy_session_resolution(target, locked.list_sessions().await)?
                 }
-                LegacySessionAction::Create { .. } => {
-                    plan_legacy_session_create(target, locked.list_sessions().await)?;
-                    LegacySessionResolution::Create
-                }
+                LegacySessionAction::Create { .. } => LegacySessionResolution::Create,
             }
         };
 
@@ -361,12 +358,24 @@ fn legacy_session_action(cmdline: &str) -> Option<LegacySessionAction<'_>> {
     match parts.next()? {
         "list" | "info" | "delete" => None,
         "switch" => Some(LegacySessionAction::Switch {
-            target: parts.next()?,
+            target: single_remaining_session_target(&mut parts)?,
         }),
         "create" => Some(LegacySessionAction::Create {
-            target: parts.next()?,
+            target: single_remaining_session_target(&mut parts)?,
         }),
-        name => Some(LegacySessionAction::Switch { target: name }),
+        name if parts.next().is_none() => Some(LegacySessionAction::Switch { target: name }),
+        _ => None,
+    }
+}
+
+fn single_remaining_session_target<'a>(
+    parts: &mut std::str::SplitWhitespace<'a>,
+) -> Option<&'a str> {
+    let target = parts.next()?;
+    if parts.next().is_some() {
+        None
+    } else {
+        Some(target)
     }
 }
 
@@ -386,21 +395,6 @@ fn plan_legacy_session_resolution(
         Some(session) => Ok(LegacySessionResolution::Existing(session.clone())),
         None => Ok(LegacySessionResolution::Create),
     }
-}
-
-fn plan_legacy_session_create(requested: &str, list_result: Result<Vec<Session>>) -> Result<()> {
-    let sessions = list_result
-        .map_err(|e| anyhow::anyhow!("could not list sessions from active backend: {e}"))?;
-
-    let conflicts: Vec<&Session> = sessions
-        .iter()
-        .filter(|session| session.id == requested || session.name == requested)
-        .collect();
-    if conflicts.is_empty() {
-        return Ok(());
-    }
-
-    Err(duplicate_legacy_session_create_error(requested, conflicts))
 }
 
 fn choose_legacy_session_by_id_or_name<'a>(
@@ -436,21 +430,6 @@ fn choose_legacy_session_by_id_or_name<'a>(
             name_matches,
         )),
     }
-}
-
-fn duplicate_legacy_session_create_error(
-    requested: &str,
-    conflicts: Vec<&Session>,
-) -> anyhow::Error {
-    let candidates = conflicts
-        .iter()
-        .map(|session| format!("backend id={} name={}", session.id, session.name))
-        .collect::<Vec<_>>()
-        .join("; ");
-
-    anyhow::anyhow!(
-        "backend session id/name '{requested}' already exists; refusing explicit create. Candidates: {candidates}"
-    )
 }
 
 fn ambiguous_legacy_session_error(
@@ -516,6 +495,12 @@ mod tests {
             legacy_session_action("/session create scratch"),
             Some(LegacySessionAction::Create { target: "scratch" })
         );
+        assert_eq!(legacy_session_action("/session research notes"), None);
+        assert_eq!(
+            legacy_session_action("/session switch research notes"),
+            None
+        );
+        assert_eq!(legacy_session_action("/session create scratch copy"), None);
         assert_eq!(legacy_session_action("/session list"), None);
         assert_eq!(legacy_session_action("/session info"), None);
         assert_eq!(legacy_session_action("/session delete research"), None);
@@ -536,16 +521,5 @@ mod tests {
             LegacySessionResolution::Existing(session) => assert_eq!(session.id, "sess-123"),
             LegacySessionResolution::Create => panic!("expected existing session resolution"),
         }
-    }
-
-    #[test]
-    fn legacy_session_create_fails_on_existing_name() {
-        let sessions = vec![session("sess-123", "Research")];
-
-        let err = plan_legacy_session_create("Research", Ok(sessions)).unwrap_err();
-        let msg = err.to_string();
-
-        assert!(msg.contains("already exists"));
-        assert!(msg.contains("backend id=sess-123 name=Research"));
     }
 }
