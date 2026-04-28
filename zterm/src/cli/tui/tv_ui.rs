@@ -26,7 +26,6 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use tokio::runtime::Handle;
 use tokio::sync::{mpsc, Mutex};
 use tracing::{info, warn};
 
@@ -77,6 +76,9 @@ enum WorkerRequest {
     /// through the shared `CommandHandler`. Structured
     /// `Ok(Some(text))` output is forwarded to the chat pane.
     Command(String),
+    /// Fetch backend sessions for the modal picker on the async
+    /// worker path. The sync TUI thread must not call backend I/O.
+    SessionPickerList,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -137,6 +139,7 @@ const INPUT_UNDO_DEPTH: usize = 64;
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const SPINNER_INTERVAL: Duration = Duration::from_millis(80);
 const TURN_FORWARD_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
+const SESSION_PICKER_LIST_TIMEOUT: Duration = Duration::from_secs(5);
 const RESPONSE_BUSY_TOAST: &str = "Busy: response in progress";
 
 /// How long a status-line toast (e.g. palette confirmation after
@@ -586,6 +589,22 @@ pub async fn run(
                         }
                     }
                 }
+                WorkerRequest::SessionPickerList => {
+                    let result = tokio::time::timeout(
+                        SESSION_PICKER_LIST_TIMEOUT,
+                        load_session_picker_sessions_for_worker(&worker_app),
+                    )
+                    .await
+                    .map_err(|_| {
+                        anyhow::anyhow!(
+                            "timed out after {}s",
+                            SESSION_PICKER_LIST_TIMEOUT.as_secs()
+                        )
+                    })
+                    .and_then(|result| result)
+                    .map_err(|e| e.to_string());
+                    let _ = worker_sink.send(TurnChunk::SessionPickerList(result));
+                }
                 WorkerRequest::Command(cmdline) => {
                     // Route slash commands through the shared
                     // `CommandHandler`. Advertised commands return
@@ -777,7 +796,6 @@ pub async fn run(
     });
 
     let blocking_app = Arc::clone(&app);
-    let runtime_handle = Handle::current();
     tokio::task::spawn_blocking(move || {
         run_blocking(
             blocking_app,
@@ -788,7 +806,6 @@ pub async fn run(
             connect_splash,
             req_tx,
             event_rx,
-            runtime_handle,
         )
     })
     .await
@@ -911,6 +928,17 @@ async fn install_stream_sink_on_active_client(app: &Arc<Mutex<App>>, sink: Strea
     };
     client.lock().await.set_stream_sink(Some(sink));
     true
+}
+
+async fn load_session_picker_sessions_for_worker(app: &Arc<Mutex<App>>) -> Result<Vec<Session>> {
+    let client = {
+        let guard = app.lock().await;
+        guard.active_workspace().and_then(|w| w.client.clone())
+    }
+    .ok_or_else(|| anyhow::anyhow!("no active workspace client"))?;
+
+    let locked = client.lock().await;
+    locked.list_sessions().await
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1343,7 +1371,6 @@ fn run_blocking(
     connect_splash: Option<String>,
     req_tx: mpsc::Sender<WorkerRequest>,
     mut event_rx: mpsc::UnboundedReceiver<TurnChunk>,
-    runtime_handle: Handle,
 ) -> Result<()> {
     let mut tapp =
         Application::new().map_err(|e| anyhow::anyhow!("turbo-vision init failed: {e:?}"))?;
@@ -1507,7 +1534,6 @@ fn run_blocking(
         &mut status_state,
         &mut typewriter_state,
         &app,
-        &runtime_handle,
         w,
         h,
     )?;
@@ -1671,13 +1697,13 @@ fn run_event_loop(
     status_state: &mut StatusState,
     typewriter_state: &mut Option<TypewriterState>,
     shared_app: &Arc<Mutex<App>>,
-    runtime_handle: &Handle,
     w: i16,
     h: i16,
 ) -> Result<()> {
     app.running = true;
     let mut last_size = app.terminal.size();
     let mut response_in_flight = false;
+    let mut session_picker_state = SessionPickerState::default();
     while app.running {
         // Poll terminal size once per tick. On change, print a
         // user-facing notice and exit so the caller can relaunch
@@ -1706,10 +1732,19 @@ fn run_event_loop(
             status_state,
             typewriter_state,
             &mut response_in_flight,
+            &mut session_picker_state,
         );
         if error_frame && status_state.beep_on_error {
             let _ = app.terminal.beep();
         }
+        maybe_open_pending_session_picker(
+            app,
+            &chat_lines,
+            &req_tx,
+            status_state,
+            &mut response_in_flight,
+            &mut session_picker_state,
+        );
         if let Some(writer) = typewriter_state.as_mut() {
             writer.tick(&chat_lines);
         }
@@ -1951,9 +1986,9 @@ fn run_event_loop(
                 &chat_lines,
                 &req_tx,
                 shared_app,
-                runtime_handle,
                 status_state,
                 &mut response_in_flight,
+                &mut session_picker_state,
             );
         }
     }
@@ -2054,6 +2089,7 @@ fn drain_stream_events(
     status_state: &mut StatusState,
     typewriter_state: &mut Option<TypewriterState>,
     response_in_flight: &mut bool,
+    session_picker_state: &mut SessionPickerState,
 ) -> bool {
     let mut saw_error = false;
     loop {
@@ -2068,6 +2104,14 @@ fn drain_stream_events(
                     }
                     TurnChunk::Status { workspace, model } => {
                         status_state.apply_status(workspace.clone(), model.clone());
+                    }
+                    TurnChunk::SessionPickerList(result) => {
+                        apply_session_picker_result(
+                            result.clone(),
+                            chat_lines,
+                            status_state,
+                            session_picker_state,
+                        );
                     }
                     TurnChunk::Finished(result) => {
                         if result.is_err() {
@@ -2168,6 +2212,7 @@ fn apply_chunk(chunk: TurnChunk, chat_lines: &Rc<RefCell<Vec<String>>>) {
         TurnChunk::Usage(_) => {}
         TurnChunk::ClearUsage => {}
         TurnChunk::Status { .. } => {}
+        TurnChunk::SessionPickerList(_) => {}
         TurnChunk::Finished(Ok(_)) => {
             lines.push(String::new());
         }
@@ -2200,9 +2245,9 @@ fn handle_command(
     chat_lines: &Rc<RefCell<Vec<String>>>,
     req_tx: &mpsc::Sender<WorkerRequest>,
     shared_app: &Arc<Mutex<App>>,
-    runtime_handle: &Handle,
     status_state: &mut StatusState,
     response_in_flight: &mut bool,
+    session_picker_state: &mut SessionPickerState,
 ) {
     match command {
         CM_QUIT => {
@@ -2333,39 +2378,14 @@ fn handle_command(
                 note_response_busy(status_state);
                 return;
             }
-            match load_session_picker_entries(shared_app, runtime_handle) {
-                Ok(entries) if entries.is_empty() => {
-                    chat_lines
-                        .borrow_mut()
-                        .push("[session] no backend sessions returned".to_string());
-                    chat_lines.borrow_mut().push(String::new());
-                }
-                Ok(entries) => {
-                    if let Some(entry) = run_session_picker(app, &entries) {
-                        match session_switch_command_for_picker_entry(&entry) {
-                            Ok(cmdline) => dispatch_command(
-                                &cmdline,
-                                chat_lines,
-                                req_tx,
-                                status_state,
-                                response_in_flight,
-                            ),
-                            Err(e) => {
-                                chat_lines
-                                    .borrow_mut()
-                                    .push(format!("[session] cannot switch via picker: {e}"));
-                                chat_lines.borrow_mut().push(String::new());
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    chat_lines
-                        .borrow_mut()
-                        .push(format!("[session] could not load backend sessions: {e}"));
-                    chat_lines.borrow_mut().push(String::new());
-                }
-            }
+            open_or_request_session_picker(
+                app,
+                chat_lines,
+                req_tx,
+                status_state,
+                response_in_flight,
+                session_picker_state,
+            );
         }
         _ => {}
     }
@@ -2625,22 +2645,169 @@ impl From<Session> for SessionPickerEntry {
     }
 }
 
-fn load_session_picker_entries(
-    shared_app: &Arc<Mutex<App>>,
-    runtime_handle: &Handle,
-) -> Result<Vec<SessionPickerEntry>> {
-    let client = {
-        let guard = shared_app.blocking_lock();
-        guard.active_workspace().and_then(|w| w.client.clone())
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SessionPickerLoad {
+    Idle,
+    Loading,
+    Ready(Vec<SessionPickerEntry>),
+    Error(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionPickerState {
+    load: SessionPickerLoad,
+    open_when_ready: bool,
+}
+
+impl Default for SessionPickerState {
+    fn default() -> Self {
+        Self {
+            load: SessionPickerLoad::Idle,
+            open_when_ready: false,
+        }
     }
-    .ok_or_else(|| anyhow::anyhow!("no active workspace client"))?;
+}
 
-    let sessions = runtime_handle.block_on(async {
-        let locked = client.lock().await;
-        locked.list_sessions().await
-    })?;
+fn request_session_picker_load(
+    chat_lines: &Rc<RefCell<Vec<String>>>,
+    req_tx: &mpsc::Sender<WorkerRequest>,
+    status_state: &mut StatusState,
+    session_picker_state: &mut SessionPickerState,
+) -> SubmissionStatus {
+    session_picker_state.open_when_ready = true;
+    if matches!(session_picker_state.load, SessionPickerLoad::Loading) {
+        status_state.set_toast("Loading sessions...".to_string());
+        return SubmissionStatus::Busy;
+    }
 
-    Ok(sessions.into_iter().map(SessionPickerEntry::from).collect())
+    {
+        let mut lines = chat_lines.borrow_mut();
+        lines.push("[session] loading backend sessions...".to_string());
+        lines.push(String::new());
+    }
+    session_picker_state.load = SessionPickerLoad::Loading;
+    status_state.set_toast("Loading sessions...".to_string());
+
+    match req_tx.try_send(WorkerRequest::SessionPickerList) {
+        Ok(()) => SubmissionStatus::Started,
+        Err(e) => {
+            session_picker_state.load = SessionPickerLoad::Idle;
+            session_picker_state.open_when_ready = false;
+            chat_lines
+                .borrow_mut()
+                .push(format!("[session] could not request backend sessions: {e}"));
+            SubmissionStatus::DispatchFailed
+        }
+    }
+}
+
+fn apply_session_picker_result(
+    result: std::result::Result<Vec<Session>, String>,
+    chat_lines: &Rc<RefCell<Vec<String>>>,
+    status_state: &mut StatusState,
+    session_picker_state: &mut SessionPickerState,
+) {
+    match result {
+        Ok(sessions) => {
+            let entries: Vec<SessionPickerEntry> =
+                sessions.into_iter().map(SessionPickerEntry::from).collect();
+            status_state.set_toast(format!("Loaded {} sessions", entries.len()));
+            session_picker_state.load = SessionPickerLoad::Ready(entries);
+        }
+        Err(message) => {
+            chat_lines.borrow_mut().push(format!(
+                "[session] could not load backend sessions: {message}"
+            ));
+            chat_lines.borrow_mut().push(String::new());
+            status_state.set_toast("Session load failed".to_string());
+            session_picker_state.load = SessionPickerLoad::Error(message);
+            session_picker_state.open_when_ready = false;
+        }
+    }
+}
+
+fn open_or_request_session_picker(
+    app: &mut Application,
+    chat_lines: &Rc<RefCell<Vec<String>>>,
+    req_tx: &mpsc::Sender<WorkerRequest>,
+    status_state: &mut StatusState,
+    response_in_flight: &mut bool,
+    session_picker_state: &mut SessionPickerState,
+) {
+    session_picker_state.open_when_ready = true;
+    maybe_open_pending_session_picker(
+        app,
+        chat_lines,
+        req_tx,
+        status_state,
+        response_in_flight,
+        session_picker_state,
+    );
+    if !session_picker_state.open_when_ready {
+        return;
+    }
+
+    match &session_picker_state.load {
+        SessionPickerLoad::Idle | SessionPickerLoad::Error(_) => {
+            request_session_picker_load(chat_lines, req_tx, status_state, session_picker_state);
+        }
+        SessionPickerLoad::Loading => {
+            status_state.set_toast("Loading sessions...".to_string());
+        }
+        SessionPickerLoad::Ready(_) => {}
+    }
+}
+
+fn maybe_open_pending_session_picker(
+    app: &mut Application,
+    chat_lines: &Rc<RefCell<Vec<String>>>,
+    req_tx: &mpsc::Sender<WorkerRequest>,
+    status_state: &mut StatusState,
+    response_in_flight: &mut bool,
+    session_picker_state: &mut SessionPickerState,
+) {
+    if !session_picker_state.open_when_ready || *response_in_flight {
+        return;
+    }
+
+    match session_picker_state.load.clone() {
+        SessionPickerLoad::Ready(entries) => {
+            session_picker_state.open_when_ready = false;
+            if entries.is_empty() {
+                chat_lines
+                    .borrow_mut()
+                    .push("[session] no backend sessions returned".to_string());
+                chat_lines.borrow_mut().push(String::new());
+                return;
+            }
+            if let Some(entry) = run_session_picker(app, &entries) {
+                match session_switch_command_for_picker_entry(&entry) {
+                    Ok(cmdline) => dispatch_command(
+                        &cmdline,
+                        chat_lines,
+                        req_tx,
+                        status_state,
+                        response_in_flight,
+                    ),
+                    Err(e) => {
+                        chat_lines
+                            .borrow_mut()
+                            .push(format!("[session] cannot switch via picker: {e}"));
+                        chat_lines.borrow_mut().push(String::new());
+                    }
+                }
+            }
+        }
+        SessionPickerLoad::Error(message) => {
+            session_picker_state.open_when_ready = false;
+            chat_lines.borrow_mut().push(format!(
+                "[session] could not load backend sessions: {message}"
+            ));
+            chat_lines.borrow_mut().push(String::new());
+            session_picker_state.load = SessionPickerLoad::Idle;
+        }
+        SessionPickerLoad::Idle | SessionPickerLoad::Loading => {}
+    }
 }
 
 fn session_switch_command_for_picker_entry(entry: &SessionPickerEntry) -> Result<String> {
@@ -3049,6 +3216,7 @@ mod tests {
         let lines = Rc::new(RefCell::new(Vec::new()));
         let mut typewriter_state = None;
         let mut response_in_flight = true;
+        let mut session_picker_state = SessionPickerState::default();
         let (tx, mut rx) = mpsc::unbounded_channel();
         tx.send(TurnChunk::ClearUsage).unwrap();
 
@@ -3057,7 +3225,8 @@ mod tests {
             &lines,
             &mut state,
             &mut typewriter_state,
-            &mut response_in_flight
+            &mut response_in_flight,
+            &mut session_picker_state
         ));
 
         assert!(state.usage.is_none());
@@ -3081,6 +3250,7 @@ mod tests {
         let lines = Rc::new(RefCell::new(Vec::new()));
         let mut typewriter_state = None;
         let mut response_in_flight = true;
+        let mut session_picker_state = SessionPickerState::default();
         let (tx, mut rx) = mpsc::unbounded_channel();
         tx.send(TurnChunk::Status {
             workspace: Some("new".to_string()),
@@ -3093,7 +3263,8 @@ mod tests {
             &lines,
             &mut state,
             &mut typewriter_state,
-            &mut response_in_flight
+            &mut response_in_flight,
+            &mut session_picker_state
         ));
 
         assert_eq!(state.workspace, "new");
@@ -3183,6 +3354,81 @@ mod tests {
         };
 
         assert!(session_switch_command_for_picker_entry(&entry).is_err());
+    }
+
+    #[test]
+    fn session_picker_open_enqueues_worker_load_without_backend_io_on_ui_thread() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let lines = Rc::new(RefCell::new(Vec::new()));
+        let mut state = StatusState::new(
+            "default".to_string(),
+            "gpt-test".to_string(),
+            "borland".to_string(),
+            false,
+        );
+        let mut picker_state = SessionPickerState::default();
+
+        let status = request_session_picker_load(&lines, &tx, &mut state, &mut picker_state);
+
+        assert_eq!(status, SubmissionStatus::Started);
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            WorkerRequest::SessionPickerList
+        ));
+        assert_eq!(
+            lines.borrow().as_slice(),
+            [
+                "[session] loading backend sessions...".to_string(),
+                String::new()
+            ]
+        );
+        assert_eq!(picker_state.load, SessionPickerLoad::Loading);
+        assert!(picker_state.open_when_ready);
+    }
+
+    #[test]
+    fn session_picker_worker_chunk_populates_cached_results() {
+        let mut state = StatusState::new(
+            "default".to_string(),
+            "gpt-test".to_string(),
+            "borland".to_string(),
+            false,
+        );
+        let lines = Rc::new(RefCell::new(Vec::new()));
+        let mut typewriter_state = None;
+        let mut response_in_flight = true;
+        let mut picker_state = SessionPickerState {
+            load: SessionPickerLoad::Loading,
+            open_when_ready: true,
+        };
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tx.send(TurnChunk::SessionPickerList(Ok(vec![Session {
+            id: "sess-123".to_string(),
+            name: "scratch".to_string(),
+            model: "gpt-test".to_string(),
+            provider: "test".to_string(),
+        }])))
+        .unwrap();
+
+        assert!(!drain_stream_events(
+            &mut rx,
+            &lines,
+            &mut state,
+            &mut typewriter_state,
+            &mut response_in_flight,
+            &mut picker_state
+        ));
+
+        match picker_state.load {
+            SessionPickerLoad::Ready(entries) => {
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].id, "sess-123");
+            }
+            other => panic!("expected ready picker entries, got {other:?}"),
+        }
+        assert!(picker_state.open_when_ready);
+        assert!(response_in_flight);
+        assert!(lines.borrow().is_empty());
     }
 
     #[test]
@@ -3277,6 +3523,7 @@ mod tests {
         ]));
         let mut typewriter_state = None;
         let mut response_in_flight = true;
+        let mut session_picker_state = SessionPickerState::default();
         let (tx, mut rx) = mpsc::unbounded_channel();
         tx.send(TurnChunk::Finished(Ok(String::new()))).unwrap();
 
@@ -3285,7 +3532,8 @@ mod tests {
             &lines,
             &mut state,
             &mut typewriter_state,
-            &mut response_in_flight
+            &mut response_in_flight,
+            &mut session_picker_state
         ));
 
         assert!(!response_in_flight);

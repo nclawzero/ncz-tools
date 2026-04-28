@@ -41,10 +41,10 @@
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 
 use crate::cli::agent::AgentClient;
@@ -478,22 +478,37 @@ fn workspace_state_path_for_config(config_path: &Path) -> PathBuf {
 
 struct WorkspaceStateLock {
     path: PathBuf,
-    file: Option<File>,
+    token: String,
 }
 
 impl Drop for WorkspaceStateLock {
     fn drop(&mut self) {
-        self.file.take();
-        if let Err(e) = std::fs::remove_file(&self.path) {
-            if e.kind() != ErrorKind::NotFound {
-                tracing::warn!(
-                    "could not remove zterm workspace state lock {}: {e}",
-                    self.path.display()
-                );
+        match std::fs::read_to_string(&self.path) {
+            Ok(text) if workspace_state_lock_token(&text).as_deref() == Some(&self.token) => {
+                if let Err(e) = std::fs::remove_file(&self.path) {
+                    if e.kind() != ErrorKind::NotFound {
+                        tracing::warn!(
+                            "could not remove zterm workspace state lock {}: {e}",
+                            self.path.display()
+                        );
+                    }
+                }
+            }
+            Ok(_) | Err(_) => {
+                // The lock was already removed or replaced after a stale-lock
+                // recovery. Do not unlink a lock we no longer own.
             }
         }
     }
 }
+
+#[derive(Debug)]
+struct WorkspaceStateLockMetadata {
+    pid: Option<u32>,
+    token: Option<String>,
+}
+
+const WORKSPACE_STATE_LOCK_METADATA_GRACE: Duration = Duration::from_secs(2);
 
 fn workspace_state_lock_path(state_path: &Path) -> PathBuf {
     let name = state_path
@@ -517,13 +532,26 @@ fn lock_workspace_state(state_path: &Path) -> Result<WorkspaceStateLock> {
             .create_new(true)
             .open(&lock_path)
         {
-            Ok(file) => {
+            Ok(mut file) => {
+                let token = uuid::Uuid::new_v4().simple().to_string();
+                if let Err(e) = write_workspace_state_lock_metadata(&mut file, &token) {
+                    let _ = std::fs::remove_file(&lock_path);
+                    return Err(e).with_context(|| {
+                        format!(
+                            "writing zterm workspace state lock metadata {}",
+                            lock_path.display()
+                        )
+                    });
+                }
                 return Ok(WorkspaceStateLock {
                     path: lock_path,
-                    file: Some(file),
+                    token,
                 });
             }
             Err(e) if e.kind() == ErrorKind::AlreadyExists && Instant::now() < deadline => {
+                if break_stale_workspace_state_lock(&lock_path)? {
+                    continue;
+                }
                 std::thread::sleep(Duration::from_millis(10));
             }
             Err(e) if e.kind() == ErrorKind::AlreadyExists => {
@@ -541,6 +569,122 @@ fn lock_workspace_state(state_path: &Path) -> Result<WorkspaceStateLock> {
                 });
             }
         }
+    }
+}
+
+fn write_workspace_state_lock_metadata(file: &mut File, token: &str) -> Result<()> {
+    let created_unix_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    writeln!(file, "pid = {}", std::process::id())?;
+    writeln!(file, "created_unix_ms = {created_unix_ms}")?;
+    writeln!(file, "token = \"{token}\"")?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn workspace_state_lock_token(text: &str) -> Option<String> {
+    parse_workspace_state_lock_metadata(text).token
+}
+
+fn parse_workspace_state_lock_metadata(text: &str) -> WorkspaceStateLockMetadata {
+    let mut pid = None;
+    let mut token = None;
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        match key.trim() {
+            "pid" => {
+                pid = value.trim().parse::<u32>().ok();
+            }
+            "token" => {
+                token = Some(value.trim().trim_matches('"').to_string());
+            }
+            _ => {}
+        }
+    }
+    WorkspaceStateLockMetadata { pid, token }
+}
+
+fn break_stale_workspace_state_lock(lock_path: &Path) -> Result<bool> {
+    let text = match std::fs::read_to_string(lock_path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(true),
+        Err(e) => {
+            return Err(e).with_context(|| {
+                format!(
+                    "reading zterm workspace state lock metadata {}",
+                    lock_path.display()
+                )
+            });
+        }
+    };
+    let metadata = parse_workspace_state_lock_metadata(&text);
+    let modified_time = std::fs::metadata(lock_path)
+        .and_then(|meta| meta.modified())
+        .ok();
+    let modified = modified_time
+        .as_ref()
+        .and_then(|mtime| mtime.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis());
+
+    if let Some(pid) = metadata.pid {
+        if process_exists(pid) {
+            return Ok(false);
+        }
+    } else if modified_time
+        .as_ref()
+        .and_then(|mtime| SystemTime::now().duration_since(*mtime).ok())
+        .map(|age| age < WORKSPACE_STATE_LOCK_METADATA_GRACE)
+        .unwrap_or(true)
+    {
+        return Ok(false);
+    }
+
+    tracing::warn!(
+        "breaking stale zterm workspace state lock {} (pid={:?}, mtime_unix_ms={:?})",
+        lock_path.display(),
+        metadata.pid,
+        modified
+    );
+    match std::fs::remove_file(lock_path) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(true),
+        Err(e) => Err(e).with_context(|| {
+            format!(
+                "removing stale zterm workspace state lock {}",
+                lock_path.display()
+            )
+        }),
+    }
+}
+
+fn process_exists(pid: u32) -> bool {
+    if pid == std::process::id() {
+        return true;
+    }
+
+    #[cfg(unix)]
+    {
+        match std::process::Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .output()
+        {
+            Ok(output) if output.status.success() => true,
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
+                !stderr.contains("no such process")
+            }
+            Err(_) => true,
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        true
     }
 }
 
@@ -600,6 +744,14 @@ fn save_workspace_state(path: &Path, state: &WorkspaceState) -> Result<()> {
 }
 
 fn apply_openclaw_workspace_state(config_path: &Path, cfg: &mut AppConfig) -> Result<()> {
+    if !cfg
+        .workspaces
+        .iter()
+        .any(|workspace| workspace.backend == Backend::Openclaw)
+    {
+        return Ok(());
+    }
+
     let state_path = workspace_state_path_for_config(config_path);
     let _state_lock = lock_workspace_state(&state_path)?;
     let mut state = load_workspace_state(&state_path)?;
@@ -1216,6 +1368,67 @@ url = "ws://old.example"
         let state = load_workspace_state(&workspace_state_path_for_config(&path)).unwrap();
         assert_eq!(state.openclaw_workspaces.len(), 1);
         assert_eq!(state.openclaw_workspaces[0].id, ids[0]);
+    }
+
+    #[test]
+    fn load_recovers_from_stale_workspace_state_lock() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        let original = r#"
+[[workspaces]]
+name = "alpha"
+backend = "openclaw"
+url = "ws://old.example"
+"#;
+        std::fs::write(&path, original).unwrap();
+
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("__zterm_no_such_test__")
+            .spawn()
+            .unwrap();
+        let stale_pid = child.id();
+        child.wait().unwrap();
+
+        let lock_path = workspace_state_lock_path(&workspace_state_path_for_config(&path));
+        std::fs::write(
+            &lock_path,
+            format!("pid = {stale_pid}\ncreated_unix_ms = 1\ntoken = \"stale\"\n"),
+        )
+        .unwrap();
+
+        let cfg = AppConfig::load(&path).unwrap();
+
+        assert!(cfg.workspaces[0].id.as_deref().unwrap().starts_with("ws_"));
+        assert!(!lock_path.exists());
+    }
+
+    #[test]
+    fn load_without_openclaw_workspaces_does_not_touch_workspace_state_lock() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        let original = r#"
+[[workspaces]]
+name = "alpha"
+backend = "zeroclaw"
+url = "http://localhost:8080"
+"#;
+        std::fs::write(&path, original).unwrap();
+
+        let lock_path = workspace_state_lock_path(&workspace_state_path_for_config(&path));
+        std::fs::write(
+            &lock_path,
+            format!(
+                "pid = {}\ncreated_unix_ms = 1\ntoken = \"live\"\n",
+                std::process::id()
+            ),
+        )
+        .unwrap();
+
+        let cfg = AppConfig::load(&path).unwrap();
+
+        assert_eq!(cfg.workspaces[0].backend, Backend::Zeroclaw);
+        assert!(lock_path.exists());
     }
 
     #[test]

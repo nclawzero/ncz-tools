@@ -165,6 +165,10 @@ pub enum TurnChunk {
         workspace: Option<String>,
         model: Option<String>,
     },
+    /// UI-only response for the Turbo Vision session picker. This
+    /// lets the picker load backend sessions on the async worker path
+    /// instead of blocking the synchronous UI thread.
+    SessionPickerList(std::result::Result<Vec<Session>, String>),
     /// The turn has completed — either with the full response text, or
     /// with an error. Emitted exactly once per submit. The UI should
     /// treat anything after this as a protocol bug.
