@@ -430,27 +430,14 @@ pub async fn run(
     let (req_tx, mut req_rx) = mpsc::channel::<WorkerRequest>(32);
     let (event_tx, event_rx) = mpsc::unbounded_channel::<TurnChunk>();
 
-    let connect_splash = connect_splash_for_active_workspace(
-        &app,
-        &session.id,
-        &workspace_name,
-        Some(event_tx.clone()),
-    )
-    .await;
+    let connect_splash = Some(connect_splash_for_workspace(&workspace_name));
 
-    // Install the streaming sink on the active workspace's client
-    // once, up front. Turn dispatch in the worker reuses this sink
-    // for every `submit_turn` — no per-turn reinstall.
-    {
-        let app_guard = app.lock().await;
-        if let Some(ws) = app_guard.active_workspace() {
-            if let Some(client_arc) = ws.client.clone() {
-                let mut client = client_arc.lock().await;
-                client.set_stream_sink(Some(event_tx.clone()));
-            } else {
-                warn!("tv_ui: active workspace has no client; turn submits will fail cleanly");
-            }
-        }
+    // Install the streaming sink on the boot workspace. The worker
+    // also reinstalls before every submitted turn and after every
+    // workspace switch, so cached splash reads cannot leave the
+    // newly-active client detached from the TUI stream.
+    if !install_stream_sink_on_active_client(&app, event_tx.clone()).await {
+        warn!("tv_ui: active workspace has no client; turn submits will fail cleanly");
     }
 
     // Worker task: owns the shared App reference and processes one
@@ -458,7 +445,7 @@ pub async fn run(
     // `TurnChunk::Finished(Err(_))`; the worker itself never panics
     // the whole process.
     let worker_app = Arc::clone(&app);
-    let worker_session_id = session.id.clone();
+    let mut worker_session_id = session.id.clone();
     let worker_sink = event_tx.clone();
     let worker_cmd_handler = CommandHandler::new(Arc::clone(&app));
     tokio::spawn(async move {
@@ -472,6 +459,7 @@ pub async fn run(
                     match client_opt {
                         Some(client_arc) => {
                             let mut client = client_arc.lock().await;
+                            client.set_stream_sink(Some(worker_sink.clone()));
                             // `submit_turn` is responsible for
                             // emitting exactly one `Finished(_)`
                             // through the installed sink on both
@@ -498,7 +486,22 @@ pub async fn run(
                     // menu/popup command paths to return structured
                     // strings; legacy stdout-only commands still get
                     // an advisory rather than silently disappearing.
-                    let is_workspace_switch = cmdline.starts_with("/workspace switch ");
+                    let is_workspace_switch = is_workspace_switch_command(&cmdline);
+                    if let Some(target_session) = session_switch_target(&cmdline) {
+                        match resolve_or_create_session_for_worker(&worker_app, target_session)
+                            .await
+                        {
+                            Ok(session) => {
+                                worker_session_id = session.id;
+                            }
+                            Err(e) => {
+                                let _ = worker_sink.send(TurnChunk::Finished(Err(format!(
+                                    "could not switch session to `{target_session}`: {e}"
+                                ))));
+                                continue;
+                            }
+                        }
+                    }
                     match worker_cmd_handler
                         .handle(&cmdline, &worker_session_id)
                         .await
@@ -506,21 +509,18 @@ pub async fn run(
                         Ok(Some(text)) => {
                             let _ = worker_sink.send(TurnChunk::Token(text));
                             if is_workspace_switch {
+                                install_stream_sink_on_active_client(
+                                    &worker_app,
+                                    worker_sink.clone(),
+                                )
+                                .await;
                                 let switched_workspace = {
                                     let guard = worker_app.lock().await;
                                     guard.active_workspace().map(|w| w.config.name.clone())
                                 };
                                 if let Some(name) = switched_workspace {
-                                    if let Some(splash) = connect_splash_for_active_workspace(
-                                        &worker_app,
-                                        &worker_session_id,
-                                        &name,
-                                        Some(worker_sink.clone()),
-                                    )
-                                    .await
-                                    {
-                                        let _ = worker_sink.send(TurnChunk::Typewriter(splash));
-                                    }
+                                    let splash = connect_splash_for_workspace(&name);
+                                    let _ = worker_sink.send(TurnChunk::Typewriter(splash));
                                 }
                             }
                             let _ = worker_sink.send(TurnChunk::Finished(Ok(String::new())));
@@ -574,53 +574,101 @@ pub async fn run(
     .map_err(|e| anyhow::anyhow!("tv_ui join error: {e}"))?
 }
 
-async fn connect_splash_for_active_workspace(
+fn connect_splash_for_workspace(workspace_name: &str) -> String {
+    let cache_path = delighters::default_connect_splash_cache_path(workspace_name);
+    if let Some(path) = &cache_path {
+        if let Some(cached) = delighters::read_cached_connect_splash(
+            path,
+            std::time::SystemTime::now(),
+            delighters::CONNECT_SPLASH_TTL,
+        ) {
+            return cached;
+        }
+    }
+
+    let fallback = delighters::local_connect_splash(workspace_name);
+    if let Some(path) = cache_path {
+        let fallback_for_cache = fallback.clone();
+        let _ = std::thread::spawn(move || {
+            if let Err(e) = delighters::write_connect_splash_cache(&path, &fallback_for_cache) {
+                warn!("connect-splash cache write failed: {e}");
+            }
+        });
+    }
+    fallback
+}
+
+async fn install_stream_sink_on_active_client(app: &Arc<Mutex<App>>, sink: StreamSink) -> bool {
+    let client = {
+        let guard = app.lock().await;
+        guard.active_workspace().and_then(|w| w.client.clone())
+    };
+    let Some(client) = client else {
+        return false;
+    };
+    client.lock().await.set_stream_sink(Some(sink));
+    true
+}
+
+async fn resolve_or_create_session_for_worker(
     app: &Arc<Mutex<App>>,
-    session_id: &str,
-    workspace_name: &str,
-    restore_sink: Option<StreamSink>,
-) -> Option<String> {
-    let cache_path = delighters::default_connect_splash_cache_path(workspace_name)?;
-    if let Some(cached) = delighters::read_cached_connect_splash(
-        &cache_path,
-        std::time::SystemTime::now(),
-        delighters::CONNECT_SPLASH_TTL,
-    ) {
-        return Some(cached);
+    session_name: &str,
+) -> Result<Session> {
+    if let Ok(metadata) = load_session_metadata_by_id_or_name(session_name) {
+        return Ok(Session {
+            id: metadata.id,
+            name: metadata.name,
+            model: metadata.model,
+            provider: metadata.provider,
+        });
     }
 
     let client = {
         let guard = app.lock().await;
         guard.active_workspace().and_then(|w| w.client.clone())
-    }?;
+    }
+    .ok_or_else(|| anyhow::anyhow!("no active workspace client"))?;
 
-    let (scratch_tx, _scratch_rx) = mpsc::unbounded_channel();
-    let generated = {
-        let mut client = client.lock().await;
-        client.set_stream_sink(Some(scratch_tx));
-        let result = client
-            .submit_turn(session_id, delighters::CONNECT_SPLASH_PROMPT)
-            .await;
-        client.set_stream_sink(restore_sink);
-        result
+    let session = client.lock().await.create_session(session_name).await?;
+    let metadata = storage::SessionMetadata {
+        id: session.id.clone(),
+        name: session.name.clone(),
+        model: session.model.clone(),
+        provider: session.provider.clone(),
+        created_at: Utc::now().to_rfc3339(),
+        message_count: 0,
+        last_active: Utc::now().to_rfc3339(),
     };
+    storage::save_session_metadata(&metadata)?;
+    Ok(session)
+}
 
-    match generated {
-        Ok(text) => {
-            let normalized = delighters::normalize_connect_splash(&text);
-            if normalized.is_empty() {
-                None
-            } else {
-                if let Err(e) = delighters::write_connect_splash_cache(&cache_path, &normalized) {
-                    warn!("connect-splash cache write failed: {e}");
-                }
-                Some(normalized)
-            }
-        }
-        Err(e) => {
-            warn!("connect-splash generation failed: {e}");
-            None
-        }
+fn load_session_metadata_by_id_or_name(session: &str) -> Result<storage::SessionMetadata> {
+    if let Ok(metadata) = storage::load_session_metadata(session) {
+        return Ok(metadata);
+    }
+    storage::list_sessions()?
+        .into_iter()
+        .find(|metadata| metadata.id == session || metadata.name == session)
+        .ok_or_else(|| anyhow::anyhow!("session metadata not found: {session}"))
+}
+
+fn is_workspace_switch_command(cmdline: &str) -> bool {
+    let mut parts = cmdline.split_whitespace();
+    matches!(parts.next(), Some("/workspace" | "/workspaces"))
+        && matches!(parts.next(), Some("switch"))
+        && parts.next().is_some()
+}
+
+fn session_switch_target(cmdline: &str) -> Option<&str> {
+    let mut parts = cmdline.split_whitespace();
+    if parts.next()? != "/session" {
+        return None;
+    }
+    match parts.next()? {
+        "list" | "info" | "delete" => None,
+        "switch" | "create" => parts.next(),
+        name => Some(name),
     }
 }
 
@@ -2007,7 +2055,7 @@ fn run_session_picker(app: &mut Application, entries: &[SessionPickerEntry]) -> 
         return None;
     }
     let idx = selected.checked_sub(CMD_SESSION_SELECT_BASE)? as usize;
-    entries.get(idx).map(|e| e.name.clone())
+    entries.get(idx).map(|e| e.id.clone())
 }
 
 /// Custom read-only scrolling text view over a shared `Vec<String>`
@@ -2160,5 +2208,29 @@ mod tests {
         assert_eq!(parse_beep_toggle("beep on"), Some(true));
         assert_eq!(parse_beep_toggle("BEEP OFF"), Some(false));
         assert_eq!(parse_beep_toggle("amber"), None);
+    }
+
+    #[test]
+    fn session_switch_target_only_matches_real_switches() {
+        assert_eq!(session_switch_target("/session research"), Some("research"));
+        assert_eq!(
+            session_switch_target("/session switch research"),
+            Some("research")
+        );
+        assert_eq!(
+            session_switch_target("/session create scratch"),
+            Some("scratch")
+        );
+        assert_eq!(session_switch_target("/session list"), None);
+        assert_eq!(session_switch_target("/session info"), None);
+        assert_eq!(session_switch_target("/workspace switch prod"), None);
+    }
+
+    #[test]
+    fn workspace_switch_detection_requires_target() {
+        assert!(is_workspace_switch_command("/workspace switch prod"));
+        assert!(is_workspace_switch_command("/workspaces switch prod"));
+        assert!(!is_workspace_switch_command("/workspace switch"));
+        assert!(!is_workspace_switch_command("/workspace list"));
     }
 }

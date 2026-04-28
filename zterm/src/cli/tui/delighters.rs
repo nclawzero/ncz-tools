@@ -6,8 +6,6 @@ use std::time::{Duration, SystemTime};
 use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 
-pub const CONNECT_SPLASH_PROMPT: &str =
-    "Generate a 4-6 line 1991 BBS modem connect sequence. Keep it ANSI-free.";
 pub const CONNECT_SPLASH_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
 const WELCOME_QUOTES: &[&str] = &[
@@ -94,6 +92,18 @@ pub fn normalize_connect_splash(text: &str) -> String {
         .take(6)
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+pub fn local_connect_splash(workspace: &str) -> String {
+    normalize_connect_splash(&format!(
+        "ATZ\n\
+         OK\n\
+         ATDT {}\n\
+         CONNECT 14400/ZTERM\n\
+         CARRIER LOCKED\n\
+         WORKSPACE READY",
+        sanitize_workspace_name(workspace).to_ascii_uppercase()
+    ))
 }
 
 pub fn load_state(path: &Path) -> ZtermState {
@@ -186,6 +196,14 @@ mod tests {
         assert_eq!(
             normalize_connect_splash(input),
             "CONNECT 2400\nline2\nline3\nline4\nline5\nline6"
+        );
+    }
+
+    #[test]
+    fn local_connect_splash_is_safe_and_normalized() {
+        assert_eq!(
+            local_connect_splash("prod typhon"),
+            "ATZ\nOK\nATDT PROD_TYPHON\nCONNECT 14400/ZTERM\nCARRIER LOCKED\nWORKSPACE READY"
         );
     }
 

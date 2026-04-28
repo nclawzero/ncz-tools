@@ -273,20 +273,41 @@ impl CommandHandler {
                     out.push_str(&format!("❌ Failed to load session: {e}\n"));
                 }
             },
-            Some(session_name) => {
-                out.push_str(&format!("🔄 Switching to session: '{session_name}'\n"));
-                if let Ok(metadata) = storage::load_session_metadata(session_name) {
+            Some("switch") | Some("create") => {
+                let Some(session_name) = args.first().copied().filter(|s| !s.is_empty()) else {
+                    out.push_str(&format!(
+                        "Usage: /session {} <name>\n",
+                        subcommand.unwrap_or("switch")
+                    ));
+                    out.push('\n');
+                    return Ok(Some(out));
+                };
+                out.push_str(&format!("🔄 Active session: '{session_name}'\n"));
+                if let Ok(metadata) = load_session_metadata_by_id_or_name(session_name) {
                     out.push_str(&format!(
                         "   Found: {}/{}, {} messages\n",
                         metadata.provider, metadata.model, metadata.message_count
                     ));
                 } else {
-                    out.push_str("   (New session - will be created on first message)\n");
+                    out.push_str("   Created for future turns\n");
+                }
+            }
+            Some(session_name) => {
+                out.push_str(&format!("🔄 Switching to session: '{session_name}'\n"));
+                if let Ok(metadata) = load_session_metadata_by_id_or_name(session_name) {
+                    out.push_str(&format!(
+                        "   Found: {}/{}, {} messages\n",
+                        metadata.provider, metadata.model, metadata.message_count
+                    ));
+                } else {
+                    out.push_str("   Created for future turns\n");
                 }
             }
             None => {
                 out.push_str("Usage: /session list         (show all sessions)\n");
                 out.push_str("       /session <name>      (switch or create)\n");
+                out.push_str("       /session switch <n>  (switch or create)\n");
+                out.push_str("       /session create <n>  (create and switch)\n");
                 out.push_str("       /session info        (current session details)\n");
                 out.push_str("       /session delete <n>  (remove session)\n");
             }
@@ -1131,6 +1152,16 @@ impl CommandHandler {
 
         Ok(Some(format!("✅ 🗂  switched to workspace: {name}\n")))
     }
+}
+
+fn load_session_metadata_by_id_or_name(session: &str) -> Result<storage::SessionMetadata> {
+    if let Ok(metadata) = storage::load_session_metadata(session) {
+        return Ok(metadata);
+    }
+    storage::list_sessions()?
+        .into_iter()
+        .find(|metadata| metadata.id == session || metadata.name == session)
+        .ok_or_else(|| anyhow!("session metadata not found: {session}"))
 }
 
 fn parse_search_args(rest: &[&str]) -> (String, usize) {
