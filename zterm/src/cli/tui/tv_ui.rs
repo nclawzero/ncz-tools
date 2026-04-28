@@ -126,6 +126,7 @@ const INPUT_UNDO_DEPTH: usize = 64;
 /// taking a cross-module dependency.
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const SPINNER_INTERVAL: Duration = Duration::from_millis(80);
+const TURN_FORWARD_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// How long a status-line toast (e.g. palette confirmation after
 /// Ctrl-P) remains visible. ~1s is long enough to read but short
@@ -304,12 +305,17 @@ impl StatusState {
     fn begin_turn(&mut self) {
         self.turn_start = Some(Instant::now());
         self.frozen_elapsed = None;
+        self.clear_usage();
     }
 
     fn end_turn(&mut self) {
         if let Some(start) = self.turn_start.take() {
             self.frozen_elapsed = Some(start.elapsed());
         }
+    }
+
+    fn clear_usage(&mut self) {
+        self.usage = None;
     }
 
     /// Current elapsed duration: live while a turn is in flight,
@@ -481,15 +487,39 @@ pub async fn run(
                     match client_opt {
                         Some(client_arc) => {
                             let mut client = client_arc.lock().await;
+                            let (turn_sink, turn_rx) = mpsc::unbounded_channel::<TurnChunk>();
+                            let mut forward_task =
+                                tokio::spawn(forward_turn_chunks(turn_rx, worker_sink.clone()));
+                            client.set_stream_sink(Some(turn_sink));
+                            let submit_result = client.submit_turn(&worker_session_id, &text).await;
                             client.set_stream_sink(Some(worker_sink.clone()));
-                            // `submit_turn` is responsible for
-                            // emitting exactly one `Finished(_)`
-                            // through the installed sink on both
-                            // success and failure. The worker
-                            // swallows the Err return (already
-                            // reflected on the sink) and waits for
-                            // the next request.
-                            let _ = client.submit_turn(&worker_session_id, &text).await;
+                            drop(client);
+
+                            let saw_finished = match tokio::time::timeout(
+                                TURN_FORWARD_DRAIN_TIMEOUT,
+                                &mut forward_task,
+                            )
+                            .await
+                            {
+                                Ok(Ok(saw_finished)) => saw_finished,
+                                Ok(Err(e)) => {
+                                    warn!("tv_ui: turn stream forwarder failed: {e}");
+                                    false
+                                }
+                                Err(_) => {
+                                    forward_task.abort();
+                                    warn!(
+                                        "tv_ui: turn stream forwarder did not drain after \
+                                         submit_turn returned"
+                                    );
+                                    false
+                                }
+                            };
+                            if let Some(err) =
+                                submit_turn_fallback_error(&submit_result, saw_finished)
+                            {
+                                let _ = worker_sink.send(TurnChunk::Finished(Err(err)));
+                            }
                         }
                         None => {
                             // Only branch where `submit_turn` was
@@ -544,6 +574,7 @@ pub async fn run(
                             }
                         };
                     }
+                    let mut session_switched = false;
                     if let Some(target_session) = session_switch_target(&cmdline) {
                         match resolve_or_create_session_for_worker(&worker_app, target_session)
                             .await
@@ -557,6 +588,7 @@ pub async fn run(
                                             workspace_name,
                                             &session,
                                         );
+                                        session_switched = true;
                                     }
                                     Err(e) => {
                                         let _ = worker_sink.send(TurnChunk::Finished(Err(format!(
@@ -579,13 +611,16 @@ pub async fn run(
                         .await
                     {
                         Ok(Some(text)) => {
+                            let model_switched = successful_model_switch_command(&cmdline, &text);
                             let _ = worker_sink.send(TurnChunk::Token(text));
+                            let mut workspace_switched = false;
                             if preflight == CommandSessionPreflight::AfterWorkspaceSwitch {
                                 let switched_workspace = {
                                     let guard = worker_app.lock().await;
                                     guard.active_workspace().map(|w| w.config.name.clone())
                                 };
                                 if switched_workspace != workspace_before_dispatch {
+                                    workspace_switched = true;
                                     install_stream_sink_on_active_client(
                                         &worker_app,
                                         worker_sink.clone(),
@@ -598,6 +633,7 @@ pub async fn run(
                                     )
                                     .await
                                     {
+                                        let _ = worker_sink.send(TurnChunk::ClearUsage);
                                         let _ =
                                             worker_sink.send(TurnChunk::Finished(Err(format!(
                                                 "workspace switched, but session setup failed: {e}"
@@ -610,12 +646,22 @@ pub async fn run(
                                     }
                                 }
                             }
+                            if should_clear_usage_after_command(
+                                workspace_switched,
+                                session_switched,
+                                model_switched,
+                            ) {
+                                let _ = worker_sink.send(TurnChunk::ClearUsage);
+                            }
                             let _ = worker_sink.send(TurnChunk::Finished(Ok(String::new())));
                         }
                         Ok(None) => {
                             let _ = worker_sink.send(TurnChunk::Token(format!(
                                 "Command `{cmdline}` completed without structured TUI output."
                             )));
+                            if should_clear_usage_after_command(false, session_switched, false) {
+                                let _ = worker_sink.send(TurnChunk::ClearUsage);
+                            }
                             let _ = worker_sink.send(TurnChunk::Finished(Ok(String::new())));
                         }
                         Err(e) if e.to_string() == "EXIT" => {
@@ -634,6 +680,9 @@ pub async fn run(
                             let _ = worker_sink.send(TurnChunk::Finished(Ok(String::new())));
                         }
                         Err(e) => {
+                            if should_clear_usage_after_command(false, session_switched, false) {
+                                let _ = worker_sink.send(TurnChunk::ClearUsage);
+                            }
                             let _ = worker_sink.send(TurnChunk::Finished(Err(e.to_string())));
                         }
                     }
@@ -681,6 +730,59 @@ fn connect_splash_for_workspace(workspace_name: &str) -> String {
         });
     }
     fallback
+}
+
+async fn forward_turn_chunks(
+    mut turn_rx: mpsc::UnboundedReceiver<TurnChunk>,
+    ui_sink: StreamSink,
+) -> bool {
+    let mut saw_finished = false;
+    while let Some(chunk) = turn_rx.recv().await {
+        if matches!(&chunk, TurnChunk::Finished(_)) {
+            saw_finished = true;
+        }
+        let _ = ui_sink.send(chunk);
+    }
+    saw_finished
+}
+
+fn submit_turn_fallback_error(
+    submit_result: &Result<String>,
+    saw_finished: bool,
+) -> Option<String> {
+    match submit_result {
+        Err(e) if !saw_finished => Some(e.to_string()),
+        _ => None,
+    }
+}
+
+fn successful_model_switch_command(cmdline: &str, output: &str) -> bool {
+    model_switch_target(cmdline).is_some() && command_output_indicates_success(output)
+}
+
+fn should_clear_usage_after_command(
+    workspace_switched: bool,
+    session_switched: bool,
+    model_switched: bool,
+) -> bool {
+    workspace_switched || session_switched || model_switched
+}
+
+fn model_switch_target(cmdline: &str) -> Option<&str> {
+    let mut parts = cmdline.split_whitespace();
+    let command = parts.next()?;
+    if !matches!(command, "/model" | "/models") {
+        return None;
+    }
+    if parts.next()? != "set" {
+        return None;
+    }
+    parts.next()
+}
+
+fn command_output_indicates_success(output: &str) -> bool {
+    let trimmed = output.trim_start();
+    !trimmed.is_empty() && !trimmed.starts_with("Usage:") && !trimmed.starts_with("❌")
 }
 
 async fn install_stream_sink_on_active_client(app: &Arc<Mutex<App>>, sink: StreamSink) -> bool {
@@ -1260,6 +1362,7 @@ fn refresh_status_line(
         if let Some(ws) = guard.active_workspace() {
             if ws.config.name != state.workspace {
                 state.workspace = ws.config.name.clone();
+                state.clear_usage();
             }
         }
     }
@@ -1661,6 +1764,9 @@ fn drain_stream_events(
                     TurnChunk::Usage(usage) => {
                         status_state.usage = Some(*usage);
                     }
+                    TurnChunk::ClearUsage => {
+                        status_state.clear_usage();
+                    }
                     TurnChunk::Finished(result) => {
                         if result.is_err() {
                             saw_error = true;
@@ -1708,6 +1814,7 @@ fn apply_chunk(chunk: TurnChunk, chat_lines: &Rc<RefCell<Vec<String>>>) {
         }
         TurnChunk::Typewriter(_) => {}
         TurnChunk::Usage(_) => {}
+        TurnChunk::ClearUsage => {}
         TurnChunk::Finished(Ok(_)) => {
             lines.push(String::new());
         }
@@ -2448,6 +2555,92 @@ mod tests {
             render_ctx_usage(Some(usage)),
             "ctx 2000/8000 (25%) [###-------]"
         );
+    }
+
+    #[test]
+    fn begin_turn_clears_stale_usage() {
+        let mut state = StatusState::new(
+            "default".to_string(),
+            "gpt-test".to_string(),
+            "borland".to_string(),
+            false,
+        );
+        state.usage = Some(TurnUsage {
+            total_tokens: Some(2_000),
+            context_window: Some(8_000),
+            ..Default::default()
+        });
+
+        state.begin_turn();
+
+        assert!(state.usage.is_none());
+        assert!(state.turn_start.is_some());
+    }
+
+    #[test]
+    fn clear_usage_chunk_resets_status_without_chat_output() {
+        let mut state = StatusState::new(
+            "default".to_string(),
+            "gpt-test".to_string(),
+            "borland".to_string(),
+            false,
+        );
+        state.usage = Some(TurnUsage {
+            total_tokens: Some(2_000),
+            context_window: Some(8_000),
+            ..Default::default()
+        });
+        let lines = Rc::new(RefCell::new(Vec::new()));
+        let mut typewriter_state = None;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tx.send(TurnChunk::ClearUsage).unwrap();
+
+        assert!(!drain_stream_events(
+            &mut rx,
+            &lines,
+            &mut state,
+            &mut typewriter_state
+        ));
+
+        assert!(state.usage.is_none());
+        assert!(lines.borrow().is_empty());
+    }
+
+    #[test]
+    fn submit_turn_err_gets_worker_fallback_only_without_finished() {
+        let err: Result<String> = Err(anyhow::anyhow!("backend unavailable"));
+        assert_eq!(
+            submit_turn_fallback_error(&err, false),
+            Some("backend unavailable".to_string())
+        );
+        assert_eq!(submit_turn_fallback_error(&err, true), None);
+
+        let ok: Result<String> = Ok("done".to_string());
+        assert_eq!(submit_turn_fallback_error(&ok, false), None);
+    }
+
+    #[test]
+    fn usage_clear_boundaries_include_session_workspace_and_model_switches() {
+        assert!(should_clear_usage_after_command(true, false, false));
+        assert!(should_clear_usage_after_command(false, true, false));
+        assert!(should_clear_usage_after_command(false, false, true));
+        assert!(!should_clear_usage_after_command(false, false, false));
+
+        assert_eq!(model_switch_target("/models set primary"), Some("primary"));
+        assert_eq!(model_switch_target("/model set fast"), Some("fast"));
+        assert_eq!(model_switch_target("/models list"), None);
+        assert!(successful_model_switch_command(
+            "/models set primary",
+            "✅ Active model key: primary\n"
+        ));
+        assert!(!successful_model_switch_command(
+            "/models set missing",
+            "❌ Failed to set model key: missing\n"
+        ));
+        assert!(!successful_model_switch_command(
+            "/models set",
+            "Usage: /models set <key>\n"
+        ));
     }
 
     #[test]

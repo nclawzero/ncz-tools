@@ -155,6 +155,10 @@ pub enum TurnChunk {
     /// Token accounting for the completed or near-completed turn.
     /// Emitted when a backend surfaces usage data.
     Usage(TurnUsage),
+    /// UI-only status reset used when the active turn context changes
+    /// without a fresh usage report (new turn, workspace/session/model
+    /// switch). Chat renderers should ignore this chunk.
+    ClearUsage,
     /// The turn has completed — either with the full response text, or
     /// with an error. Emitted exactly once per submit. The UI should
     /// treat anything after this as a protocol bug.
