@@ -25,7 +25,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use tokio::sync::{mpsc, Mutex};
 use tracing::{info, warn};
 
@@ -1040,7 +1040,7 @@ async fn resolve_or_create_session_for_worker(
     }
 
     let session = client.lock().await.create_session(session_name).await?;
-    save_worker_session_metadata(&session)?;
+    save_worker_session_metadata_best_effort(&session);
     Ok(session)
 }
 
@@ -1067,11 +1067,18 @@ async fn create_session_for_worker_client(
     session_name: &str,
 ) -> Result<Session> {
     let session = client.lock().await.create_session(session_name).await?;
-    save_worker_session_metadata(&session)?;
+    save_worker_session_metadata_best_effort(&session);
     Ok(session)
 }
 
-fn save_worker_session_metadata(session: &Session) -> Result<()> {
+fn save_worker_session_metadata_best_effort(session: &Session) -> bool {
+    save_worker_session_metadata_best_effort_with(session, storage::save_session_metadata)
+}
+
+fn save_worker_session_metadata_best_effort_with<F>(session: &Session, save: F) -> bool
+where
+    F: FnOnce(&storage::SessionMetadata) -> Result<()>,
+{
     let metadata = storage::SessionMetadata {
         id: session.id.clone(),
         name: session.name.clone(),
@@ -1082,14 +1089,21 @@ fn save_worker_session_metadata(session: &Session) -> Result<()> {
         last_active: Utc::now().to_rfc3339(),
     };
     if storage::is_safe_session_id(&metadata.id) {
-        storage::save_session_metadata(&metadata)?;
+        if let Err(e) = save(&metadata) {
+            warn!(
+                "backend session '{}' was created, but local metadata save failed: {e}",
+                metadata.id
+            );
+            return false;
+        }
     } else {
         warn!(
             "not saving local metadata for unsafe session id: {}",
             metadata.id
         );
+        return false;
     }
-    Ok(())
+    true
 }
 
 #[derive(Debug)]
@@ -1287,6 +1301,14 @@ fn session_action(cmdline: &str) -> Option<SessionAction<'_>> {
         }),
         name => Some(SessionAction::Switch { target: name }),
     }
+}
+
+fn new_session_command(now: DateTime<Utc>, nonce: uuid::Uuid) -> String {
+    format!(
+        "/session create session-{}-{}",
+        now.format("%Y%m%d-%H%M%S"),
+        nonce.simple()
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2270,8 +2292,7 @@ fn handle_command(
             }
         }
         CMD_SESSION_NEW => {
-            let name = format!("session-{}", Utc::now().format("%Y%m%d-%H%M%S"));
-            let cmdline = format!("/session {name}");
+            let cmdline = new_session_command(Utc::now(), uuid::Uuid::new_v4());
             dispatch_command(
                 &cmdline,
                 chat_lines,
@@ -3271,6 +3292,22 @@ mod tests {
     }
 
     #[test]
+    fn new_session_command_uses_explicit_create_and_nonce() {
+        let now = DateTime::parse_from_rfc3339("2026-04-28T12:34:56Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let first = new_session_command(now, uuid::Uuid::from_u128(1));
+        let second = new_session_command(now, uuid::Uuid::from_u128(2));
+
+        assert_eq!(
+            first,
+            "/session create session-20260428-123456-00000000000000000000000000000001"
+        );
+        assert_ne!(first, second);
+        assert!(second.starts_with("/session create session-20260428-123456-"));
+    }
+
+    #[test]
     fn session_delete_target_parses_only_delete_commands() {
         assert_eq!(
             session_delete_target("/session delete sess-123"),
@@ -3518,6 +3555,22 @@ mod tests {
 
         plan_worker_session_create("Scratch", Ok(sessions))
             .expect("absent session name should permit explicit create");
+    }
+
+    #[test]
+    fn worker_session_metadata_save_failure_is_best_effort() {
+        let session = Session {
+            id: "sess-123".to_string(),
+            name: "Research".to_string(),
+            model: "m".to_string(),
+            provider: "p".to_string(),
+        };
+
+        let saved = save_worker_session_metadata_best_effort_with(&session, |_| {
+            Err(anyhow::anyhow!("disk full"))
+        });
+
+        assert!(!saved);
     }
 
     #[test]
