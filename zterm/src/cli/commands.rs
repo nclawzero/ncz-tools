@@ -249,6 +249,12 @@ impl CommandHandler {
                     };
 
                     match resolve_delete_session_target(&client, name).await {
+                        Ok(target) if target.id == session_id => {
+                            out.push_str(&format!(
+                                "❌ Cannot delete active session '{}'; switch to another session before deleting it\n",
+                                target.display_name()
+                            ));
+                        }
                         Ok(target) => match client.lock().await.delete_session(&target.id).await {
                             Ok(()) => {
                                 let display = target.display_name().to_string();
@@ -1609,8 +1615,14 @@ fn format_memory_list(memories: &[serde_json::Value]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use crate::cli::agent::{AgentClient, StreamSink};
+    use crate::cli::client::Config;
     use crate::cli::client::{Model, Provider, Session};
     use crate::cli::storage::SessionMetadata;
+    use crate::cli::workspace::{App, Backend, Workspace, WorkspaceConfig};
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex as StdMutex};
+    use tokio::sync::Mutex;
 
     /// Mirror the parts→(command, subcommand, args) slicing used by the
     /// real dispatcher, so regression tests can hit every length class
@@ -1870,6 +1882,114 @@ mod tests {
             context_window: None,
             supports_reasoning: false,
         }
+    }
+
+    #[derive(Clone)]
+    struct FakeAgentClient {
+        sessions: Vec<Session>,
+        deleted: Arc<StdMutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentClient for FakeAgentClient {
+        async fn health(&self) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+
+        async fn get_config(&self) -> anyhow::Result<Config> {
+            Ok(Config {
+                agent: Default::default(),
+            })
+        }
+
+        async fn put_config(&self, _config: &Config) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn list_providers(&self) -> anyhow::Result<Vec<Provider>> {
+            Ok(Vec::new())
+        }
+
+        async fn get_models(&self, _provider: &str) -> anyhow::Result<Vec<Model>> {
+            Ok(Vec::new())
+        }
+
+        async fn list_provider_models(&self, _provider: &str) -> anyhow::Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+
+        async fn list_sessions(&self) -> anyhow::Result<Vec<Session>> {
+            Ok(self.sessions.clone())
+        }
+
+        async fn create_session(&self, name: &str) -> anyhow::Result<Session> {
+            Ok(session(name, name))
+        }
+
+        async fn load_session(&self, session_id: &str) -> anyhow::Result<Session> {
+            self.sessions
+                .iter()
+                .find(|session| session.id == session_id)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("session not found"))
+        }
+
+        async fn delete_session(&self, session_id: &str) -> anyhow::Result<()> {
+            self.deleted.lock().unwrap().push(session_id.to_string());
+            Ok(())
+        }
+
+        async fn submit_turn(
+            &mut self,
+            _session_id: &str,
+            _message: &str,
+        ) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+
+        fn set_stream_sink(&mut self, _sink: Option<StreamSink>) {}
+    }
+
+    fn app_with_fake_client(fake: FakeAgentClient) -> Arc<Mutex<App>> {
+        let boxed: Box<dyn AgentClient + Send + Sync> = Box::new(fake);
+        Arc::new(Mutex::new(App {
+            workspaces: vec![Workspace {
+                id: 0,
+                config: WorkspaceConfig {
+                    name: "test".to_string(),
+                    backend: Backend::Zeroclaw,
+                    url: "http://127.0.0.1:8888".to_string(),
+                    token_env: None,
+                    token: None,
+                    label: None,
+                },
+                client: Some(Arc::new(Mutex::new(boxed))),
+                cron: None,
+            }],
+            active: 0,
+            shared_mnemos: None,
+            config_path: PathBuf::from("test-config.toml"),
+        }))
+    }
+
+    #[tokio::test]
+    async fn command_handler_refuses_to_delete_active_backend_session() {
+        let deleted = Arc::new(StdMutex::new(Vec::new()));
+        let fake = FakeAgentClient {
+            sessions: vec![session("sess-active", "Research")],
+            deleted: Arc::clone(&deleted),
+        };
+        let handler = super::CommandHandler::new(app_with_fake_client(fake));
+
+        let out = handler
+            .handle("/session delete Research", "sess-active")
+            .await
+            .expect("command should complete")
+            .expect("delete command should return output");
+
+        assert!(out.contains("Cannot delete active session"));
+        assert!(out.contains("switch to another session"));
+        assert!(deleted.lock().unwrap().is_empty());
     }
 
     #[test]
