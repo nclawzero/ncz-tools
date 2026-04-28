@@ -3,9 +3,29 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
+use rand::seq::SliceRandom;
+use serde::{Deserialize, Serialize};
+
 pub const CONNECT_SPLASH_PROMPT: &str =
     "Generate a 4-6 line 1991 BBS modem connect sequence. Keep it ANSI-free.";
 pub const CONNECT_SPLASH_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
+const WELCOME_QUOTES: &[&str] = &[
+    "Turbo Pascal says: Hello, world!",
+    "WordStar 7 loaded. Press ^KD to save.",
+    "Paradox reports: table reindexed cleanly.",
+    "dBASE V ready. SET TALK OFF.",
+    "QEMM optimized upper memory. Conventional RAM smiles.",
+    "Procomm Plus carrier detected. ANSI-BBS mode armed.",
+];
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ZtermState {
+    #[serde(default)]
+    pub launches: u64,
+    #[serde(default)]
+    pub beep_on_error: bool,
+}
 
 pub fn sanitize_workspace_name(workspace: &str) -> String {
     let sanitized: String = workspace
@@ -33,6 +53,10 @@ pub fn connect_splash_cache_path(base: &Path, workspace: &str) -> PathBuf {
 
 pub fn default_connect_splash_cache_path(workspace: &str) -> Option<PathBuf> {
     dirs::home_dir().map(|home| connect_splash_cache_path(&home.join(".zterm"), workspace))
+}
+
+pub fn default_state_path() -> Option<PathBuf> {
+    dirs::home_dir().map(|home| home.join(".zterm").join("state.toml"))
 }
 
 pub fn is_cache_fresh(modified: SystemTime, now: SystemTime, ttl: Duration) -> bool {
@@ -72,9 +96,57 @@ pub fn normalize_connect_splash(text: &str) -> String {
         .join("\n")
 }
 
+pub fn load_state(path: &Path) -> ZtermState {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return ZtermState::default();
+    };
+    toml::from_str(&text).unwrap_or_default()
+}
+
+pub fn save_state(path: &Path, state: &ZtermState) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let body = toml::to_string_pretty(state).map_err(std::io::Error::other)?;
+    std::fs::write(path, body)
+}
+
+pub fn record_launch() -> std::io::Result<(u64, Option<String>)> {
+    let Some(path) = default_state_path() else {
+        return Err(std::io::Error::other(
+            "no home directory; cannot persist zterm state",
+        ));
+    };
+    record_launch_at(&path)
+}
+
+pub fn record_launch_at(path: &Path) -> std::io::Result<(u64, Option<String>)> {
+    let mut state = load_state(path);
+    state.launches = state.launches.saturating_add(1);
+    let launches = state.launches;
+    save_state(path, &state)?;
+    Ok((launches, welcome_quote_for_launch(launches)))
+}
+
+pub fn is_welcome_milestone(launches: u64) -> bool {
+    launches == 5 || launches == 10 || (launches >= 25 && launches % 25 == 0)
+}
+
+pub fn welcome_quote_for_launch(launches: u64) -> Option<String> {
+    if !is_welcome_milestone(launches) {
+        return None;
+    }
+    let quote = WELCOME_QUOTES
+        .choose(&mut rand::thread_rng())
+        .copied()
+        .unwrap_or(WELCOME_QUOTES[0]);
+    Some(format!("Welcome back #{launches}: {quote}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     #[test]
     fn workspace_cache_filename_is_sanitized() {
@@ -99,5 +171,30 @@ mod tests {
             normalize_connect_splash(input),
             "CONNECT 2400\nline2\nline3\nline4\nline5\nline6"
         );
+    }
+
+    #[test]
+    fn launch_counter_persists_to_state_toml() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("state.toml");
+
+        assert_eq!(record_launch_at(&path).unwrap().0, 1);
+        assert_eq!(record_launch_at(&path).unwrap().0, 2);
+
+        let state = load_state(&path);
+        assert_eq!(state.launches, 2);
+        assert!(!state.beep_on_error);
+    }
+
+    #[test]
+    fn welcome_quotes_only_land_on_milestones() {
+        assert!(!is_welcome_milestone(4));
+        assert!(is_welcome_milestone(5));
+        assert!(is_welcome_milestone(10));
+        assert!(is_welcome_milestone(25));
+        assert!(welcome_quote_for_launch(5)
+            .unwrap()
+            .starts_with("Welcome back #5:"));
+        assert!(welcome_quote_for_launch(6).is_none());
     }
 }

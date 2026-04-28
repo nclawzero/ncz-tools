@@ -659,7 +659,14 @@ fn run_blocking(
     // event loop is single-threaded; the custom ChatPane view reads
     // the buffer during its draw pass, and the event loop writes to
     // it on Enter.
-    let welcome_lines = initial_chat_lines(&workspace_name, &model, &provider);
+    let welcome_back = match delighters::record_launch() {
+        Ok((_, quote)) => quote,
+        Err(e) => {
+            warn!("welcome-back state update failed: {e}");
+            None
+        }
+    };
+    let welcome_lines = initial_chat_lines(&workspace_name, &model, &provider, welcome_back);
     let mut typewriter_state = None;
     let initial_lines = if let Some(text) = connect_splash {
         let state = TypewriterState::new(text, welcome_lines);
@@ -780,15 +787,24 @@ fn run_blocking(
     Ok(())
 }
 
-fn initial_chat_lines(workspace: &str, model: &str, provider: &str) -> Vec<String> {
-    vec![
+fn initial_chat_lines(
+    workspace: &str,
+    model: &str,
+    provider: &str,
+    welcome_back: Option<String>,
+) -> Vec<String> {
+    let mut lines = vec![
         "zterm — Turbo Vision UI (E-2 async bridge)".to_string(),
         format!("workspace: {workspace}  ·  model: {model}  ·  provider: {provider}"),
         String::new(),
         "Type a message and press Enter to submit a turn to the agent.".to_string(),
         "Press Ctrl-D (or Alt-X, F10→File→Exit, /exit) to quit. Ctrl-L to redraw.".to_string(),
         String::new(),
-    ]
+    ];
+    if let Some(quote) = welcome_back {
+        lines.insert(2, quote);
+    }
+    lines
 }
 
 fn build_menu_bar(w: i16) -> MenuBar {
