@@ -40,8 +40,11 @@
 
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
+use std::fs::{File, OpenOptions};
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
 use crate::cli::agent::AgentClient;
@@ -473,6 +476,74 @@ fn workspace_state_path_for_config(config_path: &Path) -> PathBuf {
         .join("workspace-state.toml")
 }
 
+struct WorkspaceStateLock {
+    path: PathBuf,
+    file: Option<File>,
+}
+
+impl Drop for WorkspaceStateLock {
+    fn drop(&mut self) {
+        self.file.take();
+        if let Err(e) = std::fs::remove_file(&self.path) {
+            if e.kind() != ErrorKind::NotFound {
+                tracing::warn!(
+                    "could not remove zterm workspace state lock {}: {e}",
+                    self.path.display()
+                );
+            }
+        }
+    }
+}
+
+fn workspace_state_lock_path(state_path: &Path) -> PathBuf {
+    let name = state_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("workspace-state.toml");
+    state_path.with_file_name(format!(".{name}.lock"))
+}
+
+fn lock_workspace_state(state_path: &Path) -> Result<WorkspaceStateLock> {
+    if let Some(parent) = state_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating zterm state dir {}", parent.display()))?;
+    }
+
+    let lock_path = workspace_state_lock_path(state_path);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+        {
+            Ok(file) => {
+                return Ok(WorkspaceStateLock {
+                    path: lock_path,
+                    file: Some(file),
+                });
+            }
+            Err(e) if e.kind() == ErrorKind::AlreadyExists && Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+                return Err(anyhow!(
+                    "timed out waiting for zterm workspace state lock {}",
+                    lock_path.display()
+                ));
+            }
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!(
+                        "creating zterm workspace state lock {}",
+                        lock_path.display()
+                    )
+                });
+            }
+        }
+    }
+}
+
 fn load_workspace_state(path: &Path) -> Result<WorkspaceState> {
     if !path.exists() {
         return Ok(WorkspaceState::default());
@@ -490,19 +561,47 @@ fn save_workspace_state(path: &Path, state: &WorkspaceState) -> Result<()> {
     }
     let body =
         toml::to_string_pretty(state).with_context(|| "serializing zterm workspace state TOML")?;
-    let tmp_path = path.with_extension("toml.tmp");
-    std::fs::write(&tmp_path, body)
-        .with_context(|| format!("writing zterm workspace state {}", tmp_path.display()))?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("workspace-state.toml");
+    let tmp_path = path.with_file_name(format!(
+        ".{file_name}.{}.tmp",
+        uuid::Uuid::new_v4().simple()
+    ));
+    {
+        let mut tmp_file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)
+            .with_context(|| format!("creating zterm workspace state {}", tmp_path.display()))?;
+        use std::io::Write;
+        tmp_file
+            .write_all(body.as_bytes())
+            .with_context(|| format!("writing zterm workspace state {}", tmp_path.display()))?;
+        tmp_file
+            .sync_all()
+            .with_context(|| format!("syncing zterm workspace state {}", tmp_path.display()))?;
+    }
     std::fs::rename(&tmp_path, path).with_context(|| {
         format!(
             "atomically replacing zterm workspace state {}",
             path.display()
         )
-    })
+    })?;
+    if let Some(parent) = path.parent() {
+        if let Ok(parent_dir) = File::open(parent) {
+            parent_dir
+                .sync_all()
+                .with_context(|| format!("syncing zterm state dir {}", parent.display()))?;
+        }
+    }
+    Ok(())
 }
 
 fn apply_openclaw_workspace_state(config_path: &Path, cfg: &mut AppConfig) -> Result<()> {
     let state_path = workspace_state_path_for_config(config_path);
+    let _state_lock = lock_workspace_state(&state_path)?;
     let mut state = load_workspace_state(&state_path)?;
     let mut state_changed = false;
     let mut claimed_state_entries = std::collections::HashSet::new();
@@ -601,10 +700,38 @@ fn apply_openclaw_workspace_state(config_path: &Path, cfg: &mut AppConfig) -> Re
         next_state.openclaw_workspaces.push(entry.clone());
         match save_workspace_state(&state_path, &next_state) {
             Ok(()) => {
-                state = next_state;
-                workspace.id = Some(entry.id);
-                for alias in &entry.namespace_aliases {
-                    push_unique_namespace(&mut workspace.namespace_aliases, alias.trim());
+                let verified_state = load_workspace_state(&state_path)?;
+                if let Some(entry_idx) =
+                    verified_state
+                        .openclaw_workspaces
+                        .iter()
+                        .position(|persisted| {
+                            persisted.id == entry.id
+                                && openclaw_workspace_identity_values_match(
+                                    &persisted.name,
+                                    &persisted.url,
+                                    &entry.name,
+                                    &entry.url,
+                                )
+                        })
+                {
+                    let persisted = &verified_state.openclaw_workspaces[entry_idx];
+                    let persisted_id = persisted.id.clone();
+                    let persisted_aliases = persisted.namespace_aliases.clone();
+                    state = verified_state;
+                    claimed_state_entries.insert(entry_idx);
+                    workspace.id = Some(persisted_id);
+                    for alias in &persisted_aliases {
+                        push_unique_namespace(&mut workspace.namespace_aliases, alias.trim());
+                    }
+                } else {
+                    state = verified_state;
+                    tracing::warn!(
+                        "generated openclaw workspace id for '{}' was not present after persisting {}; \
+                         staying on legacy name+url namespace",
+                        workspace.name,
+                        state_path.display()
+                    );
                 }
             }
             Err(e) => {
@@ -1054,6 +1181,41 @@ url = "ws://old.example"
 
         let reloaded = AppConfig::load(&path).unwrap();
         assert_eq!(reloaded.workspaces[0].id.as_deref(), Some(id));
+    }
+
+    #[test]
+    fn concurrent_loads_converge_on_one_persisted_openclaw_workspace_id() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        let original = r#"
+[[workspaces]]
+name = "alpha"
+backend = "openclaw"
+url = "ws://old.example"
+"#;
+        std::fs::write(&path, original).unwrap();
+
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let path = path.clone();
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                let cfg = AppConfig::load(&path).unwrap();
+                cfg.workspaces[0].id.clone().unwrap()
+            }));
+        }
+
+        let ids: Vec<String> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+        assert_eq!(ids[0], ids[1]);
+
+        let state = load_workspace_state(&workspace_state_path_for_config(&path)).unwrap();
+        assert_eq!(state.openclaw_workspaces.len(), 1);
+        assert_eq!(state.openclaw_workspaces[0].id, ids[0]);
     }
 
     #[test]
