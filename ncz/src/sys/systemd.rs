@@ -30,6 +30,10 @@ pub fn is_enabled(runner: &dyn CommandRunner, unit: &str) -> Result<bool, NczErr
     Ok(out.ok())
 }
 
+pub fn is_stopped(runner: &dyn CommandRunner, unit: &str) -> Result<bool, NczError> {
+    Ok(unit_state(runner, unit)?.is_stopped())
+}
+
 pub fn daemon_reload(runner: &dyn CommandRunner) -> Result<(), NczError> {
     let out = runner.run("sudo", &["systemctl", "daemon-reload"])?;
     if !out.ok() {
@@ -64,11 +68,11 @@ pub fn restart(runner: &dyn CommandRunner, unit: &str) -> Result<(), NczError> {
 }
 
 pub fn stop(runner: &dyn CommandRunner, unit: &str) -> Result<(), NczError> {
-    let before = stop_state(runner, unit).ok();
+    let before = unit_state(runner, unit).ok();
     let out = runner.run("sudo", &["systemctl", "stop", unit])?;
     let stop_msg = output_msg(&out);
-    let was_stopped = before.as_ref().is_some_and(StopState::is_stopped);
-    match stop_state(runner, unit) {
+    let was_stopped = before.as_ref().is_some_and(UnitState::is_stopped);
+    match unit_state(runner, unit) {
         Ok(state) if out.ok() && state.is_stopped() => Ok(()),
         Ok(state) if was_stopped && state.is_stopped() && is_idempotent_stop_failure(&out) => {
             Ok(())
@@ -102,18 +106,22 @@ fn output_msg(out: &crate::sys::ProcessOutput) -> String {
     }
 }
 
-struct StopState {
+pub struct UnitState {
     load_state: String,
     active_state: String,
     sub_state: String,
 }
 
-impl StopState {
-    fn is_stopped(&self) -> bool {
+impl UnitState {
+    pub fn is_active(&self) -> bool {
+        self.active_state == "active"
+    }
+
+    pub fn is_stopped(&self) -> bool {
         matches!(self.active_state.as_str(), "inactive" | "failed")
     }
 
-    fn describe(&self) -> String {
+    pub fn describe(&self) -> String {
         format!(
             "observed LoadState={} ActiveState={} SubState={}",
             self.load_state, self.active_state, self.sub_state
@@ -121,7 +129,7 @@ impl StopState {
     }
 }
 
-fn stop_state(runner: &dyn CommandRunner, unit: &str) -> Result<StopState, NczError> {
+pub fn unit_state(runner: &dyn CommandRunner, unit: &str) -> Result<UnitState, NczError> {
     let out = runner.run(
         "systemctl",
         &[
@@ -157,7 +165,7 @@ fn stop_state(runner: &dyn CommandRunner, unit: &str) -> Result<StopState, NczEr
         }
     }
 
-    Ok(StopState {
+    Ok(UnitState {
         load_state,
         active_state,
         sub_state,

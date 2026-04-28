@@ -115,3 +115,44 @@ pub fn atomic_write(path: &Path, contents: &[u8], mode: u32) -> Result<(), NczEr
     File::open(parent)?.sync_all()?;
     Ok(())
 }
+
+/// Remove `path` and fsync its parent directory so the unlink is durable.
+pub fn remove_file_durable(path: &Path) -> Result<(), NczError> {
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(NczError::Io(e)),
+    }
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| NczError::Precondition(format!("path has no parent: {}", path.display())))?;
+    File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remove_file_durable_removes_existing_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("agent");
+        fs::write(&path, "openclaw\n").unwrap();
+
+        remove_file_durable(&path).unwrap();
+
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn remove_file_durable_tolerates_missing_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("agent");
+
+        remove_file_durable(&path).unwrap();
+
+        assert!(!path.exists());
+    }
+}
