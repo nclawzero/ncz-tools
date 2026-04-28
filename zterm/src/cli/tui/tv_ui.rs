@@ -55,7 +55,9 @@ use turbo_vision::views::status_line::{StatusItem, StatusLine};
 use turbo_vision::views::view::{write_line_to_terminal, View};
 use turbo_vision::views::window::WindowBuilder;
 
-use crate::cli::agent::{StreamSink, TurnChunk, TurnUsage};
+use crate::cli::agent::{
+    SessionPickerListResult, SessionPickerWorkspace, StreamSink, TurnChunk, TurnUsage,
+};
 use crate::cli::client::Session;
 use crate::cli::commands::CommandHandler;
 use crate::cli::storage;
@@ -78,7 +80,7 @@ enum WorkerRequest {
     Command(String),
     /// Fetch backend sessions for the modal picker on the async
     /// worker path. The sync TUI thread must not call backend I/O.
-    SessionPickerList,
+    SessionPickerList(SessionPickerWorkspace),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -239,6 +241,10 @@ struct StatusState {
     /// try-locking the shared `App`; falls back to this cached
     /// value when the worker is holding the mutex.
     workspace: String,
+    /// Stable workspace id from config when available. The display
+    /// name is still the primary status text, but picker caches use
+    /// this alongside the name to reject stale async replies.
+    workspace_id: Option<String>,
     /// Last known active model label. Refreshed through lightweight
     /// `TurnChunk::Status` frames after command-driven context
     /// changes.
@@ -281,6 +287,7 @@ impl StatusState {
     fn new(workspace: String, model: String, current_theme: String, beep_on_error: bool) -> Self {
         Self {
             workspace,
+            workspace_id: None,
             model,
             turn_start: None,
             frozen_elapsed: None,
@@ -352,6 +359,7 @@ impl StatusState {
         if let Some(workspace) = workspace {
             if self.workspace != workspace {
                 self.workspace = workspace;
+                self.workspace_id = None;
                 changed = true;
             }
         }
@@ -364,6 +372,10 @@ impl StatusState {
         if changed {
             self.clear_usage();
         }
+    }
+
+    fn session_picker_workspace(&self) -> SessionPickerWorkspace {
+        SessionPickerWorkspace::new(self.workspace.clone(), self.workspace_id.clone())
     }
 
     /// Current elapsed duration: live while a turn is in flight,
@@ -473,13 +485,14 @@ pub async fn run(
     // Snapshot the active workspace name for the status line. A later
     // slice replaces this one-shot read with a live subscription so
     // `/workspace switch` updates the status bar in place.
-    let workspace_name = {
+    let workspace_identity = {
         let locked = app.lock().await;
         locked
             .active_workspace()
-            .map(|w| w.config.name.clone())
-            .unwrap_or_else(|| "<unknown>".to_string())
+            .map(session_picker_workspace_for_active_workspace)
+            .unwrap_or_else(|| SessionPickerWorkspace::new("<unknown>", None))
     };
+    let workspace_name = workspace_identity.name.clone();
 
     // Channels: bounded for requests (backpressure on a spammy user
     // isn't a bad thing), unbounded for streamed chunks (the UI
@@ -589,10 +602,10 @@ pub async fn run(
                         }
                     }
                 }
-                WorkerRequest::SessionPickerList => {
-                    let result = tokio::time::timeout(
+                WorkerRequest::SessionPickerList(workspace) => {
+                    let load_result = tokio::time::timeout(
                         SESSION_PICKER_LIST_TIMEOUT,
-                        load_session_picker_sessions_for_worker(&worker_app),
+                        load_session_picker_sessions_for_worker(&worker_app, &workspace),
                     )
                     .await
                     .map_err(|_| {
@@ -603,7 +616,15 @@ pub async fn run(
                     })
                     .and_then(|result| result)
                     .map_err(|e| e.to_string());
-                    let _ = worker_sink.send(TurnChunk::SessionPickerList(result));
+                    let (workspace, result) = match load_result {
+                        Ok((loaded_workspace, sessions)) => (loaded_workspace, Ok(sessions)),
+                        Err(message) => (workspace, Err(message)),
+                    };
+                    let _ =
+                        worker_sink.send(TurnChunk::SessionPickerList(SessionPickerListResult {
+                            workspace,
+                            result,
+                        }));
                 }
                 WorkerRequest::Command(cmdline) => {
                     // Route slash commands through the shared
@@ -803,6 +824,7 @@ pub async fn run(
             model,
             provider,
             workspace_name,
+            workspace_identity.id,
             connect_splash,
             req_tx,
             event_rx,
@@ -930,15 +952,63 @@ async fn install_stream_sink_on_active_client(app: &Arc<Mutex<App>>, sink: Strea
     true
 }
 
-async fn load_session_picker_sessions_for_worker(app: &Arc<Mutex<App>>) -> Result<Vec<Session>> {
-    let client = {
+async fn load_session_picker_sessions_for_worker(
+    app: &Arc<Mutex<App>>,
+    requested_workspace: &SessionPickerWorkspace,
+) -> Result<(SessionPickerWorkspace, Vec<Session>)> {
+    let (active_workspace, client) = {
         let guard = app.lock().await;
-        guard.active_workspace().and_then(|w| w.client.clone())
+        let workspace = guard
+            .active_workspace()
+            .ok_or_else(|| anyhow::anyhow!("no active workspace"))?;
+        (
+            session_picker_workspace_for_active_workspace(workspace),
+            workspace.client.clone(),
+        )
+    };
+    let client = client.ok_or_else(|| anyhow::anyhow!("no active workspace client"))?;
+    if !session_picker_workspace_matches(requested_workspace, &active_workspace) {
+        anyhow::bail!(
+            "active workspace changed from `{}` to `{}` before sessions loaded",
+            requested_workspace.name,
+            active_workspace.name
+        );
     }
-    .ok_or_else(|| anyhow::anyhow!("no active workspace client"))?;
 
     let locked = client.lock().await;
-    locked.list_sessions().await
+    let sessions = locked.list_sessions().await?;
+    Ok((active_workspace, sessions))
+}
+
+fn session_picker_workspace_for_active_workspace(
+    workspace: &crate::cli::workspace::Workspace,
+) -> SessionPickerWorkspace {
+    SessionPickerWorkspace::new(workspace.config.name.clone(), workspace.config.id.clone())
+}
+
+fn session_picker_workspace_matches(
+    expected: &SessionPickerWorkspace,
+    actual: &SessionPickerWorkspace,
+) -> bool {
+    expected.name == actual.name
+        && match (&expected.id, &actual.id) {
+            (Some(expected), Some(actual)) => expected == actual,
+            _ => true,
+        }
+}
+
+fn session_picker_load_matches_workspace(
+    load: &SessionPickerLoad,
+    workspace: &SessionPickerWorkspace,
+) -> bool {
+    match load {
+        SessionPickerLoad::Idle => true,
+        SessionPickerLoad::Loading(cached)
+        | SessionPickerLoad::Ready(cached, _)
+        | SessionPickerLoad::Error(cached, _) => {
+            session_picker_workspace_matches(cached, workspace)
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1368,6 +1438,7 @@ fn run_blocking(
     model: String,
     provider: String,
     workspace_name: String,
+    workspace_id: Option<String>,
     connect_splash: Option<String>,
     req_tx: mpsc::Sender<WorkerRequest>,
     mut event_rx: mpsc::UnboundedReceiver<TurnChunk>,
@@ -1413,6 +1484,7 @@ fn run_blocking(
         persisted_name.clone(),
         beep_on_error,
     );
+    status_state.workspace_id = workspace_id;
     let initial_status_line = build_status_line(w, h, &status_state);
     tapp.set_status_line(initial_status_line);
 
@@ -1675,8 +1747,9 @@ fn refresh_status_line(
     // updates is preferable to blocking the UI.
     if let Ok(guard) = app.try_lock() {
         if let Some(ws) = guard.active_workspace() {
-            if ws.config.name != state.workspace {
+            if ws.config.name != state.workspace || ws.config.id != state.workspace_id {
                 state.workspace = ws.config.name.clone();
+                state.workspace_id = ws.config.id.clone();
                 state.clear_usage();
             }
         }
@@ -2648,9 +2721,9 @@ impl From<Session> for SessionPickerEntry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SessionPickerLoad {
     Idle,
-    Loading,
-    Ready(Vec<SessionPickerEntry>),
-    Error(String),
+    Loading(SessionPickerWorkspace),
+    Ready(SessionPickerWorkspace, Vec<SessionPickerEntry>),
+    Error(SessionPickerWorkspace, String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2675,7 +2748,10 @@ fn request_session_picker_load(
     session_picker_state: &mut SessionPickerState,
 ) -> SubmissionStatus {
     session_picker_state.open_when_ready = true;
-    if matches!(session_picker_state.load, SessionPickerLoad::Loading) {
+    let workspace = status_state.session_picker_workspace();
+    if session_picker_load_matches_workspace(&session_picker_state.load, &workspace)
+        && matches!(session_picker_state.load, SessionPickerLoad::Loading(_))
+    {
         status_state.set_toast("Loading sessions...".to_string());
         return SubmissionStatus::Busy;
     }
@@ -2685,10 +2761,10 @@ fn request_session_picker_load(
         lines.push("[session] loading backend sessions...".to_string());
         lines.push(String::new());
     }
-    session_picker_state.load = SessionPickerLoad::Loading;
+    session_picker_state.load = SessionPickerLoad::Loading(workspace.clone());
     status_state.set_toast("Loading sessions...".to_string());
 
-    match req_tx.try_send(WorkerRequest::SessionPickerList) {
+    match req_tx.try_send(WorkerRequest::SessionPickerList(workspace)) {
         Ok(()) => SubmissionStatus::Started,
         Err(e) => {
             session_picker_state.load = SessionPickerLoad::Idle;
@@ -2702,17 +2778,22 @@ fn request_session_picker_load(
 }
 
 fn apply_session_picker_result(
-    result: std::result::Result<Vec<Session>, String>,
+    result: SessionPickerListResult,
     chat_lines: &Rc<RefCell<Vec<String>>>,
     status_state: &mut StatusState,
     session_picker_state: &mut SessionPickerState,
 ) {
-    match result {
+    let active_workspace = status_state.session_picker_workspace();
+    if !session_picker_workspace_matches(&result.workspace, &active_workspace) {
+        return;
+    }
+
+    match result.result {
         Ok(sessions) => {
             let entries: Vec<SessionPickerEntry> =
                 sessions.into_iter().map(SessionPickerEntry::from).collect();
             status_state.set_toast(format!("Loaded {} sessions", entries.len()));
-            session_picker_state.load = SessionPickerLoad::Ready(entries);
+            session_picker_state.load = SessionPickerLoad::Ready(result.workspace, entries);
         }
         Err(message) => {
             chat_lines.borrow_mut().push(format!(
@@ -2720,7 +2801,7 @@ fn apply_session_picker_result(
             ));
             chat_lines.borrow_mut().push(String::new());
             status_state.set_toast("Session load failed".to_string());
-            session_picker_state.load = SessionPickerLoad::Error(message);
+            session_picker_state.load = SessionPickerLoad::Error(result.workspace, message);
             session_picker_state.open_when_ready = false;
         }
     }
@@ -2735,6 +2816,16 @@ fn open_or_request_session_picker(
     session_picker_state: &mut SessionPickerState,
 ) {
     session_picker_state.open_when_ready = true;
+    if request_session_picker_load_if_workspace_changed(
+        chat_lines,
+        req_tx,
+        status_state,
+        session_picker_state,
+    )
+    .is_some()
+    {
+        return;
+    }
     maybe_open_pending_session_picker(
         app,
         chat_lines,
@@ -2747,14 +2838,23 @@ fn open_or_request_session_picker(
         return;
     }
 
-    match &session_picker_state.load {
-        SessionPickerLoad::Idle | SessionPickerLoad::Error(_) => {
+    let workspace = status_state.session_picker_workspace();
+    match session_picker_state.load.clone() {
+        SessionPickerLoad::Idle | SessionPickerLoad::Error(_, _) => {
             request_session_picker_load(chat_lines, req_tx, status_state, session_picker_state);
         }
-        SessionPickerLoad::Loading => {
-            status_state.set_toast("Loading sessions...".to_string());
+        SessionPickerLoad::Loading(cached) => {
+            if session_picker_workspace_matches(&cached, &workspace) {
+                status_state.set_toast("Loading sessions...".to_string());
+            } else {
+                request_session_picker_load(chat_lines, req_tx, status_state, session_picker_state);
+            }
         }
-        SessionPickerLoad::Ready(_) => {}
+        SessionPickerLoad::Ready(cached, _) => {
+            if !session_picker_workspace_matches(&cached, &workspace) {
+                request_session_picker_load(chat_lines, req_tx, status_state, session_picker_state);
+            }
+        }
     }
 }
 
@@ -2770,8 +2870,19 @@ fn maybe_open_pending_session_picker(
         return;
     }
 
+    if request_session_picker_load_if_workspace_changed(
+        chat_lines,
+        req_tx,
+        status_state,
+        session_picker_state,
+    )
+    .is_some()
+    {
+        return;
+    }
+
     match session_picker_state.load.clone() {
-        SessionPickerLoad::Ready(entries) => {
+        SessionPickerLoad::Ready(_, entries) => {
             session_picker_state.open_when_ready = false;
             if entries.is_empty() {
                 chat_lines
@@ -2798,7 +2909,7 @@ fn maybe_open_pending_session_picker(
                 }
             }
         }
-        SessionPickerLoad::Error(message) => {
+        SessionPickerLoad::Error(_, message) => {
             session_picker_state.open_when_ready = false;
             chat_lines.borrow_mut().push(format!(
                 "[session] could not load backend sessions: {message}"
@@ -2806,8 +2917,27 @@ fn maybe_open_pending_session_picker(
             chat_lines.borrow_mut().push(String::new());
             session_picker_state.load = SessionPickerLoad::Idle;
         }
-        SessionPickerLoad::Idle | SessionPickerLoad::Loading => {}
+        SessionPickerLoad::Idle | SessionPickerLoad::Loading(_) => {}
     }
+}
+
+fn request_session_picker_load_if_workspace_changed(
+    chat_lines: &Rc<RefCell<Vec<String>>>,
+    req_tx: &mpsc::Sender<WorkerRequest>,
+    status_state: &mut StatusState,
+    session_picker_state: &mut SessionPickerState,
+) -> Option<SubmissionStatus> {
+    let workspace = status_state.session_picker_workspace();
+    if session_picker_load_matches_workspace(&session_picker_state.load, &workspace) {
+        return None;
+    }
+    session_picker_state.load = SessionPickerLoad::Idle;
+    Some(request_session_picker_load(
+        chat_lines,
+        req_tx,
+        status_state,
+        session_picker_state,
+    ))
 }
 
 fn session_switch_command_for_picker_entry(entry: &SessionPickerEntry) -> Result<String> {
@@ -3371,10 +3501,10 @@ mod tests {
         let status = request_session_picker_load(&lines, &tx, &mut state, &mut picker_state);
 
         assert_eq!(status, SubmissionStatus::Started);
-        assert!(matches!(
-            rx.try_recv().unwrap(),
-            WorkerRequest::SessionPickerList
-        ));
+        let WorkerRequest::SessionPickerList(workspace) = rx.try_recv().unwrap() else {
+            panic!("expected session picker load request");
+        };
+        assert_eq!(workspace.name, "default");
         assert_eq!(
             lines.borrow().as_slice(),
             [
@@ -3382,7 +3512,10 @@ mod tests {
                 String::new()
             ]
         );
-        assert_eq!(picker_state.load, SessionPickerLoad::Loading);
+        assert_eq!(
+            picker_state.load,
+            SessionPickerLoad::Loading(SessionPickerWorkspace::new("default", None))
+        );
         assert!(picker_state.open_when_ready);
     }
 
@@ -3398,16 +3531,19 @@ mod tests {
         let mut typewriter_state = None;
         let mut response_in_flight = true;
         let mut picker_state = SessionPickerState {
-            load: SessionPickerLoad::Loading,
+            load: SessionPickerLoad::Loading(SessionPickerWorkspace::new("default", None)),
             open_when_ready: true,
         };
         let (tx, mut rx) = mpsc::unbounded_channel();
-        tx.send(TurnChunk::SessionPickerList(Ok(vec![Session {
-            id: "sess-123".to_string(),
-            name: "scratch".to_string(),
-            model: "gpt-test".to_string(),
-            provider: "test".to_string(),
-        }])))
+        tx.send(TurnChunk::SessionPickerList(SessionPickerListResult {
+            workspace: SessionPickerWorkspace::new("default", None),
+            result: Ok(vec![Session {
+                id: "sess-123".to_string(),
+                name: "scratch".to_string(),
+                model: "gpt-test".to_string(),
+                provider: "test".to_string(),
+            }]),
+        }))
         .unwrap();
 
         assert!(!drain_stream_events(
@@ -3420,7 +3556,8 @@ mod tests {
         ));
 
         match picker_state.load {
-            SessionPickerLoad::Ready(entries) => {
+            SessionPickerLoad::Ready(workspace, entries) => {
+                assert_eq!(workspace.name, "default");
                 assert_eq!(entries.len(), 1);
                 assert_eq!(entries[0].id, "sess-123");
             }
@@ -3428,6 +3565,102 @@ mod tests {
         }
         assert!(picker_state.open_when_ready);
         assert!(response_in_flight);
+        assert!(lines.borrow().is_empty());
+    }
+
+    #[test]
+    fn session_picker_workspace_change_forces_fresh_load_instead_of_stale_ready_cache() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let lines = Rc::new(RefCell::new(Vec::new()));
+        let mut state = StatusState::new(
+            "workspace-a".to_string(),
+            "gpt-test".to_string(),
+            "borland".to_string(),
+            false,
+        );
+        let mut picker_state = SessionPickerState {
+            load: SessionPickerLoad::Loading(SessionPickerWorkspace::new("workspace-a", None)),
+            open_when_ready: true,
+        };
+
+        apply_session_picker_result(
+            SessionPickerListResult {
+                workspace: SessionPickerWorkspace::new("workspace-a", None),
+                result: Ok(vec![Session {
+                    id: "stale-a-session".to_string(),
+                    name: "scratch".to_string(),
+                    model: "gpt-test".to_string(),
+                    provider: "test".to_string(),
+                }]),
+            },
+            &lines,
+            &mut state,
+            &mut picker_state,
+        );
+        assert!(matches!(&picker_state.load, SessionPickerLoad::Ready(_, _)));
+
+        state.apply_status(Some("workspace-b".to_string()), None);
+
+        let status = request_session_picker_load_if_workspace_changed(
+            &lines,
+            &tx,
+            &mut state,
+            &mut picker_state,
+        );
+
+        assert_eq!(status, Some(SubmissionStatus::Started));
+        let WorkerRequest::SessionPickerList(workspace) = rx.try_recv().unwrap() else {
+            panic!("expected fresh session picker load request");
+        };
+        assert_eq!(workspace.name, "workspace-b");
+        assert_eq!(
+            picker_state.load,
+            SessionPickerLoad::Loading(SessionPickerWorkspace::new("workspace-b", None))
+        );
+        assert!(picker_state.open_when_ready);
+    }
+
+    #[test]
+    fn session_picker_ignores_stale_worker_result_for_previous_workspace() {
+        let mut state = StatusState::new(
+            "workspace-b".to_string(),
+            "gpt-test".to_string(),
+            "borland".to_string(),
+            false,
+        );
+        let lines = Rc::new(RefCell::new(Vec::new()));
+        let mut typewriter_state = None;
+        let mut response_in_flight = false;
+        let mut picker_state = SessionPickerState {
+            load: SessionPickerLoad::Loading(SessionPickerWorkspace::new("workspace-b", None)),
+            open_when_ready: true,
+        };
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tx.send(TurnChunk::SessionPickerList(SessionPickerListResult {
+            workspace: SessionPickerWorkspace::new("workspace-a", None),
+            result: Ok(vec![Session {
+                id: "stale-a-session".to_string(),
+                name: "scratch".to_string(),
+                model: "gpt-test".to_string(),
+                provider: "test".to_string(),
+            }]),
+        }))
+        .unwrap();
+
+        assert!(!drain_stream_events(
+            &mut rx,
+            &lines,
+            &mut state,
+            &mut typewriter_state,
+            &mut response_in_flight,
+            &mut picker_state
+        ));
+
+        assert_eq!(
+            picker_state.load,
+            SessionPickerLoad::Loading(SessionPickerWorkspace::new("workspace-b", None))
+        );
+        assert!(picker_state.open_when_ready);
         assert!(lines.borrow().is_empty());
     }
 

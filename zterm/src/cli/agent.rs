@@ -139,6 +139,30 @@ fn first_u64(value: &serde_json::Value, keys: &[&str]) -> Option<u64> {
     })
 }
 
+/// Workspace identity attached to async session-picker loads so the TUI can
+/// ignore results that complete after the active workspace changes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionPickerWorkspace {
+    pub name: String,
+    pub id: Option<String>,
+}
+
+impl SessionPickerWorkspace {
+    pub fn new(name: impl Into<String>, id: Option<String>) -> Self {
+        Self {
+            name: name.into(),
+            id,
+        }
+    }
+}
+
+/// UI-only response body for the Turbo Vision session picker.
+#[derive(Debug, Clone)]
+pub struct SessionPickerListResult {
+    pub workspace: SessionPickerWorkspace,
+    pub result: std::result::Result<Vec<Session>, String>,
+}
+
 /// Streaming chunk emitted by an `AgentClient` during `submit_turn` when a
 /// sink has been installed via `AgentClient::set_stream_sink`. The TUI
 /// consumes these to append tokens into the chat pane as they arrive from
@@ -168,7 +192,7 @@ pub enum TurnChunk {
     /// UI-only response for the Turbo Vision session picker. This
     /// lets the picker load backend sessions on the async worker path
     /// instead of blocking the synchronous UI thread.
-    SessionPickerList(std::result::Result<Vec<Session>, String>),
+    SessionPickerList(SessionPickerListResult),
     /// The turn has completed — either with the full response text, or
     /// with an error. Emitted exactly once per submit. The UI should
     /// treat anything after this as a protocol bug.
