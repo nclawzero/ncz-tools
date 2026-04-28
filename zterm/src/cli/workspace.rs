@@ -339,7 +339,7 @@ impl Workspace {
             token: self.config.resolved_token(),
         };
 
-        let client = OpenClawClient::connect_and_handshake(&self.config.url, &device, &params)
+        let mut client = OpenClawClient::connect_and_handshake(&self.config.url, &device, &params)
             .await
             .with_context(|| {
                 format!(
@@ -347,11 +347,21 @@ impl Workspace {
                     self.config.name, self.config.url
                 )
             })?;
+        client.set_session_namespace(openclaw_session_namespace(&self.config));
 
         let boxed: Box<dyn AgentClient + Send + Sync> = Box::new(client);
         self.client = Some(Arc::new(Mutex::new(boxed)));
         Ok(())
     }
+}
+
+fn openclaw_session_namespace(config: &WorkspaceConfig) -> String {
+    format!(
+        "backend={};workspace={};url={}",
+        config.backend.as_str(),
+        config.name.trim(),
+        config.url.trim_end_matches('/')
+    )
 }
 
 /// Canonical path for zterm's openclaw device key. Shared across

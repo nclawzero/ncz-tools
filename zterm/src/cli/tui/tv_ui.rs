@@ -598,9 +598,12 @@ pub async fn run(
                         let _ = worker_sink.send(TurnChunk::Finished(Ok(String::new())));
                         continue;
                     }
-                    if let Some(target) =
-                        active_worker_session_delete_target(&cmdline, &worker_app, &worker_sessions)
-                            .await
+                    if let Some(target) = active_worker_session_delete_target(
+                        &cmdline,
+                        &worker_app,
+                        &mut worker_sessions,
+                    )
+                    .await
                     {
                         let _ = worker_sink.send(TurnChunk::Finished(Err(format!(
                             "cannot delete active session `{target}`; switch to another session before deleting it"
@@ -969,23 +972,92 @@ async fn remembered_session_id_for_active_workspace(
 async fn active_worker_session_delete_target(
     cmdline: &str,
     app: &Arc<Mutex<App>>,
-    sessions: &HashMap<String, WorkerSessionBinding>,
+    sessions: &mut HashMap<String, WorkerSessionBinding>,
 ) -> Option<String> {
-    let workspace_name = current_workspace_name(app).await.ok()?;
-    active_worker_session_delete_target_for_workspace(cmdline, &workspace_name, sessions)
+    let target = session_delete_target(cmdline)?.to_string();
+    let (workspace_name, client) = {
+        let guard = app.lock().await;
+        let workspace = guard.active_workspace()?;
+        (workspace.config.name.clone(), workspace.client.clone())
+    };
+    let backend_sessions = match client {
+        Some(client) => client.lock().await.list_sessions().await.ok(),
+        None => None,
+    };
+
+    active_worker_session_delete_target_for_workspace(
+        &target,
+        &workspace_name,
+        sessions,
+        backend_sessions.as_deref(),
+    )
 }
 
 fn active_worker_session_delete_target_for_workspace(
-    cmdline: &str,
+    target: &str,
     workspace_name: &str,
-    sessions: &HashMap<String, WorkerSessionBinding>,
+    sessions: &mut HashMap<String, WorkerSessionBinding>,
+    backend_sessions: Option<&[Session]>,
 ) -> Option<String> {
-    let target = session_delete_target(cmdline)?;
-    let binding = sessions.get(workspace_name)?;
-    if binding.id == target || binding.name == target {
+    let binding = sessions.get(workspace_name)?.clone();
+    let (active_binding, target_id) = if let Some(backend_sessions) = backend_sessions {
+        let active_binding = refreshed_active_worker_session_binding(&binding, backend_sessions)?;
+        let target_id = canonical_session_id_for_delete_target(target, backend_sessions)?;
+        (active_binding, target_id)
+    } else if binding.id == target || binding.name == target {
+        let target_id = binding.id.clone();
+        (binding, target_id)
+    } else {
+        return None;
+    };
+
+    if sessions.get(workspace_name) != Some(&active_binding) {
+        sessions.insert(workspace_name.to_string(), active_binding.clone());
+    }
+
+    if active_binding.id == target_id {
         return Some(target.to_string());
     }
     None
+}
+
+fn refreshed_active_worker_session_binding(
+    binding: &WorkerSessionBinding,
+    backend_sessions: &[Session],
+) -> Option<WorkerSessionBinding> {
+    if let Some(session) = backend_sessions
+        .iter()
+        .find(|session| session.id == binding.id)
+    {
+        return Some(WorkerSessionBinding::from_session(session));
+    }
+
+    let mut name_matches = backend_sessions
+        .iter()
+        .filter(|session| session.name == binding.name);
+    let session = name_matches.next()?;
+    if name_matches.next().is_some() {
+        return None;
+    }
+    Some(WorkerSessionBinding::from_session(session))
+}
+
+fn canonical_session_id_for_delete_target(
+    target: &str,
+    backend_sessions: &[Session],
+) -> Option<String> {
+    if let Some(session) = backend_sessions.iter().find(|session| session.id == target) {
+        return Some(session.id.clone());
+    }
+
+    let mut name_matches = backend_sessions
+        .iter()
+        .filter(|session| session.name == target);
+    let session = name_matches.next()?;
+    if name_matches.next().is_some() {
+        return None;
+    }
+    Some(session.id.clone())
 }
 
 async fn ensure_session_for_active_workspace(
@@ -3307,7 +3379,66 @@ mod tests {
     }
 
     #[test]
-    fn active_worker_session_delete_target_matches_active_binding_id_or_name() {
+    fn active_worker_session_delete_target_resolves_backend_alias_before_matching_active() {
+        let mut bindings = HashMap::new();
+        remember_worker_session(
+            &mut bindings,
+            "default".to_string(),
+            &Session {
+                id: "sess-123".to_string(),
+                name: "Research".to_string(),
+                model: "m".to_string(),
+                provider: "p".to_string(),
+            },
+        );
+        let backend_sessions = vec![Session {
+            id: "sess-123".to_string(),
+            name: "Renamed Display".to_string(),
+            model: "m".to_string(),
+            provider: "p".to_string(),
+        }];
+
+        assert_eq!(
+            active_worker_session_delete_target_for_workspace(
+                "sess-123",
+                "default",
+                &mut bindings,
+                Some(&backend_sessions)
+            ),
+            Some("sess-123".to_string())
+        );
+        assert_eq!(
+            active_worker_session_delete_target_for_workspace(
+                "Renamed Display",
+                "default",
+                &mut bindings,
+                Some(&backend_sessions)
+            ),
+            Some("Renamed Display".to_string())
+        );
+        assert_eq!(bindings["default"].name, "Renamed Display");
+        assert_eq!(
+            active_worker_session_delete_target_for_workspace(
+                "Research",
+                "default",
+                &mut bindings,
+                Some(&backend_sessions)
+            ),
+            None
+        );
+        assert_eq!(
+            active_worker_session_delete_target_for_workspace(
+                "sess-123",
+                "other-workspace",
+                &mut bindings,
+                Some(&backend_sessions)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn active_worker_session_delete_target_keeps_cached_fallback_without_backend() {
         let mut bindings = HashMap::new();
         remember_worker_session(
             &mut bindings,
@@ -3322,35 +3453,12 @@ mod tests {
 
         assert_eq!(
             active_worker_session_delete_target_for_workspace(
-                "/session delete sess-123",
+                "Research",
                 "default",
-                &bindings
-            ),
-            Some("sess-123".to_string())
-        );
-        assert_eq!(
-            active_worker_session_delete_target_for_workspace(
-                "/session delete Research",
-                "default",
-                &bindings
+                &mut bindings,
+                None
             ),
             Some("Research".to_string())
-        );
-        assert_eq!(
-            active_worker_session_delete_target_for_workspace(
-                "/session delete other",
-                "default",
-                &bindings
-            ),
-            None
-        );
-        assert_eq!(
-            active_worker_session_delete_target_for_workspace(
-                "/session delete sess-123",
-                "other-workspace",
-                &bindings
-            ),
-            None
         );
     }
 

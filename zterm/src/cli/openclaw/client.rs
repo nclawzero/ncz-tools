@@ -67,6 +67,8 @@ const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// backpressure the caller rather than buffer arbitrary requests.
 const OUTBOUND_CAPACITY: usize = 16;
 
+const DEFAULT_SESSION_NAMESPACE: &str = "openclaw";
+
 /// Channel capacity for server-pushed events. Streaming turns can push
 /// bursty deltas; bump higher than outbound.
 const EVENT_CAPACITY: usize = 256;
@@ -108,6 +110,12 @@ pub struct OpenClawClient {
     /// emits Token/Usage/Finished frames just like `ZeroclawClient`.
     stream_sink: Option<crate::cli::agent::StreamSink>,
 
+    /// Stable zterm workspace namespace for generated OpenClaw session
+    /// keys. OpenClaw stores sessions in a backend namespace, so zterm
+    /// includes the workspace namespace in its deterministic key to keep
+    /// same-label workspaces from sharing transcripts.
+    session_namespace: String,
+
     read_task: Option<JoinHandle<()>>,
     write_task: Option<JoinHandle<()>>,
 }
@@ -117,6 +125,7 @@ impl std::fmt::Debug for OpenClawClient {
         f.debug_struct("OpenClawClient")
             .field("connected", &self.connected.load(Ordering::Relaxed))
             .field("event_rx_live", &self.event_rx.is_some())
+            .field("session_namespace", &self.session_namespace)
             .finish()
     }
 }
@@ -159,6 +168,7 @@ impl OpenClawClient {
             connected,
             hello_ok: None,
             stream_sink: None,
+            session_namespace: DEFAULT_SESSION_NAMESPACE.to_string(),
             read_task: Some(read_task),
             write_task: Some(write_task),
         })
@@ -274,6 +284,18 @@ impl OpenClawClient {
     /// was built via the raw connect (e.g. for protocol-level tests).
     pub fn hello_ok(&self) -> Option<&super::handshake::HelloOk> {
         self.hello_ok.as_ref()
+    }
+
+    /// Set the zterm workspace namespace used for deterministic
+    /// session-key generation. Callers should set this before exposing
+    /// the client through `AgentClient`.
+    pub fn set_session_namespace(&mut self, namespace: impl Into<String>) {
+        let namespace = namespace.into();
+        self.session_namespace = if namespace.trim().is_empty() {
+            DEFAULT_SESSION_NAMESPACE.to_string()
+        } else {
+            namespace
+        };
     }
 
     /// Fire the server health RPC. Returns true on success; false
@@ -951,6 +973,7 @@ pub(super) fn tests_support_new_fake(
         connected: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(connected)),
         hello_ok: None,
         stream_sink: None,
+        session_namespace: DEFAULT_SESSION_NAMESPACE.to_string(),
         read_task: None,
         write_task: None,
     }
@@ -1066,7 +1089,7 @@ impl AgentClient for OpenClawClient {
     }
 
     async fn create_session(&self, name: &str) -> anyhow::Result<Session> {
-        let key = stable_session_key(name);
+        let key = stable_session_key(&self.session_namespace, name);
         let created = match self
             .rpc_sessions_create(SessionsCreateOpts {
                 key: Some(key.clone()),
@@ -1165,7 +1188,7 @@ impl OpenClawClient {
     }
 }
 
-fn stable_session_key(label: &str) -> String {
+fn stable_session_key(namespace: &str, label: &str) -> String {
     let mut slug = String::new();
     let mut last_dash = false;
     for ch in label.trim().chars() {
@@ -1197,6 +1220,8 @@ fn stable_session_key(label: &str) -> String {
     let slug: String = slug.chars().take(40).collect();
 
     let mut hasher = Sha256::new();
+    hasher.update(namespace.trim().as_bytes());
+    hasher.update(b"\0");
     hasher.update(label.as_bytes());
     let digest = hex_lower(&hasher.finalize());
     format!("zterm-{slug}-{}", &digest[..16])
@@ -1249,13 +1274,25 @@ mod tests {
 
     #[test]
     fn stable_session_key_is_deterministic_and_sanitized() {
-        let first = stable_session_key("Research Notes");
-        let second = stable_session_key("Research Notes");
+        let first = stable_session_key("workspace:alpha", "Research Notes");
+        let second = stable_session_key("workspace:alpha", "Research Notes");
 
         assert_eq!(first, second);
         assert!(first.starts_with("zterm-research-notes-"));
         assert!(!first.contains(' '));
-        assert_ne!(first, stable_session_key("Research"));
+        assert_ne!(first, stable_session_key("workspace:alpha", "Research"));
+    }
+
+    #[test]
+    fn stable_session_key_is_namespaced() {
+        let alpha = stable_session_key("backend=openclaw;workspace=alpha", "Research");
+        let beta = stable_session_key("backend=openclaw;workspace=beta", "Research");
+
+        assert_ne!(alpha, beta);
+        assert_eq!(
+            alpha,
+            stable_session_key("backend=openclaw;workspace=alpha", "Research")
+        );
     }
 
     #[tokio::test]
@@ -1263,7 +1300,7 @@ mod tests {
         let pending = PendingRequests::new();
         let (outbound_tx, mut outbound_rx) = mpsc::channel::<RequestFrame>(OUTBOUND_CAPACITY);
         let client = tests_support_new_fake(pending.clone(), Some(outbound_tx), true);
-        let expected_key = stable_session_key("Research");
+        let expected_key = stable_session_key(DEFAULT_SESSION_NAMESPACE, "Research");
 
         let create_task = tokio::spawn(async move { client.create_session("Research").await });
         let req = outbound_rx
@@ -1307,7 +1344,7 @@ mod tests {
         let pending = PendingRequests::new();
         let (outbound_tx, mut outbound_rx) = mpsc::channel::<RequestFrame>(OUTBOUND_CAPACITY);
         let client = tests_support_new_fake(pending.clone(), Some(outbound_tx), true);
-        let expected_key = stable_session_key("Research");
+        let expected_key = stable_session_key(DEFAULT_SESSION_NAMESPACE, "Research");
 
         let create_task = tokio::spawn(async move { client.create_session("Research").await });
         let create_req = outbound_rx
@@ -1364,11 +1401,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn duplicate_create_recovery_loads_only_namespaced_exact_key() {
+        let pending = PendingRequests::new();
+        let (outbound_tx, mut outbound_rx) = mpsc::channel::<RequestFrame>(OUTBOUND_CAPACITY);
+        let mut client = tests_support_new_fake(pending.clone(), Some(outbound_tx), true);
+        client.set_session_namespace("backend=openclaw;workspace=alpha;url=ws://shared");
+        let expected_key = stable_session_key(
+            "backend=openclaw;workspace=alpha;url=ws://shared",
+            "Research",
+        );
+        let other_workspace_key = stable_session_key(
+            "backend=openclaw;workspace=beta;url=ws://shared",
+            "Research",
+        );
+
+        let create_task = tokio::spawn(async move { client.create_session("Research").await });
+        let create_req = outbound_rx
+            .recv()
+            .await
+            .expect("create request should be sent");
+
+        pending
+            .resolve(ResponseFrame {
+                id: create_req.id,
+                ok: false,
+                payload: None,
+                error: Some(super::super::wire::ErrorBody {
+                    code: "ALREADY_EXISTS".to_string(),
+                    message: "session already exists".to_string(),
+                    details: None,
+                }),
+            })
+            .await;
+
+        let list_req = outbound_rx
+            .recv()
+            .await
+            .expect("load_session should list sessions after duplicate create");
+
+        pending
+            .resolve(ResponseFrame {
+                id: list_req.id,
+                ok: true,
+                payload: Some(serde_json::json!({
+                    "ts": 1,
+                    "path": "sessions.jsonl",
+                    "count": 2,
+                    "defaults": {},
+                    "sessions": [
+                        {
+                            "key": other_workspace_key,
+                            "kind": "direct",
+                            "label": "Research"
+                        },
+                        {
+                            "key": expected_key.clone(),
+                            "kind": "direct",
+                            "label": "Research"
+                        }
+                    ]
+                })),
+                error: None,
+            })
+            .await;
+
+        let session = create_task
+            .await
+            .expect("create task should join")
+            .expect("duplicate create should load namespaced exact key");
+        assert_eq!(session.id, expected_key);
+        assert_eq!(session.name, "Research");
+    }
+
+    #[tokio::test]
     async fn duplicate_create_recovery_requires_exact_session_key() {
         let pending = PendingRequests::new();
         let (outbound_tx, mut outbound_rx) = mpsc::channel::<RequestFrame>(OUTBOUND_CAPACITY);
         let client = tests_support_new_fake(pending.clone(), Some(outbound_tx), true);
-        let expected_key = stable_session_key("Research");
+        let expected_key = stable_session_key(DEFAULT_SESSION_NAMESPACE, "Research");
 
         let create_task = tokio::spawn(async move { client.create_session("Research").await });
         let create_req = outbound_rx
@@ -1438,6 +1548,7 @@ mod tests {
             connected: Arc::new(AtomicBool::new(false)),
             hello_ok: None,
             stream_sink: None,
+            session_namespace: DEFAULT_SESSION_NAMESPACE.to_string(),
             read_task: None,
             write_task: None,
         };
@@ -1467,6 +1578,7 @@ mod tests {
             connected: Arc::new(AtomicBool::new(true)),
             hello_ok: None,
             stream_sink: None,
+            session_namespace: DEFAULT_SESSION_NAMESPACE.to_string(),
             read_task: None,
             write_task: None,
         };
@@ -1491,6 +1603,7 @@ mod tests {
             connected: Arc::new(AtomicBool::new(true)),
             hello_ok: None,
             stream_sink: None,
+            session_namespace: DEFAULT_SESSION_NAMESPACE.to_string(),
             read_task: None,
             write_task: None,
         };
