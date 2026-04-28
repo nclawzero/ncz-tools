@@ -1196,7 +1196,10 @@ mod tests {
 
         assert!(matches!(err, NczError::Io(_)));
         assert!(provider_file.exists());
-        assert_eq!(fs::read_to_string(paths.agent_env()).unwrap(), agent_env_body);
+        assert_eq!(
+            fs::read_to_string(paths.agent_env()).unwrap(),
+            agent_env_body
+        );
     }
 
     #[test]
@@ -1391,9 +1394,11 @@ mod tests {
             fs::read_to_string(paths.agent_env()).unwrap(),
             "EXAMPLE_API_KEY=secret\nOTHER=1\n"
         );
-        assert!(fs::read_to_string(paths.providers_dir().join("example.json"))
-            .unwrap()
-            .contains(r#""model": "new""#));
+        assert!(
+            fs::read_to_string(paths.providers_dir().join("example.json"))
+                .unwrap()
+                .contains(r#""model": "new""#)
+        );
     }
 
     #[test]
@@ -1428,7 +1433,10 @@ mod tests {
 
         assert!(matches!(err, NczError::Io(_)));
         assert_eq!(fs::read_to_string(provider_file).unwrap(), original);
-        assert_eq!(fs::read_to_string(paths.agent_env()).unwrap(), agent_env_body);
+        assert_eq!(
+            fs::read_to_string(paths.agent_env()).unwrap(),
+            agent_env_body
+        );
     }
 
     #[test]
