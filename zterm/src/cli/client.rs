@@ -789,14 +789,19 @@ impl ZeroclawClient {
     /// Delete a session
     pub async fn delete_session(&self, session_id: &str) -> Result<()> {
         let url = format!("{}/api/sessions/{}", self.base_url, session_id);
-        self.http_client
+        let res = self
+            .http_client
             .delete(&url)
             .bearer_auth(&self.token)
             .send()
             .await
             .map_err(|e| anyhow!("Failed to delete session: {}", e))?;
 
-        Ok(())
+        if res.status().is_success() {
+            Ok(())
+        } else {
+            Err(anyhow!("Failed to delete session: {}", res.status()))
+        }
     }
 
     // ===== CRON & AUTOMATION =====

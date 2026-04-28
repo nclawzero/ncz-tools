@@ -1,7 +1,11 @@
 use anyhow::{anyhow, Result};
 use chrono::Utc;
 use std::fs;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
+use crate::cli::agent::AgentClient;
+use crate::cli::client::Session;
 use crate::cli::client::ZeroclawClient;
 use crate::cli::input::InputHistory;
 use crate::cli::storage;
@@ -39,6 +43,14 @@ impl CommandHandler {
 
     async fn current_inventory(&self) -> crate::cli::workspace::WorkspaceInventory {
         self.app.lock().await.inventory()
+    }
+
+    async fn current_agent_client(&self) -> Option<Arc<Mutex<Box<dyn AgentClient + Send + Sync>>>> {
+        self.app
+            .lock()
+            .await
+            .active_workspace()
+            .and_then(|w| w.client.clone())
     }
 
     /// Handle a slash command (maps to zeroclaw CLI)
@@ -240,12 +252,44 @@ impl CommandHandler {
                 if name.is_empty() {
                     out.push_str("Usage: /session delete <name>\n");
                 } else {
-                    match storage::delete_session(name) {
-                        Ok(_) => {
-                            out.push_str(&format!("✅ Deleted session: {name}\n"));
-                        }
+                    let Some(client) = self.current_agent_client().await else {
+                        out.push_str("❌ Failed to delete session: no active workspace client\n");
+                        out.push('\n');
+                        return Ok(Some(out));
+                    };
+
+                    match resolve_delete_session_target(&client, name).await {
+                        Ok(target) => match client.lock().await.delete_session(&target.id).await {
+                            Ok(()) => {
+                                let display = target.display_name().to_string();
+                                if let Some(local_id) = target.local_id.as_deref() {
+                                    if let Err(e) = storage::delete_session(local_id) {
+                                        out.push_str(&format!(
+                                            "⚠️ Backend deleted session '{display}', but local metadata cleanup failed: {e}\n"
+                                        ));
+                                    } else {
+                                        out.push_str(&format!(
+                                            "✅ Deleted session: {display} ({})\n",
+                                            target.id
+                                        ));
+                                    }
+                                } else {
+                                    let _ = storage::delete_session(&target.id);
+                                    out.push_str(&format!(
+                                        "✅ Deleted session: {display} ({})\n",
+                                        target.id
+                                    ));
+                                }
+                            }
+                            Err(e) => {
+                                out.push_str(&format!(
+                                    "❌ Backend failed to delete session '{}': {e}\n",
+                                    target.display_name()
+                                ));
+                            }
+                        },
                         Err(e) => {
-                            out.push_str(&format!("❌ Failed to delete session: {e}\n"));
+                            out.push_str(&format!("❌ Failed to resolve session '{name}': {e}\n"));
                         }
                     }
                 }
@@ -1164,6 +1208,81 @@ fn load_session_metadata_by_id_or_name(session: &str) -> Result<storage::Session
         .ok_or_else(|| anyhow!("session metadata not found: {session}"))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeleteSessionTarget {
+    id: String,
+    name: String,
+    local_id: Option<String>,
+}
+
+impl DeleteSessionTarget {
+    fn display_name(&self) -> &str {
+        if self.name.is_empty() {
+            &self.id
+        } else {
+            &self.name
+        }
+    }
+}
+
+async fn resolve_delete_session_target(
+    client: &Arc<Mutex<Box<dyn AgentClient + Send + Sync>>>,
+    requested: &str,
+) -> Result<DeleteSessionTarget> {
+    let local = load_session_metadata_by_id_or_name(requested).ok();
+    let backend_sessions = client.lock().await.list_sessions().await;
+
+    match backend_sessions {
+        Ok(sessions) => choose_delete_session_target(requested, Some(&sessions), local.as_ref()),
+        Err(_) => choose_delete_session_target(requested, None, local.as_ref()),
+    }
+}
+
+fn choose_delete_session_target(
+    requested: &str,
+    backend_sessions: Option<&[Session]>,
+    local: Option<&storage::SessionMetadata>,
+) -> Result<DeleteSessionTarget> {
+    if let Some(session) =
+        backend_sessions.and_then(|sessions| find_session_by_id_or_name(sessions, requested))
+    {
+        let local_id = local
+            .filter(|metadata| metadata.id == session.id || metadata.name == session.name)
+            .map(|metadata| metadata.id.clone());
+        return Ok(DeleteSessionTarget {
+            id: session.id.clone(),
+            name: session.name.clone(),
+            local_id,
+        });
+    }
+
+    if let Some(metadata) = local {
+        return Ok(DeleteSessionTarget {
+            id: metadata.id.clone(),
+            name: metadata.name.clone(),
+            local_id: Some(metadata.id.clone()),
+        });
+    }
+
+    if backend_sessions.is_none() {
+        return Ok(DeleteSessionTarget {
+            id: requested.to_string(),
+            name: requested.to_string(),
+            local_id: None,
+        });
+    }
+
+    Err(anyhow!(
+        "not found in active backend sessions or local metadata"
+    ))
+}
+
+fn find_session_by_id_or_name<'a>(sessions: &'a [Session], requested: &str) -> Option<&'a Session> {
+    sessions
+        .iter()
+        .find(|session| session.id == requested || session.name == requested)
+}
+
 fn parse_search_args(rest: &[&str]) -> (String, usize) {
     // Last arg is treated as limit if it parses as usize; otherwise
     // everything is treated as the query.
@@ -1233,6 +1352,8 @@ fn format_memory_list(memories: &[serde_json::Value]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use crate::cli::client::Session;
+    use crate::cli::storage::SessionMetadata;
 
     /// Mirror the parts→(command, subcommand, args) slicing used by the
     /// real dispatcher, so regression tests can hit every length class
@@ -1308,5 +1429,62 @@ mod tests {
         assert!(out.contains("[memory-abcde]"));
         assert!(out.contains("(work) short note"));
         assert!(out.ends_with('\n'));
+    }
+
+    fn session(id: &str, name: &str) -> Session {
+        Session {
+            id: id.to_string(),
+            name: name.to_string(),
+            model: "m".to_string(),
+            provider: "p".to_string(),
+        }
+    }
+
+    fn metadata(id: &str, name: &str) -> SessionMetadata {
+        SessionMetadata {
+            id: id.to_string(),
+            name: name.to_string(),
+            model: "m".to_string(),
+            provider: "p".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            message_count: 0,
+            last_active: "2026-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn delete_resolver_prefers_backend_display_name_match() {
+        let backend = vec![session("sess-123", "Research")];
+        let target = super::choose_delete_session_target("Research", Some(&backend), None).unwrap();
+
+        assert_eq!(target.id, "sess-123");
+        assert_eq!(target.name, "Research");
+        assert_eq!(target.local_id, None);
+    }
+
+    #[test]
+    fn delete_resolver_uses_local_metadata_to_resolve_display_name() {
+        let local = metadata("local-456", "Planning");
+        let target = super::choose_delete_session_target("Planning", Some(&[]), Some(&local))
+            .expect("local metadata should resolve display name");
+
+        assert_eq!(target.id, "local-456");
+        assert_eq!(target.local_id.as_deref(), Some("local-456"));
+    }
+
+    #[test]
+    fn delete_resolver_fails_when_backend_list_is_authoritative_and_no_match() {
+        let backend = vec![session("sess-123", "Research")];
+        let err = super::choose_delete_session_target("missing", Some(&backend), None).unwrap_err();
+
+        assert!(err.to_string().contains("not found"));
+    }
+
+    #[test]
+    fn delete_resolver_allows_raw_id_when_backend_list_unavailable() {
+        let target = super::choose_delete_session_target("raw-id", None, None).unwrap();
+
+        assert_eq!(target.id, "raw-id");
+        assert_eq!(target.local_id, None);
     }
 }

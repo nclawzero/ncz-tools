@@ -16,7 +16,7 @@
 //! the E-slice sequence.
 
 use std::cell::RefCell;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -109,7 +109,10 @@ const CMD_PALETTE_NEXT: u16 = 1300;
 const CMD_PERSIST_THEME: u16 = 1301;
 
 /// `/` key maps to this KeyCode per `crossterm_to_keycode`: plain
-/// ASCII character with no modifiers, so `c as u16` = 0x2F.
+/// ASCII character with no modifiers, so `c as u16` = 0x2F. Plain
+/// slash is intentionally regular text input; the command popup is
+/// reserved for Ctrl-K/menu paths so arbitrary slash commands remain
+/// typeable.
 const KB_SLASH: u16 = b'/' as u16;
 
 /// Depth of the input-line undo/redo ring. 64 snapshots is more
@@ -445,13 +448,32 @@ pub async fn run(
     // `TurnChunk::Finished(Err(_))`; the worker itself never panics
     // the whole process.
     let worker_app = Arc::clone(&app);
-    let mut worker_session_id = session.id.clone();
+    let mut worker_sessions = HashMap::from([(
+        workspace_name.clone(),
+        WorkerSessionBinding::from_session(&session),
+    )]);
+    let fallback_session_name = session.name.clone();
     let worker_sink = event_tx.clone();
     let worker_cmd_handler = CommandHandler::new(Arc::clone(&app));
     tokio::spawn(async move {
         while let Some(req) = req_rx.recv().await {
             match req {
                 WorkerRequest::Turn(text) => {
+                    let worker_session_id = match ensure_session_for_active_workspace(
+                        &worker_app,
+                        &mut worker_sessions,
+                        &fallback_session_name,
+                    )
+                    .await
+                    {
+                        Ok(session_id) => session_id,
+                        Err(e) => {
+                            let _ = worker_sink.send(TurnChunk::Finished(Err(format!(
+                                "could not prepare session for active workspace: {e}"
+                            ))));
+                            continue;
+                        }
+                    };
                     let client_opt = {
                         let guard = worker_app.lock().await;
                         guard.active_workspace().and_then(|w| w.client.clone())
@@ -487,13 +509,40 @@ pub async fn run(
                     // strings; legacy stdout-only commands still get
                     // an advisory rather than silently disappearing.
                     let is_workspace_switch = is_workspace_switch_command(&cmdline);
+                    let command_session_id = match ensure_session_for_active_workspace(
+                        &worker_app,
+                        &mut worker_sessions,
+                        &fallback_session_name,
+                    )
+                    .await
+                    {
+                        Ok(session_id) => session_id,
+                        Err(e) => {
+                            let _ = worker_sink.send(TurnChunk::Finished(Err(format!(
+                                "could not prepare session for active workspace: {e}"
+                            ))));
+                            continue;
+                        }
+                    };
                     if let Some(target_session) = session_switch_target(&cmdline) {
                         match resolve_or_create_session_for_worker(&worker_app, target_session)
                             .await
                         {
-                            Ok(session) => {
-                                worker_session_id = session.id;
-                            }
+                            Ok(session) => match current_workspace_name(&worker_app).await {
+                                Ok(workspace_name) => {
+                                    remember_worker_session(
+                                        &mut worker_sessions,
+                                        workspace_name,
+                                        &session,
+                                    );
+                                }
+                                Err(e) => {
+                                    let _ = worker_sink.send(TurnChunk::Finished(Err(format!(
+                                            "could not bind session `{target_session}` to workspace: {e}"
+                                        ))));
+                                    continue;
+                                }
+                            },
                             Err(e) => {
                                 let _ = worker_sink.send(TurnChunk::Finished(Err(format!(
                                     "could not switch session to `{target_session}`: {e}"
@@ -503,7 +552,7 @@ pub async fn run(
                         }
                     }
                     match worker_cmd_handler
-                        .handle(&cmdline, &worker_session_id)
+                        .handle(&cmdline, &command_session_id)
                         .await
                     {
                         Ok(Some(text)) => {
@@ -514,6 +563,18 @@ pub async fn run(
                                     worker_sink.clone(),
                                 )
                                 .await;
+                                if let Err(e) = ensure_session_for_active_workspace(
+                                    &worker_app,
+                                    &mut worker_sessions,
+                                    &fallback_session_name,
+                                )
+                                .await
+                                {
+                                    let _ = worker_sink.send(TurnChunk::Finished(Err(format!(
+                                        "workspace switched, but session setup failed: {e}"
+                                    ))));
+                                    continue;
+                                }
                                 let switched_workspace = {
                                     let guard = worker_app.lock().await;
                                     guard.active_workspace().map(|w| w.config.name.clone())
@@ -610,24 +671,97 @@ async fn install_stream_sink_on_active_client(app: &Arc<Mutex<App>>, sink: Strea
     true
 }
 
-async fn resolve_or_create_session_for_worker(
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorkerSessionBinding {
+    id: String,
+    name: String,
+}
+
+impl WorkerSessionBinding {
+    fn from_session(session: &Session) -> Self {
+        Self {
+            id: session.id.clone(),
+            name: session.name.clone(),
+        }
+    }
+}
+
+fn remember_worker_session(
+    sessions: &mut HashMap<String, WorkerSessionBinding>,
+    workspace_name: String,
+    session: &Session,
+) {
+    sessions.insert(workspace_name, WorkerSessionBinding::from_session(session));
+}
+
+async fn current_workspace_name(app: &Arc<Mutex<App>>) -> Result<String> {
+    let guard = app.lock().await;
+    guard
+        .active_workspace()
+        .map(|w| w.config.name.clone())
+        .ok_or_else(|| anyhow::anyhow!("no active workspace"))
+}
+
+async fn ensure_session_for_active_workspace(
     app: &Arc<Mutex<App>>,
-    session_name: &str,
-) -> Result<Session> {
-    if let Ok(metadata) = load_session_metadata_by_id_or_name(session_name) {
-        return Ok(Session {
-            id: metadata.id,
-            name: metadata.name,
-            model: metadata.model,
-            provider: metadata.provider,
-        });
+    sessions: &mut HashMap<String, WorkerSessionBinding>,
+    fallback_session_name: &str,
+) -> Result<String> {
+    let workspace_name = current_workspace_name(app).await?;
+    if let Some(binding) = sessions.get(&workspace_name).cloned() {
+        if let Ok(session) = load_session_for_worker(app, &binding.id).await {
+            remember_worker_session(sessions, workspace_name, &session);
+            return Ok(session.id);
+        }
+        let session = resolve_or_create_session_for_worker(app, &binding.name).await?;
+        remember_worker_session(sessions, workspace_name, &session);
+        return Ok(session.id);
     }
 
+    let session = resolve_or_create_session_for_worker(app, fallback_session_name).await?;
+    remember_worker_session(sessions, workspace_name, &session);
+    Ok(session.id)
+}
+
+async fn load_session_for_worker(app: &Arc<Mutex<App>>, session_id: &str) -> Result<Session> {
     let client = {
         let guard = app.lock().await;
         guard.active_workspace().and_then(|w| w.client.clone())
     }
     .ok_or_else(|| anyhow::anyhow!("no active workspace client"))?;
+
+    let locked = client.lock().await;
+    locked.load_session(session_id).await
+}
+
+async fn resolve_or_create_session_for_worker(
+    app: &Arc<Mutex<App>>,
+    session_name: &str,
+) -> Result<Session> {
+    let client = {
+        let guard = app.lock().await;
+        guard.active_workspace().and_then(|w| w.client.clone())
+    }
+    .ok_or_else(|| anyhow::anyhow!("no active workspace client"))?;
+
+    {
+        let locked = client.lock().await;
+        if let Ok(sessions) = locked.list_sessions().await {
+            if let Some(session) = find_session_by_id_or_name(&sessions, session_name) {
+                return Ok(session.clone());
+            }
+        }
+
+        if let Ok(session) = locked.load_session(session_name).await {
+            return Ok(session);
+        }
+
+        if let Ok(metadata) = load_session_metadata_by_id_or_name(session_name) {
+            if let Ok(session) = locked.load_session(&metadata.id).await {
+                return Ok(session);
+            }
+        }
+    }
 
     let session = client.lock().await.create_session(session_name).await?;
     let metadata = storage::SessionMetadata {
@@ -641,6 +775,12 @@ async fn resolve_or_create_session_for_worker(
     };
     storage::save_session_metadata(&metadata)?;
     Ok(session)
+}
+
+fn find_session_by_id_or_name<'a>(sessions: &'a [Session], requested: &str) -> Option<&'a Session> {
+    sessions
+        .iter()
+        .find(|session| session.id == requested || session.name == requested)
 }
 
 fn load_session_metadata_by_id_or_name(session: &str) -> Result<storage::SessionMetadata> {
@@ -1153,12 +1293,12 @@ fn run_event_loop(
             status_line.handle_event(&mut event);
         }
 
-        // Slash-command popup: `/` on an empty input line matches
-        // the v0.3 spec; Ctrl-K remains as a command-palette
-        // fallback for users who want to type a literal slash command.
+        // Slash-command popup: reserve Ctrl-K/menu paths for the
+        // picker so plain `/` remains ordinary text input. That keeps
+        // arbitrary slash commands typeable even when the popup is
+        // dismissed.
         if event.what == EventType::Keyboard
-            && (event.key_code == KB_CTRL_K || event.key_code == KB_SLASH)
-            && input_data.borrow().is_empty()
+            && should_open_slash_popup(event.key_code, input_data.borrow().is_empty())
         {
             let selected = run_slash_popup(app);
             if selected != 0 {
@@ -1364,6 +1504,10 @@ fn run_slash_popup(app: &mut Application) -> u16 {
     // desktop, chat, input line, menu bar, and status line in the
     // right order, so there's nothing to clean up here.
     menu_box.execute(&mut app.terminal)
+}
+
+fn should_open_slash_popup(key_code: u16, input_empty: bool) -> bool {
+    input_empty && key_code == KB_CTRL_K
 }
 
 /// Non-blocking drain of the worker → TUI event channel. Called at
@@ -2211,6 +2355,13 @@ mod tests {
     }
 
     #[test]
+    fn slash_popup_ignores_plain_slash() {
+        assert!(should_open_slash_popup(KB_CTRL_K, true));
+        assert!(!should_open_slash_popup(KB_SLASH, true));
+        assert!(!should_open_slash_popup(KB_CTRL_K, false));
+    }
+
+    #[test]
     fn session_switch_target_only_matches_real_switches() {
         assert_eq!(session_switch_target("/session research"), Some("research"));
         assert_eq!(
@@ -2232,5 +2383,28 @@ mod tests {
         assert!(is_workspace_switch_command("/workspaces switch prod"));
         assert!(!is_workspace_switch_command("/workspace switch"));
         assert!(!is_workspace_switch_command("/workspace list"));
+    }
+
+    #[test]
+    fn worker_session_bindings_are_per_workspace() {
+        let mut bindings = HashMap::new();
+        let alpha = Session {
+            id: "alpha-id".to_string(),
+            name: "main".to_string(),
+            model: "m".to_string(),
+            provider: "p".to_string(),
+        };
+        let beta = Session {
+            id: "beta-id".to_string(),
+            name: "main".to_string(),
+            model: "m".to_string(),
+            provider: "p".to_string(),
+        };
+
+        remember_worker_session(&mut bindings, "alpha".to_string(), &alpha);
+        remember_worker_session(&mut bindings, "beta".to_string(), &beta);
+
+        assert_eq!(bindings["alpha"].id, "alpha-id");
+        assert_eq!(bindings["beta"].id, "beta-id");
     }
 }
