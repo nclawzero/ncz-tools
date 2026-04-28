@@ -1229,34 +1229,93 @@ async fn resolve_delete_session_target(
     client: &Arc<Mutex<Box<dyn AgentClient + Send + Sync>>>,
     requested: &str,
 ) -> Result<DeleteSessionTarget> {
-    let local = load_session_metadata_by_id_or_name(requested).ok();
+    let local_sessions = storage::list_sessions().unwrap_or_default();
     let backend_sessions = client.lock().await.list_sessions().await;
 
     match backend_sessions {
-        Ok(sessions) => choose_delete_session_target(requested, Some(&sessions), local.as_ref()),
-        Err(_) => choose_delete_session_target(requested, None, local.as_ref()),
+        Ok(sessions) => choose_delete_session_target(requested, Some(&sessions), &local_sessions),
+        Err(_) => choose_delete_session_target(requested, None, &local_sessions),
     }
 }
 
 fn choose_delete_session_target(
     requested: &str,
     backend_sessions: Option<&[Session]>,
-    local: Option<&storage::SessionMetadata>,
+    local_sessions: &[storage::SessionMetadata],
 ) -> Result<DeleteSessionTarget> {
-    if let Some(session) =
-        backend_sessions.and_then(|sessions| find_session_by_id_or_name(sessions, requested))
-    {
-        let local_id = local
-            .filter(|metadata| metadata.id == session.id || metadata.name == session.name)
-            .map(|metadata| metadata.id.clone());
+    if let Some(sessions) = backend_sessions {
+        let exact_backend: Vec<&Session> = sessions
+            .iter()
+            .filter(|session| session.id == requested)
+            .collect();
+        match exact_backend.as_slice() {
+            [session] => {
+                return Ok(DeleteSessionTarget {
+                    id: session.id.clone(),
+                    name: session.name.clone(),
+                    local_id: unique_local_id_match(local_sessions, &session.id),
+                });
+            }
+            [] => {}
+            _ => {
+                return Err(ambiguous_delete_target_error(
+                    requested,
+                    exact_backend,
+                    Vec::new(),
+                ));
+            }
+        }
+    }
+
+    let exact_local: Vec<&storage::SessionMetadata> = local_sessions
+        .iter()
+        .filter(|metadata| metadata.id == requested)
+        .collect();
+    match exact_local.as_slice() {
+        [metadata] => {
+            return Ok(DeleteSessionTarget {
+                id: metadata.id.clone(),
+                name: metadata.name.clone(),
+                local_id: Some(metadata.id.clone()),
+            });
+        }
+        [] => {}
+        _ => {
+            return Err(ambiguous_delete_target_error(
+                requested,
+                Vec::new(),
+                exact_local,
+            ));
+        }
+    }
+
+    let backend_name_matches: Vec<&Session> = backend_sessions
+        .unwrap_or(&[])
+        .iter()
+        .filter(|session| session.name == requested)
+        .collect();
+    let local_name_matches: Vec<&storage::SessionMetadata> = local_sessions
+        .iter()
+        .filter(|metadata| metadata.name == requested)
+        .collect();
+
+    if backend_name_matches.len() > 1 || local_name_matches.len() > 1 {
+        return Err(ambiguous_delete_target_error(
+            requested,
+            backend_name_matches,
+            local_name_matches,
+        ));
+    }
+
+    if let Some(session) = backend_name_matches.first() {
         return Ok(DeleteSessionTarget {
             id: session.id.clone(),
             name: session.name.clone(),
-            local_id,
+            local_id: unique_local_id_match(local_sessions, &session.id),
         });
     }
 
-    if let Some(metadata) = local {
+    if let Some(metadata) = local_name_matches.first() {
         return Ok(DeleteSessionTarget {
             id: metadata.id.clone(),
             name: metadata.name.clone(),
@@ -1277,10 +1336,40 @@ fn choose_delete_session_target(
     ))
 }
 
-fn find_session_by_id_or_name<'a>(sessions: &'a [Session], requested: &str) -> Option<&'a Session> {
-    sessions
+fn unique_local_id_match(local_sessions: &[storage::SessionMetadata], id: &str) -> Option<String> {
+    let mut matches = local_sessions
         .iter()
-        .find(|session| session.id == requested || session.name == requested)
+        .filter(|metadata| metadata.id == id)
+        .map(|metadata| metadata.id.clone());
+    let first = matches.next()?;
+    if matches.next().is_none() {
+        Some(first)
+    } else {
+        None
+    }
+}
+
+fn ambiguous_delete_target_error(
+    requested: &str,
+    backend: Vec<&Session>,
+    local: Vec<&storage::SessionMetadata>,
+) -> anyhow::Error {
+    let mut candidates = Vec::new();
+    candidates.extend(
+        backend
+            .iter()
+            .map(|session| format!("backend id={} name={}", session.id, session.name)),
+    );
+    candidates.extend(
+        local
+            .iter()
+            .map(|metadata| format!("local id={} name={}", metadata.id, metadata.name)),
+    );
+
+    anyhow!(
+        "ambiguous session name/label '{requested}'; use an explicit id. Candidates: {}",
+        candidates.join("; ")
+    )
 }
 
 fn parse_search_args(rest: &[&str]) -> (String, usize) {
@@ -1455,7 +1544,7 @@ mod tests {
     #[test]
     fn delete_resolver_prefers_backend_display_name_match() {
         let backend = vec![session("sess-123", "Research")];
-        let target = super::choose_delete_session_target("Research", Some(&backend), None).unwrap();
+        let target = super::choose_delete_session_target("Research", Some(&backend), &[]).unwrap();
 
         assert_eq!(target.id, "sess-123");
         assert_eq!(target.name, "Research");
@@ -1465,7 +1554,8 @@ mod tests {
     #[test]
     fn delete_resolver_uses_local_metadata_to_resolve_display_name() {
         let local = metadata("local-456", "Planning");
-        let target = super::choose_delete_session_target("Planning", Some(&[]), Some(&local))
+        let local_sessions = vec![local];
+        let target = super::choose_delete_session_target("Planning", Some(&[]), &local_sessions)
             .expect("local metadata should resolve display name");
 
         assert_eq!(target.id, "local-456");
@@ -1475,16 +1565,67 @@ mod tests {
     #[test]
     fn delete_resolver_fails_when_backend_list_is_authoritative_and_no_match() {
         let backend = vec![session("sess-123", "Research")];
-        let err = super::choose_delete_session_target("missing", Some(&backend), None).unwrap_err();
+        let err = super::choose_delete_session_target("missing", Some(&backend), &[]).unwrap_err();
 
         assert!(err.to_string().contains("not found"));
     }
 
     #[test]
     fn delete_resolver_allows_raw_id_when_backend_list_unavailable() {
-        let target = super::choose_delete_session_target("raw-id", None, None).unwrap();
+        let target = super::choose_delete_session_target("raw-id", None, &[]).unwrap();
 
         assert_eq!(target.id, "raw-id");
         assert_eq!(target.local_id, None);
+    }
+
+    #[test]
+    fn delete_resolver_prefers_exact_backend_id_over_duplicate_names() {
+        let backend = vec![
+            session("sess-123", "Research"),
+            session("sess-456", "Research"),
+        ];
+        let local = vec![
+            metadata("local-123", "Research"),
+            metadata("local-456", "Research"),
+        ];
+
+        let target =
+            super::choose_delete_session_target("sess-456", Some(&backend), &local).unwrap();
+
+        assert_eq!(target.id, "sess-456");
+        assert_eq!(target.name, "Research");
+        assert_eq!(target.local_id, None);
+    }
+
+    #[test]
+    fn delete_resolver_fails_closed_on_duplicate_backend_names() {
+        let backend = vec![
+            session("sess-123", "Research"),
+            session("sess-456", "Research"),
+        ];
+
+        let err = super::choose_delete_session_target("Research", Some(&backend), &[]).unwrap_err();
+        let msg = err.to_string();
+
+        assert!(msg.contains("ambiguous session name/label 'Research'"));
+        assert!(msg.contains("sess-123"));
+        assert!(msg.contains("sess-456"));
+        assert!(msg.contains("explicit id"));
+    }
+
+    #[test]
+    fn delete_resolver_fails_closed_on_duplicate_local_names() {
+        let local = vec![
+            metadata("local-123", "Planning"),
+            metadata("local-456", "Planning"),
+        ];
+
+        let err = super::choose_delete_session_target("Planning", Some(&[]), &local).unwrap_err();
+        let msg = err.to_string();
+
+        assert!(msg.contains("ambiguous session name/label 'Planning'"));
+        assert!(msg.contains("local-123"));
+        assert!(msg.contains("local-456"));
+        assert!(msg.contains("explicit id"));
     }
 }

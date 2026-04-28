@@ -506,8 +506,14 @@ pub async fn run(
                     // Route slash commands through the shared
                     // `CommandHandler`. v0.3.1 refactors the TV
                     // menu/popup command paths to return structured
-                    // strings; legacy stdout-only commands still get
-                    // an advisory rather than silently disappearing.
+                    // strings. Commands still audited as stdout-only
+                    // are blocked before `CommandHandler` execution
+                    // so side effects cannot happen invisibly.
+                    if let Some(message) = stdout_only_slash_command_block_message(&cmdline) {
+                        let _ = worker_sink.send(TurnChunk::Token(message));
+                        let _ = worker_sink.send(TurnChunk::Finished(Ok(String::new())));
+                        continue;
+                    }
                     let is_workspace_switch = is_workspace_switch_command(&cmdline);
                     let command_session_id = match ensure_session_for_active_workspace(
                         &worker_app,
@@ -588,9 +594,7 @@ pub async fn run(
                         }
                         Ok(None) => {
                             let _ = worker_sink.send(TurnChunk::Token(format!(
-                                "(command `{cmdline}` — stdout renderer lands \
-                                 in a later slice; structured output not yet \
-                                 available)"
+                                "Command `{cmdline}` completed without structured TUI output."
                             )));
                             let _ = worker_sink.send(TurnChunk::Finished(Ok(String::new())));
                         }
@@ -798,6 +802,38 @@ fn is_workspace_switch_command(cmdline: &str) -> bool {
     matches!(parts.next(), Some("/workspace" | "/workspaces"))
         && matches!(parts.next(), Some("switch"))
         && parts.next().is_some()
+}
+
+fn stdout_only_slash_command_block_message(cmdline: &str) -> Option<String> {
+    let command = cmdline.split_whitespace().next()?;
+    if !matches!(
+        command,
+        "/agent"
+            | "/daemon"
+            | "/gateway"
+            | "/service"
+            | "/onboard"
+            | "/doctor"
+            | "/cron"
+            | "/skill"
+            | "/skills"
+            | "/channels"
+            | "/channel"
+            | "/hardware"
+            | "/peripheral"
+            | "/estop"
+            | "/completions"
+            | "/clear"
+            | "/save"
+            | "/history"
+            | "/config"
+    ) {
+        return None;
+    }
+
+    Some(format!(
+        "Command `{command}` is not available in the full-screen TUI yet because it still writes only to stdout. No action was taken. Use `--legacy-repl` for this command, or use `/help` to see TUI-ready commands."
+    ))
 }
 
 fn session_switch_target(cmdline: &str) -> Option<&str> {
@@ -2383,6 +2419,32 @@ mod tests {
         assert!(is_workspace_switch_command("/workspaces switch prod"));
         assert!(!is_workspace_switch_command("/workspace switch"));
         assert!(!is_workspace_switch_command("/workspace list"));
+    }
+
+    #[test]
+    fn stdout_only_slash_blocker_blocks_side_effect_commands() {
+        let cron = stdout_only_slash_command_block_message("/cron add '0 9 * * *' standup")
+            .expect("cron is stdout-only in the TUI audit");
+        assert!(cron.contains("No action was taken"));
+        assert!(cron.contains("--legacy-repl"));
+
+        let clear = stdout_only_slash_command_block_message("/clear")
+            .expect("clear mutates local metadata through a stdout-only handler");
+        assert!(clear.contains("No action was taken"));
+
+        let save = stdout_only_slash_command_block_message("/save out.txt")
+            .expect("save writes a file through a stdout-only handler");
+        assert!(save.contains("No action was taken"));
+    }
+
+    #[test]
+    fn stdout_only_slash_blocker_allows_structured_tui_commands() {
+        assert!(stdout_only_slash_command_block_message("/help").is_none());
+        assert!(stdout_only_slash_command_block_message("/info").is_none());
+        assert!(stdout_only_slash_command_block_message("/session delete sess-123").is_none());
+        assert!(stdout_only_slash_command_block_message("/workspace switch prod").is_none());
+        assert!(stdout_only_slash_command_block_message("/models set primary").is_none());
+        assert!(stdout_only_slash_command_block_message("/memory list").is_none());
     }
 
     #[test]
