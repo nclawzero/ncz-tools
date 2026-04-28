@@ -116,6 +116,10 @@ pub struct OpenClawClient {
     /// same-label workspaces from sharing transcripts.
     session_namespace: String,
 
+    /// Previous zterm namespaces that remain readable during
+    /// migration from mutable name+URL-derived keys.
+    session_namespace_aliases: Vec<String>,
+
     read_task: Option<JoinHandle<()>>,
     write_task: Option<JoinHandle<()>>,
 }
@@ -126,6 +130,7 @@ impl std::fmt::Debug for OpenClawClient {
             .field("connected", &self.connected.load(Ordering::Relaxed))
             .field("event_rx_live", &self.event_rx.is_some())
             .field("session_namespace", &self.session_namespace)
+            .field("session_namespace_aliases", &self.session_namespace_aliases)
             .finish()
     }
 }
@@ -169,6 +174,7 @@ impl OpenClawClient {
             hello_ok: None,
             stream_sink: None,
             session_namespace: DEFAULT_SESSION_NAMESPACE.to_string(),
+            session_namespace_aliases: Vec::new(),
             read_task: Some(read_task),
             write_task: Some(write_task),
         })
@@ -296,6 +302,29 @@ impl OpenClawClient {
         } else {
             namespace
         };
+    }
+
+    /// Set prior namespaces that should be considered visible for
+    /// list/load/delete, but never used for new session keys.
+    pub fn set_session_namespace_aliases<I, S>(&mut self, aliases: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.session_namespace_aliases.clear();
+        for alias in aliases {
+            let alias = alias.into();
+            let alias = alias.trim();
+            if !alias.is_empty()
+                && alias != self.session_namespace
+                && !self
+                    .session_namespace_aliases
+                    .iter()
+                    .any(|existing| existing == alias)
+            {
+                self.session_namespace_aliases.push(alias.to_string());
+            }
+        }
     }
 
     /// Fire the server health RPC. Returns true on success; false
@@ -974,6 +1003,7 @@ pub(super) fn tests_support_new_fake(
         hello_ok: None,
         stream_sink: None,
         session_namespace: DEFAULT_SESSION_NAMESPACE.to_string(),
+        session_namespace_aliases: Vec::new(),
         read_task: None,
         write_task: None,
     }
@@ -1079,12 +1109,14 @@ impl AgentClient for OpenClawClient {
     }
 
     async fn list_sessions(&self) -> anyhow::Result<Vec<Session>> {
+        let limit = 200;
         let result = self
             .rpc_sessions_list(SessionsListOpts {
-                limit: Some(200),
+                limit: Some(limit),
                 ..Default::default()
             })
             .await?;
+        ensure_session_list_not_truncated(&result, limit)?;
         Ok(self
             .namespaced_session_rows(result.sessions)
             .into_iter()
@@ -1117,19 +1149,22 @@ impl AgentClient for OpenClawClient {
     }
 
     async fn load_session(&self, session_id: &str) -> anyhow::Result<Session> {
+        let limit = 500;
         let result = self
             .rpc_sessions_list(SessionsListOpts {
-                limit: Some(500),
+                limit: Some(limit),
+                search: Some(session_id.to_string()),
                 ..Default::default()
             })
             .await?;
-        for row in result.sessions {
-            if self.row_belongs_to_session_namespace(&row)
+        for row in &result.sessions {
+            if self.row_belongs_to_session_namespace(row)
                 && (row.key == session_id || row.session_id.as_deref() == Some(session_id))
             {
-                return Ok(row_into_session(row));
+                return Ok(row_into_session(row.clone()));
             }
         }
+        ensure_targeted_session_list_not_truncated(&result, limit, session_id)?;
         anyhow::bail!("openclaw: session not found: {session_id}")
     }
 
@@ -1180,17 +1215,20 @@ impl AgentClient for OpenClawClient {
 
 impl OpenClawClient {
     async fn load_session_key_exact(&self, key: &str) -> anyhow::Result<Session> {
+        let limit = 500;
         let result = self
             .rpc_sessions_list(SessionsListOpts {
-                limit: Some(500),
+                limit: Some(limit),
+                search: Some(key.to_string()),
                 ..Default::default()
             })
             .await?;
-        for row in result.sessions {
-            if row.key == key && self.row_belongs_to_session_namespace(&row) {
-                return Ok(row_into_session(row));
+        for row in &result.sessions {
+            if row.key == key && self.row_belongs_to_session_namespace(row) {
+                return Ok(row_into_session(row.clone()));
             }
         }
+        ensure_targeted_session_list_not_truncated(&result, limit, key)?;
         anyhow::bail!("openclaw: session not found: {key}")
     }
 
@@ -1207,8 +1245,46 @@ impl OpenClawClient {
         let Some(label) = row.label.as_deref() else {
             return false;
         };
-        row.key == stable_session_key(&self.session_namespace, label)
+        self.session_namespaces()
+            .into_iter()
+            .any(|namespace| row.key == stable_session_key(namespace, label))
     }
+
+    fn session_namespaces(&self) -> Vec<&str> {
+        let mut namespaces = Vec::with_capacity(1 + self.session_namespace_aliases.len());
+        namespaces.push(self.session_namespace.as_str());
+        namespaces.extend(self.session_namespace_aliases.iter().map(String::as_str));
+        namespaces
+    }
+}
+
+fn ensure_targeted_session_list_not_truncated(
+    result: &super::handshake::OpenClawSessionsListResult,
+    requested_limit: u32,
+    target: &str,
+) -> anyhow::Result<()> {
+    let returned = result.sessions.len() as u32;
+    if result.count > returned || returned >= requested_limit {
+        anyhow::bail!(
+            "openclaw: targeted session lookup for '{target}' was truncated (returned {returned}, count {}, limit {requested_limit}); refusing to treat absence as not found",
+            result.count
+        );
+    }
+    Ok(())
+}
+
+fn ensure_session_list_not_truncated(
+    result: &super::handshake::OpenClawSessionsListResult,
+    requested_limit: u32,
+) -> anyhow::Result<()> {
+    let returned = result.sessions.len() as u32;
+    if result.count > returned || returned >= requested_limit {
+        anyhow::bail!(
+            "openclaw: sessions.list response was truncated (returned {returned}, count {}, limit {requested_limit}); refusing to return a partial session list",
+            result.count
+        );
+    }
+    Ok(())
 }
 
 fn stable_session_key(namespace: &str, label: &str) -> String {
@@ -1658,6 +1734,242 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn session_list_includes_previous_namespace_aliases() {
+        let pending = PendingRequests::new();
+        let (outbound_tx, mut outbound_rx) = mpsc::channel::<RequestFrame>(OUTBOUND_CAPACITY);
+        let mut client = tests_support_new_fake(pending.clone(), Some(outbound_tx), true);
+        let primary_namespace = "backend=openclaw;workspace_id=ws_immutable";
+        let legacy_namespace = "backend=openclaw;workspace=alpha;url=ws://old";
+        client.set_session_namespace(primary_namespace);
+        client.set_session_namespace_aliases([legacy_namespace]);
+
+        let legacy_key = stable_session_key(legacy_namespace, "Research");
+        let list_task = tokio::spawn(async move { client.list_sessions().await });
+        let list_req = outbound_rx
+            .recv()
+            .await
+            .expect("list request should be sent");
+        pending
+            .resolve(ResponseFrame {
+                id: list_req.id,
+                ok: true,
+                payload: Some(serde_json::json!({
+                    "ts": 1,
+                    "path": "sessions.jsonl",
+                    "count": 1,
+                    "defaults": {},
+                    "sessions": [{
+                        "key": legacy_key,
+                        "kind": "direct",
+                        "label": "Research"
+                    }]
+                })),
+                error: None,
+            })
+            .await;
+
+        let sessions = list_task
+            .await
+            .expect("list task should join")
+            .expect("alias list should succeed");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, legacy_key);
+        assert_eq!(sessions[0].name, "Research");
+    }
+
+    #[tokio::test]
+    async fn list_sessions_fails_closed_when_sessions_list_hits_cap() {
+        let pending = PendingRequests::new();
+        let (outbound_tx, mut outbound_rx) = mpsc::channel::<RequestFrame>(OUTBOUND_CAPACITY);
+        let client = tests_support_new_fake(pending.clone(), Some(outbound_tx), true);
+
+        let list_task = tokio::spawn(async move { client.list_sessions().await });
+        let list_req = outbound_rx
+            .recv()
+            .await
+            .expect("list request should be sent");
+        assert_eq!(list_req.method, "sessions.list");
+        assert_eq!(list_req.params.as_ref().unwrap()["limit"], 200);
+
+        let sessions: Vec<_> = (0..200)
+            .map(|idx| {
+                let label = format!("Session {idx}");
+                serde_json::json!({
+                    "key": stable_session_key(DEFAULT_SESSION_NAMESPACE, &label),
+                    "kind": "direct",
+                    "label": label
+                })
+            })
+            .collect();
+        pending
+            .resolve(ResponseFrame {
+                id: list_req.id,
+                ok: true,
+                payload: Some(serde_json::json!({
+                    "ts": 1,
+                    "path": "sessions.jsonl",
+                    "count": 200,
+                    "defaults": {},
+                    "sessions": sessions
+                })),
+                error: None,
+            })
+            .await;
+
+        let err = list_task
+            .await
+            .expect("list task should join")
+            .expect_err("capped list must fail closed");
+        assert!(err.to_string().contains("truncated"));
+        assert!(err.to_string().contains("partial session list"));
+    }
+
+    #[tokio::test]
+    async fn targeted_load_fails_closed_when_sessions_list_is_truncated() {
+        let pending = PendingRequests::new();
+        let (outbound_tx, mut outbound_rx) = mpsc::channel::<RequestFrame>(OUTBOUND_CAPACITY);
+        let client = tests_support_new_fake(pending.clone(), Some(outbound_tx), true);
+        let target = stable_session_key(DEFAULT_SESSION_NAMESPACE, "Missing");
+        let target_for_task = target.clone();
+
+        let load_task = tokio::spawn(async move { client.load_session(&target_for_task).await });
+        let list_req = outbound_rx
+            .recv()
+            .await
+            .expect("load request should be sent");
+        assert_eq!(list_req.method, "sessions.list");
+        assert_eq!(list_req.params.as_ref().unwrap()["limit"], 500);
+        assert_eq!(
+            list_req.params.as_ref().unwrap()["search"].as_str(),
+            Some(target.as_str())
+        );
+
+        pending
+            .resolve(ResponseFrame {
+                id: list_req.id,
+                ok: true,
+                payload: Some(serde_json::json!({
+                    "ts": 1,
+                    "path": "sessions.jsonl",
+                    "count": 501,
+                    "defaults": {},
+                    "sessions": []
+                })),
+                error: None,
+            })
+            .await;
+
+        let err = load_task
+            .await
+            .expect("load task should join")
+            .expect_err("truncated targeted lookup must fail closed");
+        assert!(err.to_string().contains("truncated"));
+        assert!(!err.to_string().contains("session not found"));
+    }
+
+    #[tokio::test]
+    async fn targeted_delete_fails_closed_when_validation_list_is_truncated() {
+        let pending = PendingRequests::new();
+        let (outbound_tx, mut outbound_rx) = mpsc::channel::<RequestFrame>(OUTBOUND_CAPACITY);
+        let client = tests_support_new_fake(pending.clone(), Some(outbound_tx), true);
+        let target = stable_session_key(DEFAULT_SESSION_NAMESPACE, "Missing");
+        let target_for_task = target.clone();
+
+        let delete_task =
+            tokio::spawn(async move { client.delete_session(&target_for_task).await });
+        let list_req = outbound_rx
+            .recv()
+            .await
+            .expect("delete validation list request should be sent");
+        assert_eq!(list_req.method, "sessions.list");
+
+        pending
+            .resolve(ResponseFrame {
+                id: list_req.id,
+                ok: true,
+                payload: Some(serde_json::json!({
+                    "ts": 1,
+                    "path": "sessions.jsonl",
+                    "count": 600,
+                    "defaults": {},
+                    "sessions": []
+                })),
+                error: None,
+            })
+            .await;
+
+        let err = delete_task
+            .await
+            .expect("delete task should join")
+            .expect_err("truncated delete validation must fail closed");
+        assert!(err.to_string().contains("truncated"));
+        if let Ok(Some(req)) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), outbound_rx.recv()).await
+        {
+            panic!(
+                "truncated delete validation must not send {}, id {}",
+                req.method, req.id
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn duplicate_create_recovery_fails_closed_when_exact_lookup_is_truncated() {
+        let pending = PendingRequests::new();
+        let (outbound_tx, mut outbound_rx) = mpsc::channel::<RequestFrame>(OUTBOUND_CAPACITY);
+        let client = tests_support_new_fake(pending.clone(), Some(outbound_tx), true);
+        let expected_key = stable_session_key(DEFAULT_SESSION_NAMESPACE, "Research");
+
+        let create_task = tokio::spawn(async move { client.create_session("Research").await });
+        let create_req = outbound_rx
+            .recv()
+            .await
+            .expect("create request should be sent");
+        pending
+            .resolve(ResponseFrame {
+                id: create_req.id,
+                ok: false,
+                payload: None,
+                error: Some(super::super::wire::ErrorBody {
+                    code: "ALREADY_EXISTS".to_string(),
+                    message: "session already exists".to_string(),
+                    details: None,
+                }),
+            })
+            .await;
+
+        let list_req = outbound_rx
+            .recv()
+            .await
+            .expect("duplicate create recovery should list sessions");
+        assert_eq!(
+            list_req.params.as_ref().unwrap()["search"].as_str(),
+            Some(expected_key.as_str())
+        );
+        pending
+            .resolve(ResponseFrame {
+                id: list_req.id,
+                ok: true,
+                payload: Some(serde_json::json!({
+                    "ts": 1,
+                    "path": "sessions.jsonl",
+                    "count": 700,
+                    "defaults": {},
+                    "sessions": []
+                })),
+                error: None,
+            })
+            .await;
+
+        let err = create_task
+            .await
+            .expect("create task should join")
+            .expect_err("truncated duplicate recovery must fail closed");
+        assert!(err.to_string().contains("truncated"));
+        assert!(!err.to_string().contains("session not found"));
+    }
+
     fn two_workspace_research_sessions_payload(
         active_key: &str,
         foreign_key: &str,
@@ -1699,6 +2011,7 @@ mod tests {
             hello_ok: None,
             stream_sink: None,
             session_namespace: DEFAULT_SESSION_NAMESPACE.to_string(),
+            session_namespace_aliases: Vec::new(),
             read_task: None,
             write_task: None,
         };
@@ -1729,6 +2042,7 @@ mod tests {
             hello_ok: None,
             stream_sink: None,
             session_namespace: DEFAULT_SESSION_NAMESPACE.to_string(),
+            session_namespace_aliases: Vec::new(),
             read_task: None,
             write_task: None,
         };
@@ -1754,6 +2068,7 @@ mod tests {
             hello_ok: None,
             stream_sink: None,
             session_namespace: DEFAULT_SESSION_NAMESPACE.to_string(),
+            session_namespace_aliases: Vec::new(),
             read_task: None,
             write_task: None,
         };

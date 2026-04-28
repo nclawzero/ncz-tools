@@ -9,7 +9,6 @@ use crate::cli::client::ZeroclawClient;
 use crate::cli::client::{Model, Provider, Session};
 use crate::cli::input::InputHistory;
 use crate::cli::storage;
-use crate::cli::ui;
 
 /// Command handler.
 ///
@@ -170,7 +169,7 @@ impl CommandHandler {
               /peripheral list   List configured devices\n  \
               /estop status      Check emergency stop\n\
             \n\
-            Session (REPL-only):\n  \
+            Local Session:\n  \
               /config            Show configuration\n  \
               /clear             Clear history\n  \
               /save [file]       Export session\n  \
@@ -354,19 +353,22 @@ impl CommandHandler {
 
     /// Handle /history command
     async fn handle_history(&self) -> Result<Option<String>> {
-        match InputHistory::load_from_file() {
+        let out = match InputHistory::load_from_file() {
             Ok(history) => {
-                println!("\n📜 Command History:");
-                for (i, entry) in history.entries().iter().enumerate() {
-                    println!("  {}. {}", i + 1, entry);
+                if history.entries().is_empty() {
+                    "No history available yet\n".to_string()
+                } else {
+                    let mut out = "\n📜 Command History:\n".to_string();
+                    for (i, entry) in history.entries().iter().enumerate() {
+                        out.push_str(&format!("  {}. {}\n", i + 1, entry));
+                    }
+                    out.push('\n');
+                    out
                 }
-                println!();
             }
-            Err(_) => {
-                println!("No history available yet");
-            }
-        }
-        Ok(None)
+            Err(_) => "No history available yet\n".to_string(),
+        };
+        Ok(Some(out))
     }
 
     // Zeroclaw Agent & Daemon
@@ -375,19 +377,18 @@ impl CommandHandler {
         subcommand: Option<&str>,
         args: &[&str],
     ) -> Result<Option<String>> {
-        match subcommand {
+        let out = match subcommand {
             Some("-m") | Some("--message") => {
                 let msg = args.join(" ");
-                println!("📤 Sending: {}", msg);
-                println!("   (Via zeroclaw agent -m)");
+                format!("📤 Sending: {msg}\n   (Via zeroclaw agent -m)\n")
             }
             Some("-p") | Some("--provider") => {
                 let provider = args.first().copied().unwrap_or("default");
-                println!("🔄 Using provider: {}", provider);
+                format!("🔄 Using provider: {provider}\n")
             }
-            _ => println!("✓ Agent mode active (already running)"),
-        }
-        Ok(None)
+            _ => "✓ Agent mode active (already running)\n".to_string(),
+        };
+        Ok(Some(out))
     }
 
     async fn handle_daemon(
@@ -395,29 +396,28 @@ impl CommandHandler {
         subcommand: Option<&str>,
         args: &[&str],
     ) -> Result<Option<String>> {
-        println!("\n🔌 Daemon & Gateway:");
+        let mut out = "\n🔌 Daemon & Gateway:\n".to_string();
         match subcommand {
             Some("-p") | Some("--port") => {
                 let port = args.first().copied().unwrap_or("42617");
-                println!("  Starting on port: {}", port);
+                out.push_str(&format!("  Starting on port: {port}\n"));
             }
-            _ => println!("  Listening on: http://127.0.0.1:42617"),
+            _ => out.push_str("  Listening on: http://127.0.0.1:42617\n"),
         }
-        println!("  Channels: Connected");
-        println!("  Scheduler: Active");
-        println!("  (Full daemon features in Phase 7+)");
-        println!();
-        Ok(None)
+        out.push_str("  Channels: Connected\n");
+        out.push_str("  Scheduler: Active\n");
+        out.push_str("  (Full daemon features in Phase 7+)\n\n");
+        Ok(Some(out))
     }
 
     async fn handle_service(&self, subcommand: Option<&str>) -> Result<Option<String>> {
-        match subcommand {
-            Some("install") => println!("📦 Install system service (Phase 7+)"),
-            Some("status") => println!("  Service: Not installed"),
-            Some("start") | Some("stop") | Some("restart") => println!("  (Phase 7+)"),
-            _ => println!("Usage: /service install|status|start|stop|restart"),
-        }
-        Ok(None)
+        let out = match subcommand {
+            Some("install") => "📦 Install system service (Phase 7+)\n",
+            Some("status") => "  Service: Not installed\n",
+            Some("start") | Some("stop") | Some("restart") => "  (Phase 7+)\n",
+            _ => "Usage: /service install|status|start|stop|restart\n",
+        };
+        Ok(Some(out.to_string()))
     }
 
     async fn handle_onboard(
@@ -425,39 +425,38 @@ impl CommandHandler {
         subcommand: Option<&str>,
         args: &[&str],
     ) -> Result<Option<String>> {
-        println!("\n⚙️  Onboarding:");
+        let mut out = "\n⚙️  Onboarding:\n".to_string();
         match subcommand {
             Some("--provider") => {
                 let provider = args.first().copied().unwrap_or("openrouter");
-                println!("  Provider: {}", provider);
+                out.push_str(&format!("  Provider: {provider}\n"));
             }
-            Some("--force") => println!("  Config: Reset"),
-            _ => println!("  Config: ~/.zeroclaw/config.toml"),
+            Some("--force") => out.push_str("  Config: Reset\n"),
+            _ => out.push_str("  Config: ~/.zeroclaw/config.toml\n"),
         }
-        println!("  (Interactive setup in Phase 7+)");
-        println!();
-        Ok(None)
+        out.push_str("  (Interactive setup in Phase 7+)\n\n");
+        Ok(Some(out))
     }
 
     async fn handle_doctor(&self, subcommand: Option<&str>) -> Result<Option<String>> {
-        println!("\n🏥 System Diagnostics:");
+        let mut out = "\n🏥 System Diagnostics:\n".to_string();
         match subcommand {
             Some("models") => {
-                println!("  Probing model connectivity...");
-                println!("  • Groq: ✓");
-                println!("  • OpenAI: ✓");
-                println!("  • Configured providers: ✓");
+                out.push_str("  Probing model connectivity...\n");
+                out.push_str("  • Groq: ✓\n");
+                out.push_str("  • OpenAI: ✓\n");
+                out.push_str("  • Configured providers: ✓\n");
             }
-            Some("traces") => println!("  Execution traces: (Phase 7+)"),
+            Some("traces") => out.push_str("  Execution traces: (Phase 7+)\n"),
             _ => {
-                println!("  Gateway: ✓ Running");
-                println!("  Config: ✓ Valid");
-                println!("  Memory: ✓ SQLite");
-                println!("  Channels: ✓ Connected");
+                out.push_str("  Gateway: ✓ Running\n");
+                out.push_str("  Config: ✓ Valid\n");
+                out.push_str("  Memory: ✓ SQLite\n");
+                out.push_str("  Channels: ✓ Connected\n");
             }
         }
-        println!();
-        Ok(None)
+        out.push('\n');
+        Ok(Some(out))
     }
 
     /// Handle /memory command with MNEMOS integration
@@ -644,9 +643,10 @@ impl CommandHandler {
     }
 
     async fn handle_cron(&self, subcommand: Option<&str>, args: &[&str]) -> Result<Option<String>> {
+        let mut out = String::new();
         match subcommand {
             Some("list") => {
-                println!("\n⏰ Scheduled Tasks:");
+                out.push_str("\n⏰ Scheduled Tasks:\n");
                 let res = match self.current_cron().await {
                     Some(c) => c.list_cron_jobs().await,
                     None => Err(anyhow::anyhow!("cron not available on this backend")),
@@ -660,20 +660,24 @@ impl CommandHandler {
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("?");
                             let prompt = job.get("prompt").and_then(|v| v.as_str()).unwrap_or("?");
-                            println!("  {}. [{}] {} → {}", i + 1, &id[..8], expr, prompt);
+                            let short_id: String = id.chars().take(8).collect();
+                            out.push_str(&format!(
+                                "  {}. [{}] {} → {}\n",
+                                i + 1,
+                                short_id,
+                                expr,
+                                prompt
+                            ));
                         }
                     }
-                    Ok(_) => println!("  (No scheduled tasks)"),
-                    Err(_) => println!("  (Gateway unavailable)"),
+                    Ok(_) => out.push_str("  (No scheduled tasks)\n"),
+                    Err(e) => out.push_str(&format!("  (Gateway unavailable: {e})\n")),
                 }
-                println!();
             }
             Some("add") => {
                 if args.len() < 2 {
-                    ui::print_error(
-                        "Usage: /cron add '<expr>' '<prompt>'",
-                        Some("Example: /cron add '0 9 * * *' 'Daily standup'"),
-                    );
+                    out.push_str("Usage: /cron add '<expr>' '<prompt>'\n");
+                    out.push_str("Example: /cron add '0 9 * * *' 'Daily standup'\n");
                 } else {
                     let expr = args[0];
                     let prompt = args[1..].join(" ");
@@ -683,21 +687,20 @@ impl CommandHandler {
                     };
                     match res {
                         Ok(id) => {
-                            ui::print_success(&format!("✅ Created cron job: {}", &id[..16]));
-                            println!("   Expression: {} → {}", expr, prompt);
+                            let short_id: String = id.chars().take(16).collect();
+                            out.push_str(&format!("✅ Created cron job: {short_id}\n"));
+                            out.push_str(&format!("   Expression: {expr} → {prompt}\n"));
                         }
                         Err(e) => {
-                            ui::print_error("Failed to create cron job", Some(&e.to_string()))
+                            out.push_str(&format!("❌ Failed to create cron job: {e}\n"));
                         }
                     }
                 }
             }
             Some("add-at") => {
                 if args.len() < 2 {
-                    ui::print_error(
-                        "Usage: /cron add-at '<datetime>' '<prompt>'",
-                        Some("Example: /cron add-at '2026-04-21T10:00:00Z' 'Meeting'"),
-                    );
+                    out.push_str("Usage: /cron add-at '<datetime>' '<prompt>'\n");
+                    out.push_str("Example: /cron add-at '2026-04-21T10:00:00Z' 'Meeting'\n");
                 } else {
                     let datetime = args[0];
                     let prompt = args[1..].join(" ");
@@ -707,66 +710,67 @@ impl CommandHandler {
                     };
                     match res {
                         Ok(_) => {
-                            ui::print_success(&format!("✅ Scheduled task for {}", datetime));
-                            println!("   Prompt: {}", prompt);
+                            out.push_str(&format!("✅ Scheduled task for {datetime}\n"));
+                            out.push_str(&format!("   Prompt: {prompt}\n"));
                         }
-                        Err(e) => ui::print_error("Failed to schedule task", Some(&e.to_string())),
+                        Err(e) => out.push_str(&format!("❌ Failed to schedule task: {e}\n")),
                     }
                 }
             }
             Some("pause") => {
                 let id = args.first().copied().unwrap_or("");
                 if id.is_empty() {
-                    ui::print_error("Usage: /cron pause <id>", None);
+                    out.push_str("Usage: /cron pause <id>\n");
                 } else {
                     let res = match self.current_cron().await {
                         Some(c) => c.pause_cron(id).await,
                         None => Err(anyhow::anyhow!("cron not available on this backend")),
                     };
                     match res {
-                        Ok(_) => ui::print_success(&format!("⏸️  Paused job: {}", id)),
-                        Err(e) => ui::print_error("Failed to pause job", Some(&e.to_string())),
+                        Ok(_) => out.push_str(&format!("⏸️  Paused job: {id}\n")),
+                        Err(e) => out.push_str(&format!("❌ Failed to pause job: {e}\n")),
                     }
                 }
             }
             Some("resume") => {
                 let id = args.first().copied().unwrap_or("");
                 if id.is_empty() {
-                    ui::print_error("Usage: /cron resume <id>", None);
+                    out.push_str("Usage: /cron resume <id>\n");
                 } else {
                     let res = match self.current_cron().await {
                         Some(c) => c.resume_cron(id).await,
                         None => Err(anyhow::anyhow!("cron not available on this backend")),
                     };
                     match res {
-                        Ok(_) => ui::print_success(&format!("▶️  Resumed job: {}", id)),
-                        Err(e) => ui::print_error("Failed to resume job", Some(&e.to_string())),
+                        Ok(_) => out.push_str(&format!("▶️  Resumed job: {id}\n")),
+                        Err(e) => out.push_str(&format!("❌ Failed to resume job: {e}\n")),
                     }
                 }
             }
             Some("remove") => {
                 let id = args.first().copied().unwrap_or("");
                 if id.is_empty() {
-                    ui::print_error("Usage: /cron remove <id>", None);
+                    out.push_str("Usage: /cron remove <id>\n");
                 } else {
                     let res = match self.current_cron().await {
                         Some(c) => c.delete_cron(id).await,
                         None => Err(anyhow::anyhow!("cron not available on this backend")),
                     };
                     match res {
-                        Ok(_) => ui::print_success(&format!("🗑️  Deleted job: {}", id)),
-                        Err(e) => ui::print_error("Failed to delete job", Some(&e.to_string())),
+                        Ok(_) => out.push_str(&format!("🗑️  Deleted job: {id}\n")),
+                        Err(e) => out.push_str(&format!("❌ Failed to delete job: {e}\n")),
                     }
                 }
             }
             _ => {
-                println!("Usage: /cron list");
-                println!("       /cron add '<expr>' '<prompt>'");
-                println!("       /cron add-at '<datetime>' '<prompt>'");
-                println!("       /cron pause|resume|remove <id>");
+                out.push_str("Usage: /cron list\n");
+                out.push_str("       /cron add '<expr>' '<prompt>'\n");
+                out.push_str("       /cron add-at '<datetime>' '<prompt>'\n");
+                out.push_str("       /cron pause|resume|remove <id>\n");
             }
         }
-        Ok(None)
+        out.push('\n');
+        Ok(Some(out))
     }
 
     /// Handle /skill command with zeroclaw integration
@@ -775,15 +779,14 @@ impl CommandHandler {
         subcommand: Option<&str>,
         _args: &[&str],
     ) -> Result<Option<String>> {
-        match subcommand {
-            Some("list") => println!("⚡ Installed Skills: (none)"),
-            Some("install") => println!("  Installing: (Phase 7+)"),
-            Some("audit") => println!("  Auditing skills: (Phase 7+)"),
-            Some("remove") => println!("  Removing skill: (Phase 7+)"),
-            _ => println!("Usage: /skill list|install <path>|audit|remove"),
-        }
-        println!();
-        Ok(None)
+        let out = match subcommand {
+            Some("list") => "⚡ Installed Skills: (none)\n\n",
+            Some("install") => "  Installing: (Phase 7+)\n\n",
+            Some("audit") => "  Auditing skills: (Phase 7+)\n\n",
+            Some("remove") => "  Removing skill: (Phase 7+)\n\n",
+            _ => "Usage: /skill list|install <path>|audit|remove\n\n",
+        };
+        Ok(Some(out.to_string()))
     }
 
     async fn handle_providers(&self) -> Result<Option<String>> {
@@ -947,31 +950,25 @@ impl CommandHandler {
     }
 
     async fn handle_channels(&self, subcommand: Option<&str>) -> Result<Option<String>> {
-        match subcommand {
+        let out = match subcommand {
             Some("list") => {
-                println!("\n💬 Channels:");
-                println!("  (None configured)");
-                println!("  Available: Slack, Discord, Telegram, Matrix, Email, IRC");
+                "\n💬 Channels:\n  (None configured)\n  Available: Slack, Discord, Telegram, Matrix, Email, IRC\n\n"
             }
-            Some("doctor") => println!("  Channel health: (Phase 7+)"),
-            _ => println!("Usage: /channel list|doctor"),
-        }
-        println!();
-        Ok(None)
+            Some("doctor") => "  Channel health: (Phase 7+)\n\n",
+            _ => "Usage: /channel list|doctor\n\n",
+        };
+        Ok(Some(out.to_string()))
     }
 
     async fn handle_hardware(&self, subcommand: Option<&str>) -> Result<Option<String>> {
-        match subcommand {
+        let out = match subcommand {
             Some("discover") => {
-                println!("\n🔌 Hardware Discovery:");
-                println!("  (No USB devices found)");
-                println!("  Supports: STM32, Arduino, Raspberry Pi, ESP32");
+                "\n🔌 Hardware Discovery:\n  (No USB devices found)\n  Supports: STM32, Arduino, Raspberry Pi, ESP32\n\n"
             }
-            Some("introspect") => println!("  Probing device... (Phase 7+)"),
-            _ => println!("Usage: /hardware discover|introspect <port>"),
-        }
-        println!();
-        Ok(None)
+            Some("introspect") => "  Probing device... (Phase 7+)\n\n",
+            _ => "Usage: /hardware discover|introspect <port>\n\n",
+        };
+        Ok(Some(out.to_string()))
     }
 
     async fn handle_peripheral(
@@ -979,15 +976,14 @@ impl CommandHandler {
         subcommand: Option<&str>,
         _args: &[&str],
     ) -> Result<Option<String>> {
-        match subcommand {
-            Some("list") => println!("📱 Peripherals: (none)"),
-            Some("add") => println!("  Adding peripheral... (Phase 7+)"),
-            Some("flash-nucleo") => println!("  Flashing STM32... (Phase 7+)"),
-            Some("flash") => println!("  Flashing Arduino... (Phase 7+)"),
-            _ => println!("Usage: /peripheral list|add|flash-nucleo|flash"),
-        }
-        println!();
-        Ok(None)
+        let out = match subcommand {
+            Some("list") => "📱 Peripherals: (none)\n\n",
+            Some("add") => "  Adding peripheral... (Phase 7+)\n\n",
+            Some("flash-nucleo") => "  Flashing STM32... (Phase 7+)\n\n",
+            Some("flash") => "  Flashing Arduino... (Phase 7+)\n\n",
+            _ => "Usage: /peripheral list|add|flash-nucleo|flash\n\n",
+        };
+        Ok(Some(out.to_string()))
     }
 
     async fn handle_estop(
@@ -995,43 +991,44 @@ impl CommandHandler {
         subcommand: Option<&str>,
         args: &[&str],
     ) -> Result<Option<String>> {
-        match subcommand {
-            Some("status") => println!("🛑 Emergency Stop: Disengaged"),
+        let out = match subcommand {
+            Some("status") => "🛑 Emergency Stop: Disengaged\n\n".to_string(),
             Some("--level") => {
                 let level = args.first().copied().unwrap_or("<level>");
-                println!("  Level: {} (Phase 7+)", level);
+                format!("  Level: {level} (Phase 7+)\n\n")
             }
-            Some("resume") => println!("  ▶️  Resuming (Phase 7+)"),
-            _ => println!("Usage: /estop status|--level <kill-all|network-kill|...>"),
-        }
-        println!();
-        Ok(None)
+            Some("resume") => "  ▶️  Resuming (Phase 7+)\n\n".to_string(),
+            _ => "Usage: /estop status|--level <kill-all|network-kill|...>\n\n".to_string(),
+        };
+        Ok(Some(out))
     }
 
     async fn handle_completions(&self, subcommand: Option<&str>) -> Result<Option<String>> {
-        match subcommand {
-            Some("zsh") => println!("📝 Zsh completions: (Phase 7+)"),
-            Some("bash") => println!("📝 Bash completions: (Phase 7+)"),
-            Some("fish") => println!("📝 Fish completions: (Phase 7+)"),
-            _ => println!("Usage: /completions zsh|bash|fish"),
-        }
-        println!();
-        Ok(None)
+        let out = match subcommand {
+            Some("zsh") => "📝 Zsh completions: (Phase 7+)\n\n",
+            Some("bash") => "📝 Bash completions: (Phase 7+)\n\n",
+            Some("fish") => "📝 Fish completions: (Phase 7+)\n\n",
+            _ => "Usage: /completions zsh|bash|fish\n\n",
+        };
+        Ok(Some(out.to_string()))
     }
 
     /// Handle /config command
     async fn handle_config(&self) -> Result<Option<String>> {
-        println!("\n⚙️  Configuration:");
+        let mut out = "\n⚙️  Configuration:\n".to_string();
         match storage::load_config() {
             Ok(content) => {
-                println!("{}", content);
+                out.push_str(&content);
+                if !out.ends_with('\n') {
+                    out.push('\n');
+                }
             }
             Err(e) => {
-                ui::print_error("Could not load config", Some(&e.to_string()));
+                out.push_str(&format!("❌ Could not load config: {e}\n"));
             }
         }
-        println!();
-        Ok(None)
+        out.push('\n');
+        Ok(Some(out))
     }
 
     /// Handle /clear command
@@ -1040,9 +1037,11 @@ impl CommandHandler {
             metadata.message_count = 0;
             metadata.last_active = Utc::now().to_rfc3339();
             storage::save_session_metadata(&metadata)?;
-            ui::print_success("✓ Session history cleared");
+            return Ok(Some("✓ Session history cleared\n".to_string()));
         }
-        Ok(None)
+        Ok(Some(
+            "No local session history metadata found to clear\n".to_string(),
+        ))
     }
 
     /// Handle /save command
@@ -1057,13 +1056,13 @@ impl CommandHandler {
         if let Ok(history_path) = storage::session_history_file(session_id) {
             if history_path.exists() {
                 fs::copy(&history_path, &filename)?;
-                ui::print_success(&format!("✓ Session saved to {}", filename));
+                return Ok(Some(format!("✓ Session saved to {filename}\n")));
             } else {
-                ui::print_error("No history to save", None);
+                return Ok(Some("No history to save\n".to_string()));
             }
         }
 
-        Ok(None)
+        Ok(Some("No history to save\n".to_string()))
     }
 
     async fn handle_workspace(
@@ -1142,11 +1141,10 @@ impl CommandHandler {
             Some("switch") => {
                 let name = args.join(" ");
                 if name.is_empty() {
-                    ui::print_error(
-                        "Usage: /workspace switch <name>",
-                        Some("/workspace list to see names"),
-                    );
-                    return Ok(None);
+                    return Ok(Some(
+                        "Usage: /workspace switch <name>\n   /workspace list to see names\n"
+                            .to_string(),
+                    ));
                 }
                 self.switch_workspace(&name).await
             }
@@ -1884,7 +1882,7 @@ mod tests {
         }
     }
 
-    #[derive(Clone)]
+    #[derive(Clone, Default)]
     struct FakeAgentClient {
         sessions: Vec<Session>,
         deleted: Arc<StdMutex<Vec<String>>>,
@@ -1956,12 +1954,14 @@ mod tests {
             workspaces: vec![Workspace {
                 id: 0,
                 config: WorkspaceConfig {
+                    id: None,
                     name: "test".to_string(),
                     backend: Backend::Zeroclaw,
                     url: "http://127.0.0.1:8888".to_string(),
                     token_env: None,
                     token: None,
                     label: None,
+                    namespace_aliases: Vec::new(),
                 },
                 client: Some(Arc::new(Mutex::new(boxed))),
                 cron: None,
@@ -1970,6 +1970,36 @@ mod tests {
             shared_mnemos: None,
             config_path: PathBuf::from("test-config.toml"),
         }))
+    }
+
+    #[tokio::test]
+    async fn advertised_local_commands_return_structured_tui_output() {
+        let handler = super::CommandHandler::new(app_with_fake_client(FakeAgentClient::default()));
+
+        for cmdline in [
+            "/agent",
+            "/cron list",
+            "/clear",
+            "/save",
+            "/history",
+            "/config",
+            "/doctor",
+            "/skill list",
+            "/channels list",
+            "/hardware discover",
+            "/peripheral list",
+            "/estop status",
+        ] {
+            let out = handler
+                .handle(cmdline, "session-for-structured-output-test")
+                .await
+                .expect("command should not fail")
+                .expect("advertised command should return TUI output");
+            assert!(
+                !out.trim().is_empty(),
+                "{cmdline} should not complete silently"
+            );
+        }
     }
 
     #[tokio::test]

@@ -74,8 +74,7 @@ enum WorkerRequest {
     Turn(String),
     /// Dispatch a slash command (e.g. `/help`, `/models list`)
     /// through the shared `CommandHandler`. Structured
-    /// `Ok(Some(text))` output is forwarded to the chat pane; any
-    /// legacy stdout-only command still gets a small advisory frame.
+    /// `Ok(Some(text))` output is forwarded to the chat pane.
     Command(String),
 }
 
@@ -588,11 +587,9 @@ pub async fn run(
                 }
                 WorkerRequest::Command(cmdline) => {
                     // Route slash commands through the shared
-                    // `CommandHandler`. v0.3.1 refactors the TV
-                    // menu/popup command paths to return structured
-                    // strings. Commands still audited as stdout-only
-                    // are blocked before `CommandHandler` execution
-                    // so side effects cannot happen invisibly.
+                    // `CommandHandler`. Advertised commands return
+                    // structured strings so side effects are visible
+                    // inside the full-screen TUI.
                     if let Some(message) = stdout_only_slash_command_block_message(&cmdline) {
                         let _ = worker_sink.send(TurnChunk::Token(message));
                         let _ = worker_sink.send(TurnChunk::Finished(Ok(String::new())));
@@ -1267,35 +1264,8 @@ fn command_session_preflight(cmdline: &str) -> CommandSessionPreflight {
 }
 
 fn stdout_only_slash_command_block_message(cmdline: &str) -> Option<String> {
-    let command = cmdline.split_whitespace().next()?;
-    if !matches!(
-        command,
-        "/agent"
-            | "/daemon"
-            | "/gateway"
-            | "/service"
-            | "/onboard"
-            | "/doctor"
-            | "/cron"
-            | "/skill"
-            | "/skills"
-            | "/channels"
-            | "/channel"
-            | "/hardware"
-            | "/peripheral"
-            | "/estop"
-            | "/completions"
-            | "/clear"
-            | "/save"
-            | "/history"
-            | "/config"
-    ) {
-        return None;
-    }
-
-    Some(format!(
-        "Command `{command}` is not available in the full-screen TUI yet because it still writes only to stdout. No action was taken. Use `--legacy-repl` for this command, or use `/help` to see TUI-ready commands."
-    ))
+    cmdline.split_whitespace().next()?;
+    None
 }
 
 fn session_delete_target(cmdline: &str) -> Option<&str> {
@@ -3520,29 +3490,32 @@ mod tests {
     }
 
     #[test]
-    fn stdout_only_slash_blocker_blocks_side_effect_commands() {
-        let cron = stdout_only_slash_command_block_message("/cron add '0 9 * * *' standup")
-            .expect("cron is stdout-only in the TUI audit");
-        assert!(cron.contains("No action was taken"));
-        assert!(cron.contains("--legacy-repl"));
-
-        let clear = stdout_only_slash_command_block_message("/clear")
-            .expect("clear mutates local metadata through a stdout-only handler");
-        assert!(clear.contains("No action was taken"));
-
-        let save = stdout_only_slash_command_block_message("/save out.txt")
-            .expect("save writes a file through a stdout-only handler");
-        assert!(save.contains("No action was taken"));
-    }
-
-    #[test]
-    fn stdout_only_slash_blocker_allows_structured_tui_commands() {
-        assert!(stdout_only_slash_command_block_message("/help").is_none());
-        assert!(stdout_only_slash_command_block_message("/info").is_none());
-        assert!(stdout_only_slash_command_block_message("/session delete sess-123").is_none());
-        assert!(stdout_only_slash_command_block_message("/workspace switch prod").is_none());
-        assert!(stdout_only_slash_command_block_message("/models set primary").is_none());
-        assert!(stdout_only_slash_command_block_message("/memory list").is_none());
+    fn stdout_only_slash_blocker_allows_advertised_tui_commands() {
+        for cmdline in [
+            "/help",
+            "/info",
+            "/agent",
+            "/cron list",
+            "/clear",
+            "/save out.txt",
+            "/history",
+            "/config",
+            "/session delete sess-123",
+            "/workspace switch prod",
+            "/models set primary",
+            "/memory list",
+            "/doctor",
+            "/skill list",
+            "/channels list",
+            "/hardware discover",
+            "/peripheral list",
+            "/estop status",
+        ] {
+            assert!(
+                stdout_only_slash_command_block_message(cmdline).is_none(),
+                "{cmdline} should route through CommandHandler instead of the stdout-only blocker"
+            );
+        }
     }
 
     #[test]

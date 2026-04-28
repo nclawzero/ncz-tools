@@ -82,6 +82,12 @@ impl Backend {
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkspaceConfig {
+    /// Immutable workspace identifier used for zterm-owned
+    /// backend namespaces. This is generated once during config
+    /// migration and must survive display-name / URL edits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+
     /// Operator-facing name shown in the tab bar / selection UX.
     /// Must be unique within a single `AppConfig.workspaces` list.
     pub name: String,
@@ -108,6 +114,11 @@ pub struct WorkspaceConfig {
     /// Optional display override. Falls back to `name` when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+
+    /// Previous zterm session namespaces that should remain visible
+    /// while users migrate from the old mutable name+URL namespace.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub namespace_aliases: Vec<String>,
 }
 
 impl WorkspaceConfig {
@@ -161,7 +172,15 @@ impl AppConfig {
         }
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading zterm config from {}", path.display()))?;
-        Self::parse(&text)
+        let mut cfg = Self::parse(&text)?;
+        if migrate_openclaw_workspace_ids(&mut cfg) {
+            cfg.validate()?;
+            let migrated = toml::to_string_pretty(&cfg)
+                .with_context(|| "serializing migrated zterm config TOML")?;
+            std::fs::write(path, migrated)
+                .with_context(|| format!("writing migrated zterm config to {}", path.display()))?;
+        }
+        Ok(cfg)
     }
 
     /// Parse a TOML string (tested directly, avoids disk I/O).
@@ -176,12 +195,21 @@ impl AppConfig {
     pub fn validate(&self) -> Result<()> {
         use std::collections::HashSet;
         let mut seen: HashSet<&str> = HashSet::new();
+        let mut seen_ids: HashSet<&str> = HashSet::new();
         for w in &self.workspaces {
             if !seen.insert(w.name.as_str()) {
                 return Err(anyhow!(
                     "workspace name '{}' appears more than once",
                     w.name
                 ));
+            }
+            if let Some(id) = w.id.as_deref() {
+                if id.trim().is_empty() {
+                    return Err(anyhow!("workspace '{}' has an empty id", w.name));
+                }
+                if !seen_ids.insert(id) {
+                    return Err(anyhow!("workspace id '{}' appears more than once", id));
+                }
             }
         }
         if let Some(active) = &self.active {
@@ -348,6 +376,7 @@ impl Workspace {
                 )
             })?;
         client.set_session_namespace(openclaw_session_namespace(&self.config));
+        client.set_session_namespace_aliases(openclaw_session_namespace_aliases(&self.config));
 
         let boxed: Box<dyn AgentClient + Send + Sync> = Box::new(client);
         self.client = Some(Arc::new(Mutex::new(boxed)));
@@ -356,12 +385,70 @@ impl Workspace {
 }
 
 fn openclaw_session_namespace(config: &WorkspaceConfig) -> String {
+    if let Some(id) = config
+        .id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    {
+        return format!("backend={};workspace_id={}", config.backend.as_str(), id);
+    }
+    openclaw_legacy_session_namespace(config)
+}
+
+fn openclaw_legacy_session_namespace(config: &WorkspaceConfig) -> String {
     format!(
         "backend={};workspace={};url={}",
         config.backend.as_str(),
         config.name.trim(),
         config.url.trim_end_matches('/')
     )
+}
+
+fn openclaw_session_namespace_aliases(config: &WorkspaceConfig) -> Vec<String> {
+    let mut aliases = Vec::new();
+    for alias in &config.namespace_aliases {
+        push_unique_namespace(&mut aliases, alias.trim());
+    }
+    push_unique_namespace(&mut aliases, &openclaw_legacy_session_namespace(config));
+    let primary = openclaw_session_namespace(config);
+    aliases.retain(|alias| alias != &primary);
+    aliases
+}
+
+fn push_unique_namespace(namespaces: &mut Vec<String>, namespace: &str) {
+    if !namespace.is_empty() && !namespaces.iter().any(|existing| existing == namespace) {
+        namespaces.push(namespace.to_string());
+    }
+}
+
+fn migrate_openclaw_workspace_ids(cfg: &mut AppConfig) -> bool {
+    let mut changed = false;
+    for workspace in &mut cfg.workspaces {
+        if workspace.backend != Backend::Openclaw {
+            continue;
+        }
+        let legacy_namespace = openclaw_legacy_session_namespace(workspace);
+        if workspace
+            .id
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .is_empty()
+        {
+            workspace.id = Some(format!("ws_{}", uuid::Uuid::new_v4().simple()));
+            changed = true;
+        }
+        if !workspace
+            .namespace_aliases
+            .iter()
+            .any(|alias| alias == &legacy_namespace)
+        {
+            workspace.namespace_aliases.push(legacy_namespace);
+            changed = true;
+        }
+    }
+    changed
 }
 
 /// Canonical path for zterm's openclaw device key. Shared across
@@ -493,12 +580,14 @@ impl App {
         token: Option<String>,
     ) -> Result<Self> {
         let cfg = WorkspaceConfig {
+            id: None,
             name: "default".to_string(),
             backend: Backend::Zeroclaw,
             url: url.into(),
             token_env: None,
             token,
             label: None,
+            namespace_aliases: Vec::new(),
         };
         let ws = Workspace::instantiate(0, cfg)?;
         let config_path = AppConfig::default_path()
@@ -628,14 +717,72 @@ url = "http://a"
     }
 
     #[test]
+    fn load_migrates_openclaw_workspace_id_and_legacy_namespace_alias() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[[workspaces]]
+name = "alpha"
+backend = "openclaw"
+url = "ws://old.example"
+"#,
+        )
+        .unwrap();
+
+        let cfg = AppConfig::load(&path).unwrap();
+        let workspace = &cfg.workspaces[0];
+        let id = workspace.id.as_deref().expect("migration should assign id");
+        assert!(id.starts_with("ws_"));
+        assert!(workspace
+            .namespace_aliases
+            .iter()
+            .any(|alias| { alias == "backend=openclaw;workspace=alpha;url=ws://old.example" }));
+
+        let reloaded = AppConfig::load(&path).unwrap();
+        assert_eq!(reloaded.workspaces[0].id.as_deref(), Some(id));
+    }
+
+    #[test]
+    fn immutable_openclaw_namespace_survives_workspace_rename_and_url_change() {
+        let cfg = WorkspaceConfig {
+            id: Some("ws_stable".to_string()),
+            name: "renamed".to_string(),
+            backend: Backend::Openclaw,
+            url: "ws://new.example/".to_string(),
+            token_env: None,
+            token: None,
+            label: None,
+            namespace_aliases: vec![
+                "backend=openclaw;workspace=alpha;url=ws://old.example".to_string()
+            ],
+        };
+
+        assert_eq!(
+            openclaw_session_namespace(&cfg),
+            "backend=openclaw;workspace_id=ws_stable"
+        );
+        let aliases = openclaw_session_namespace_aliases(&cfg);
+        assert!(aliases
+            .iter()
+            .any(|alias| alias == "backend=openclaw;workspace=alpha;url=ws://old.example"));
+        assert!(aliases
+            .iter()
+            .any(|alias| alias == "backend=openclaw;workspace=renamed;url=ws://new.example"));
+    }
+
+    #[test]
     fn resolved_token_prefers_env_var() {
         let cfg = WorkspaceConfig {
+            id: None,
             name: "w".into(),
             backend: Backend::Zeroclaw,
             url: "http://a".into(),
             token_env: Some("ZTERM_TEST_TOKEN_VAR".into()),
             token: Some("inline".into()),
             label: None,
+            namespace_aliases: Vec::new(),
         };
         std::env::set_var("ZTERM_TEST_TOKEN_VAR", "env-wins");
         assert_eq!(cfg.resolved_token().as_deref(), Some("env-wins"));
@@ -647,12 +794,14 @@ url = "http://a"
     #[test]
     fn resolved_token_none_when_nothing_configured() {
         let cfg = WorkspaceConfig {
+            id: None,
             name: "w".into(),
             backend: Backend::Zeroclaw,
             url: "http://a".into(),
             token_env: None,
             token: None,
             label: None,
+            namespace_aliases: Vec::new(),
         };
         assert!(cfg.resolved_token().is_none());
     }
@@ -660,12 +809,14 @@ url = "http://a"
     #[test]
     fn display_label_falls_back_to_name() {
         let a = WorkspaceConfig {
+            id: None,
             name: "prod".into(),
             backend: Backend::Zeroclaw,
             url: "http://a".into(),
             token_env: None,
             token: None,
             label: Some("Production".into()),
+            namespace_aliases: Vec::new(),
         };
         assert_eq!(a.display_label(), "Production");
         let b = WorkspaceConfig { label: None, ..a };
@@ -675,12 +826,14 @@ url = "http://a"
     #[test]
     fn instantiate_zeroclaw_workspace_populates_client() {
         let cfg = WorkspaceConfig {
+            id: None,
             name: "w".into(),
             backend: Backend::Zeroclaw,
             url: "http://127.0.0.1:42617".into(),
             token_env: None,
             token: Some("tok".into()),
             label: None,
+            namespace_aliases: Vec::new(),
         };
         let ws = Workspace::instantiate(0, cfg).unwrap();
         assert_eq!(ws.id, 0);
@@ -696,12 +849,14 @@ url = "http://a"
     #[test]
     fn instantiate_openclaw_leaves_client_none() {
         let cfg = WorkspaceConfig {
+            id: None,
             name: "oc".into(),
             backend: Backend::Openclaw,
             url: "ws://127.0.0.1:18789".into(),
             token_env: None,
             token: None,
             label: None,
+            namespace_aliases: Vec::new(),
         };
         let ws = Workspace::instantiate(0, cfg).unwrap();
         assert!(
@@ -714,12 +869,14 @@ url = "http://a"
     #[tokio::test]
     async fn activate_zeroclaw_is_noop_returns_ok() {
         let cfg = WorkspaceConfig {
+            id: None,
             name: "w".into(),
             backend: Backend::Zeroclaw,
             url: "http://127.0.0.1:42617".into(),
             token_env: None,
             token: Some("tok".into()),
             label: None,
+            namespace_aliases: Vec::new(),
         };
         let mut ws = Workspace::instantiate(0, cfg).unwrap();
         assert!(ws.is_activated());
