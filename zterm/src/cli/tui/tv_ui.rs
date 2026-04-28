@@ -52,10 +52,11 @@ use turbo_vision::views::status_line::{StatusItem, StatusLine};
 use turbo_vision::views::view::{write_line_to_terminal, View};
 use turbo_vision::views::window::WindowBuilder;
 
-use crate::cli::agent::{TurnChunk, TurnUsage};
+use crate::cli::agent::{StreamSink, TurnChunk, TurnUsage};
 use crate::cli::client::Session;
 use crate::cli::commands::CommandHandler;
 use crate::cli::storage;
+use crate::cli::tui::delighters;
 use crate::cli::tui::themes;
 use crate::cli::workspace::App;
 
@@ -127,6 +128,76 @@ const SPINNER_INTERVAL: Duration = Duration::from_millis(80);
 /// Ctrl-P) remains visible. ~1s is long enough to read but short
 /// enough that mashing Ctrl-P repeatedly still feels live.
 const TOAST_DURATION: Duration = Duration::from_millis(1000);
+const TYPEWRITER_INTERVAL: Duration = Duration::from_millis(30);
+
+struct TypewriterState {
+    chars: Vec<char>,
+    pos: usize,
+    last_emit: Instant,
+    after_lines: Vec<String>,
+    completed: bool,
+}
+
+impl TypewriterState {
+    fn new(text: impl Into<String>, after_lines: Vec<String>) -> Self {
+        Self {
+            chars: text.into().chars().collect(),
+            pos: 0,
+            last_emit: Instant::now(),
+            after_lines,
+            completed: false,
+        }
+    }
+
+    fn tick(&mut self, lines: &Rc<RefCell<Vec<String>>>) {
+        if self.completed {
+            return;
+        }
+
+        let due = typewriter_chars_due(self.last_emit.elapsed(), TYPEWRITER_INTERVAL);
+        if due == 0 {
+            return;
+        }
+
+        let mut lines = lines.borrow_mut();
+        if lines.is_empty() {
+            lines.push(String::new());
+        }
+
+        for _ in 0..due {
+            let Some(ch) = self.chars.get(self.pos).copied() else {
+                self.completed = true;
+                lines.push(String::new());
+                lines.extend(self.after_lines.drain(..));
+                return;
+            };
+            self.pos += 1;
+            self.last_emit += TYPEWRITER_INTERVAL;
+            if ch == '\n' {
+                lines.push(String::new());
+            } else if let Some(last) = lines.last_mut() {
+                last.push(ch);
+            }
+        }
+    }
+}
+
+fn start_typewriter(
+    state: &mut Option<TypewriterState>,
+    lines: &Rc<RefCell<Vec<String>>>,
+    text: String,
+    after_lines: Vec<String>,
+) {
+    lines.borrow_mut().push(String::new());
+    *state = Some(TypewriterState::new(text, after_lines));
+}
+
+fn typewriter_chars_due(elapsed: Duration, interval: Duration) -> usize {
+    if interval.is_zero() {
+        return usize::MAX;
+    }
+    (elapsed.as_millis() / interval.as_millis()) as usize
+}
 
 /// Live state feeding the status line. Mutated on each event-loop
 /// tick from the TV thread.
@@ -348,6 +419,14 @@ pub async fn run(
     let (req_tx, mut req_rx) = mpsc::channel::<WorkerRequest>(32);
     let (event_tx, event_rx) = mpsc::unbounded_channel::<TurnChunk>();
 
+    let connect_splash = connect_splash_for_active_workspace(
+        &app,
+        &session.id,
+        &workspace_name,
+        Some(event_tx.clone()),
+    )
+    .await;
+
     // Install the streaming sink on the active workspace's client
     // once, up front. Turn dispatch in the worker reuses this sink
     // for every `submit_turn` — no per-turn reinstall.
@@ -408,12 +487,31 @@ pub async fn run(
                     // menu/popup command paths to return structured
                     // strings; legacy stdout-only commands still get
                     // an advisory rather than silently disappearing.
+                    let is_workspace_switch = cmdline.starts_with("/workspace switch ");
                     match worker_cmd_handler
                         .handle(&cmdline, &worker_session_id)
                         .await
                     {
                         Ok(Some(text)) => {
                             let _ = worker_sink.send(TurnChunk::Token(text));
+                            if is_workspace_switch {
+                                let switched_workspace = {
+                                    let guard = worker_app.lock().await;
+                                    guard.active_workspace().map(|w| w.config.name.clone())
+                                };
+                                if let Some(name) = switched_workspace {
+                                    if let Some(splash) = connect_splash_for_active_workspace(
+                                        &worker_app,
+                                        &worker_session_id,
+                                        &name,
+                                        Some(worker_sink.clone()),
+                                    )
+                                    .await
+                                    {
+                                        let _ = worker_sink.send(TurnChunk::Typewriter(splash));
+                                    }
+                                }
+                            }
                             let _ = worker_sink.send(TurnChunk::Finished(Ok(String::new())));
                         }
                         Ok(None) => {
@@ -456,6 +554,7 @@ pub async fn run(
             model,
             provider,
             workspace_name,
+            connect_splash,
             req_tx,
             event_rx,
         )
@@ -464,12 +563,63 @@ pub async fn run(
     .map_err(|e| anyhow::anyhow!("tv_ui join error: {e}"))?
 }
 
+async fn connect_splash_for_active_workspace(
+    app: &Arc<Mutex<App>>,
+    session_id: &str,
+    workspace_name: &str,
+    restore_sink: Option<StreamSink>,
+) -> Option<String> {
+    let cache_path = delighters::default_connect_splash_cache_path(workspace_name)?;
+    if let Some(cached) = delighters::read_cached_connect_splash(
+        &cache_path,
+        std::time::SystemTime::now(),
+        delighters::CONNECT_SPLASH_TTL,
+    ) {
+        return Some(cached);
+    }
+
+    let client = {
+        let guard = app.lock().await;
+        guard.active_workspace().and_then(|w| w.client.clone())
+    }?;
+
+    let (scratch_tx, _scratch_rx) = mpsc::unbounded_channel();
+    let generated = {
+        let mut client = client.lock().await;
+        client.set_stream_sink(Some(scratch_tx));
+        let result = client
+            .submit_turn(session_id, delighters::CONNECT_SPLASH_PROMPT)
+            .await;
+        client.set_stream_sink(restore_sink);
+        result
+    };
+
+    match generated {
+        Ok(text) => {
+            let normalized = delighters::normalize_connect_splash(&text);
+            if normalized.is_empty() {
+                None
+            } else {
+                if let Err(e) = delighters::write_connect_splash_cache(&cache_path, &normalized) {
+                    warn!("connect-splash cache write failed: {e}");
+                }
+                Some(normalized)
+            }
+        }
+        Err(e) => {
+            warn!("connect-splash generation failed: {e}");
+            None
+        }
+    }
+}
+
 fn run_blocking(
     app: Arc<Mutex<App>>,
     session: Session,
     model: String,
     provider: String,
     workspace_name: String,
+    connect_splash: Option<String>,
     req_tx: mpsc::Sender<WorkerRequest>,
     mut event_rx: mpsc::UnboundedReceiver<TurnChunk>,
 ) -> Result<()> {
@@ -509,11 +659,16 @@ fn run_blocking(
     // event loop is single-threaded; the custom ChatPane view reads
     // the buffer during its draw pass, and the event loop writes to
     // it on Enter.
-    let chat_lines: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(initial_chat_lines(
-        &workspace_name,
-        &model,
-        &provider,
-    )));
+    let welcome_lines = initial_chat_lines(&workspace_name, &model, &provider);
+    let mut typewriter_state = None;
+    let initial_lines = if let Some(text) = connect_splash {
+        let state = TypewriterState::new(text, welcome_lines);
+        typewriter_state = Some(state);
+        vec![String::new()]
+    } else {
+        welcome_lines
+    };
+    let chat_lines: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(initial_lines));
 
     // Shared input buffer for the InputLine. Turbo Vision's
     // InputLine is already Rc<RefCell<String>>-backed; we hold an
@@ -616,6 +771,7 @@ fn run_blocking(
         req_tx,
         &mut event_rx,
         &mut status_state,
+        &mut typewriter_state,
         &app,
         w,
         h,
@@ -768,6 +924,7 @@ fn run_event_loop(
     req_tx: mpsc::Sender<WorkerRequest>,
     event_rx: &mut mpsc::UnboundedReceiver<TurnChunk>,
     status_state: &mut StatusState,
+    typewriter_state: &mut Option<TypewriterState>,
     shared_app: &Arc<Mutex<App>>,
     w: i16,
     h: i16,
@@ -796,7 +953,17 @@ fn run_event_loop(
         // *before* redrawing, so new tokens are visible this frame.
         // Also lets the status-state timer observe `Finished` frames
         // inline with the rest of the UI update.
-        drain_stream_events(event_rx, &chat_lines, status_state);
+        drain_stream_events(event_rx, &chat_lines, status_state, typewriter_state);
+        if let Some(writer) = typewriter_state.as_mut() {
+            writer.tick(&chat_lines);
+        }
+        if typewriter_state
+            .as_ref()
+            .map(|writer| writer.completed)
+            .unwrap_or(false)
+        {
+            *typewriter_state = None;
+        }
 
         // Advance the in-flight spinner (no-op while idle).
         status_state.tick_spinner();
@@ -1125,6 +1292,7 @@ fn drain_stream_events(
     event_rx: &mut mpsc::UnboundedReceiver<TurnChunk>,
     chat_lines: &Rc<RefCell<Vec<String>>>,
     status_state: &mut StatusState,
+    typewriter_state: &mut Option<TypewriterState>,
 ) {
     loop {
         match event_rx.try_recv() {
@@ -1135,6 +1303,9 @@ fn drain_stream_events(
                     }
                     TurnChunk::Finished(_) => {
                         status_state.end_turn();
+                    }
+                    TurnChunk::Typewriter(text) => {
+                        start_typewriter(typewriter_state, chat_lines, text.clone(), Vec::new());
                     }
                     TurnChunk::Token(_) => {}
                 }
@@ -1171,6 +1342,7 @@ fn apply_chunk(chunk: TurnChunk, chat_lines: &Rc<RefCell<Vec<String>>>) {
                 lines.push(piece.to_string());
             }
         }
+        TurnChunk::Typewriter(_) => {}
         TurnChunk::Usage(_) => {}
         TurnChunk::Finished(Ok(_)) => {
             lines.push(String::new());
@@ -1900,6 +2072,22 @@ mod tests {
         assert_eq!(
             next_spinner_frame(SPINNER_FRAMES.len() - 1, SPINNER_FRAMES.len()),
             0
+        );
+    }
+
+    #[test]
+    fn typewriter_due_uses_thirty_ms_cadence() {
+        assert_eq!(
+            typewriter_chars_due(Duration::from_millis(29), TYPEWRITER_INTERVAL),
+            0
+        );
+        assert_eq!(
+            typewriter_chars_due(Duration::from_millis(30), TYPEWRITER_INTERVAL),
+            1
+        );
+        assert_eq!(
+            typewriter_chars_due(Duration::from_millis(95), TYPEWRITER_INTERVAL),
+            3
         );
     }
 }

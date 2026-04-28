@@ -7,6 +7,7 @@ use crate::cli::client::Session;
 use crate::cli::pairing::PairingManager;
 use crate::cli::storage::{self, SessionMetadata};
 
+pub mod delighters;
 pub mod onboarding;
 pub mod repl;
 pub mod rusty_repl;

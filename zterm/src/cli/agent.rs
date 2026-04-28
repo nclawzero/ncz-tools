@@ -149,6 +149,9 @@ pub enum TurnChunk {
     /// A streamed token fragment. Concatenating every `Token` in order
     /// yields the same text that legacy stdout mode would have printed.
     Token(String),
+    /// A short UX flourish that should be rendered with the TUI
+    /// typewriter cadence instead of appended as an agent response.
+    Typewriter(String),
     /// Token accounting for the completed or near-completed turn.
     /// Emitted when a backend surfaces usage data.
     Usage(TurnUsage),
