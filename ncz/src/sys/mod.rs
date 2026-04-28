@@ -188,8 +188,7 @@ fn join_reader(
     handle
         .join()
         .map_err(|_| {
-            NczError::Io(io::Error::new(
-                io::ErrorKind::Other,
+            NczError::Io(io::Error::other(
                 "reader thread panicked",
             ))
         })?
