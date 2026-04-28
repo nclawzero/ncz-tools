@@ -136,6 +136,21 @@ pub fn remove_provider_bindings_for_key(
     Ok(removed)
 }
 
+pub fn remove_provider_bindings_for_providers(
+    paths: &Paths,
+    providers: &std::collections::BTreeSet<String>,
+) -> Result<Vec<String>, NczError> {
+    let mut removed = Vec::new();
+    for provider in providers {
+        validate_provider_binding_name(provider)?;
+        let binding_key = provider_binding_key(provider)?;
+        if remove_path(&paths.agent_env(), &binding_key)? {
+            removed.push(provider.clone());
+        }
+    }
+    Ok(removed)
+}
+
 pub fn remove_override(paths: &Paths, agent: &str, key: &str) -> Result<bool, NczError> {
     remove_path(&paths.agent_env_override(agent), key)
 }

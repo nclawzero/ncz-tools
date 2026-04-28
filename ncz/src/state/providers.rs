@@ -106,6 +106,42 @@ pub fn read_all(paths: &Paths) -> Result<Vec<ProviderRecord>, NczError> {
 }
 
 pub fn migrate_legacy(paths: &Paths) -> Result<Vec<PathBuf>, NczError> {
+    let migrations = legacy_migrations(paths)?;
+
+    if migrations.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut snapshot_paths = vec![paths.agent_env()];
+    snapshot_paths.extend(legacy_migration_file_paths(&migrations));
+    let snapshots = snapshot_files(&snapshot_paths)?;
+    let result = migrate_legacy_inner(paths, &migrations);
+    if let Err(err) = result {
+        restore_file_snapshots(&snapshots)?;
+        return Err(err);
+    }
+
+    let mut migrated: Vec<PathBuf> = migrations
+        .into_iter()
+        .map(|migration| migration.canonical_path)
+        .collect();
+    migrated.sort();
+    migrated.dedup();
+    Ok(migrated)
+}
+
+pub fn legacy_migration_snapshot_paths(paths: &Paths) -> Result<Vec<PathBuf>, NczError> {
+    Ok(legacy_migration_file_paths(&legacy_migrations(paths)?))
+}
+
+struct LegacyMigration {
+    path: PathBuf,
+    declaration: ProviderDeclaration,
+    inline_secret: Option<String>,
+    canonical_path: PathBuf,
+}
+
+fn legacy_migrations(paths: &Paths) -> Result<Vec<LegacyMigration>, NczError> {
     let files = provider_files(paths)?;
     preflight_provider_files(&files)?;
 
@@ -149,39 +185,18 @@ pub fn migrate_legacy(paths: &Paths) -> Result<Vec<PathBuf>, NczError> {
             canonical_path,
         });
     }
-
-    if migrations.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let mut snapshot_paths = vec![paths.agent_env()];
-    for migration in &migrations {
-        snapshot_paths.push(migration.path.clone());
-        snapshot_paths.push(migration.canonical_path.clone());
-    }
-    snapshot_paths.sort();
-    snapshot_paths.dedup();
-    let snapshots = snapshot_files(&snapshot_paths)?;
-    let result = migrate_legacy_inner(paths, &migrations);
-    if let Err(err) = result {
-        restore_file_snapshots(&snapshots)?;
-        return Err(err);
-    }
-
-    let mut migrated: Vec<PathBuf> = migrations
-        .into_iter()
-        .map(|migration| migration.canonical_path)
-        .collect();
-    migrated.sort();
-    migrated.dedup();
-    Ok(migrated)
+    Ok(migrations)
 }
 
-struct LegacyMigration {
-    path: PathBuf,
-    declaration: ProviderDeclaration,
-    inline_secret: Option<String>,
-    canonical_path: PathBuf,
+fn legacy_migration_file_paths(migrations: &[LegacyMigration]) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for migration in migrations {
+        paths.push(migration.path.clone());
+        paths.push(migration.canonical_path.clone());
+    }
+    paths.sort();
+    paths.dedup();
+    paths
 }
 
 fn migrate_legacy_inner(paths: &Paths, migrations: &[LegacyMigration]) -> Result<(), NczError> {
@@ -441,6 +456,7 @@ pub fn remove(paths: &Paths, name: &str) -> Result<bool, NczError> {
     validate_name(name)?;
     let mut removed = false;
     let mut aliases = BTreeSet::from([name.to_string()]);
+    let mut removal_paths = Vec::new();
     for path in provider_files(paths)? {
         let fallback_name = path
             .file_stem()
@@ -456,7 +472,7 @@ pub fn remove(paths: &Paths, name: &str) -> Result<bool, NczError> {
                 aliases.insert(declaration.name);
             }
             removed = true;
-            state::remove_file_durable(&path)?;
+            removal_paths.push(path);
             continue;
         }
         let declaration = declaration?;
@@ -464,11 +480,24 @@ pub fn remove(paths: &Paths, name: &str) -> Result<bool, NczError> {
             aliases.insert(fallback_name);
             aliases.insert(declaration.name);
             removed = true;
-            state::remove_file_durable(&path)?;
+            removal_paths.push(path);
         }
     }
     for alias in aliases {
-        state::remove_file_durable(&model_cache_path(paths, &alias)?)?;
+        removal_paths.push(model_cache_path(paths, &alias)?);
+    }
+    removal_paths.sort();
+    removal_paths.dedup();
+    let snapshots = snapshot_files(&removal_paths)?;
+    let result = (|| {
+        for path in &removal_paths {
+            state::remove_file_durable(path)?;
+        }
+        Ok(())
+    })();
+    if let Err(err) = result {
+        restore_file_snapshots(&snapshots)?;
+        return Err(err);
     }
     Ok(removed)
 }

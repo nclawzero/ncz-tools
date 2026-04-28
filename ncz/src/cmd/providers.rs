@@ -305,6 +305,7 @@ pub fn add(
         models: Vec::new(),
     };
     let _lock = state::acquire_lock(&paths.lock_path)?;
+    let mut revoked_binding_aliases = None;
     if input.force {
         let aliases = provider_state::removal_aliases(paths, &declaration.name)?;
         let inline_replacements =
@@ -325,8 +326,23 @@ pub fn add(
         if !primary_references.is_empty() {
             require_agent_env_credential(paths, &declaration)?;
         }
+        revoked_binding_aliases = Some(aliases);
     }
-    let path = provider_state::write(paths, &declaration, input.force)?;
+    let path = if let Some(aliases) = revoked_binding_aliases {
+        let snapshots = snapshot_paths(&[paths.agent_env()], 0o600)?;
+        match (|| {
+            agent_env::remove_provider_bindings_for_providers(paths, &aliases)?;
+            provider_state::write(paths, &declaration, true)
+        })() {
+            Ok(path) => path,
+            Err(err) => {
+                restore_snapshots(&snapshots)?;
+                return Err(err);
+            }
+        }
+    } else {
+        provider_state::write(paths, &declaration, false)?
+    };
     Ok(ProviderAddReport {
         schema_version: common::SCHEMA_VERSION,
         provider: provider_report_from_parts(ctx, &declaration, path.display().to_string()),
@@ -337,7 +353,17 @@ pub fn remove(paths: &Paths, name: &str) -> Result<ProviderRemoveReport, NczErro
     let _lock = state::acquire_lock(&paths.lock_path)?;
     let aliases = provider_state::removal_aliases(paths, name)?;
     reject_primary_references(paths, &aliases)?;
-    let removed = provider_state::remove(paths, name)?;
+    let snapshots = snapshot_paths(&[paths.agent_env()], 0o600)?;
+    let removed = match (|| {
+        agent_env::remove_provider_bindings_for_providers(paths, &aliases)?;
+        provider_state::remove(paths, name)
+    })() {
+        Ok(removed) => removed,
+        Err(err) => {
+            restore_snapshots(&snapshots)?;
+            return Err(err);
+        }
+    };
     Ok(ProviderRemoveReport {
         schema_version: common::SCHEMA_VERSION,
         name: name.to_string(),
@@ -1123,6 +1149,57 @@ mod tests {
     }
 
     #[test]
+    fn providers_remove_revokes_provider_binding() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        fs::create_dir_all(paths.providers_dir()).unwrap();
+        fs::create_dir_all(&paths.etc_dir).unwrap();
+        fs::write(
+            paths.providers_dir().join("example.json"),
+            r#"{"schema_version":1,"name":"example","url":"https://api.example.test","model":"old","key_env":"EXAMPLE_API_KEY","type":"openai-compat","health_path":"/health"}"#,
+        )
+        .unwrap();
+        fs::write(
+            paths.agent_env(),
+            "EXAMPLE_API_KEY=secret\nNCZ_PROVIDER_BINDING_6578616D706C65=\"EXAMPLE_API_KEY https://api.example.test\"\nOTHER=1\n",
+        )
+        .unwrap();
+
+        let report = remove(&paths, "example").unwrap();
+
+        assert!(report.removed);
+        assert!(!paths.providers_dir().join("example.json").exists());
+        assert_eq!(
+            fs::read_to_string(paths.agent_env()).unwrap(),
+            "EXAMPLE_API_KEY=secret\nOTHER=1\n"
+        );
+    }
+
+    #[test]
+    fn providers_remove_rolls_back_binding_on_remove_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        fs::create_dir_all(paths.providers_dir()).unwrap();
+        fs::create_dir_all(&paths.etc_dir).unwrap();
+        let provider_file = paths.providers_dir().join("example.json");
+        fs::write(
+            &provider_file,
+            r#"{"schema_version":1,"name":"example","url":"https://api.example.test","model":"old","key_env":"EXAMPLE_API_KEY","type":"openai-compat","health_path":"/health"}"#,
+        )
+        .unwrap();
+        fs::create_dir(paths.providers_dir().join("example.models.json")).unwrap();
+        let agent_env_body =
+            "EXAMPLE_API_KEY=secret\nNCZ_PROVIDER_BINDING_6578616D706C65=\"EXAMPLE_API_KEY https://api.example.test\"\n";
+        fs::write(paths.agent_env(), agent_env_body).unwrap();
+
+        let err = remove(&paths, "example").unwrap_err();
+
+        assert!(matches!(err, NczError::Io(_)));
+        assert!(provider_file.exists());
+        assert_eq!(fs::read_to_string(paths.agent_env()).unwrap(), agent_env_body);
+    }
+
+    #[test]
     fn providers_add_force_rejects_primary_replacement_with_missing_credential() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = test_paths(tmp.path());
@@ -1255,6 +1332,103 @@ mod tests {
         );
         assert_eq!(fs::read_to_string(legacy_file).unwrap(), legacy);
         assert!(!paths.providers_dir().join("local.json").exists());
+    }
+
+    #[test]
+    fn providers_add_force_revokes_stale_provider_binding() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        fs::create_dir_all(paths.providers_dir()).unwrap();
+        fs::create_dir_all(&paths.etc_dir).unwrap();
+        fs::write(
+            paths.providers_dir().join("example.json"),
+            r#"{"schema_version":1,"name":"example","url":"https://api.example.test","model":"old","key_env":"EXAMPLE_API_KEY","type":"openai-compat","health_path":"/health"}"#,
+        )
+        .unwrap();
+        fs::write(
+            paths.agent_env(),
+            "EXAMPLE_API_KEY=secret\nNCZ_PROVIDER_BINDING_6578616D706C65=\"EXAMPLE_API_KEY https://api.example.test\"\nOTHER=1\n",
+        )
+        .unwrap();
+        let runner = FakeRunner::new();
+        runner.expect(
+            "curl",
+            &[
+                "-q",
+                "-fsS",
+                "-o",
+                "/dev/null",
+                "--max-time",
+                "3",
+                "--max-filesize",
+                "65536",
+                "--noproxy",
+                "*",
+                "--proxy",
+                "",
+                "--",
+                "https://api.example.test/health",
+            ],
+            out(0, "", ""),
+        );
+
+        run_with_paths(
+            &ctx(&runner),
+            &paths,
+            ProvidersAction::Add {
+                name: "example".to_string(),
+                url: "https://api.example.test".to_string(),
+                model: "new".to_string(),
+                key_env: "EXAMPLE_API_KEY".to_string(),
+                provider_type: "openai-compat".to_string(),
+                health_path: "/health".to_string(),
+                force: true,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(paths.agent_env()).unwrap(),
+            "EXAMPLE_API_KEY=secret\nOTHER=1\n"
+        );
+        assert!(fs::read_to_string(paths.providers_dir().join("example.json"))
+            .unwrap()
+            .contains(r#""model": "new""#));
+    }
+
+    #[test]
+    fn providers_add_force_rolls_back_binding_on_write_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        fs::create_dir_all(paths.providers_dir()).unwrap();
+        fs::create_dir_all(&paths.etc_dir).unwrap();
+        let provider_file = paths.providers_dir().join("example.json");
+        let original = r#"{"schema_version":1,"name":"example","url":"https://api.example.test","model":"old","key_env":"EXAMPLE_API_KEY","type":"openai-compat","health_path":"/health"}"#;
+        fs::write(&provider_file, original).unwrap();
+        fs::create_dir(paths.providers_dir().join("example.models.json")).unwrap();
+        let agent_env_body =
+            "EXAMPLE_API_KEY=secret\nNCZ_PROVIDER_BINDING_6578616D706C65=\"EXAMPLE_API_KEY https://api.example.test\"\n";
+        fs::write(paths.agent_env(), agent_env_body).unwrap();
+        let runner = FakeRunner::new();
+
+        let err = run_with_paths(
+            &ctx(&runner),
+            &paths,
+            ProvidersAction::Add {
+                name: "example".to_string(),
+                url: "https://api.example.test".to_string(),
+                model: "new".to_string(),
+                key_env: "EXAMPLE_API_KEY".to_string(),
+                provider_type: "openai-compat".to_string(),
+                health_path: "/health".to_string(),
+                force: true,
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, NczError::Io(_)));
+        assert_eq!(fs::read_to_string(provider_file).unwrap(), original);
+        assert_eq!(fs::read_to_string(paths.agent_env()).unwrap(), agent_env_body);
     }
 
     #[test]

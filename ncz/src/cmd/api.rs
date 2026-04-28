@@ -154,14 +154,25 @@ fn upsert(
         provider_state::validate_name(provider)?;
     }
     let _lock = state::acquire_lock(&paths.lock_path)?;
-    let provider_bindings = resolve_provider_bindings(paths, key, providers)?;
     let mut target_paths: Vec<PathBuf> = vec![paths.agent_env()];
     target_paths.extend(agents.iter().map(|agent| paths.agent_env_override(agent)));
+    if !providers.is_empty() {
+        target_paths.extend(provider_state::legacy_migration_snapshot_paths(paths)?);
+    }
+    target_paths.sort();
+    target_paths.dedup();
     let snapshots = snapshot_paths(&target_paths)?;
 
-    let mut agent_override_files = Vec::new();
-    let result = (|| -> Result<bool, NczError> {
-        let mut changed = agent_env::set(paths, key, value)?;
+    let result = (|| -> Result<(bool, Vec<String>, Vec<ProviderBinding>), NczError> {
+        let migrated = if providers.is_empty() {
+            false
+        } else {
+            !provider_state::migrate_legacy(paths)?.is_empty()
+        };
+        let provider_bindings = resolve_provider_bindings(paths, key, providers)?;
+        let set_changed = agent_env::set(paths, key, value)?;
+        let mut changed = migrated || set_changed;
+        let mut agent_override_files = Vec::new();
         for agent_name in agents {
             if agent_env::set_override(paths, agent_name, key, value)? {
                 changed = true;
@@ -173,10 +184,10 @@ fn upsert(
                 changed = true;
             }
         }
-        Ok(changed)
+        Ok((changed, agent_override_files, provider_bindings))
     })();
-    let changed = match result {
-        Ok(changed) => changed,
+    let (changed, agent_override_files, provider_bindings) = match result {
+        Ok(result) => result,
         Err(err) => {
             restore_snapshots(&snapshots)?;
             return Err(err);
@@ -357,6 +368,7 @@ fn credential_references(paths: &Paths, key: &str) -> Result<Vec<String>, NczErr
 struct FileSnapshot {
     path: PathBuf,
     body: Option<Vec<u8>>,
+    mode: u32,
 }
 
 fn snapshot_paths(paths: &[PathBuf]) -> Result<Vec<FileSnapshot>, NczError> {
@@ -376,16 +388,23 @@ fn snapshot_path(path: &Path) -> Result<FileSnapshot, NczError> {
         }
         Err(e) => return Err(NczError::Io(e)),
     };
+    let mode = if body.is_some() {
+        use std::os::unix::fs::PermissionsExt;
+        fs::metadata(path)?.permissions().mode() & 0o777
+    } else {
+        0o600
+    };
     Ok(FileSnapshot {
         path: path.to_path_buf(),
         body,
+        mode,
     })
 }
 
 fn restore_snapshots(snapshots: &[FileSnapshot]) -> Result<(), NczError> {
     for snapshot in snapshots.iter().rev() {
         match &snapshot.body {
-            Some(body) => state::atomic_write(&snapshot.path, body, 0o600)?,
+            Some(body) => state::atomic_write(&snapshot.path, body, snapshot.mode)?,
             None => {
                 if let Err(err) = state::remove_file_durable(&snapshot.path) {
                     match err {
@@ -514,6 +533,85 @@ mod tests {
             "https://api.example.test"
         )
         .unwrap());
+    }
+
+    #[test]
+    fn api_set_provider_migrates_legacy_before_rotation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        fs::create_dir_all(paths.providers_dir()).unwrap();
+        fs::create_dir_all(&paths.etc_dir).unwrap();
+        fs::write(
+            paths.providers_dir().join("local.env"),
+            "PROVIDER_NAME=local\nPROVIDER_URL=http://127.0.0.1:8080\nMODEL=mini\nAPI_KEY=old\n",
+        )
+        .unwrap();
+        fs::write(paths.agent_env(), "LOCAL_API_KEY=old\n").unwrap();
+        env::set_var("NCZ_TEST_ROTATED_API_SECRET", "new");
+        let runner = FakeRunner::new();
+
+        let report = run_with_paths(
+            &ctx(&runner),
+            &paths,
+            ApiAction::Set {
+                key: "LOCAL_API_KEY".to_string(),
+                value: None,
+                value_env: Some("NCZ_TEST_ROTATED_API_SECRET".to_string()),
+                value_stdin: false,
+                agents: Vec::new(),
+                providers: vec!["local".to_string()],
+            },
+        )
+        .unwrap();
+
+        let ApiReport::Mutate(report) = report else {
+            panic!("expected mutation report");
+        };
+        assert!(report.changed);
+        assert_eq!(report.provider_bindings, vec!["local"]);
+        assert!(!paths.providers_dir().join("local.env").exists());
+        assert!(paths.providers_dir().join("local.json").exists());
+        assert_eq!(
+            fs::read_to_string(paths.agent_env()).unwrap(),
+            "LOCAL_API_KEY=new\nNCZ_PROVIDER_BINDING_6C6F63616C=\"LOCAL_API_KEY http://127.0.0.1:8080\"\n"
+        );
+    }
+
+    #[test]
+    fn api_set_provider_rejects_mismatched_legacy_inline_secret_before_writing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        fs::create_dir_all(paths.providers_dir()).unwrap();
+        fs::create_dir_all(&paths.etc_dir).unwrap();
+        let legacy_file = paths.providers_dir().join("local.env");
+        let legacy =
+            "PROVIDER_NAME=local\nPROVIDER_URL=http://127.0.0.1:8080\nMODEL=mini\nAPI_KEY=old\n";
+        fs::write(&legacy_file, legacy).unwrap();
+        fs::write(paths.agent_env(), "LOCAL_API_KEY=other\n").unwrap();
+        env::set_var("NCZ_TEST_REJECTED_ROTATION_SECRET", "new");
+        let runner = FakeRunner::new();
+
+        let err = run_with_paths(
+            &ctx(&runner),
+            &paths,
+            ApiAction::Set {
+                key: "LOCAL_API_KEY".to_string(),
+                value: None,
+                value_env: Some("NCZ_TEST_REJECTED_ROTATION_SECRET".to_string()),
+                value_stdin: false,
+                agents: Vec::new(),
+                providers: vec!["local".to_string()],
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, NczError::Precondition(_)));
+        assert_eq!(
+            fs::read_to_string(paths.agent_env()).unwrap(),
+            "LOCAL_API_KEY=other\n"
+        );
+        assert_eq!(fs::read_to_string(legacy_file).unwrap(), legacy);
+        assert!(!paths.providers_dir().join("local.json").exists());
     }
 
     #[test]
