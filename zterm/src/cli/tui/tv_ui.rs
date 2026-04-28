@@ -79,6 +79,13 @@ enum WorkerRequest {
     Command(String),
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum SubmissionStatus {
+    Started,
+    Busy,
+    DispatchFailed,
+}
+
 // Custom commands. Menu and slash-popup entries route through the
 // shared `CommandHandler` where a backend action exists; purely
 // visual TUI concerns (theme presets/editing) stay local.
@@ -130,6 +137,7 @@ const INPUT_UNDO_DEPTH: usize = 64;
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const SPINNER_INTERVAL: Duration = Duration::from_millis(80);
 const TURN_FORWARD_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
+const RESPONSE_BUSY_TOAST: &str = "Busy: response in progress";
 
 /// How long a status-line toast (e.g. palette confirmation after
 /// Ctrl-P) remains visible. ~1s is long enough to read but short
@@ -538,10 +546,8 @@ pub async fn run(
                                     observed_finished.load(Ordering::Acquire)
                                 }
                             };
-                            if let Some(finished) =
-                                submit_turn_fallback_finished(&submit_result, saw_finished)
-                            {
-                                let _ = worker_sink.send(finished);
+                            for chunk in submit_turn_fallback_chunks(&submit_result, saw_finished) {
+                                let _ = worker_sink.send(chunk);
                             }
                         }
                         None => {
@@ -778,14 +784,24 @@ async fn forward_turn_chunks(
     saw_finished
 }
 
-fn submit_turn_fallback_finished(
+fn submit_turn_fallback_chunks(
     submit_result: &Result<String>,
     saw_finished: bool,
-) -> Option<TurnChunk> {
+) -> Vec<TurnChunk> {
+    if saw_finished {
+        return Vec::new();
+    }
+
     match submit_result {
-        Ok(text) if !saw_finished => Some(TurnChunk::Finished(Ok(text.clone()))),
-        Err(e) if !saw_finished => Some(TurnChunk::Finished(Err(e.to_string()))),
-        _ => None,
+        Ok(text) => {
+            let mut chunks = Vec::new();
+            if !text.is_empty() {
+                chunks.push(TurnChunk::Token(text.clone()));
+            }
+            chunks.push(TurnChunk::Finished(Ok(String::new())));
+            chunks
+        }
+        Err(e) => vec![TurnChunk::Finished(Err(e.to_string()))],
     }
 }
 
@@ -1427,6 +1443,7 @@ fn run_event_loop(
 ) -> Result<()> {
     app.running = true;
     let mut last_size = app.terminal.size();
+    let mut response_in_flight = false;
     while app.running {
         // Poll terminal size once per tick. On change, print a
         // user-facing notice and exit so the caller can relaunch
@@ -1449,8 +1466,13 @@ fn run_event_loop(
         // *before* redrawing, so new tokens are visible this frame.
         // Also lets the status-state timer observe `Finished` frames
         // inline with the rest of the UI update.
-        let error_frame =
-            drain_stream_events(event_rx, &chat_lines, status_state, typewriter_state);
+        let error_frame = drain_stream_events(
+            event_rx,
+            &chat_lines,
+            status_state,
+            typewriter_state,
+            &mut response_in_flight,
+        );
         if error_frame && status_state.beep_on_error {
             let _ = app.terminal.beep();
         }
@@ -1592,22 +1614,22 @@ fn run_event_loop(
         if event.what == EventType::Keyboard && event.key_code == KB_ENTER {
             let submitted = input_data.borrow().clone();
             if !submitted.is_empty() {
-                {
-                    let mut lines = chat_lines.borrow_mut();
-                    lines.push(format!("> {submitted}"));
-                    lines.push(String::new());
+                if response_in_flight {
+                    note_response_busy(status_state);
+                    continue;
                 }
-                // `set_text("")` resets `cursor_pos`, selection, and
-                // `first_pos` — safe to use mid-session unlike raw
-                // `data.clear()` which would leave `cursor_pos`
-                // pointing past the end of an empty string and panic
-                // in `String::insert` on the next keystroke.
-                input_line.borrow_mut().set_text(String::new());
                 // `/theme …` is a TUI-only concern — it toggles the
                 // live `TPalette` and has no meaning on the
                 // rustyline path. Intercept before routing to the
                 // CommandHandler so the worker never sees it.
                 if let Some(rest) = submitted.strip_prefix("/theme") {
+                    append_prompt_placeholder(&submitted, &chat_lines);
+                    // `set_text("")` resets `cursor_pos`, selection, and
+                    // `first_pos` — safe to use mid-session unlike raw
+                    // `data.clear()` which would leave `cursor_pos`
+                    // pointing past the end of an empty string and panic
+                    // in `String::insert` on the next keystroke.
+                    input_line.borrow_mut().set_text(String::new());
                     handle_theme_command(
                         rest.trim(),
                         &chat_lines,
@@ -1625,27 +1647,27 @@ fn run_event_loop(
                 // everything else submits as an agent turn.
                 let is_turn = !submitted.starts_with('/');
                 let request = if is_turn {
-                    WorkerRequest::Turn(submitted)
+                    WorkerRequest::Turn(submitted.clone())
                 } else {
-                    status_state.set_toast(format!("Command: {submitted}"));
-                    WorkerRequest::Command(submitted)
+                    WorkerRequest::Command(submitted.clone())
                 };
-                // Only agent turns drive the elapsed counter —
-                // slash commands are nearly instantaneous and
-                // jittering the timer on each /help would look
-                // wrong.
-                if is_turn {
-                    status_state.begin_turn();
-                }
-                if let Err(e) = req_tx.blocking_send(request) {
-                    chat_lines
-                        .borrow_mut()
-                        .push(format!("[error] could not dispatch: {e}"));
-                    if is_turn {
-                        // Undo the timer start; the turn never
-                        // made it to the worker.
-                        status_state.turn_start = None;
-                    }
+                let toast = (!is_turn).then(|| format!("Command: {submitted}"));
+                let status = dispatch_worker_backed_submission(
+                    &submitted,
+                    request,
+                    &chat_lines,
+                    &req_tx,
+                    status_state,
+                    &mut response_in_flight,
+                    is_turn,
+                    toast,
+                    "dispatch",
+                );
+                if status != SubmissionStatus::Busy {
+                    // Clear after a non-busy submit attempt. Busy
+                    // submissions keep the typed input intact so the
+                    // user can send it once the active response finishes.
+                    input_line.borrow_mut().set_text(String::new());
                 }
                 // Consume the Enter so the input line itself (which
                 // would otherwise ignore it anyway, but be explicit)
@@ -1696,6 +1718,7 @@ fn run_event_loop(
                 &req_tx,
                 shared_app,
                 status_state,
+                &mut response_in_flight,
             );
         }
     }
@@ -1795,6 +1818,7 @@ fn drain_stream_events(
     chat_lines: &Rc<RefCell<Vec<String>>>,
     status_state: &mut StatusState,
     typewriter_state: &mut Option<TypewriterState>,
+    response_in_flight: &mut bool,
 ) -> bool {
     let mut saw_error = false;
     loop {
@@ -1812,6 +1836,7 @@ fn drain_stream_events(
                             saw_error = true;
                         }
                         status_state.end_turn();
+                        *response_in_flight = false;
                     }
                     TurnChunk::Typewriter(text) => {
                         start_typewriter(typewriter_state, chat_lines, text.clone(), Vec::new());
@@ -1828,6 +1853,55 @@ fn drain_stream_events(
         }
     }
     saw_error
+}
+
+fn note_response_busy(status_state: &mut StatusState) {
+    status_state.set_toast(RESPONSE_BUSY_TOAST);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_worker_backed_submission(
+    label: &str,
+    request: WorkerRequest,
+    chat_lines: &Rc<RefCell<Vec<String>>>,
+    req_tx: &mpsc::Sender<WorkerRequest>,
+    status_state: &mut StatusState,
+    response_in_flight: &mut bool,
+    starts_turn_timer: bool,
+    toast: Option<String>,
+    error_context: &str,
+) -> SubmissionStatus {
+    if *response_in_flight {
+        note_response_busy(status_state);
+        return SubmissionStatus::Busy;
+    }
+
+    if let Some(toast) = toast {
+        status_state.set_toast(toast);
+    }
+    append_prompt_placeholder(label, chat_lines);
+
+    // Only agent turns drive the elapsed counter — slash commands are
+    // nearly instantaneous and jittering the timer on each /help would
+    // look wrong.
+    if starts_turn_timer {
+        status_state.begin_turn();
+    }
+    *response_in_flight = true;
+
+    if let Err(e) = req_tx.blocking_send(request) {
+        *response_in_flight = false;
+        if starts_turn_timer {
+            // Undo the timer start; the turn never made it to the worker.
+            status_state.turn_start = None;
+        }
+        chat_lines
+            .borrow_mut()
+            .push(format!("[error] could not {error_context}: {e}"));
+        return SubmissionStatus::DispatchFailed;
+    }
+
+    SubmissionStatus::Started
 }
 
 /// Apply a single streamed chunk to the chat buffer.
@@ -1887,6 +1961,7 @@ fn handle_command(
     req_tx: &mpsc::Sender<WorkerRequest>,
     shared_app: &Arc<Mutex<App>>,
     status_state: &mut StatusState,
+    response_in_flight: &mut bool,
 ) {
     match command {
         CM_QUIT => {
@@ -1946,7 +2021,13 @@ fn handle_command(
                 CMD_SESSION_LIST => "/session list",
                 _ => return,
             };
-            dispatch_command(cmdline, chat_lines, req_tx, status_state);
+            dispatch_command(
+                cmdline,
+                chat_lines,
+                req_tx,
+                status_state,
+                response_in_flight,
+            );
         }
         // E-5: Workspace switch opens a modal picker populated from
         // the current App state. On selection, dispatch
@@ -1966,7 +2047,13 @@ fn handle_command(
             }
             if let Some(selected_name) = run_workspace_picker(app, &workspaces) {
                 let cmdline = format!("/workspace switch {selected_name}");
-                dispatch_command(&cmdline, chat_lines, req_tx, status_state);
+                dispatch_command(
+                    &cmdline,
+                    chat_lines,
+                    req_tx,
+                    status_state,
+                    response_in_flight,
+                );
             }
         }
         // Theme preset slots from the slash popup. Map the id back
@@ -1974,6 +2061,10 @@ fn handle_command(
         // `handle_theme_command` so the rendering path stays in
         // one place.
         cmd if (CMD_THEME_BASE..CMD_THEME_BASE + themes::PRESETS.len() as u16).contains(&cmd) => {
+            if *response_in_flight {
+                note_response_busy(status_state);
+                return;
+            }
             let idx = (cmd - CMD_THEME_BASE) as usize;
             if let Some(theme) = themes::PRESETS.get(idx) {
                 handle_theme_command(
@@ -1989,17 +2080,35 @@ fn handle_command(
         CMD_SESSION_NEW => {
             let name = format!("session-{}", Utc::now().format("%Y%m%d-%H%M%S"));
             let cmdline = format!("/session {name}");
-            dispatch_command(&cmdline, chat_lines, req_tx, status_state);
+            dispatch_command(
+                &cmdline,
+                chat_lines,
+                req_tx,
+                status_state,
+                response_in_flight,
+            );
         }
         CMD_SESSION_OPEN => {
             let sessions = snapshot_sessions();
             if sessions.is_empty() {
-                dispatch_command("/session list", chat_lines, req_tx, status_state);
+                dispatch_command(
+                    "/session list",
+                    chat_lines,
+                    req_tx,
+                    status_state,
+                    response_in_flight,
+                );
                 return;
             }
             if let Some(selected_name) = run_session_picker(app, &sessions) {
                 let cmdline = format!("/session {selected_name}");
-                dispatch_command(&cmdline, chat_lines, req_tx, status_state);
+                dispatch_command(
+                    &cmdline,
+                    chat_lines,
+                    req_tx,
+                    status_state,
+                    response_in_flight,
+                );
             }
         }
         _ => {}
@@ -2190,18 +2299,25 @@ fn dispatch_command(
     chat_lines: &Rc<RefCell<Vec<String>>>,
     req_tx: &mpsc::Sender<WorkerRequest>,
     status_state: &mut StatusState,
+    response_in_flight: &mut bool,
 ) {
-    status_state.set_toast(format!("Command: {cmdline}"));
-    {
-        let mut lines = chat_lines.borrow_mut();
-        lines.push(format!("> {cmdline}"));
-        lines.push(String::new());
-    }
-    if let Err(e) = req_tx.blocking_send(WorkerRequest::Command(cmdline.to_string())) {
-        chat_lines
-            .borrow_mut()
-            .push(format!("[error] could not dispatch command: {e}"));
-    }
+    let _ = dispatch_worker_backed_submission(
+        cmdline,
+        WorkerRequest::Command(cmdline.to_string()),
+        chat_lines,
+        req_tx,
+        status_state,
+        response_in_flight,
+        false,
+        Some(format!("Command: {cmdline}")),
+        "dispatch command",
+    );
+}
+
+fn append_prompt_placeholder(label: &str, chat_lines: &Rc<RefCell<Vec<String>>>) {
+    let mut lines = chat_lines.borrow_mut();
+    lines.push(format!("> {label}"));
+    lines.push(String::new());
 }
 
 /// Read a snapshot of configured workspaces from the shared App.
@@ -2632,6 +2748,7 @@ mod tests {
         });
         let lines = Rc::new(RefCell::new(Vec::new()));
         let mut typewriter_state = None;
+        let mut response_in_flight = true;
         let (tx, mut rx) = mpsc::unbounded_channel();
         tx.send(TurnChunk::ClearUsage).unwrap();
 
@@ -2639,32 +2756,160 @@ mod tests {
             &mut rx,
             &lines,
             &mut state,
-            &mut typewriter_state
+            &mut typewriter_state,
+            &mut response_in_flight
         ));
 
         assert!(state.usage.is_none());
         assert!(lines.borrow().is_empty());
+        assert!(response_in_flight);
     }
 
     #[test]
-    fn submit_turn_result_gets_worker_fallback_only_without_finished() {
+    fn submit_turn_result_gets_worker_fallback_chunks_only_without_finished() {
         let err: Result<String> = Err(anyhow::anyhow!("backend unavailable"));
-        match submit_turn_fallback_finished(&err, false) {
-            Some(TurnChunk::Finished(Err(message))) => {
-                assert_eq!(message, "backend unavailable");
-            }
+        let err_chunks = submit_turn_fallback_chunks(&err, false);
+        match err_chunks.as_slice() {
+            [TurnChunk::Finished(Err(message))] => assert_eq!(message, "backend unavailable"),
             other => panic!("expected synthetic error Finished, got {other:?}"),
         }
-        assert!(submit_turn_fallback_finished(&err, true).is_none());
+        assert!(submit_turn_fallback_chunks(&err, true).is_empty());
 
         let ok: Result<String> = Ok("done".to_string());
-        match submit_turn_fallback_finished(&ok, false) {
-            Some(TurnChunk::Finished(Ok(text))) => {
+        let ok_chunks = submit_turn_fallback_chunks(&ok, false);
+        match ok_chunks.as_slice() {
+            [TurnChunk::Token(text), TurnChunk::Finished(Ok(done))] => {
                 assert_eq!(text, "done");
+                assert!(done.is_empty());
             }
-            other => panic!("expected synthetic success Finished, got {other:?}"),
+            other => panic!("expected synthetic success Token + Finished, got {other:?}"),
         }
-        assert!(submit_turn_fallback_finished(&ok, true).is_none());
+        assert!(submit_turn_fallback_chunks(&ok, true).is_empty());
+
+        let empty_ok: Result<String> = Ok(String::new());
+        match submit_turn_fallback_chunks(&empty_ok, false).as_slice() {
+            [TurnChunk::Finished(Ok(done))] => assert!(done.is_empty()),
+            other => panic!("expected synthetic empty success Finished, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ok_submit_turn_fallback_renders_returned_text_before_finished() {
+        let lines = Rc::new(RefCell::new(vec!["> hello".to_string(), String::new()]));
+        let ok: Result<String> = Ok("complete response".to_string());
+
+        for chunk in submit_turn_fallback_chunks(&ok, false) {
+            apply_chunk(chunk, &lines);
+        }
+
+        assert_eq!(
+            lines.borrow().as_slice(),
+            ["> hello", "complete response", ""]
+        );
+    }
+
+    #[test]
+    fn worker_submission_gate_blocks_second_command_placeholder() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let lines = Rc::new(RefCell::new(vec![
+            "> first".to_string(),
+            "partial".to_string(),
+        ]));
+        let mut state = StatusState::new(
+            "default".to_string(),
+            "gpt-test".to_string(),
+            "borland".to_string(),
+            false,
+        );
+        let mut response_in_flight = true;
+
+        dispatch_command("/help", &lines, &tx, &mut state, &mut response_in_flight);
+
+        assert!(response_in_flight);
+        assert!(rx.try_recv().is_err());
+        assert_eq!(
+            lines.borrow().as_slice(),
+            ["> first".to_string(), "partial".to_string()]
+        );
+        assert_eq!(
+            state.toast.as_ref().map(|(msg, _)| msg.as_str()),
+            Some(RESPONSE_BUSY_TOAST)
+        );
+    }
+
+    #[test]
+    fn worker_submission_gate_blocks_second_turn_placeholder() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let lines = Rc::new(RefCell::new(vec![
+            "> first".to_string(),
+            "partial".to_string(),
+        ]));
+        let mut state = StatusState::new(
+            "default".to_string(),
+            "gpt-test".to_string(),
+            "borland".to_string(),
+            false,
+        );
+        let mut response_in_flight = true;
+
+        let status = dispatch_worker_backed_submission(
+            "second",
+            WorkerRequest::Turn("second".to_string()),
+            &lines,
+            &tx,
+            &mut state,
+            &mut response_in_flight,
+            true,
+            None,
+            "dispatch",
+        );
+
+        assert_eq!(status, SubmissionStatus::Busy);
+        assert!(response_in_flight);
+        assert!(rx.try_recv().is_err());
+        assert_eq!(
+            lines.borrow().as_slice(),
+            ["> first".to_string(), "partial".to_string()]
+        );
+        assert!(state.turn_start.is_none());
+        assert_eq!(
+            state.toast.as_ref().map(|(msg, _)| msg.as_str()),
+            Some(RESPONSE_BUSY_TOAST)
+        );
+    }
+
+    #[test]
+    fn finished_chunk_clears_response_in_flight() {
+        let mut state = StatusState::new(
+            "default".to_string(),
+            "gpt-test".to_string(),
+            "borland".to_string(),
+            false,
+        );
+        state.begin_turn();
+        let lines = Rc::new(RefCell::new(vec![
+            "> first".to_string(),
+            "done".to_string(),
+        ]));
+        let mut typewriter_state = None;
+        let mut response_in_flight = true;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tx.send(TurnChunk::Finished(Ok(String::new()))).unwrap();
+
+        assert!(!drain_stream_events(
+            &mut rx,
+            &lines,
+            &mut state,
+            &mut typewriter_state,
+            &mut response_in_flight
+        ));
+
+        assert!(!response_in_flight);
+        assert!(state.turn_start.is_none());
+        assert_eq!(
+            lines.borrow().as_slice(),
+            ["> first".to_string(), "done".to_string(), String::new()]
+        );
     }
 
     #[tokio::test]
