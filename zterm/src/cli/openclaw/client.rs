@@ -1140,6 +1140,16 @@ impl AgentClient for OpenClawClient {
             }
             Err(err) => return Err(err),
         };
+        let created_label = created.label.as_deref().unwrap_or(name);
+        if created.key != key
+            && !self.session_key_belongs_to_session_namespace(&created.key, created_label)
+        {
+            anyhow::bail!(
+                "openclaw: sessions.create returned mismatched session key '{}' for requested key '{}'; refusing to bind",
+                created.key,
+                key
+            );
+        }
         Ok(Session {
             id: created.key.clone(),
             name: created.label.unwrap_or_else(|| created.key.clone()),
@@ -1245,9 +1255,13 @@ impl OpenClawClient {
         let Some(label) = row.label.as_deref() else {
             return false;
         };
+        self.session_key_belongs_to_session_namespace(&row.key, label)
+    }
+
+    fn session_key_belongs_to_session_namespace(&self, key: &str, label: &str) -> bool {
         self.session_namespaces()
             .into_iter()
-            .any(|namespace| row.key == stable_session_key(namespace, label))
+            .any(|namespace| key == stable_session_key(namespace, label))
     }
 
     fn session_namespaces(&self) -> Vec<&str> {
@@ -1436,6 +1450,41 @@ mod tests {
             .expect("create should succeed");
         assert_eq!(session.id, expected_key);
         assert_eq!(session.name, "Research");
+    }
+
+    #[tokio::test]
+    async fn create_session_rejects_mismatched_created_key() {
+        let pending = PendingRequests::new();
+        let (outbound_tx, mut outbound_rx) = mpsc::channel::<RequestFrame>(OUTBOUND_CAPACITY);
+        let client = tests_support_new_fake(pending.clone(), Some(outbound_tx), true);
+        let expected_key = stable_session_key(DEFAULT_SESSION_NAMESPACE, "Research");
+
+        let create_task = tokio::spawn(async move { client.create_session("Research").await });
+        let req = outbound_rx
+            .recv()
+            .await
+            .expect("create request should be sent");
+
+        pending
+            .resolve(ResponseFrame {
+                id: req.id,
+                ok: true,
+                payload: Some(serde_json::json!({
+                    "key": "foreign-session-key",
+                    "label": "Research",
+                    "entry": {}
+                })),
+                error: None,
+            })
+            .await;
+
+        let err = create_task
+            .await
+            .expect("create task should join")
+            .expect_err("mismatched create key must fail closed");
+        assert!(err.to_string().contains("mismatched session key"));
+        assert!(err.to_string().contains(&expected_key));
+        assert!(err.to_string().contains("foreign-session-key"));
     }
 
     #[tokio::test]

@@ -541,12 +541,9 @@ fn apply_openclaw_workspace_state(config_path: &Path, cfg: &mut AppConfig) -> Re
             continue;
         }
 
-        if let Some(entry_idx) = find_openclaw_workspace_state_entry(
-            &state,
-            workspace,
-            workspace_index,
-            &claimed_state_entries,
-        )? {
+        if let Some(entry_idx) =
+            find_openclaw_workspace_state_entry(&state, workspace, &claimed_state_entries)?
+        {
             if !claimed_state_entries.insert(entry_idx) {
                 return Err(anyhow!(
                     "openclaw workspace state entry {} matched more than one workspace",
@@ -610,7 +607,6 @@ fn normalize_workspace_url(url: &str) -> String {
 fn find_openclaw_workspace_state_entry(
     state: &WorkspaceState,
     workspace: &WorkspaceConfig,
-    workspace_index: usize,
     claimed_state_entries: &std::collections::HashSet<usize>,
 ) -> Result<Option<usize>> {
     let identity_matches: Vec<usize> = state
@@ -633,14 +629,7 @@ fn find_openclaw_workspace_state_entry(
         return Ok(Some(idx));
     }
 
-    Ok(state
-        .openclaw_workspaces
-        .iter()
-        .enumerate()
-        .find(|(idx, entry)| {
-            !claimed_state_entries.contains(idx) && entry.index == Some(workspace_index)
-        })
-        .map(|(idx, _)| idx))
+    Ok(None)
 }
 
 fn openclaw_workspace_state_identity_matches(
@@ -1003,7 +992,7 @@ url = "ws://old.example"
     }
 
     #[test]
-    fn state_backed_openclaw_id_survives_rename_and_url_edit_without_new_legacy_alias() {
+    fn state_backed_openclaw_id_does_not_survive_rename_without_config_id() {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("config.toml");
         let original = r#"
@@ -1032,23 +1021,138 @@ url = "ws://new.example"
 
         let reloaded = AppConfig::load(&path).unwrap();
         let workspace = &reloaded.workspaces[0];
-        assert_eq!(workspace.id.as_deref(), Some(id.as_str()));
+        let new_id = workspace
+            .id
+            .as_deref()
+            .expect("renamed workspace gets fresh id");
+        assert_ne!(new_id, id);
         assert!(workspace
             .namespace_aliases
             .iter()
-            .any(|alias| alias == old_namespace));
+            .any(|alias| alias == "backend=openclaw;workspace=renamed;url=ws://new.example"));
         assert!(!workspace
             .namespace_aliases
             .iter()
-            .any(|alias| alias == "backend=openclaw;workspace=renamed;url=ws://new.example"));
+            .any(|alias| alias == old_namespace));
 
         let state = load_workspace_state(&workspace_state_path_for_config(&path)).unwrap();
-        let entry = state
+        let old_entry = state
             .openclaw_workspaces
             .iter()
             .find(|entry| entry.id == id)
-            .expect("state entry for generated id");
-        assert_eq!(entry.namespace_aliases, vec![old_namespace.to_string()]);
+            .expect("old state entry remains unclaimed");
+        assert_eq!(old_entry.namespace_aliases, vec![old_namespace.to_string()]);
+        assert!(
+            state
+                .openclaw_workspaces
+                .iter()
+                .any(|entry| entry.id == new_id
+                    && entry.namespace_aliases
+                        == vec![
+                            "backend=openclaw;workspace=renamed;url=ws://new.example".to_string()
+                        ])
+        );
+    }
+
+    #[test]
+    fn openclaw_remove_then_add_at_same_index_gets_fresh_state_id() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        let original = r#"
+[[workspaces]]
+name = "alpha"
+backend = "openclaw"
+url = "ws://old.example"
+"#;
+        std::fs::write(&path, original).unwrap();
+
+        let cfg = AppConfig::load(&path).unwrap();
+        let old_id = cfg.workspaces[0].id.clone().unwrap();
+
+        let replacement = r#"
+[[workspaces]]
+name = "beta"
+backend = "openclaw"
+url = "ws://new.example"
+"#;
+        std::fs::write(&path, replacement).unwrap();
+
+        let reloaded = AppConfig::load(&path).unwrap();
+        let replacement_id = reloaded.workspaces[0].id.as_deref().unwrap();
+        assert_ne!(replacement_id, old_id);
+        assert!(reloaded.workspaces[0]
+            .namespace_aliases
+            .iter()
+            .any(|alias| alias == "backend=openclaw;workspace=beta;url=ws://new.example"));
+        assert!(!reloaded.workspaces[0]
+            .namespace_aliases
+            .iter()
+            .any(|alias| alias == "backend=openclaw;workspace=alpha;url=ws://old.example"));
+
+        let state = load_workspace_state(&workspace_state_path_for_config(&path)).unwrap();
+        assert!(state
+            .openclaw_workspaces
+            .iter()
+            .any(|entry| entry.id == old_id));
+        assert!(state
+            .openclaw_workspaces
+            .iter()
+            .any(|entry| entry.id == replacement_id));
+    }
+
+    #[test]
+    fn openclaw_reorder_and_rename_does_not_inherit_index_state_id() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        let original = r#"
+[[workspaces]]
+name = "alpha"
+backend = "openclaw"
+url = "ws://a.example"
+
+[[workspaces]]
+name = "beta"
+backend = "openclaw"
+url = "ws://b.example"
+"#;
+        std::fs::write(&path, original).unwrap();
+
+        let cfg = AppConfig::load(&path).unwrap();
+        let alpha_id = cfg.workspaces[0].id.clone().unwrap();
+        let beta_id = cfg.workspaces[1].id.clone().unwrap();
+
+        let reordered_and_renamed = r#"
+[[workspaces]]
+name = "gamma"
+backend = "openclaw"
+url = "ws://b.example"
+
+[[workspaces]]
+name = "alpha"
+backend = "openclaw"
+url = "ws://a.example"
+"#;
+        std::fs::write(&path, reordered_and_renamed).unwrap();
+
+        let reloaded = AppConfig::load(&path).unwrap();
+        let gamma = &reloaded.workspaces[0];
+        let alpha = &reloaded.workspaces[1];
+        let gamma_id = gamma.id.as_deref().unwrap();
+        assert_ne!(gamma_id, alpha_id);
+        assert_ne!(gamma_id, beta_id);
+        assert_eq!(alpha.id.as_deref(), Some(alpha_id.as_str()));
+        assert!(gamma
+            .namespace_aliases
+            .iter()
+            .any(|alias| alias == "backend=openclaw;workspace=gamma;url=ws://b.example"));
+        assert!(!gamma
+            .namespace_aliases
+            .iter()
+            .any(|alias| alias == "backend=openclaw;workspace=alpha;url=ws://a.example"));
+        assert!(!gamma
+            .namespace_aliases
+            .iter()
+            .any(|alias| alias == "backend=openclaw;workspace=beta;url=ws://b.example"));
     }
 
     #[test]
