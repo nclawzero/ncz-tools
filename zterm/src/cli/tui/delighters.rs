@@ -145,7 +145,7 @@ pub fn set_beep_on_error_at(path: &Path, enabled: bool) -> std::io::Result<Zterm
 }
 
 pub fn is_welcome_milestone(launches: u64) -> bool {
-    launches == 5 || launches == 10 || (launches >= 25 && launches % 25 == 0)
+    launches == 5 || launches == 10 || (launches >= 25 && launches.is_multiple_of(25))
 }
 
 pub fn welcome_quote_for_launch(launches: u64) -> Option<String> {

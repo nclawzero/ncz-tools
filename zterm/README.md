@@ -17,9 +17,11 @@ unsafe code:    zero in zterm
 
 ## Status
 
-**v0.2.0 — multi-backend, public release.** Ships zeroclaw and openclaw backends behind a shared `trait AgentClient`, runtime multi-workspace switching, and a `--workspace` CLI override. v0.1 users see zero behavior change — a single-workspace synthesized bootstrap keeps the old `--remote` + `--token` flow working with no config file.
+**v0.3.1 — Turbo Vision UX release.** Ships the Paradox 4.5/dBASE V-inspired `turbo-vision-4-rust` TUI, real slash-command routing through `CommandHandler`, live workspace/model/context-token status, spinner/menu feedback, cached connect splash, milestone welcome-back lines, and opt-in beep-on-error.
 
-Previous: v0.1.x — zeroclaw-only, private builds on ARGONAS.
+Previous: v0.2.0 — multi-backend public release with zeroclaw and openclaw behind a shared `trait AgentClient`, runtime multi-workspace switching, and a `--workspace` CLI override.
+
+Earlier: v0.1.x — zeroclaw-only, private builds on ARGONAS.
 
 ---
 
@@ -29,7 +31,7 @@ A pure API client. zterm talks to an agent daemon over HTTP + WebSocket streamin
 
 - **The daemon is authoritative.** zterm does not cache server-side state, shadow sessions locally, or reimplement daemon logic. What the API says is what you see.
 - **Local or remote, same surface.** Point zterm at `http://localhost:42617` or at a Pi on your LAN or at a remote host — same code path. Transport is not a special case.
-- **No embedded web UI.** No browser, no webview, no HTML rendering. Terminal only, `ratatui` + `crossterm` + `rustyline`.
+- **No embedded web UI.** No browser, no webview, no HTML rendering. Terminal only, `turbo-vision-4-rust` + `crossterm`, with `rustyline` kept as a legacy fallback.
 - **No per-project web junk.** Features exposed only via the daemon's API. Agent-specific web widgets are explicitly out of scope — zterm renders what the API returns, in a terminal, respectfully.
 
 ## What zterm is not
@@ -155,9 +157,12 @@ src/
     ├── pairing.rs           first-run daemon pairing
     ├── storage.rs           zterm-local state: input history, config
     ├── commands.rs          command palette (/model, /session, /memory, ...)
-    ├── tui/                 ratatui + crossterm UI
+    ├── tui/                 Turbo Vision TUI + legacy rustyline fallback
     │   ├── mod.rs
+    │   ├── delighters.rs
     │   ├── repl.rs
+    │   ├── tv_ui.rs
+    │   ├── themes.rs
     │   ├── splash.rs
     │   └── onboarding.rs
     ├── theme.rs             color theme
@@ -173,7 +178,7 @@ src/
 
 **Opinionated boundaries:**
 
-- `storage.rs` stores **only zterm-local state** — input history, aliases, theme, daemon URL config. It must not shadow server-side state (sessions, messages, models). The daemon is authoritative.
+- `storage.rs` and the `~/.zterm/*.toml` files store **only zterm-local state** — input history, aliases, theme, daemon URL config, launch counter, and UI preferences. They must not shadow server-side state (sessions, messages, models). The daemon is authoritative.
 - `client.rs` will become `trait AgentClient` + concrete impl(s) in v0.2.
 - MNEMOS support is config-driven — not a runtime dependency. URL and token come from env; no hardcoded endpoints or credentials anywhere in source.
 

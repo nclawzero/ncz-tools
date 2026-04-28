@@ -381,7 +381,7 @@ fn token_budget_bar(pct: u8, width: usize) -> String {
     if width == 0 {
         return String::new();
     }
-    let filled = ((pct.min(100) as usize * width) + 99) / 100;
+    let filled = (pct.min(100) as usize * width).div_ceil(100);
     format!(
         "[{}{}]",
         "#".repeat(filled),
@@ -624,6 +624,7 @@ async fn connect_splash_for_active_workspace(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_blocking(
     app: Arc<Mutex<App>>,
     session: Session,
@@ -1104,13 +1105,11 @@ fn run_event_loop(
             status_line.handle_event(&mut event);
         }
 
-        // Slash typing is plain — `/` inserts a literal slash so
-        // multi-word commands like "/models set together" can be
-        // typed without the popup hijacking keyboard focus. The
-        // popup is still available via Ctrl-K (palette convention)
-        // or F10 → top menu bar for discoverability.
+        // Slash-command popup: `/` on an empty input line matches
+        // the v0.3 spec; Ctrl-K remains as a command-palette
+        // fallback for users who want to type a literal slash command.
         if event.what == EventType::Keyboard
-            && event.key_code == KB_CTRL_K
+            && (event.key_code == KB_CTRL_K || event.key_code == KB_SLASH)
             && input_data.borrow().is_empty()
         {
             let selected = run_slash_popup(app);
@@ -1312,12 +1311,11 @@ fn run_slash_popup(app: &mut Application) -> u16 {
 
     let menu = turbo_vision::core::menu_data::Menu::from_items(items);
     let mut menu_box = MenuBox::new(position, menu);
-    let result = menu_box.execute(&mut app.terminal);
     // The MenuBox leaves the terminal dirty under its footprint;
     // the outer event loop's next `redraw()` tick will repaint the
     // desktop, chat, input line, menu bar, and status line in the
     // right order, so there's nothing to clean up here.
-    result
+    menu_box.execute(&mut app.terminal)
 }
 
 /// Non-blocking drain of the worker → TUI event channel. Called at

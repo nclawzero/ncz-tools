@@ -4,6 +4,13 @@
 **Date**: April 20, 2026  
 **Commits**: be2d6fa, a2fa042, 9dddeb5
 
+> v0.3.1 note: the default interactive UI is now the Turbo
+> Vision TUI in `src/cli/tui/tv_ui.rs`. The ANSI splash documented
+> here remains relevant to the legacy/stdout path; the TV path adds
+> runtime palette presets, `~/.zterm/theme.toml`, cached
+> connect-splash text at `~/.zterm/cache/connect-splash/`, and
+> `~/.zterm/state.toml` for launch count plus `beep_on_error`.
+
 ---
 
 ## Overview
