@@ -18,7 +18,10 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -503,8 +506,12 @@ pub async fn run(
                         Some(client_arc) => {
                             let mut client = client_arc.lock().await;
                             let (turn_sink, turn_rx) = mpsc::unbounded_channel::<TurnChunk>();
-                            let mut forward_task =
-                                tokio::spawn(forward_turn_chunks(turn_rx, worker_sink.clone()));
+                            let observed_finished = Arc::new(AtomicBool::new(false));
+                            let mut forward_task = tokio::spawn(forward_turn_chunks(
+                                turn_rx,
+                                worker_sink.clone(),
+                                Arc::clone(&observed_finished),
+                            ));
                             client.set_stream_sink(Some(turn_sink));
                             let submit_result = client.submit_turn(&worker_session_id, &text).await;
                             client.set_stream_sink(Some(worker_sink.clone()));
@@ -519,21 +526,22 @@ pub async fn run(
                                 Ok(Ok(saw_finished)) => saw_finished,
                                 Ok(Err(e)) => {
                                     warn!("tv_ui: turn stream forwarder failed: {e}");
-                                    false
+                                    observed_finished.load(Ordering::Acquire)
                                 }
                                 Err(_) => {
                                     forward_task.abort();
+                                    let _ = forward_task.await;
                                     warn!(
                                         "tv_ui: turn stream forwarder did not drain after \
                                          submit_turn returned"
                                     );
-                                    false
+                                    observed_finished.load(Ordering::Acquire)
                                 }
                             };
-                            if let Some(err) =
-                                submit_turn_fallback_error(&submit_result, saw_finished)
+                            if let Some(finished) =
+                                submit_turn_fallback_finished(&submit_result, saw_finished)
                             {
-                                let _ = worker_sink.send(TurnChunk::Finished(Err(err)));
+                                let _ = worker_sink.send(finished);
                             }
                         }
                         None => {
@@ -750,23 +758,33 @@ fn connect_splash_for_workspace(workspace_name: &str) -> String {
 async fn forward_turn_chunks(
     mut turn_rx: mpsc::UnboundedReceiver<TurnChunk>,
     ui_sink: StreamSink,
+    observed_finished: Arc<AtomicBool>,
 ) -> bool {
     let mut saw_finished = false;
     while let Some(chunk) = turn_rx.recv().await {
-        if matches!(&chunk, TurnChunk::Finished(_)) {
-            saw_finished = true;
+        let is_finished = matches!(&chunk, TurnChunk::Finished(_));
+        if is_finished {
+            if saw_finished {
+                continue;
+            }
+            if ui_sink.send(chunk).is_ok() {
+                saw_finished = true;
+                observed_finished.store(true, Ordering::Release);
+            }
+            continue;
         }
         let _ = ui_sink.send(chunk);
     }
     saw_finished
 }
 
-fn submit_turn_fallback_error(
+fn submit_turn_fallback_finished(
     submit_result: &Result<String>,
     saw_finished: bool,
-) -> Option<String> {
+) -> Option<TurnChunk> {
     match submit_result {
-        Err(e) if !saw_finished => Some(e.to_string()),
+        Ok(text) if !saw_finished => Some(TurnChunk::Finished(Ok(text.clone()))),
+        Err(e) if !saw_finished => Some(TurnChunk::Finished(Err(e.to_string()))),
         _ => None,
     }
 }
@@ -2629,16 +2647,48 @@ mod tests {
     }
 
     #[test]
-    fn submit_turn_err_gets_worker_fallback_only_without_finished() {
+    fn submit_turn_result_gets_worker_fallback_only_without_finished() {
         let err: Result<String> = Err(anyhow::anyhow!("backend unavailable"));
-        assert_eq!(
-            submit_turn_fallback_error(&err, false),
-            Some("backend unavailable".to_string())
-        );
-        assert_eq!(submit_turn_fallback_error(&err, true), None);
+        match submit_turn_fallback_finished(&err, false) {
+            Some(TurnChunk::Finished(Err(message))) => {
+                assert_eq!(message, "backend unavailable");
+            }
+            other => panic!("expected synthetic error Finished, got {other:?}"),
+        }
+        assert!(submit_turn_fallback_finished(&err, true).is_none());
 
         let ok: Result<String> = Ok("done".to_string());
-        assert_eq!(submit_turn_fallback_error(&ok, false), None);
+        match submit_turn_fallback_finished(&ok, false) {
+            Some(TurnChunk::Finished(Ok(text))) => {
+                assert_eq!(text, "done");
+            }
+            other => panic!("expected synthetic success Finished, got {other:?}"),
+        }
+        assert!(submit_turn_fallback_finished(&ok, true).is_none());
+    }
+
+    #[tokio::test]
+    async fn forward_turn_chunks_forwards_only_one_finished() {
+        let (turn_tx, turn_rx) = mpsc::unbounded_channel();
+        let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
+        let observed_finished = Arc::new(AtomicBool::new(false));
+
+        turn_tx
+            .send(TurnChunk::Finished(Ok("first".to_string())))
+            .unwrap();
+        turn_tx
+            .send(TurnChunk::Finished(Ok("second".to_string())))
+            .unwrap();
+        drop(turn_tx);
+
+        assert!(forward_turn_chunks(turn_rx, ui_tx, Arc::clone(&observed_finished)).await);
+        assert!(observed_finished.load(Ordering::Acquire));
+
+        match ui_rx.recv().await {
+            Some(TurnChunk::Finished(Ok(text))) => assert_eq!(text, "first"),
+            other => panic!("expected first Finished, got {other:?}"),
+        }
+        assert!(ui_rx.recv().await.is_none());
     }
 
     #[test]
