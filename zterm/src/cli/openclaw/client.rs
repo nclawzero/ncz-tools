@@ -1066,6 +1066,7 @@ async fn collect_turn_result(
 ) -> anyhow::Result<()> {
     let deadline = tokio::time::Instant::now() + timeout;
     let mut saw_terminal_completion = false;
+    let mut saw_uncorrelated_assistant_message = false;
     let mut expected_message_id: Option<String> = expected_ack_message_id.map(str::to_string);
     let mut pending_runless_messages: Vec<BufferedAssistantMessage> = Vec::new();
     let mut pending_runless_bytes = 0usize;
@@ -1073,14 +1074,26 @@ async fn collect_turn_result(
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
-            return finish_completed_or_timeout(timeout, turn, saw_terminal_completion);
+            return finish_completed_or_timeout(
+                timeout,
+                turn,
+                saw_terminal_completion,
+                saw_uncorrelated_assistant_message,
+            );
         }
 
         let rx_res = tokio::time::timeout(remaining, event_rx.recv()).await;
         let event = match rx_res {
             Ok(Some(ev)) => ev,
             Ok(None) => anyhow::bail!("openclaw: event channel closed mid-stream"),
-            Err(_) => return finish_completed_or_timeout(timeout, turn, saw_terminal_completion),
+            Err(_) => {
+                return finish_completed_or_timeout(
+                    timeout,
+                    turn,
+                    saw_terminal_completion,
+                    saw_uncorrelated_assistant_message,
+                );
+            }
         };
 
         if event.event != "session.message" {
@@ -1100,7 +1113,7 @@ async fn collect_turn_result(
                     &mut pending_runless_bytes,
                     expected_message_id.as_deref(),
                 )?;
-                if turn_can_finish(turn) {
+                if turn_completion_can_finish(turn, saw_uncorrelated_assistant_message) {
                     return Ok(());
                 }
             }
@@ -1110,12 +1123,7 @@ async fn collect_turn_result(
             Some(p) => p,
             None => continue,
         };
-        if payload
-            .get("sessionKey")
-            .and_then(|v| v.as_str())
-            .map(|s| s != session_key)
-            .unwrap_or(true)
-        {
+        if !payload_matches_session_key(payload, session_key) {
             continue;
         }
         let message = match payload.get("message") {
@@ -1179,6 +1187,7 @@ async fn collect_turn_result(
                     tracing::debug!(
                         "openclaw: ignoring runId-less assistant message for session {session_key} without explicit run/message correlation"
                     );
+                    saw_uncorrelated_assistant_message = true;
                     continue;
                 }
             }
@@ -1192,7 +1201,8 @@ async fn collect_turn_result(
         // Text-bearing events can be deltas or intermediate snapshots;
         // success still requires the expected run/message completion
         // marker so we do not truncate a streaming reply.
-        if message_completed && turn_can_finish(turn) {
+        if message_completed && turn_completion_can_finish(turn, saw_uncorrelated_assistant_message)
+        {
             return Ok(());
         }
         tracing::debug!(
@@ -1527,12 +1537,22 @@ fn turn_can_finish(turn: &super::handshake::TurnResult) -> bool {
     !turn.text.is_empty() || turn_can_finish_without_text(turn)
 }
 
+fn turn_completion_can_finish(
+    turn: &super::handshake::TurnResult,
+    saw_uncorrelated_assistant_message: bool,
+) -> bool {
+    turn_can_finish(turn) || !saw_uncorrelated_assistant_message
+}
+
 fn finish_completed_or_timeout(
     timeout: std::time::Duration,
     turn: &super::handshake::TurnResult,
     saw_terminal_completion: bool,
+    saw_uncorrelated_assistant_message: bool,
 ) -> anyhow::Result<()> {
-    if saw_terminal_completion && turn_can_finish(turn) {
+    if saw_terminal_completion
+        && turn_completion_can_finish(turn, saw_uncorrelated_assistant_message)
+    {
         return Ok(());
     }
     anyhow::bail!(
@@ -2690,6 +2710,26 @@ mod tests {
         }
     }
 
+    fn assistant_delta_event_with_session_key_alias(
+        alias: &str,
+        session_key: &str,
+        run_id: &str,
+        message_id: &str,
+        text: &str,
+    ) -> super::super::wire::EventFrame {
+        let mut event = assistant_delta_event(session_key, run_id, message_id, text);
+        if let Some(payload) = event
+            .payload
+            .as_mut()
+            .and_then(|payload| payload.as_object_mut())
+        {
+            if let Some(value) = payload.remove("sessionKey") {
+                payload.insert(alias.to_string(), value);
+            }
+        }
+        event
+    }
+
     fn assistant_event_without_run_id(
         session_key: &str,
         text: &str,
@@ -2883,6 +2923,75 @@ mod tests {
 
         assert_eq!(turn.run_id.as_deref(), Some("current-run"));
         assert_eq!(turn.text, "hello world");
+    }
+
+    #[tokio::test]
+    async fn collect_turn_result_accepts_session_key_aliases_for_content_payloads() {
+        for alias in ["session_key", "key"] {
+            let (event_tx, mut event_rx) = mpsc::channel::<super::super::wire::EventFrame>(4);
+            event_tx
+                .send(assistant_delta_event_with_session_key_alias(
+                    alias,
+                    "session-a",
+                    "current-run",
+                    "message-1",
+                    alias,
+                ))
+                .await
+                .unwrap();
+            event_tx
+                .send(run_completed_event("session-a", "current-run"))
+                .await
+                .unwrap();
+
+            let mut turn = super::super::handshake::TurnResult {
+                run_id: Some("current-run".to_string()),
+                ..Default::default()
+            };
+            collect_turn_result(
+                &mut event_rx,
+                "session-a",
+                "current-run",
+                None,
+                None,
+                Duration::from_millis(50),
+                &mut turn,
+            )
+            .await
+            .expect("session-key aliases should collect content frames");
+
+            assert_eq!(turn.text, alias);
+        }
+    }
+
+    #[tokio::test]
+    async fn collect_turn_result_accepts_completion_only_run() {
+        let (event_tx, mut event_rx) = mpsc::channel::<super::super::wire::EventFrame>(1);
+        event_tx
+            .send(run_completed_event("session-a", "current-run"))
+            .await
+            .unwrap();
+
+        let mut turn = super::super::handshake::TurnResult {
+            run_id: Some("current-run".to_string()),
+            ..Default::default()
+        };
+        collect_turn_result(
+            &mut event_rx,
+            "session-a",
+            "current-run",
+            None,
+            None,
+            Duration::from_millis(50),
+            &mut turn,
+        )
+        .await
+        .expect("completion-only run should finish as an empty successful turn");
+
+        assert_eq!(turn.run_id.as_deref(), Some("current-run"));
+        assert!(turn.text.is_empty());
+        assert!(turn.tool_calls.is_empty());
+        assert!(turn.tool_results.is_empty());
     }
 
     #[tokio::test]
