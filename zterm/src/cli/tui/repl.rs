@@ -542,18 +542,26 @@ impl ReplLoop {
                 ui::print_error("turn not submitted", Some(&e.to_string()));
                 continue;
             }
-            if let Err(e) = mark_repl_transcript_pending(&transcript_scope, &session_id) {
-                ui::print_error(
-                    "could not persist pending transcript marker; turn not submitted",
-                    Some(&e.to_string()),
-                );
-                continue;
-            }
+            let pending_marker_id =
+                match mark_repl_transcript_pending(&transcript_scope, &session_id) {
+                    Ok(marker_id) => marker_id,
+                    Err(e) => {
+                        ui::print_error(
+                            "could not persist pending transcript marker; turn not submitted",
+                            Some(&e.to_string()),
+                        );
+                        continue;
+                    }
+                };
             if let Err(e) =
                 append_repl_transcript_entry(&transcript_scope, &session_id, "user", &input)
             {
-                let clear_error =
-                    clear_repl_transcript_pending_marker(&transcript_scope, &session_id).err();
+                let clear_error = clear_repl_transcript_pending_marker(
+                    &transcript_scope,
+                    &session_id,
+                    &pending_marker_id,
+                )
+                .err();
                 let mut detail = e.to_string();
                 if let Some(clear_error) = clear_error {
                     detail.push_str(&format!(
@@ -583,9 +591,11 @@ impl ReplLoop {
                         surface_repl_transcript_incomplete(&transcript_scope, &session_id, &e);
                     }
                     if !transcript_incomplete {
-                        if let Err(e) =
-                            clear_repl_transcript_pending_marker(&transcript_scope, &session_id)
-                        {
+                        if let Err(e) = clear_repl_transcript_pending_marker(
+                            &transcript_scope,
+                            &session_id,
+                            &pending_marker_id,
+                        ) {
                             ui::print_error(
                                 "terminal transcript persisted, but pending marker remains",
                                 Some(&e.to_string()),
@@ -623,9 +633,11 @@ impl ReplLoop {
                         );
                     }
                     if !transcript_incomplete {
-                        if let Err(e) =
-                            clear_repl_transcript_pending_marker(&transcript_scope, &session_id)
-                        {
+                        if let Err(e) = clear_repl_transcript_pending_marker(
+                            &transcript_scope,
+                            &session_id,
+                            &pending_marker_id,
+                        ) {
                             ui::print_error(
                                 "terminal transcript persisted, but pending marker remains",
                                 Some(&e.to_string()),
@@ -1255,20 +1267,24 @@ fn append_repl_transcript_entry(
 fn mark_repl_transcript_pending(
     scope: &storage::LocalWorkspaceScope,
     session_id: &str,
-) -> Result<()> {
-    storage::mark_scoped_session_history_incomplete(
+) -> Result<String> {
+    let marker_id = format!("turn-{}", uuid::Uuid::new_v4());
+    storage::mark_scoped_session_history_pending_turn(
         scope,
         session_id,
+        &marker_id,
         "turn submitted to backend; terminal transcript entry pending",
     )
-    .map_err(|e| anyhow::anyhow!("could not persist pending transcript marker: {e}"))
+    .map_err(|e| anyhow::anyhow!("could not persist pending transcript marker: {e}"))?;
+    Ok(marker_id)
 }
 
 fn clear_repl_transcript_pending_marker(
     scope: &storage::LocalWorkspaceScope,
     session_id: &str,
+    marker_id: &str,
 ) -> Result<()> {
-    storage::clear_scoped_session_history_incomplete_marker(scope, session_id)
+    storage::clear_scoped_session_history_pending_turn_marker(scope, session_id, marker_id)
         .map(|_| ())
         .map_err(|e| anyhow::anyhow!("could not clear pending transcript marker: {e}"))
 }
@@ -1998,7 +2014,13 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn legacy_repl_boot_binding_serves_info_and_first_turn_without_create() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+
         let submitted = Arc::new(StdMutex::new(Vec::new()));
         let deleted = Arc::new(StdMutex::new(Vec::new()));
         let created = Arc::new(StdMutex::new(Vec::new()));
@@ -2049,10 +2071,21 @@ mod tests {
             submitted.lock().unwrap().as_slice(),
             &[("boot-session".to_string(), "hello".to_string())]
         );
+
+        match old_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn repl_workspace_switch_then_delete_active_new_workspace_session_is_blocked() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+
         let alpha_submitted = Arc::new(StdMutex::new(Vec::new()));
         let beta_submitted = Arc::new(StdMutex::new(Vec::new()));
         let alpha_deleted = Arc::new(StdMutex::new(Vec::new()));
@@ -2104,10 +2137,21 @@ mod tests {
         assert!(out.contains("Cannot delete active session"));
         assert!(beta_deleted.lock().unwrap().is_empty());
         assert!(alpha_deleted.lock().unwrap().is_empty());
+
+        match old_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn legacy_repl_malformed_quoted_session_switch_does_not_rebind() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+
         let submitted = Arc::new(StdMutex::new(Vec::new()));
         let deleted = Arc::new(StdMutex::new(Vec::new()));
         let chat = session("chat-session", "chat");
@@ -2142,10 +2186,21 @@ mod tests {
         assert!(out.contains("unterminated"));
         assert_eq!(repl.session.id, "chat-session");
         assert_eq!(repl.session.name, "chat");
+
+        match old_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn legacy_repl_quoted_session_switch_rebinds_to_single_target() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+
         let submitted = Arc::new(StdMutex::new(Vec::new()));
         let deleted = Arc::new(StdMutex::new(Vec::new()));
         let chat = session("chat-session", "chat");
@@ -2179,5 +2234,10 @@ mod tests {
         assert_eq!(out, "✅ Active backend session: Research Notes\n");
         assert_eq!(repl.session.id, "research-notes-session");
         assert_eq!(repl.session.name, "Research Notes");
+
+        match old_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
     }
 }

@@ -667,19 +667,23 @@ pub async fn run(
                                 .await;
                                 continue;
                             }
-                            if let Err(e) =
-                                mark_turn_transcript_pending(&transcript_scope, &worker_session_id)
-                            {
-                                send_worker_finished(
-                                    &worker_sink,
-                                    Err(format!(
-                                        "could not mark transcript pending for session {}; turn not submitted: {e}",
-                                        worker_session_id
-                                    )),
-                                )
-                                .await;
-                                continue;
-                            }
+                            let pending_marker_id = match mark_turn_transcript_pending(
+                                &transcript_scope,
+                                &worker_session_id,
+                            ) {
+                                Ok(marker_id) => marker_id,
+                                Err(e) => {
+                                    send_worker_finished(
+                                        &worker_sink,
+                                        Err(format!(
+                                            "could not mark transcript pending for session {}; turn not submitted: {e}",
+                                            worker_session_id
+                                        )),
+                                    )
+                                    .await;
+                                    continue;
+                                }
+                            };
                             if let Err(e) = append_turn_transcript_entry(
                                 &transcript_scope,
                                 &worker_session_id,
@@ -689,6 +693,7 @@ pub async fn run(
                                 let clear_error = clear_turn_transcript_pending_marker(
                                     &transcript_scope,
                                     &worker_session_id,
+                                    &pending_marker_id,
                                 )
                                 .err();
                                 let mut message = format!("{e}; turn not submitted");
@@ -829,6 +834,7 @@ pub async fn run(
                                 if let Err(e) = clear_turn_transcript_pending_marker(
                                     &transcript_scope,
                                     &worker_session_id,
+                                    &pending_marker_id,
                                 ) {
                                     terminal_override = Some(Err(format!(
                                         "terminal transcript persisted, but pending transcript marker could not be cleared: {e}; /save remains disabled until /clear"
@@ -2049,20 +2055,24 @@ fn append_turn_transcript_entry(
 fn mark_turn_transcript_pending(
     scope: &storage::LocalWorkspaceScope,
     session_id: &str,
-) -> Result<()> {
-    storage::mark_scoped_session_history_incomplete(
+) -> Result<String> {
+    let marker_id = format!("turn-{}", uuid::Uuid::new_v4());
+    storage::mark_scoped_session_history_pending_turn(
         scope,
         session_id,
+        &marker_id,
         TURN_TRANSCRIPT_PENDING_REASON,
     )
-    .map_err(|e| anyhow::anyhow!("could not persist pending transcript marker: {e}"))
+    .map_err(|e| anyhow::anyhow!("could not persist pending transcript marker: {e}"))?;
+    Ok(marker_id)
 }
 
 fn clear_turn_transcript_pending_marker(
     scope: &storage::LocalWorkspaceScope,
     session_id: &str,
+    marker_id: &str,
 ) -> Result<()> {
-    storage::clear_scoped_session_history_incomplete_marker(scope, session_id)
+    storage::clear_scoped_session_history_pending_turn_marker(scope, session_id, marker_id)
         .map(|_| ())
         .map_err(|e| anyhow::anyhow!("could not clear pending transcript marker: {e}"))
 }
@@ -7905,14 +7915,14 @@ mod tests {
         )
         .unwrap();
 
-        mark_turn_transcript_pending(&scope, "main").unwrap();
+        let marker_id = mark_turn_transcript_pending(&scope, "main").unwrap();
         assert!(storage::scoped_session_history_is_incomplete(&scope, "main").unwrap());
         let err = storage::ensure_scoped_session_history_complete(&scope, "main").unwrap_err();
         assert!(err.to_string().contains("run /clear"));
 
         append_turn_transcript_entry(&scope, "main", "user", "hello").unwrap();
         append_turn_transcript_entry(&scope, "main", "assistant", "hi").unwrap();
-        clear_turn_transcript_pending_marker(&scope, "main").unwrap();
+        clear_turn_transcript_pending_marker(&scope, "main", &marker_id).unwrap();
 
         assert!(!storage::scoped_session_history_is_incomplete(&scope, "main").unwrap());
         let history =
@@ -7920,6 +7930,32 @@ mod tests {
                 .unwrap();
         assert!(history.contains(r#""role":"user""#));
         assert!(history.contains(r#""role":"assistant""#));
+    }
+
+    #[test]
+    fn pending_turn_marker_clear_does_not_clear_concurrent_turn() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let scope = storage::workspace_scope(
+            "zeroclaw",
+            &format!("pending-concurrent-turn-{}", uuid::Uuid::new_v4()),
+            None,
+        )
+        .unwrap();
+
+        let turn_a = mark_turn_transcript_pending(&scope, "main").unwrap();
+        let turn_b = mark_turn_transcript_pending(&scope, "main").unwrap();
+
+        clear_turn_transcript_pending_marker(&scope, "main", &turn_a).unwrap();
+
+        assert!(storage::scoped_session_history_is_incomplete(&scope, "main").unwrap());
+        assert!(
+            storage::scoped_session_history_pending_marker_file(&scope, "main", &turn_b)
+                .unwrap()
+                .exists()
+        );
+
+        clear_turn_transcript_pending_marker(&scope, "main", &turn_b).unwrap();
+        assert!(!storage::scoped_session_history_is_incomplete(&scope, "main").unwrap());
     }
 
     #[test]

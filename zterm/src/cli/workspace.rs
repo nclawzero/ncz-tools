@@ -2313,6 +2313,11 @@ url = "ws://c"
 
     #[test]
     fn synthesize_single_zeroclaw_builds_one_activated_workspace() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+
         let app =
             App::synthesize_single_zeroclaw("http://127.0.0.1:42617", Some("tok".to_string()))
                 .unwrap();
@@ -2323,13 +2328,28 @@ url = "ws://c"
         assert_eq!(ws.config.backend, Backend::Zeroclaw);
         assert!(ws.is_activated());
         assert!(ws.cron.is_some());
+
+        match old_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
     }
 
     #[test]
     fn synthesize_single_zeroclaw_handles_missing_token() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+
         let app = App::synthesize_single_zeroclaw("http://a", None).unwrap();
         assert_eq!(app.workspaces.len(), 1);
         assert!(app.active_workspace().unwrap().is_activated());
+
+        match old_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
     }
 
     #[test]

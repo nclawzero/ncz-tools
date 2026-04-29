@@ -198,6 +198,26 @@ pub fn scoped_session_history_incomplete_file(
     Ok(scoped_session_dir(scope, session_id)?.join("history.incomplete"))
 }
 
+/// Directory of per-turn pending transcript markers.
+pub fn scoped_session_history_pending_dir(
+    scope: &LocalWorkspaceScope,
+    session_id: &str,
+) -> Result<PathBuf> {
+    Ok(scoped_session_dir(scope, session_id)?.join("history.incomplete.d"))
+}
+
+/// One pending marker owned by a single submitted turn.
+pub fn scoped_session_history_pending_marker_file(
+    scope: &LocalWorkspaceScope,
+    session_id: &str,
+    marker_id: &str,
+) -> Result<PathBuf> {
+    if !is_safe_session_id(marker_id) {
+        return Err(anyhow!("unsafe turn marker id for local history marker"));
+    }
+    Ok(scoped_session_history_pending_dir(scope, session_id)?.join(marker_id))
+}
+
 /// Ensure config directory exists
 pub fn ensure_config_dir() -> Result<()> {
     let dir = config_dir()?;
@@ -429,6 +449,38 @@ pub fn mark_scoped_session_history_incomplete(
     Ok(())
 }
 
+/// Mark a submitted turn whose terminal transcript entry is not durable yet.
+pub fn mark_scoped_session_history_pending_turn(
+    scope: &LocalWorkspaceScope,
+    session_id: &str,
+    marker_id: &str,
+    reason: &str,
+) -> Result<()> {
+    if !is_safe_session_id(session_id) {
+        return Err(anyhow!("unsafe session id for local history marker"));
+    }
+    if !is_safe_session_id(marker_id) {
+        return Err(anyhow!("unsafe turn marker id for local history marker"));
+    }
+
+    ensure_scoped_session_dir(scope, session_id)?;
+    let dir = scoped_session_history_pending_dir(scope, session_id)?;
+    create_private_dir_all(&dir)?;
+    let file = scoped_session_history_pending_marker_file(scope, session_id, marker_id)?;
+    let mut out = open_private_write_file(&file)?;
+    writeln!(out, "{reason}")
+        .map_err(|e| anyhow!("Failed to write session history pending marker: {}", e))?;
+    out.sync_all()
+        .map_err(|e| anyhow!("Failed to sync session history pending marker: {}", e))?;
+    sync_parent_dir(&file).map_err(|e| {
+        anyhow!(
+            "Failed to sync session history pending marker directory: {}",
+            e
+        )
+    })?;
+    Ok(())
+}
+
 /// True when `/save` should refuse to export this scoped transcript.
 pub fn scoped_session_history_is_incomplete(
     scope: &LocalWorkspaceScope,
@@ -437,7 +489,19 @@ pub fn scoped_session_history_is_incomplete(
     if !is_safe_session_id(session_id) {
         return Err(anyhow!("unsafe session id for local history marker check"));
     }
-    Ok(scoped_session_history_incomplete_file(scope, session_id)?.exists())
+    if scoped_session_history_incomplete_file(scope, session_id)?.exists() {
+        return Ok(true);
+    }
+
+    let dir = scoped_session_history_pending_dir(scope, session_id)?;
+    match fs::read_dir(&dir) {
+        Ok(mut entries) => Ok(entries.next().transpose()?.is_some()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(anyhow!(
+            "Failed to read session history pending marker directory: {}",
+            e
+        )),
+    }
 }
 
 /// Refuse new turns while the local transcript is known incomplete.
@@ -463,7 +527,7 @@ pub fn clear_scoped_session_history_incomplete_marker(
     }
 
     let file = scoped_session_history_incomplete_file(scope, session_id)?;
-    let removed = match fs::remove_file(&file) {
+    let mut removed = match fs::remove_file(&file) {
         Ok(()) => true,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
         Err(e) => {
@@ -473,6 +537,19 @@ pub fn clear_scoped_session_history_incomplete_marker(
             ))
         }
     };
+
+    let pending_dir = scoped_session_history_pending_dir(scope, session_id)?;
+    match fs::remove_dir_all(&pending_dir) {
+        Ok(()) => removed = true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(anyhow!(
+                "Failed to clear session history pending marker directory: {}",
+                e
+            ))
+        }
+    }
+
     if removed {
         sync_parent_dir(&file).map_err(|e| {
             anyhow!(
@@ -480,6 +557,63 @@ pub fn clear_scoped_session_history_incomplete_marker(
                 e
             )
         })?;
+    }
+    Ok(removed)
+}
+
+/// Clear one pending transcript marker, leaving any other submitted turn markers intact.
+pub fn clear_scoped_session_history_pending_turn_marker(
+    scope: &LocalWorkspaceScope,
+    session_id: &str,
+    marker_id: &str,
+) -> Result<bool> {
+    if !is_safe_session_id(session_id) {
+        return Err(anyhow!("unsafe session id for local history marker clear"));
+    }
+    if !is_safe_session_id(marker_id) {
+        return Err(anyhow!(
+            "unsafe turn marker id for local history marker clear"
+        ));
+    }
+
+    let file = scoped_session_history_pending_marker_file(scope, session_id, marker_id)?;
+    let removed = match fs::remove_file(&file) {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => {
+            return Err(anyhow!(
+                "Failed to clear session history pending marker: {}",
+                e
+            ))
+        }
+    };
+    if removed {
+        sync_parent_dir(&file).map_err(|e| {
+            anyhow!(
+                "Failed to sync session history pending marker directory after clear: {}",
+                e
+            )
+        })?;
+        let dir = scoped_session_history_pending_dir(scope, session_id)?;
+        match fs::remove_dir(&dir) {
+            Ok(()) => {
+                sync_parent_dir(&dir).map_err(|e| {
+                    anyhow!(
+                        "Failed to sync session history pending marker parent after clear: {}",
+                        e
+                    )
+                })?;
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::NotFound
+                    || e.kind() == std::io::ErrorKind::DirectoryNotEmpty => {}
+            Err(e) => {
+                return Err(anyhow!(
+                    "Failed to remove empty session history pending marker directory: {}",
+                    e
+                ))
+            }
+        }
     }
     Ok(removed)
 }
@@ -500,6 +634,12 @@ pub fn clear_scoped_session_history(scope: &LocalWorkspaceScope, session_id: &st
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(anyhow!("Failed to clear session history: {}", e)),
         }
+    }
+    let pending_dir = scoped_session_history_pending_dir(scope, session_id)?;
+    match fs::remove_dir_all(&pending_dir) {
+        Ok(()) => removed = true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(anyhow!("Failed to clear session history: {}", e)),
     }
     Ok(removed)
 }
@@ -848,6 +988,21 @@ mod tests {
             fs::metadata(&marker).unwrap().permissions().mode() & 0o777,
             0o600
         );
+        mark_scoped_session_history_pending_turn(&scope, "main", "turn-a", "pending").unwrap();
+        let pending_marker =
+            scoped_session_history_pending_marker_file(&scope, "main", "turn-a").unwrap();
+        assert_eq!(
+            fs::metadata(&pending_marker).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(scoped_session_history_pending_dir(&scope, "main").unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
     }
 
     #[test]
@@ -866,6 +1021,9 @@ mod tests {
         assert!(!scoped_session_history_incomplete_file(&scope, "main")
             .unwrap()
             .exists());
+        assert!(!scoped_session_history_pending_dir(&scope, "main")
+            .unwrap()
+            .exists());
         assert!(!scoped_session_history_is_incomplete(&scope, "main").unwrap());
     }
 
@@ -876,14 +1034,53 @@ mod tests {
 
         append_scoped_session_history(&scope, "main", "user", "hello").unwrap();
         mark_scoped_session_history_incomplete(&scope, "main", "turn pending").unwrap();
+        mark_scoped_session_history_pending_turn(&scope, "main", "turn-a", "turn pending").unwrap();
 
         assert!(scoped_session_history_is_incomplete(&scope, "main").unwrap());
         assert!(clear_scoped_session_history_incomplete_marker(&scope, "main").unwrap());
         assert!(!scoped_session_history_is_incomplete(&scope, "main").unwrap());
+        assert!(!scoped_session_history_pending_dir(&scope, "main")
+            .unwrap()
+            .exists());
         let history =
             fs::read_to_string(scoped_session_history_file(&scope, "main").unwrap()).unwrap();
         assert!(history.contains(r#""content":"hello""#));
         assert!(!clear_scoped_session_history_incomplete_marker(&scope, "main").unwrap());
+    }
+
+    #[test]
+    fn pending_turn_marker_clear_is_owner_scoped() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let scope = scope(&format!("pending-owner-{}", uuid::Uuid::new_v4()));
+
+        mark_scoped_session_history_pending_turn(&scope, "main", "turn-a", "turn A pending")
+            .unwrap();
+        mark_scoped_session_history_pending_turn(&scope, "main", "turn-b", "turn B pending")
+            .unwrap();
+
+        assert!(scoped_session_history_is_incomplete(&scope, "main").unwrap());
+        assert!(
+            clear_scoped_session_history_pending_turn_marker(&scope, "main", "turn-a").unwrap()
+        );
+        assert!(
+            !scoped_session_history_pending_marker_file(&scope, "main", "turn-a")
+                .unwrap()
+                .exists()
+        );
+        assert!(
+            scoped_session_history_pending_marker_file(&scope, "main", "turn-b")
+                .unwrap()
+                .exists()
+        );
+        assert!(scoped_session_history_is_incomplete(&scope, "main").unwrap());
+
+        assert!(
+            !clear_scoped_session_history_pending_turn_marker(&scope, "main", "turn-a").unwrap()
+        );
+        assert!(
+            clear_scoped_session_history_pending_turn_marker(&scope, "main", "turn-b").unwrap()
+        );
+        assert!(!scoped_session_history_is_incomplete(&scope, "main").unwrap());
     }
 
     #[test]
@@ -892,7 +1089,8 @@ mod tests {
         let scope = scope(&format!("blocked-{}", uuid::Uuid::new_v4()));
 
         append_scoped_session_history(&scope, "main", "user", "hello").unwrap();
-        mark_scoped_session_history_incomplete(&scope, "main", "run state unresolved").unwrap();
+        mark_scoped_session_history_pending_turn(&scope, "main", "turn-a", "run state unresolved")
+            .unwrap();
 
         let err = ensure_scoped_session_history_complete(&scope, "main").unwrap_err();
         assert!(err.to_string().contains("run /clear"));
