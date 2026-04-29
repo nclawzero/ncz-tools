@@ -1367,6 +1367,19 @@ impl AgentClient for OpenClawClient {
                 }
             }
         }
+        let legacy_result = self
+            .rpc_sessions_list(SessionsListOpts {
+                limit: Some(500),
+                include_derived_titles: true,
+                ..Default::default()
+            })
+            .await?;
+        ensure_session_list_not_truncated(&legacy_result, 500)?;
+        for row in self.legacy_server_key_session_rows(legacy_result.sessions) {
+            if seen.insert(row.key.clone()) {
+                sessions.push(row_into_session(row));
+            }
+        }
         Ok(sessions)
     }
 
@@ -1497,10 +1510,38 @@ impl OpenClawClient {
     }
 
     fn row_belongs_to_session_namespace(&self, row: &super::handshake::OpenClawSessionRow) -> bool {
+        self.stable_row_belongs_to_session_namespace(row)
+            || self.legacy_server_key_row_belongs_to_session_namespace(row)
+    }
+
+    fn stable_row_belongs_to_session_namespace(
+        &self,
+        row: &super::handshake::OpenClawSessionRow,
+    ) -> bool {
         let Some(label) = row.label.as_deref() else {
             return false;
         };
         self.session_key_belongs_to_session_namespace(&row.key, label)
+    }
+
+    fn legacy_server_key_session_rows(
+        &self,
+        rows: Vec<super::handshake::OpenClawSessionRow>,
+    ) -> Vec<super::handshake::OpenClawSessionRow> {
+        rows.into_iter()
+            .filter(|row| {
+                !self.stable_row_belongs_to_session_namespace(row)
+                    && self.legacy_server_key_row_belongs_to_session_namespace(row)
+            })
+            .collect()
+    }
+
+    fn legacy_server_key_row_belongs_to_session_namespace(
+        &self,
+        row: &super::handshake::OpenClawSessionRow,
+    ) -> bool {
+        self.row_metadata_matches_session_namespace(row)
+            || self.row_title_matches_session_namespace(row)
     }
 
     fn session_key_belongs_to_session_namespace(&self, key: &str, label: &str) -> bool {
@@ -1516,6 +1557,203 @@ impl OpenClawClient {
         namespaces.extend(self.session_namespace_aliases.iter().map(String::as_str));
         namespaces
     }
+
+    fn row_metadata_matches_session_namespace(
+        &self,
+        row: &super::handshake::OpenClawSessionRow,
+    ) -> bool {
+        let metadata_strings = row_metadata_strings(row);
+        if metadata_strings.is_empty() {
+            return false;
+        }
+
+        let identities: Vec<SessionNamespaceIdentity> = self
+            .session_namespaces()
+            .into_iter()
+            .map(SessionNamespaceIdentity::from_namespace)
+            .collect();
+
+        identities.iter().any(|identity| {
+            metadata_strings
+                .iter()
+                .any(|value| identity.matches_metadata_value(value))
+        }) || identities
+            .iter()
+            .any(|identity| identity.matches_metadata_fields(&metadata_strings))
+    }
+
+    fn row_title_matches_session_namespace(
+        &self,
+        row: &super::handshake::OpenClawSessionRow,
+    ) -> bool {
+        let mut text_fields = Vec::new();
+        for value in [
+            row.label.as_deref(),
+            row.display_name.as_deref(),
+            row.derived_title.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                text_fields.push(trimmed);
+            }
+        }
+
+        if text_fields.is_empty() {
+            return false;
+        }
+
+        self.session_namespaces().into_iter().any(|namespace| {
+            let identity = SessionNamespaceIdentity::from_namespace(namespace);
+            text_fields
+                .iter()
+                .any(|field| identity.matches_title(field))
+        })
+    }
+}
+
+#[derive(Debug)]
+struct SessionNamespaceIdentity<'a> {
+    namespace: &'a str,
+    workspace_id: Option<&'a str>,
+    workspace_name: Option<&'a str>,
+    workspace_url: Option<&'a str>,
+}
+
+impl<'a> SessionNamespaceIdentity<'a> {
+    fn from_namespace(namespace: &'a str) -> Self {
+        Self {
+            namespace,
+            workspace_id: namespace_component(namespace, "workspace_id"),
+            workspace_name: namespace_component(namespace, "workspace"),
+            workspace_url: namespace_component(namespace, "url"),
+        }
+    }
+
+    fn matches_metadata_value(&self, value: &str) -> bool {
+        let value = value.trim();
+        !value.is_empty()
+            && (value == self.namespace
+                || self
+                    .workspace_id
+                    .map(|workspace_id| value == workspace_id)
+                    .unwrap_or(false))
+    }
+
+    fn matches_metadata_fields(&self, values: &[String]) -> bool {
+        if let Some(workspace_id) = self.workspace_id {
+            return values.iter().any(|value| value.trim() == workspace_id);
+        }
+
+        match (self.workspace_name, self.workspace_url) {
+            (Some(name), Some(url)) => {
+                let has_name = values.iter().any(|value| value.trim() == name);
+                let has_url = values
+                    .iter()
+                    .any(|value| urls_equivalent(value.trim(), url));
+                has_name && has_url
+            }
+            _ => false,
+        }
+    }
+
+    fn matches_title(&self, title: &str) -> bool {
+        if title.contains(self.namespace) {
+            return true;
+        }
+        if let Some(workspace_id) = self.workspace_id {
+            return title.contains(workspace_id);
+        }
+        match (self.workspace_name, self.workspace_url) {
+            (Some(name), Some(url)) => title.contains(name) && title.contains(url),
+            _ => false,
+        }
+    }
+}
+
+fn namespace_component<'a>(namespace: &'a str, key: &str) -> Option<&'a str> {
+    namespace.split(';').find_map(|part| {
+        let (part_key, value) = part.split_once('=')?;
+        (part_key == key && !value.trim().is_empty()).then_some(value.trim())
+    })
+}
+
+fn urls_equivalent(actual: &str, expected: &str) -> bool {
+    actual.trim_end_matches('/') == expected.trim_end_matches('/')
+}
+
+fn row_metadata_strings(row: &super::handshake::OpenClawSessionRow) -> Vec<String> {
+    let mut out = Vec::new();
+    for (key, value) in &row.extra {
+        collect_metadata_strings_for_key(key, value, false, &mut out);
+    }
+    out
+}
+
+fn collect_metadata_strings_for_key(
+    key: &str,
+    value: &serde_json::Value,
+    in_identity_container: bool,
+    out: &mut Vec<String>,
+) {
+    let normalized_key = normalize_metadata_key(key);
+    let is_identity_key = is_session_identity_metadata_key(&normalized_key);
+    let in_identity_container =
+        in_identity_container || is_session_identity_metadata_container(&normalized_key);
+
+    match value {
+        serde_json::Value::String(s) => {
+            if is_identity_key || in_identity_container {
+                let trimmed = s.trim();
+                if !trimmed.is_empty() {
+                    out.push(trimmed.to_string());
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_metadata_strings_for_key(key, item, in_identity_container, out);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for (child_key, value) in map {
+                collect_metadata_strings_for_key(child_key, value, in_identity_container, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn normalize_metadata_key(key: &str) -> String {
+    key.chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .map(|ch| ch.to_ascii_lowercase())
+        .collect()
+}
+
+fn is_session_identity_metadata_key(key: &str) -> bool {
+    matches!(
+        key,
+        "sessionnamespace"
+            | "ztermsessionnamespace"
+            | "namespace"
+            | "workspacenamespace"
+            | "workspaceid"
+            | "ztermworkspaceid"
+            | "workspacename"
+            | "workspaceurl"
+            | "workspace"
+            | "url"
+    )
+}
+
+fn is_session_identity_metadata_container(key: &str) -> bool {
+    matches!(
+        key,
+        "metadata" | "zterm" | "session" | "workspace" | "workspaceidentity"
+    )
 }
 
 fn ensure_targeted_session_list_not_truncated(
@@ -1645,6 +1883,7 @@ mod tests {
             derived_title: None,
             updated_at: None,
             session_id: Some("compat-session-id".to_string()),
+            extra: serde_json::Map::new(),
         });
 
         assert_eq!(session.id, "canonical-key");
@@ -2476,6 +2715,7 @@ mod tests {
                 error: None,
             })
             .await;
+        resolve_empty_legacy_session_scan(&pending, &mut outbound_rx).await;
 
         let sessions = list_task
             .await
@@ -2613,6 +2853,7 @@ mod tests {
                 error: None,
             })
             .await;
+        resolve_empty_legacy_session_scan(&pending, &mut outbound_rx).await;
 
         let sessions = list_task
             .await
@@ -2676,6 +2917,7 @@ mod tests {
                 error: None,
             })
             .await;
+        resolve_empty_legacy_session_scan(&pending, &mut outbound_rx).await;
 
         let sessions = list_task
             .await
@@ -2684,6 +2926,178 @@ mod tests {
         assert_eq!(sessions.len(), 2);
         assert_eq!(sessions[0].name, "Research");
         assert_eq!(sessions[1].name, "Planning");
+    }
+
+    #[tokio::test]
+    async fn legacy_server_generated_session_keys_are_scoped_by_workspace_metadata() {
+        let pending = PendingRequests::new();
+        let (outbound_tx, mut outbound_rx) = mpsc::channel::<RequestFrame>(OUTBOUND_CAPACITY);
+        let mut client = tests_support_new_fake(pending.clone(), Some(outbound_tx), true);
+        let active_namespace = "backend=openclaw;workspace_id=ws_active";
+        let foreign_namespace = "backend=openclaw;workspace_id=ws_foreign";
+        client.set_session_namespace(active_namespace);
+        let server_key = "oc-server-generated-123";
+        let foreign_server_key = "oc-server-generated-foreign";
+        let client = Arc::new(client);
+
+        let list_client = Arc::clone(&client);
+        let list_task = tokio::spawn(async move { list_client.list_sessions().await });
+        let stable_req = outbound_rx
+            .recv()
+            .await
+            .expect("stable namespace scan should be sent first");
+        assert_eq!(
+            stable_req.params.as_ref().unwrap()["search"].as_str(),
+            Some(session_key_prefix(active_namespace).as_str())
+        );
+        pending
+            .resolve(ResponseFrame {
+                id: stable_req.id,
+                ok: true,
+                payload: Some(serde_json::json!({
+                    "ts": 1,
+                    "path": "sessions.jsonl",
+                    "count": 0,
+                    "defaults": {},
+                    "sessions": []
+                })),
+                error: None,
+            })
+            .await;
+
+        let legacy_req = outbound_rx
+            .recv()
+            .await
+            .expect("legacy server-key scan should be sent");
+        assert_eq!(legacy_req.method, "sessions.list");
+        assert_eq!(legacy_req.params.as_ref().unwrap()["limit"], 500);
+        assert!(legacy_req.params.as_ref().unwrap().get("search").is_none());
+        pending
+            .resolve(ResponseFrame {
+                id: legacy_req.id,
+                ok: true,
+                payload: Some(serde_json::json!({
+                    "ts": 1,
+                    "path": "sessions.jsonl",
+                    "count": 2,
+                    "defaults": {},
+                    "sessions": [
+                        {
+                            "key": foreign_server_key,
+                            "kind": "direct",
+                            "label": "Research",
+                            "metadata": {
+                                "zterm": { "sessionNamespace": foreign_namespace }
+                            }
+                        },
+                        {
+                            "key": server_key,
+                            "kind": "direct",
+                            "label": "Research",
+                            "metadata": {
+                                "zterm": { "sessionNamespace": active_namespace }
+                            }
+                        }
+                    ]
+                })),
+                error: None,
+            })
+            .await;
+
+        let sessions = list_task
+            .await
+            .expect("list task should join")
+            .expect("legacy server-key list should succeed");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, server_key);
+        assert_eq!(sessions[0].name, "Research");
+
+        let load_client = Arc::clone(&client);
+        let load_task = tokio::spawn(async move { load_client.load_session(server_key).await });
+        let load_req = outbound_rx
+            .recv()
+            .await
+            .expect("load should search by server-generated key");
+        assert_eq!(
+            load_req.params.as_ref().unwrap()["search"].as_str(),
+            Some(server_key)
+        );
+        pending
+            .resolve(ResponseFrame {
+                id: load_req.id,
+                ok: true,
+                payload: Some(serde_json::json!({
+                    "ts": 1,
+                    "path": "sessions.jsonl",
+                    "count": 1,
+                    "defaults": {},
+                    "sessions": [{
+                        "key": server_key,
+                        "kind": "direct",
+                        "label": "Research",
+                        "metadata": {
+                            "zterm": { "sessionNamespace": active_namespace }
+                        }
+                    }]
+                })),
+                error: None,
+            })
+            .await;
+        let loaded = load_task
+            .await
+            .expect("load task should join")
+            .expect("metadata-gated server key should load");
+        assert_eq!(loaded.id, server_key);
+
+        let delete_client = Arc::clone(&client);
+        let delete_task =
+            tokio::spawn(async move { delete_client.delete_session(server_key).await });
+        let delete_lookup_req = outbound_rx
+            .recv()
+            .await
+            .expect("delete should validate by loading first");
+        pending
+            .resolve(ResponseFrame {
+                id: delete_lookup_req.id,
+                ok: true,
+                payload: Some(serde_json::json!({
+                    "ts": 1,
+                    "path": "sessions.jsonl",
+                    "count": 1,
+                    "defaults": {},
+                    "sessions": [{
+                        "key": server_key,
+                        "kind": "direct",
+                        "label": "Research",
+                        "metadata": {
+                            "zterm": { "sessionNamespace": active_namespace }
+                        }
+                    }]
+                })),
+                error: None,
+            })
+            .await;
+        let delete_req = outbound_rx
+            .recv()
+            .await
+            .expect("validated server-key delete should be sent");
+        assert_eq!(delete_req.method, "sessions.delete");
+        assert_eq!(
+            delete_req.params.as_ref().unwrap()["key"].as_str(),
+            Some(server_key)
+        );
+        pending
+            .resolve(ResponseFrame {
+                id: delete_req.id,
+                ok: true,
+                payload: Some(serde_json::json!({})),
+                error: None,
+            })
+            .await;
+        delete_task
+            .await
+            .expect("delete task should join")
+            .expect("metadata-gated server key should delete");
     }
 
     #[tokio::test]
@@ -2905,6 +3319,37 @@ mod tests {
                 }
             ]
         })
+    }
+
+    async fn resolve_empty_legacy_session_scan(
+        pending: &PendingRequests,
+        outbound_rx: &mut mpsc::Receiver<RequestFrame>,
+    ) {
+        let req = outbound_rx
+            .recv()
+            .await
+            .expect("legacy compatibility scan should be sent");
+        assert_eq!(req.method, "sessions.list");
+        assert_eq!(req.params.as_ref().unwrap()["limit"], 500);
+        assert_eq!(
+            req.params.as_ref().unwrap()["includeDerivedTitles"],
+            serde_json::json!(true)
+        );
+        assert!(req.params.as_ref().unwrap().get("search").is_none());
+        pending
+            .resolve(ResponseFrame {
+                id: req.id,
+                ok: true,
+                payload: Some(serde_json::json!({
+                    "ts": 1,
+                    "path": "sessions.jsonl",
+                    "count": 0,
+                    "defaults": {},
+                    "sessions": []
+                })),
+                error: None,
+            })
+            .await;
     }
 
     #[tokio::test]

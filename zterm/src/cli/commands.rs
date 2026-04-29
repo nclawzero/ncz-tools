@@ -1324,7 +1324,7 @@ fn redact_config_line(line: &str) -> (String, Option<&'static str>) {
 
     let key = &line[..eq_idx];
     if !is_sensitive_config_key(key) {
-        return (line.to_string(), None);
+        return redact_sensitive_config_pairs_in_line(line);
     }
 
     let rhs = &line[eq_idx + 1..];
@@ -1355,6 +1355,104 @@ fn redact_config_line(line: &str) -> (String, Option<&'static str>) {
     )
 }
 
+fn redact_sensitive_config_pairs_in_line(line: &str) -> (String, Option<&'static str>) {
+    let mut redacted = String::with_capacity(line.len());
+    let mut cursor = 0;
+    let mut search_from = 0;
+    let mut delimiter = None;
+
+    while let Some(eq_idx) = find_unquoted_char_from(line, '=', search_from) {
+        let Some((key_start, key_end)) = config_key_bounds_before_equals(line, eq_idx) else {
+            search_from = eq_idx + 1;
+            continue;
+        };
+
+        if !is_sensitive_config_key(&line[key_start..key_end]) {
+            search_from = eq_idx + 1;
+            continue;
+        }
+
+        let value_start =
+            eq_idx + 1 + line[eq_idx + 1..].len() - line[eq_idx + 1..].trim_start().len();
+        let value_end = find_unquoted_value_end(line, value_start);
+        let value_trimmed_end = line[..value_end].trim_end().len();
+        if delimiter.is_none() {
+            delimiter = multiline_secret_delimiter(&line[value_start..value_trimmed_end]);
+        }
+
+        redacted.push_str(&line[cursor..value_start]);
+        redacted.push('"');
+        redacted.push_str(CONFIG_SECRET_MASK);
+        redacted.push('"');
+        redacted.push_str(&line[value_trimmed_end..value_end]);
+        cursor = value_end;
+        search_from = value_end.saturating_add(1);
+    }
+
+    if cursor == 0 {
+        (line.to_string(), None)
+    } else {
+        redacted.push_str(&line[cursor..]);
+        (redacted, delimiter)
+    }
+}
+
+fn config_key_bounds_before_equals(line: &str, eq_idx: usize) -> Option<(usize, usize)> {
+    let key_end = line[..eq_idx].trim_end().len();
+    if key_end == 0 {
+        return None;
+    }
+
+    let mut key_start = key_end;
+    for (idx, ch) in line[..key_end].char_indices().rev() {
+        if is_config_key_char(ch) {
+            key_start = idx;
+        } else {
+            break;
+        }
+    }
+
+    (key_start < key_end).then_some((key_start, key_end))
+}
+
+fn is_config_key_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.')
+}
+
+fn find_unquoted_value_end(line: &str, value_start: usize) -> usize {
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut depth = 0usize;
+
+    for (offset, ch) in line[value_start..].char_indices() {
+        let idx = value_start + offset;
+        match quote {
+            Some('"') => {
+                if escaped {
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == '"' {
+                    quote = None;
+                }
+            }
+            Some('\'') => {
+                if ch == '\'' {
+                    quote = None;
+                }
+            }
+            Some(_) => unreachable!(),
+            None if ch == '"' || ch == '\'' => quote = Some(ch),
+            None if matches!(ch, '{' | '[' | '(') => depth += 1,
+            None if matches!(ch, '}' | ']' | ')') && depth > 0 => depth -= 1,
+            None if depth == 0 && matches!(ch, ',' | '}' | ']' | '#') => return idx,
+            None => {}
+        }
+    }
+
+    line.len()
+}
+
 fn is_sensitive_config_key(key: &str) -> bool {
     let lower = normalize_config_key(key);
     CONFIG_SECRET_KEY_FRAGMENTS
@@ -1376,10 +1474,17 @@ fn multiline_secret_delimiter(value: &str) -> Option<&'static str> {
 }
 
 fn find_unquoted_char(input: &str, target: char) -> Option<usize> {
+    find_unquoted_char_from(input, target, 0)
+}
+
+fn find_unquoted_char_from(input: &str, target: char, start: usize) -> Option<usize> {
     let mut quote: Option<char> = None;
     let mut escaped = false;
 
     for (idx, ch) in input.char_indices() {
+        if idx < start {
+            continue;
+        }
         match quote {
             Some('"') => {
                 if escaped {
@@ -2505,6 +2610,30 @@ private_key = "snake-private-key"
         assert!(!out.contains("camel-api-key"));
         assert!(!out.contains("dash-api-key"));
         assert!(!out.contains("snake-private-key"));
+    }
+
+    #[test]
+    fn fallback_config_redactor_masks_malformed_inline_table_secrets() {
+        let out = super::redact_config_secrets(
+            r#"
+[unterminated
+gateway = { url = "ws://gateway.example", token = "inline-token-value" }
+provider = { name = "openai", api_key = "inline-api-key", privateKey = "inline-private-key" }
+provider_settings = { tokens = ["array-token-1", "array-token-2"], name = "kept" }
+"#,
+        );
+
+        assert!(out.contains("url = \"ws://gateway.example\""));
+        assert!(out.contains("token = \"***REDACTED***\""));
+        assert!(out.contains("api_key = \"***REDACTED***\""));
+        assert!(out.contains("privateKey = \"***REDACTED***\""));
+        assert!(out.contains("tokens = \"***REDACTED***\""));
+        assert!(out.contains("name = \"kept\""));
+        assert!(!out.contains("inline-token-value"));
+        assert!(!out.contains("inline-api-key"));
+        assert!(!out.contains("inline-private-key"));
+        assert!(!out.contains("array-token-1"));
+        assert!(!out.contains("array-token-2"));
     }
 
     #[tokio::test]

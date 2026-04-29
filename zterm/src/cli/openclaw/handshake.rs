@@ -570,6 +570,9 @@ pub struct OpenClawSessionRow {
 
     #[serde(default, rename = "sessionId", skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+
+    #[serde(default, flatten, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Outer wrapper of a `sessions.list` response. Matches
