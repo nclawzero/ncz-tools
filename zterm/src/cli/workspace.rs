@@ -558,20 +558,126 @@ fn workspace_state_lock_path(state_path: &Path) -> PathBuf {
     state_path.with_file_name(format!(".{name}.lock"))
 }
 
-fn lock_workspace_state(state_path: &Path) -> Result<WorkspaceStateLock> {
+fn ensure_private_workspace_state_parent(state_path: &Path) -> Result<()> {
     if let Some(parent) = state_path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating zterm state dir {}", parent.display()))?;
+        harden_private_workspace_state_dir(parent)?;
     }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn harden_private_workspace_state_dir(dir: &Path) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let metadata = std::fs::symlink_metadata(dir)
+        .with_context(|| format!("checking zterm state dir {}", dir.display()))?;
+    if metadata.file_type().is_symlink() {
+        return Err(anyhow!(
+            "refusing to use symlinked zterm state dir {}",
+            dir.display()
+        ));
+    }
+    if !metadata.is_dir() {
+        return Err(anyhow!(
+            "zterm state path is not a directory: {}",
+            dir.display()
+        ));
+    }
+    if metadata.uid() != current_euid() {
+        return Err(anyhow!(
+            "refusing to use zterm state dir {} owned by uid {}",
+            dir.display(),
+            metadata.uid()
+        ));
+    }
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("setting private zterm state dir mode {}", dir.display()))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn harden_private_workspace_state_dir(_dir: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn current_euid() -> u32 {
+    unsafe extern "C" {
+        fn geteuid() -> u32;
+    }
+    unsafe { geteuid() }
+}
+
+fn open_private_workspace_state_create_new(path: &Path) -> std::io::Result<File> {
+    let mut opts = OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(path)
+}
+
+fn harden_existing_workspace_state_file(path: &Path, label: &str) -> Result<bool> {
+    let exists = harden_existing_workspace_state_file_impl(path, label)?;
+    Ok(exists)
+}
+
+#[cfg(unix)]
+fn harden_existing_workspace_state_file_impl(path: &Path, label: &str) -> Result<bool> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(e) => {
+            return Err(e)
+                .with_context(|| format!("checking zterm workspace {label} {}", path.display()))
+        }
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(anyhow!(
+            "refusing to use symlinked zterm workspace {label} {}",
+            path.display()
+        ));
+    }
+    if !metadata.is_file() {
+        return Err(anyhow!(
+            "zterm workspace {label} is not a regular file: {}",
+            path.display()
+        ));
+    }
+    if metadata.uid() != current_euid() {
+        return Err(anyhow!(
+            "refusing to use zterm workspace {label} {} owned by uid {}",
+            path.display(),
+            metadata.uid()
+        ));
+    }
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).with_context(|| {
+        format!(
+            "setting private zterm workspace {label} mode {}",
+            path.display()
+        )
+    })?;
+    Ok(true)
+}
+
+#[cfg(not(unix))]
+fn harden_existing_workspace_state_file_impl(path: &Path, _label: &str) -> Result<bool> {
+    Ok(path.exists())
+}
+
+fn lock_workspace_state(state_path: &Path) -> Result<WorkspaceStateLock> {
+    ensure_private_workspace_state_parent(state_path)?;
 
     let lock_path = workspace_state_lock_path(state_path);
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&lock_path)
-        {
+        match open_private_workspace_state_create_new(&lock_path) {
             Ok(mut file) => {
                 let token = uuid::Uuid::new_v4().simple().to_string();
                 if let Err(e) = write_workspace_state_lock_metadata(&mut file, &token) {
@@ -649,6 +755,9 @@ fn parse_workspace_state_lock_metadata(text: &str) -> WorkspaceStateLockMetadata
 }
 
 fn break_stale_workspace_state_lock(lock_path: &Path) -> Result<bool> {
+    if !harden_existing_workspace_state_file(lock_path, "state lock")? {
+        return Ok(true);
+    }
     let text = match std::fs::read_to_string(lock_path) {
         Ok(text) => text,
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(true),
@@ -729,7 +838,7 @@ fn process_exists(pid: u32) -> bool {
 }
 
 fn load_workspace_state(path: &Path) -> Result<WorkspaceState> {
-    if !path.exists() {
+    if !harden_existing_workspace_state_file(path, "state sidecar")? {
         return Ok(WorkspaceState::default());
     }
     let text = std::fs::read_to_string(path)
@@ -739,10 +848,7 @@ fn load_workspace_state(path: &Path) -> Result<WorkspaceState> {
 }
 
 fn save_workspace_state(path: &Path, state: &WorkspaceState) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating zterm state dir {}", parent.display()))?;
-    }
+    ensure_private_workspace_state_parent(path)?;
     let body =
         toml::to_string_pretty(state).with_context(|| "serializing zterm workspace state TOML")?;
     let file_name = path
@@ -754,10 +860,7 @@ fn save_workspace_state(path: &Path, state: &WorkspaceState) -> Result<()> {
         uuid::Uuid::new_v4().simple()
     ));
     {
-        let mut tmp_file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp_path)
+        let mut tmp_file = open_private_workspace_state_create_new(&tmp_path)
             .with_context(|| format!("creating zterm workspace state {}", tmp_path.display()))?;
         use std::io::Write;
         tmp_file
@@ -773,6 +876,7 @@ fn save_workspace_state(path: &Path, state: &WorkspaceState) -> Result<()> {
             path.display()
         )
     })?;
+    harden_existing_workspace_state_file(path, "state sidecar")?;
     if let Some(parent) = path.parent() {
         if let Ok(parent_dir) = File::open(parent) {
             parent_dir
@@ -846,6 +950,29 @@ fn apply_workspace_state(config_path: &Path, cfg: &mut AppConfig) -> Result<()> 
                 &workspace.url,
             );
             continue;
+        }
+
+        if let Some(entry_idx) = find_plausible_stale_stable_workspace_state_entry(
+            &state.zeroclaw_workspaces,
+            workspace,
+            workspace_index,
+            &claimed_zeroclaw_entries,
+        ) {
+            let entry = &state.zeroclaw_workspaces[entry_idx];
+            return Err(anyhow!(
+                "zeroclaw workspace '{}' has no explicit id and partially matches persisted workspace-state entry {} \
+                 (stored name='{}', url='{}', id='{}') at the same Zeroclaw index ({}). \
+                 Refusing to reuse or mint a fresh id because this likely represents a renamed or URL-edited workspace. \
+                 Add `id = \"{}\"` to the [[workspaces]] entry, or remove the stale entry from {} if this is a new workspace.",
+                workspace.name,
+                entry_idx,
+                entry.name,
+                entry.url,
+                entry.id,
+                workspace_index,
+                entry.id,
+                state_path.display()
+            ));
         }
 
         let generated_id = format!("ws_{}", uuid::Uuid::new_v4().simple());
@@ -1096,8 +1223,27 @@ fn stable_workspace_state_identity_matches(
             .iter()
             .any(|identity| workspace_identity_matches(&identity.name, &identity.url, workspace))
         || (entry.index == Some(workspace_index)
-            && normalize_workspace_url(&entry.url) == normalize_workspace_url(&workspace.url))
-        || (entry.index == Some(workspace_index) && entry.name == workspace.name)
+            && workspace_identity_matches(&entry.name, &entry.url, workspace))
+}
+
+fn find_plausible_stale_stable_workspace_state_entry(
+    entries: &[StableWorkspaceState],
+    workspace: &WorkspaceConfig,
+    workspace_index: usize,
+    claimed_entries: &std::collections::HashSet<usize>,
+) -> Option<usize> {
+    entries.iter().enumerate().position(|(idx, entry)| {
+        !claimed_entries.contains(&idx)
+            && entry.index == Some(workspace_index)
+            && !stable_workspace_state_identity_matches(entry, workspace, workspace_index)
+            && (entry.name == workspace.name
+                || normalize_workspace_url(&entry.url) == normalize_workspace_url(&workspace.url)
+                || entry.identity_aliases.iter().any(|identity| {
+                    identity.name == workspace.name
+                        || normalize_workspace_url(&identity.url)
+                            == normalize_workspace_url(&workspace.url)
+                }))
+    })
 }
 
 fn find_openclaw_workspace_state_entry(
@@ -1666,6 +1812,70 @@ unknown_workspace_field = { nested = "also ignored" }
         assert_eq!(std::fs::read(&path).unwrap(), original);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn workspace_state_sidecar_uses_private_permissions_and_hardens_existing() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[[workspaces]]
+name = "alpha"
+backend = "openclaw"
+url = "ws://old.example"
+"#,
+        )
+        .unwrap();
+
+        AppConfig::load(&path).unwrap();
+
+        let state_path = workspace_state_path_for_config(&path);
+        assert_eq!(
+            std::fs::metadata(tmp.path()).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&state_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        std::fs::set_permissions(&state_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        AppConfig::load(&path).unwrap();
+        assert_eq!(
+            std::fs::metadata(&state_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_state_sidecar_rejects_symlink() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[[workspaces]]
+name = "alpha"
+backend = "openclaw"
+url = "ws://old.example"
+"#,
+        )
+        .unwrap();
+        let state_path = workspace_state_path_for_config(&path);
+        let target = tmp.path().join("target-state.toml");
+        std::fs::write(&target, "").unwrap();
+        std::os::unix::fs::symlink(&target, &state_path).unwrap();
+
+        let err = AppConfig::load(&path).unwrap_err();
+
+        assert!(err.to_string().contains("symlinked zterm workspace"));
+    }
+
     #[test]
     fn readonly_primary_openclaw_config_loads_with_generated_sidecar_id() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -1701,7 +1911,7 @@ url = "ws://old.example"
 
     #[cfg(unix)]
     #[test]
-    fn generated_openclaw_id_errors_when_workspace_state_cannot_be_persisted() {
+    fn generated_openclaw_id_errors_when_workspace_state_path_is_unsafe() {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("config.toml");
         std::fs::write(
@@ -1714,20 +1924,13 @@ url = "ws://old.example"
 "#,
         )
         .unwrap();
-        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        let state_path = workspace_state_path_for_config(&path);
+        std::fs::create_dir(&state_path).unwrap();
 
         let err = AppConfig::load(&path).unwrap_err();
 
-        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let msg = err.to_string();
-        assert!(
-            msg.contains("workspace state lock") || msg.contains("workspace-state.toml"),
-            "{msg}"
-        );
-        assert!(
-            !workspace_state_path_for_config(&path).exists(),
-            "load must not continue with an in-memory-only generated id"
-        );
+        assert!(msg.contains("state sidecar is not a regular file"), "{msg}");
     }
 
     #[cfg(unix)]
@@ -2018,7 +2221,48 @@ url = "ws://a.example"
     }
 
     #[test]
-    fn zeroclaw_workspace_id_survives_rename_and_preserves_incomplete_marker() {
+    fn zeroclaw_idless_rename_same_url_fails_closed() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let prior = std::env::var("ZTERM_CONFIG_DIR").ok();
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::env::set_var("ZTERM_CONFIG_DIR", tmp.path());
+        let path = tmp.path().join("config.toml");
+        let original = r#"
+[[workspaces]]
+name = "alpha"
+backend = "zeroclaw"
+url = "http://127.0.0.1:42617"
+token = ""
+"#;
+        std::fs::write(&path, original).unwrap();
+
+        let cfg = AppConfig::load(&path).unwrap();
+        let id = cfg.workspaces[0].id.clone().unwrap();
+
+        let renamed = r#"
+[[workspaces]]
+name = "renamed"
+backend = "zeroclaw"
+url = "http://127.0.0.1:42617"
+token = ""
+"#;
+        std::fs::write(&path, renamed).unwrap();
+
+        let err = AppConfig::load(&path).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("partially matches persisted workspace-state entry"));
+        assert!(msg.contains("same Zeroclaw index (0)"));
+        assert!(msg.contains(&format!("id='{id}'")));
+        assert!(msg.contains("Add `id = "));
+
+        match prior {
+            Some(value) => std::env::set_var("ZTERM_CONFIG_DIR", value),
+            None => std::env::remove_var("ZTERM_CONFIG_DIR"),
+        }
+    }
+
+    #[test]
+    fn zeroclaw_explicit_workspace_id_survives_rename_and_preserves_incomplete_marker() {
         let _env = crate::cli::test_env_lock().lock().unwrap();
         let prior = std::env::var("ZTERM_CONFIG_DIR").ok();
         let tmp = tempfile::TempDir::new().unwrap();
@@ -2043,13 +2287,16 @@ token = ""
         )
         .unwrap();
 
-        let renamed = r#"
+        let renamed = format!(
+            r#"
 [[workspaces]]
+id = "{id}"
 name = "renamed"
 backend = "zeroclaw"
 url = "http://127.0.0.1:42617"
 token = ""
-"#;
+"#
+        );
         std::fs::write(&path, renamed).unwrap();
 
         let reloaded = AppConfig::load(&path).unwrap();
