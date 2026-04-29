@@ -153,6 +153,9 @@ const TURN_STREAM_MAX_BYTES: usize = 2 * 1024 * 1024;
 const COMMAND_ERROR_ALREADY_RENDERED: &str = "__zterm_command_error_already_rendered__";
 const PARTIAL_STREAM_INCOMPLETE_REASON: &str =
     "partial response incomplete; backend stream ended without a finished frame";
+const STATUS_LABEL_MAX_CHARS: usize = 48;
+const STATUS_TOAST_MAX_CHARS: usize = 96;
+const WORKSPACE_PICKER_LABEL_MAX_CHARS: usize = 48;
 const SESSION_PICKER_NAME_MAX_CHARS: usize = 48;
 const SESSION_PICKER_DETAIL_MAX_CHARS: usize = 32;
 const SESSION_PICKER_ID_MAX_CHARS: usize = 64;
@@ -443,7 +446,7 @@ impl StatusState {
     /// summary so the user gets immediate visual feedback.
     fn render_summary(&self) -> String {
         if let Some((msg, _)) = &self.toast {
-            return msg.clone();
+            return menu_safe_label_field(msg, STATUS_TOAST_MAX_CHARS);
         }
         let lead = match self.spinner_char() {
             Some(s) => format!("{s} "),
@@ -452,8 +455,8 @@ impl StatusState {
         format!(
             "{}{} · {} · {} · {} elapsed",
             lead,
-            self.workspace,
-            self.model,
+            menu_safe_label_field(&self.workspace, STATUS_LABEL_MAX_CHARS),
+            menu_safe_label_field(&self.model, STATUS_LABEL_MAX_CHARS),
             render_ctx_usage(self.usage),
             self.elapsed_mmss()
         )
@@ -794,19 +797,20 @@ pub async fn run(
                         }));
                 }
                 WorkerRequest::Command(cmdline) => {
-                    run_worker_command_with_timeout(
+                    let timeout = slash_command_timeout(&cmdline);
+                    let command = handle_worker_command_request(
+                        cmdline,
+                        &worker_app,
+                        &mut worker_sessions,
+                        &fallback_session_name,
                         &worker_sink,
-                        COMMAND_WORKER_TIMEOUT,
-                        handle_worker_command_request(
-                            cmdline,
-                            &worker_app,
-                            &mut worker_sessions,
-                            &fallback_session_name,
-                            &worker_sink,
-                            &worker_cmd_handler,
-                        ),
-                    )
-                    .await;
+                        &worker_cmd_handler,
+                    );
+                    if let Some(timeout) = timeout {
+                        run_worker_command_with_timeout(&worker_sink, timeout, command).await;
+                    } else {
+                        command.await;
+                    }
                 }
             }
         }
@@ -840,6 +844,30 @@ where
             Err(format!("slash command timed out after {timeout:?}")),
         )
         .await;
+    }
+}
+
+fn slash_command_timeout(cmdline: &str) -> Option<Duration> {
+    (!slash_command_may_mutate_state(cmdline)).then_some(COMMAND_WORKER_TIMEOUT)
+}
+
+fn slash_command_may_mutate_state(cmdline: &str) -> bool {
+    let tokens = match tokenize_slash_command(cmdline) {
+        Ok(tokens) => tokens,
+        Err(_) => return false,
+    };
+    let command = tokens.first().map(String::as_str);
+    let subcommand = tokens.get(1).map(String::as_str);
+    match (command, subcommand) {
+        (Some("/clear" | "/save"), _) => true,
+        (Some("/models" | "/model"), Some("set")) => true,
+        (Some("/workspace" | "/workspaces"), Some("switch")) => true,
+        (Some("/memory"), Some("post" | "delete")) => true,
+        (Some("/cron"), Some("add" | "add-at" | "pause" | "resume" | "delete")) => true,
+        (Some("/session"), Some("delete" | "switch" | "create")) => true,
+        (Some("/session"), Some("list" | "info")) => false,
+        (Some("/session"), Some(_)) => true,
+        _ => false,
     }
 }
 
@@ -3641,11 +3669,7 @@ fn run_workspace_picker(app: &mut Application, entries: &[WorkspacePickerEntry])
             // [1100, 1200) range. We don't expose these outside of
             // this picker — they're immediately mapped back to a
             // workspace name after `execute` returns.
-            let active_marker = if e.active { "●" } else { " " };
-            let label = format!(
-                " {} {}  [{}]  {}",
-                active_marker, e.name, e.backend, e.label
-            );
+            let label = workspace_picker_menu_label(e);
             MenuItem::with_shortcut(&label, CMD_WS_SELECT_BASE + i as u16, 0, "", 0)
         })
         .collect();
@@ -3667,6 +3691,17 @@ fn run_workspace_picker(app: &mut Application, entries: &[WorkspacePickerEntry])
     }
     let idx = selected.checked_sub(CMD_WS_SELECT_BASE)? as usize;
     entries.get(idx).map(|e| e.name.clone())
+}
+
+fn workspace_picker_menu_label(entry: &WorkspacePickerEntry) -> String {
+    let active_marker = if entry.active { "●" } else { " " };
+    format!(
+        " {} {}  [{}]  {}",
+        active_marker,
+        menu_safe_label_field(&entry.name, WORKSPACE_PICKER_LABEL_MAX_CHARS),
+        entry.backend,
+        menu_safe_label_field(&entry.label, WORKSPACE_PICKER_LABEL_MAX_CHARS)
+    )
 }
 
 /// Present a MenuBox-style modal picker of backend sessions.
@@ -3873,6 +3908,29 @@ mod tests {
             render_ctx_usage(Some(usage)),
             "ctx 2000/8000 (25%) [###-------]"
         );
+    }
+
+    #[test]
+    fn status_summary_sanitizes_workspace_model_and_toast_labels() {
+        let mut state = StatusState::new(
+            "ws\u{1b}]52;c;owned\u{07}~name".to_string(),
+            format!("model-{}~", "x".repeat(80)),
+            "borland".to_string(),
+            false,
+        );
+
+        let summary = state.render_summary();
+        assert!(!summary.contains('\u{1b}'));
+        assert!(!summary.contains('\u{7}'));
+        assert!(!summary.contains('~'));
+        assert!(summary.contains("<ESC>"));
+        assert!(summary.contains("..."));
+
+        state.set_toast("toast\u{1b}[31m~".to_string());
+        let toast = state.render_summary();
+        assert!(!toast.contains('\u{1b}'));
+        assert!(!toast.contains('~'));
+        assert!(toast.contains("<ESC>"));
     }
 
     #[test]
@@ -4110,6 +4168,25 @@ mod tests {
         assert!(label.contains("<ESC>"));
         assert!(label.contains("..."));
         assert!(label.chars().count() < 180);
+    }
+
+    #[test]
+    fn workspace_picker_label_sanitizes_and_caps_config_fields() {
+        let entry = WorkspacePickerEntry {
+            name: "prod\u{1b}]52;c;owned\u{07}~ws".to_string(),
+            label: format!("label-{}~", "x".repeat(80)),
+            backend: "zeroclaw".to_string(),
+            active: true,
+        };
+
+        let label = workspace_picker_menu_label(&entry);
+
+        assert!(!label.contains('\u{1b}'));
+        assert!(!label.contains('\u{7}'));
+        assert!(!label.contains('~'));
+        assert!(label.contains("<ESC>"));
+        assert!(label.contains("..."));
+        assert!(label.chars().count() < 140);
     }
 
     #[test]
@@ -4487,6 +4564,24 @@ mod tests {
             }
             other => panic!("expected timeout terminal error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn mutating_slash_commands_do_not_use_generic_timeout() {
+        assert!(slash_command_timeout("/memory post hello").is_none());
+        assert!(slash_command_timeout("/cron add '0 9 * * *' 'standup'").is_none());
+        assert!(slash_command_timeout("/session create \"Research Notes\"").is_none());
+        assert!(slash_command_timeout("/workspace switch prod").is_none());
+        assert!(slash_command_timeout("/models set primary").is_none());
+
+        assert_eq!(
+            slash_command_timeout("/memory list").map(|d| d.as_secs()),
+            Some(COMMAND_WORKER_TIMEOUT.as_secs())
+        );
+        assert_eq!(
+            slash_command_timeout("/session list").map(|d| d.as_secs()),
+            Some(COMMAND_WORKER_TIMEOUT.as_secs())
+        );
     }
 
     #[test]
