@@ -862,8 +862,8 @@ fn slash_command_may_mutate_state(cmdline: &str) -> bool {
         (Some("/clear" | "/save"), _) => true,
         (Some("/models" | "/model"), Some("set")) => true,
         (Some("/workspace" | "/workspaces"), Some("switch")) => true,
-        (Some("/memory"), Some("post" | "delete")) => true,
-        (Some("/cron"), Some("add" | "add-at" | "pause" | "resume" | "delete")) => true,
+        (Some("/memory"), Some("post" | "add" | "delete" | "rm")) => true,
+        (Some("/cron"), Some("add" | "add-at" | "pause" | "resume" | "delete" | "remove")) => true,
         (Some("/session"), Some("delete" | "switch" | "create")) => true,
         (Some("/session"), Some("list" | "info")) => false,
         (Some("/session"), Some(_)) => true,
@@ -4569,7 +4569,10 @@ mod tests {
     #[test]
     fn mutating_slash_commands_do_not_use_generic_timeout() {
         assert!(slash_command_timeout("/memory post hello").is_none());
+        assert!(slash_command_timeout("/memory add hello").is_none());
+        assert!(slash_command_timeout("/memory rm memory-1").is_none());
         assert!(slash_command_timeout("/cron add '0 9 * * *' 'standup'").is_none());
+        assert!(slash_command_timeout("/cron remove cron-1").is_none());
         assert!(slash_command_timeout("/session create \"Research Notes\"").is_none());
         assert!(slash_command_timeout("/workspace switch prod").is_none());
         assert!(slash_command_timeout("/models set primary").is_none());
