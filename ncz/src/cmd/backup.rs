@@ -266,7 +266,7 @@ pub(crate) fn create_with_options(
         sources.extend(volume_sources(ctx, captured_live_volumes)?);
     }
     let hostname = hostname(ctx);
-    let manifest = backup_state::manifest(hostname, &sources, captured_live_volumes);
+    let manifest = backup_state::manifest_with_options(hostname, &sources, captured_live_volumes);
     backup_state::write_archive(archive, &manifest, &sources)?;
     let redacted_count = manifest
         .sources
@@ -758,8 +758,11 @@ mod tests {
             contents: contents.to_vec(),
         };
         let sources = std::slice::from_ref(&source);
-        let manifest =
-            backup_state::manifest("test-host".to_string(), sources, unsafe_live_volumes);
+        let manifest = backup_state::manifest_with_options(
+            "test-host".to_string(),
+            sources,
+            unsafe_live_volumes,
+        );
         backup_state::write_archive(archive, &manifest, sources).unwrap();
         manifest
     }

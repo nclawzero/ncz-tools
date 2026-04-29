@@ -24,6 +24,7 @@ pub const VOLUME_PREFIX: &str = "podman://volume/";
 pub const VOLUME_NAMES: &[&str] = &["zeroclaw-data", "openclaw-data", "hermes-data"];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct BackupManifest {
     pub schema_version: u32,
     pub hostname: String,
@@ -55,7 +56,11 @@ pub struct ArchiveEntry {
     pub contents: Vec<u8>,
 }
 
-pub fn manifest(
+pub fn manifest(hostname: String, sources: &[ArchiveSource]) -> BackupManifest {
+    manifest_with_options(hostname, sources, false)
+}
+
+pub fn manifest_with_options(
     hostname: String,
     sources: &[ArchiveSource],
     unsafe_live_volumes: bool,
@@ -638,7 +643,7 @@ mod tests {
             false,
             b"openclaw\n".to_vec(),
         )];
-        let manifest = manifest("host".to_string(), &sources, false);
+        let manifest = manifest("host".to_string(), &sources);
 
         write_archive(&archive, &manifest, &sources).unwrap();
         let (read_manifest, entries) = read_archive(&archive).unwrap();
