@@ -1560,6 +1560,25 @@ fn turn_completion_can_finish(turn: &super::handshake::TurnResult) -> bool {
     turn_can_finish(turn)
 }
 
+fn submit_turn_transcript_text(turn: &super::handshake::TurnResult) -> Result<String> {
+    if !turn.text.is_empty() {
+        return Ok(turn.text.clone());
+    }
+
+    if !turn.tool_calls.is_empty()
+        || !turn.tool_results.is_empty()
+        || !turn.thinking.trim().is_empty()
+    {
+        return Err(anyhow!(
+            "openclaw: completed turn had non-text assistant activity but no transcript text; refusing to mark it complete"
+        ));
+    }
+
+    Err(anyhow!(
+        "openclaw: completed turn produced no assistant transcript text"
+    ))
+}
+
 fn finish_completed_or_timeout(
     timeout: std::time::Duration,
     turn: &super::handshake::TurnResult,
@@ -1882,16 +1901,23 @@ impl AgentClient for OpenClawClient {
 
         match result {
             Ok(turn) => {
-                if let Some(sink) = &self.stream_sink {
-                    if !turn.text.is_empty() {
-                        let _ = sink.send(TurnChunk::Token(turn.text.clone()));
+                let transcript_text = match submit_turn_transcript_text(&turn) {
+                    Ok(text) => text,
+                    Err(e) => {
+                        if let Some(sink) = &self.stream_sink {
+                            let _ = sink.send(TurnChunk::Finished(Err(e.to_string())));
+                        }
+                        return Err(e);
                     }
+                };
+                if let Some(sink) = &self.stream_sink {
+                    let _ = sink.send(TurnChunk::Token(transcript_text.clone()));
                     if let Some(usage) = turn.usage {
                         let _ = sink.send(TurnChunk::Usage(usage));
                     }
-                    let _ = sink.send(TurnChunk::Finished(Ok(turn.text.clone())));
+                    let _ = sink.send(TurnChunk::Finished(Ok(transcript_text.clone())));
                 }
-                Ok(turn.text)
+                Ok(transcript_text)
             }
             Err(e) => {
                 if let Some(sink) = &self.stream_sink {
@@ -2369,6 +2395,55 @@ mod tests {
         let client = tests_support_new_fake(PendingRequests::new(), None, true);
 
         assert!(!crate::cli::agent::AgentClient::submit_turn_is_cancellation_safe(&client));
+    }
+
+    #[test]
+    fn openclaw_submit_turn_rejects_tool_only_transcript_success() {
+        let turn = super::super::handshake::TurnResult {
+            tool_calls: vec![serde_json::json!({
+                "type": "tool_use",
+                "name": "read_file",
+            })],
+            tool_results: vec![serde_json::json!({
+                "type": "tool_result",
+                "content": "ok",
+            })],
+            ..Default::default()
+        };
+
+        let err = submit_turn_transcript_text(&turn)
+            .expect_err("tool-only turn must not become a blank successful transcript")
+            .to_string();
+
+        assert!(err.contains("non-text assistant activity"));
+    }
+
+    #[test]
+    fn openclaw_submit_turn_rejects_thinking_only_transcript_success() {
+        let turn = super::super::handshake::TurnResult {
+            thinking: "checking filesystem".to_string(),
+            ..Default::default()
+        };
+
+        let err = submit_turn_transcript_text(&turn)
+            .expect_err("thinking-only turn must not become a blank successful transcript")
+            .to_string();
+
+        assert!(err.contains("non-text assistant activity"));
+    }
+
+    #[test]
+    fn openclaw_submit_turn_accepts_text_with_tool_activity() {
+        let turn = super::super::handshake::TurnResult {
+            text: "done".to_string(),
+            tool_calls: vec![serde_json::json!({
+                "type": "tool_use",
+                "name": "read_file",
+            })],
+            ..Default::default()
+        };
+
+        assert_eq!(submit_turn_transcript_text(&turn).unwrap(), "done");
     }
 
     #[tokio::test]
