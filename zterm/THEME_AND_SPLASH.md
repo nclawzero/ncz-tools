@@ -10,9 +10,10 @@
 > runtime palette presets, `~/.zterm/theme.toml`, cached
 > connect-splash text at `~/.zterm/cache/connect-splash/`, and
 > `~/.zterm/state.toml` for launch count plus `beep_on_error`. The
-> connect splash is a local modem sequence. Backend/LLM generation is
-> deferred until zterm has a non-persistent generation endpoint or a
-> durable cleanup ledger for scratch sessions. State writes use a
+> v0.3.1 connect splash is a local modem sequence, not
+> backend/LLM-generated text. Backend/LLM generation is deferred until
+> zterm has a non-persistent generation endpoint or a durable cleanup
+> ledger for scratch sessions. State writes use a
 > bounded lock wait, and the TV path persists a mutation fence after
 > timed-out mutating slash commands until `/resync --force`.
 
