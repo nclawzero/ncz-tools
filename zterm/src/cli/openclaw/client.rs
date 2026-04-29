@@ -1795,7 +1795,13 @@ impl AgentClient for OpenClawClient {
             }
             Err(err) => return Err(err),
         };
-        let created_label = created.label.as_deref().unwrap_or(name);
+        let Some(created_label) = created.label.as_deref() else {
+            anyhow::bail!(
+                "openclaw: sessions.create returned key '{}' without requested label '{}'; refusing to bind",
+                created.key,
+                name
+            );
+        };
         if created.key != key {
             anyhow::bail!(
                 "openclaw: sessions.create returned mismatched session key '{}' for requested key '{}' (label '{}'); refusing to bind",
@@ -1804,9 +1810,17 @@ impl AgentClient for OpenClawClient {
                 created_label
             );
         }
+        if created_label != name {
+            anyhow::bail!(
+                "openclaw: sessions.create returned mismatched label '{}' for requested label '{}' (key '{}'); refusing to bind",
+                created_label,
+                name,
+                created.key
+            );
+        }
         Ok(Session {
             id: created.key.clone(),
-            name: created.label.unwrap_or_else(|| created.key.clone()),
+            name: created_label.to_string(),
             model: String::new(),
             provider: String::new(),
         })
@@ -3852,6 +3866,76 @@ mod tests {
         assert!(err.to_string().contains("mismatched session key"));
         assert!(err.to_string().contains(&expected_key));
         assert!(err.to_string().contains("foreign-session-key"));
+    }
+
+    #[tokio::test]
+    async fn create_session_rejects_missing_created_label() {
+        let pending = PendingRequests::new();
+        let (outbound_tx, mut outbound_rx) = mpsc::channel::<RequestFrame>(OUTBOUND_CAPACITY);
+        let client = tests_support_new_fake(pending.clone(), Some(outbound_tx), true);
+        let expected_key = stable_session_key(DEFAULT_SESSION_NAMESPACE, "Research");
+
+        let create_task = tokio::spawn(async move { client.create_session("Research").await });
+        let req = outbound_rx
+            .recv()
+            .await
+            .expect("create request should be sent");
+
+        pending
+            .resolve(ResponseFrame {
+                id: req.id,
+                ok: true,
+                payload: Some(serde_json::json!({
+                    "key": expected_key.clone(),
+                    "entry": {}
+                })),
+                error: None,
+            })
+            .await;
+
+        let err = create_task
+            .await
+            .expect("create task should join")
+            .expect_err("missing create label must fail closed");
+        assert!(err.to_string().contains("without requested label"));
+        assert!(err.to_string().contains(&expected_key));
+        assert!(err.to_string().contains("Research"));
+    }
+
+    #[tokio::test]
+    async fn create_session_rejects_mismatched_created_label() {
+        let pending = PendingRequests::new();
+        let (outbound_tx, mut outbound_rx) = mpsc::channel::<RequestFrame>(OUTBOUND_CAPACITY);
+        let client = tests_support_new_fake(pending.clone(), Some(outbound_tx), true);
+        let expected_key = stable_session_key(DEFAULT_SESSION_NAMESPACE, "Research");
+
+        let create_task = tokio::spawn(async move { client.create_session("Research").await });
+        let req = outbound_rx
+            .recv()
+            .await
+            .expect("create request should be sent");
+
+        pending
+            .resolve(ResponseFrame {
+                id: req.id,
+                ok: true,
+                payload: Some(serde_json::json!({
+                    "key": expected_key.clone(),
+                    "label": "research",
+                    "entry": {}
+                })),
+                error: None,
+            })
+            .await;
+
+        let err = create_task
+            .await
+            .expect("create task should join")
+            .expect_err("mismatched create label must fail closed");
+        assert!(err.to_string().contains("mismatched label"));
+        assert!(err.to_string().contains("Research"));
+        assert!(err.to_string().contains("research"));
+        assert!(err.to_string().contains(&expected_key));
     }
 
     #[tokio::test]
