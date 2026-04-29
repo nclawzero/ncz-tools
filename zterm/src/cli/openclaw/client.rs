@@ -222,26 +222,26 @@ impl OpenClawClient {
         }
         let req = RequestFrame::new(method, params);
         let id = req.id.clone();
-        let rx = self.pending.register(id.clone()).await;
+        let mut pending = self.pending.register_guard(id.clone()).await;
         let Some(tx) = self.outbound_tx.as_ref() else {
-            self.pending.cancel(&id).await;
+            pending.cancel();
             return Err(anyhow!("openclaw: write loop dropped (connection closed)"));
         };
         if tx.send(req).await.is_err() {
-            self.pending.cancel(&id).await;
+            pending.cancel();
             return Err(anyhow!("openclaw: write loop dropped (connection closed)"));
         }
 
-        match tokio::time::timeout(timeout, rx).await {
+        match tokio::time::timeout(timeout, pending.receiver_mut()).await {
             Ok(Ok(frame)) => Ok(frame),
             Ok(Err(_)) => {
-                self.pending.cancel(&id).await;
+                pending.cancel();
                 Err(anyhow!(
                     "openclaw: request {id} abandoned (connection closed before response)"
                 ))
             }
             Err(_) => {
-                self.pending.cancel(&id).await;
+                pending.cancel();
                 Err(anyhow!(
                     "openclaw: request {id} timed out after {timeout:?}"
                 ))
@@ -4259,6 +4259,33 @@ mod tests {
         assert!(
             pending.is_empty().await,
             "timed-out requests must not remain in the pending map"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropped_send_request_cancels_pending_request() {
+        let pending = PendingRequests::new();
+        let (outbound_tx, mut outbound_rx) = mpsc::channel::<RequestFrame>(OUTBOUND_CAPACITY);
+        let client = tests_support_new_fake(pending.clone(), Some(outbound_tx), true);
+
+        let task = tokio::spawn(async move {
+            client
+                .send_request_with_timeout("models.list", None, Duration::from_secs(60))
+                .await
+        });
+        let req = outbound_rx
+            .recv()
+            .await
+            .expect("request should be sent before cancellation");
+        assert_eq!(req.method, "models.list");
+        assert_eq!(pending.len().await, 1);
+
+        task.abort();
+        let _ = task.await;
+
+        assert!(
+            pending.is_empty().await,
+            "dropping an in-flight request future must clear its pending id"
         );
     }
 

@@ -31,6 +31,7 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
+use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::mpsc;
 
 // Re-export the shared types rather than duplicate them. They originated
@@ -203,11 +204,56 @@ pub enum TurnChunk {
     Finished(std::result::Result<String, String>),
 }
 
-/// Tokio sender half the TUI hands to the client before each turn.
-/// `UnboundedSender` keeps the streaming path cheap and drop-safe: if
-/// the TUI goes away mid-turn the client's sends silently fail rather
-/// than block on a bounded channel.
-pub type StreamSink = mpsc::UnboundedSender<TurnChunk>;
+/// Bounded sender half the TUI hands to the client before each turn.
+///
+/// `send` is intentionally synchronous because some legacy emission
+/// helpers are not async. It uses `try_send` under the hood: if the UI
+/// cannot keep up, the shared sender is dropped so the receiver observes a
+/// disconnect and closes the active turn instead of growing memory without
+/// bound.
+#[derive(Debug, Clone)]
+pub struct StreamSink {
+    inner: Arc<StdMutex<Option<mpsc::Sender<TurnChunk>>>>,
+}
+
+impl StreamSink {
+    pub fn channel(capacity: usize) -> (Self, mpsc::Receiver<TurnChunk>) {
+        let (tx, rx) = mpsc::channel(capacity.max(1));
+        (
+            Self {
+                inner: Arc::new(StdMutex::new(Some(tx))),
+            },
+            rx,
+        )
+    }
+
+    pub fn send(
+        &self,
+        chunk: TurnChunk,
+    ) -> std::result::Result<(), mpsc::error::TrySendError<TurnChunk>> {
+        let Ok(mut guard) = self.inner.lock() else {
+            return Err(mpsc::error::TrySendError::Closed(chunk));
+        };
+        let result = match guard.as_ref() {
+            Some(tx) => tx.try_send(chunk),
+            None => Err(mpsc::error::TrySendError::Closed(chunk)),
+        };
+        if matches!(
+            result,
+            Err(mpsc::error::TrySendError::Full(_)) | Err(mpsc::error::TrySendError::Closed(_))
+        ) {
+            *guard = None;
+        }
+        result
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.inner
+            .lock()
+            .map(|guard| guard.is_none())
+            .unwrap_or(true)
+    }
+}
 
 /// Backend-agnostic agent client.
 ///

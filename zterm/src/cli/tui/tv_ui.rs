@@ -143,6 +143,10 @@ const SPINNER_INTERVAL: Duration = Duration::from_millis(80);
 const TURN_FORWARD_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
 const SESSION_PICKER_LIST_TIMEOUT: Duration = Duration::from_secs(5);
 const RESPONSE_BUSY_TOAST: &str = "Busy: response in progress";
+const UI_EVENT_CAPACITY: usize = 512;
+const TURN_STREAM_CAPACITY: usize = 128;
+const TURN_TOKEN_COALESCE_BYTES: usize = 4096;
+const TURN_STREAM_MAX_BYTES: usize = 2 * 1024 * 1024;
 
 /// How long a status-line toast (e.g. palette confirmation after
 /// Ctrl-P) remains visible. ~1s is long enough to read but short
@@ -162,10 +166,13 @@ struct TypewriterState {
 impl TypewriterState {
     fn new(text: impl Into<String>, after_lines: Vec<String>, current_line: usize) -> Self {
         Self {
-            chars: text.into().chars().collect(),
+            chars: sanitize_terminal_text(&text.into()).chars().collect(),
             pos: 0,
             last_emit: Instant::now(),
-            after_lines,
+            after_lines: after_lines
+                .into_iter()
+                .map(|line| sanitize_terminal_text(&line))
+                .collect(),
             current_line,
             completed: false,
         }
@@ -232,6 +239,25 @@ fn typewriter_chars_due(elapsed: Duration, interval: Duration) -> usize {
         return usize::MAX;
     }
     (elapsed.as_millis() / interval.as_millis()) as usize
+}
+
+fn sanitize_terminal_text(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        match ch {
+            '\n' => out.push('\n'),
+            '\u{1b}' => out.push_str("<ESC>"),
+            '\u{7f}' => out.push_str("^?"),
+            '\u{00}'..='\u{1f}' => {
+                out.push('^');
+                out.push(((ch as u8) + b'@') as char);
+            }
+            '\u{80}'..='\u{9f}' => out.push_str(&format!("<0x{:02X}>", ch as u32)),
+            _ if ch.is_control() => out.push_str(&format!("<U+{:04X}>", ch as u32)),
+            _ => out.push(ch),
+        }
+    }
+    out
 }
 
 /// Live state feeding the status line. Mutated on each event-loop
@@ -472,7 +498,7 @@ fn parse_beep_toggle(arg: &str) -> Option<bool> {
 /// thread, so the UI runs inside `spawn_blocking`. The async agent
 /// path lives in a tokio worker task: TV thread → `WorkerRequest` via
 /// bounded mpsc → worker → active client's `submit_turn` → streamed
-/// `TurnChunk`s via unbounded mpsc → TV thread drains on every
+/// `TurnChunk`s via bounded mpsc → TV thread drains on every
 /// poll-timeout tick.
 pub async fn run(
     app: Arc<Mutex<App>>,
@@ -494,11 +520,11 @@ pub async fn run(
     };
     let workspace_name = workspace_identity.name.clone();
 
-    // Channels: bounded for requests (backpressure on a spammy user
-    // isn't a bad thing), unbounded for streamed chunks (the UI
-    // drains on every tick so this should never grow).
+    // Channels are bounded on both sides. If streamed chunks outrun
+    // the UI drain loop, StreamSink closes the receiver so the active
+    // turn fails instead of letting memory grow without bound.
     let (req_tx, mut req_rx) = mpsc::channel::<WorkerRequest>(32);
-    let (event_tx, event_rx) = mpsc::unbounded_channel::<TurnChunk>();
+    let (event_tx, event_rx) = StreamSink::channel(UI_EVENT_CAPACITY);
 
     let connect_splash = Some(connect_splash_for_workspace(&workspace_name));
 
@@ -573,7 +599,7 @@ pub async fn run(
                                 &text,
                             );
                             let mut client = client_arc.lock().await;
-                            let (turn_sink, turn_rx) = mpsc::unbounded_channel::<TurnChunk>();
+                            let (turn_sink, turn_rx) = StreamSink::channel(TURN_STREAM_CAPACITY);
                             let observed_finished = Arc::new(AtomicBool::new(false));
                             let forwarded_token = Arc::new(AtomicBool::new(false));
                             let mut forward_task = tokio::spawn(forward_turn_chunks(
@@ -904,29 +930,78 @@ fn connect_splash_for_workspace(workspace_name: &str) -> String {
 }
 
 async fn forward_turn_chunks(
-    mut turn_rx: mpsc::UnboundedReceiver<TurnChunk>,
+    mut turn_rx: mpsc::Receiver<TurnChunk>,
     ui_sink: StreamSink,
     observed_finished: Arc<AtomicBool>,
     forwarded_token: Arc<AtomicBool>,
 ) -> bool {
     let mut saw_finished = false;
-    while let Some(chunk) = turn_rx.recv().await {
-        let is_finished = matches!(&chunk, TurnChunk::Finished(_));
-        if is_finished {
-            if saw_finished {
-                continue;
-            }
-            if ui_sink.send(chunk).is_ok() {
-                saw_finished = true;
-                observed_finished.store(true, Ordering::Release);
-            }
-            continue;
+    let mut pending_token = String::new();
+    let mut forwarded_bytes = 0usize;
+
+    let flush_token = |pending_token: &mut String| -> bool {
+        if pending_token.is_empty() {
+            return true;
         }
-        let is_token = matches!(&chunk, TurnChunk::Token(_));
-        if ui_sink.send(chunk).is_ok() && is_token {
+        let chunk = TurnChunk::Token(std::mem::take(pending_token));
+        if ui_sink.send(chunk).is_ok() {
             forwarded_token.store(true, Ordering::Release);
+            true
+        } else {
+            false
+        }
+    };
+
+    while let Some(chunk) = turn_rx.recv().await {
+        match chunk {
+            TurnChunk::Token(text) => {
+                forwarded_bytes = forwarded_bytes.saturating_add(text.len());
+                if forwarded_bytes > TURN_STREAM_MAX_BYTES {
+                    if !flush_token(&mut pending_token) {
+                        return saw_finished;
+                    }
+                    let message = format!(
+                        "response exceeded {} byte TUI stream limit; turn closed",
+                        TURN_STREAM_MAX_BYTES
+                    );
+                    if ui_sink.send(TurnChunk::Finished(Err(message))).is_ok() {
+                        saw_finished = true;
+                        observed_finished.store(true, Ordering::Release);
+                    }
+                    return saw_finished;
+                }
+                pending_token.push_str(&text);
+                if pending_token.len() >= TURN_TOKEN_COALESCE_BYTES
+                    && !flush_token(&mut pending_token)
+                {
+                    return saw_finished;
+                }
+            }
+            TurnChunk::Finished(result) => {
+                if saw_finished {
+                    continue;
+                }
+                if !flush_token(&mut pending_token) {
+                    return saw_finished;
+                }
+                if ui_sink.send(TurnChunk::Finished(result)).is_ok() {
+                    saw_finished = true;
+                    observed_finished.store(true, Ordering::Release);
+                } else {
+                    return saw_finished;
+                }
+            }
+            other => {
+                if !flush_token(&mut pending_token) {
+                    return saw_finished;
+                }
+                if ui_sink.send(other).is_err() {
+                    return saw_finished;
+                }
+            }
         }
     }
+    let _ = flush_token(&mut pending_token);
     saw_finished
 }
 
@@ -1550,7 +1625,7 @@ fn run_blocking(
     workspace_id: Option<String>,
     connect_splash: Option<String>,
     req_tx: mpsc::Sender<WorkerRequest>,
-    mut event_rx: mpsc::UnboundedReceiver<TurnChunk>,
+    mut event_rx: mpsc::Receiver<TurnChunk>,
 ) -> Result<()> {
     let mut tapp =
         Application::new().map_err(|e| anyhow::anyhow!("turbo-vision init failed: {e:?}"))?;
@@ -1875,7 +1950,7 @@ fn run_event_loop(
     input_undo: Rc<RefCell<VecDeque<String>>>,
     input_redo: Rc<RefCell<VecDeque<String>>>,
     req_tx: mpsc::Sender<WorkerRequest>,
-    event_rx: &mut mpsc::UnboundedReceiver<TurnChunk>,
+    event_rx: &mut mpsc::Receiver<TurnChunk>,
     status_state: &mut StatusState,
     typewriter_state: &mut Option<TypewriterState>,
     shared_app: &Arc<Mutex<App>>,
@@ -2280,7 +2355,7 @@ fn is_exit_command(input: &str) -> bool {
 /// `Finished` frames to stop the elapsed-turn timer so the status
 /// line freezes at the final duration instead of ticking forever.
 fn drain_stream_events(
-    event_rx: &mut mpsc::UnboundedReceiver<TurnChunk>,
+    event_rx: &mut mpsc::Receiver<TurnChunk>,
     chat_lines: &Rc<RefCell<Vec<String>>>,
     status_state: &mut StatusState,
     typewriter_state: &mut Option<TypewriterState>,
@@ -2405,7 +2480,8 @@ fn apply_chunk(chunk: TurnChunk, chat_lines: &Rc<RefCell<Vec<String>>>) {
     let mut lines = chat_lines.borrow_mut();
     match chunk {
         TurnChunk::Token(s) => {
-            let mut parts = s.split('\n');
+            let safe = sanitize_terminal_text(&s);
+            let mut parts = safe.split('\n');
             if let Some(first) = parts.next() {
                 if let Some(last) = lines.last_mut() {
                     last.push_str(first);
@@ -2426,7 +2502,7 @@ fn apply_chunk(chunk: TurnChunk, chat_lines: &Rc<RefCell<Vec<String>>>) {
             lines.push(String::new());
         }
         TurnChunk::Finished(Err(e)) => {
-            lines.push(format!("[error] {e}"));
+            lines.push(format!("[error] {}", sanitize_terminal_text(&e)));
             lines.push(String::new());
         }
     }
@@ -3399,7 +3475,8 @@ impl View for ChatPane {
             let mut buf = DrawBuffer::new(width);
             buf.move_char(0, ' ', attr, width);
             if let Some(line) = visible.get(row) {
-                let truncated: String = line.chars().take(width).collect();
+                let safe = sanitize_terminal_text(line);
+                let truncated: String = safe.chars().take(width).collect();
                 buf.move_str(0, &truncated, attr);
             }
             write_line_to_terminal(
@@ -3483,8 +3560,8 @@ mod tests {
         let mut typewriter_state = None;
         let mut response_in_flight = true;
         let mut session_picker_state = SessionPickerState::default();
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        tx.send(TurnChunk::ClearUsage).unwrap();
+        let (tx, mut rx) = mpsc::channel(8);
+        tx.try_send(TurnChunk::ClearUsage).unwrap();
 
         assert!(!drain_stream_events(
             &mut rx,
@@ -3517,8 +3594,8 @@ mod tests {
         let mut typewriter_state = None;
         let mut response_in_flight = true;
         let mut session_picker_state = SessionPickerState::default();
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        tx.send(TurnChunk::Status {
+        let (tx, mut rx) = mpsc::channel(8);
+        tx.try_send(TurnChunk::Status {
             workspace: Some("new".to_string()),
             model: Some("consult".to_string()),
         })
@@ -3596,6 +3673,33 @@ mod tests {
     }
 
     #[test]
+    fn token_chunks_render_terminal_controls_visibly() {
+        let lines = Rc::new(RefCell::new(vec![String::new()]));
+
+        apply_chunk(
+            TurnChunk::Token("ok\u{1b}]52;c;owned\u{07}\nnext\u{9b}31m".to_string()),
+            &lines,
+        );
+
+        let lines = lines.borrow();
+        assert_eq!(lines[0], "ok<ESC>]52;c;owned^G");
+        assert_eq!(lines[1], "next<0x9B>31m");
+        assert!(!lines.iter().any(|line| {
+            line.contains('\u{1b}') || line.contains('\u{07}') || line.contains('\u{9b}')
+        }));
+    }
+
+    #[test]
+    fn cached_typewriter_splash_sanitizes_terminal_controls() {
+        let writer =
+            TypewriterState::new("boot\u{1b}[31m\nready", vec!["after\u{07}".to_string()], 0);
+
+        let text: String = writer.chars.iter().collect();
+        assert_eq!(text, "boot<ESC>[31m\nready");
+        assert_eq!(writer.after_lines, ["after^G"]);
+    }
+
+    #[test]
     fn session_picker_entry_builds_switch_command_from_backend_id() {
         let entry = SessionPickerEntry {
             id: "sess-123".to_string(),
@@ -3670,8 +3774,8 @@ mod tests {
             load: SessionPickerLoad::Loading(SessionPickerWorkspace::new("default", None)),
             open_when_ready: true,
         };
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        tx.send(TurnChunk::SessionPickerList(SessionPickerListResult {
+        let (tx, mut rx) = mpsc::channel(8);
+        tx.try_send(TurnChunk::SessionPickerList(SessionPickerListResult {
             workspace: SessionPickerWorkspace::new("default", None),
             result: Ok(vec![Session {
                 id: "sess-123".to_string(),
@@ -3771,8 +3875,8 @@ mod tests {
             load: SessionPickerLoad::Loading(SessionPickerWorkspace::new("workspace-b", None)),
             open_when_ready: true,
         };
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        tx.send(TurnChunk::SessionPickerList(SessionPickerListResult {
+        let (tx, mut rx) = mpsc::channel(8);
+        tx.try_send(TurnChunk::SessionPickerList(SessionPickerListResult {
             workspace: SessionPickerWorkspace::new("workspace-a", None),
             result: Ok(vec![Session {
                 id: "stale-a-session".to_string(),
@@ -3893,8 +3997,8 @@ mod tests {
         let mut typewriter_state = None;
         let mut response_in_flight = true;
         let mut session_picker_state = SessionPickerState::default();
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        tx.send(TurnChunk::Finished(Ok(String::new()))).unwrap();
+        let (tx, mut rx) = mpsc::channel(8);
+        tx.try_send(TurnChunk::Finished(Ok(String::new()))).unwrap();
 
         assert!(!drain_stream_events(
             &mut rx,
@@ -3926,7 +4030,7 @@ mod tests {
         let mut typewriter_state = None;
         let mut response_in_flight = true;
         let mut session_picker_state = SessionPickerState::default();
-        let (tx, mut rx) = mpsc::unbounded_channel::<TurnChunk>();
+        let (tx, mut rx) = mpsc::channel::<TurnChunk>(8);
         drop(tx);
 
         assert!(drain_stream_events(
@@ -3948,16 +4052,16 @@ mod tests {
 
     #[tokio::test]
     async fn forward_turn_chunks_forwards_only_one_finished() {
-        let (turn_tx, turn_rx) = mpsc::unbounded_channel();
-        let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
+        let (turn_tx, turn_rx) = mpsc::channel(8);
+        let (ui_tx, mut ui_rx) = StreamSink::channel(8);
         let observed_finished = Arc::new(AtomicBool::new(false));
         let forwarded_token = Arc::new(AtomicBool::new(false));
 
         turn_tx
-            .send(TurnChunk::Finished(Ok("first".to_string())))
+            .try_send(TurnChunk::Finished(Ok("first".to_string())))
             .unwrap();
         turn_tx
-            .send(TurnChunk::Finished(Ok("second".to_string())))
+            .try_send(TurnChunk::Finished(Ok("second".to_string())))
             .unwrap();
         drop(turn_tx);
 
@@ -3982,13 +4086,13 @@ mod tests {
 
     #[tokio::test]
     async fn forward_turn_chunks_tracks_forwarded_tokens_without_finished() {
-        let (turn_tx, turn_rx) = mpsc::unbounded_channel();
-        let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
+        let (turn_tx, turn_rx) = mpsc::channel(8);
+        let (ui_tx, mut ui_rx) = StreamSink::channel(8);
         let observed_finished = Arc::new(AtomicBool::new(false));
         let forwarded_token = Arc::new(AtomicBool::new(false));
 
         turn_tx
-            .send(TurnChunk::Token("partial".to_string()))
+            .try_send(TurnChunk::Token("partial".to_string()))
             .unwrap();
         drop(turn_tx);
 
@@ -4007,6 +4111,85 @@ mod tests {
         match ui_rx.recv().await {
             Some(TurnChunk::Token(text)) => assert_eq!(text, "partial"),
             other => panic!("expected forwarded token, got {other:?}"),
+        }
+        assert!(ui_rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn stream_sink_closes_on_bounded_overflow() {
+        let (sink, mut rx) = StreamSink::channel(1);
+
+        assert!(sink.send(TurnChunk::Token("queued".to_string())).is_ok());
+        assert!(sink.send(TurnChunk::Token("overflow".to_string())).is_err());
+        assert!(sink.is_closed());
+
+        match rx.recv().await {
+            Some(TurnChunk::Token(text)) => assert_eq!(text, "queued"),
+            other => panic!("expected queued token, got {other:?}"),
+        }
+        assert!(rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn forward_turn_chunks_coalesces_token_bursts() {
+        let (turn_tx, turn_rx) = mpsc::channel(8);
+        let (ui_tx, mut ui_rx) = StreamSink::channel(8);
+        let observed_finished = Arc::new(AtomicBool::new(false));
+        let forwarded_token = Arc::new(AtomicBool::new(false));
+
+        turn_tx
+            .try_send(TurnChunk::Token("hel".to_string()))
+            .unwrap();
+        turn_tx
+            .try_send(TurnChunk::Token("lo".to_string()))
+            .unwrap();
+        drop(turn_tx);
+
+        assert!(
+            !forward_turn_chunks(
+                turn_rx,
+                ui_tx,
+                Arc::clone(&observed_finished),
+                Arc::clone(&forwarded_token),
+            )
+            .await
+        );
+        assert!(forwarded_token.load(Ordering::Acquire));
+        match ui_rx.recv().await {
+            Some(TurnChunk::Token(text)) => assert_eq!(text, "hello"),
+            other => panic!("expected coalesced token, got {other:?}"),
+        }
+        assert!(ui_rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn forward_turn_chunks_caps_token_bytes_with_error() {
+        let (turn_tx, turn_rx) = mpsc::channel(2);
+        let (ui_tx, mut ui_rx) = StreamSink::channel(8);
+        let observed_finished = Arc::new(AtomicBool::new(false));
+        let forwarded_token = Arc::new(AtomicBool::new(false));
+
+        turn_tx
+            .try_send(TurnChunk::Token("x".repeat(TURN_STREAM_MAX_BYTES + 1)))
+            .unwrap();
+        drop(turn_tx);
+
+        assert!(
+            forward_turn_chunks(
+                turn_rx,
+                ui_tx,
+                Arc::clone(&observed_finished),
+                Arc::clone(&forwarded_token),
+            )
+            .await
+        );
+        assert!(observed_finished.load(Ordering::Acquire));
+        assert!(!forwarded_token.load(Ordering::Acquire));
+        match ui_rx.recv().await {
+            Some(TurnChunk::Finished(Err(message))) => {
+                assert!(message.contains("TUI stream limit"));
+            }
+            other => panic!("expected stream-limit error, got {other:?}"),
         }
         assert!(ui_rx.recv().await.is_none());
     }

@@ -1280,7 +1280,7 @@ fallback = "gemini"
         );
         assert!(client.stream_sink.is_none());
 
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, _rx) = StreamSink::channel(8);
         client.set_stream_sink(Some(tx));
         assert!(client.stream_sink.is_some());
 

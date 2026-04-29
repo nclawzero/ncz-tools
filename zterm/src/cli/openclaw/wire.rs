@@ -29,8 +29,8 @@
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::sync::{oneshot, Mutex};
+use std::sync::{Arc, Mutex};
+use tokio::sync::oneshot;
 use uuid::Uuid;
 
 /// A parsed openclaw wire frame.
@@ -163,15 +163,29 @@ impl PendingRequests {
     /// caller should await for the matching response.
     pub async fn register(&self, id: String) -> oneshot::Receiver<ResponseFrame> {
         let (tx, rx) = oneshot::channel();
-        self.inner.lock().await.insert(id, tx);
+        self.inner
+            .lock()
+            .expect("pending request mutex")
+            .insert(id, tx);
         rx
+    }
+
+    /// Register a pending request with a guard that removes the id if
+    /// the caller future is dropped before a response arrives.
+    pub async fn register_guard(&self, id: String) -> PendingRequestGuard {
+        let rx = self.register(id.clone()).await;
+        PendingRequestGuard {
+            pending: self.clone(),
+            id,
+            rx,
+        }
     }
 
     /// Deliver a response to its waiting caller. Returns `true` if
     /// the id was in flight, `false` if no caller was waiting (stale
     /// id, timed-out caller, or duplicate response).
     pub async fn resolve(&self, frame: ResponseFrame) -> bool {
-        let mut map = self.inner.lock().await;
+        let mut map = self.inner.lock().expect("pending request mutex");
         if let Some(tx) = map.remove(&frame.id) {
             // Receiver may already be dropped (caller gave up). That's
             // fine — we still report "delivered to the map" as `true`.
@@ -185,7 +199,15 @@ impl PendingRequests {
     /// Remove a request that the caller has given up on. Returns `true`
     /// when an in-flight entry was present.
     pub async fn cancel(&self, id: &str) -> bool {
-        self.inner.lock().await.remove(id).is_some()
+        self.cancel_sync(id)
+    }
+
+    fn cancel_sync(&self, id: &str) -> bool {
+        self.inner
+            .lock()
+            .expect("pending request mutex")
+            .remove(id)
+            .is_some()
     }
 
     /// Abandon all in-flight requests. Called by the read loop when
@@ -193,16 +215,38 @@ impl PendingRequests {
     /// see their `oneshot::Receiver` return `RecvError` and bubble up
     /// a connection-lost error.
     pub async fn abort_all(&self) {
-        self.inner.lock().await.clear();
+        self.inner.lock().expect("pending request mutex").clear();
     }
 
     /// Number of in-flight requests (for debug / metrics).
     pub async fn len(&self) -> usize {
-        self.inner.lock().await.len()
+        self.inner.lock().expect("pending request mutex").len()
     }
 
     pub async fn is_empty(&self) -> bool {
-        self.inner.lock().await.is_empty()
+        self.inner.lock().expect("pending request mutex").is_empty()
+    }
+}
+
+pub struct PendingRequestGuard {
+    pending: PendingRequests,
+    id: String,
+    rx: oneshot::Receiver<ResponseFrame>,
+}
+
+impl PendingRequestGuard {
+    pub fn receiver_mut(&mut self) -> &mut oneshot::Receiver<ResponseFrame> {
+        &mut self.rx
+    }
+
+    pub fn cancel(&self) -> bool {
+        self.pending.cancel_sync(&self.id)
+    }
+}
+
+impl Drop for PendingRequestGuard {
+    fn drop(&mut self) {
+        self.pending.cancel_sync(&self.id);
     }
 }
 
