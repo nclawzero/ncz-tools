@@ -182,6 +182,12 @@ impl PendingRequests {
         }
     }
 
+    /// Remove a request that the caller has given up on. Returns `true`
+    /// when an in-flight entry was present.
+    pub async fn cancel(&self, id: &str) -> bool {
+        self.inner.lock().await.remove(id).is_some()
+    }
+
     /// Abandon all in-flight requests. Called by the read loop when
     /// the underlying WebSocket closes unexpectedly — waiting tasks
     /// see their `oneshot::Receiver` return `RecvError` and bubble up
@@ -369,6 +375,17 @@ mod tests {
 
         pending.abort_all().await;
         assert!(pending.is_empty().await);
+    }
+
+    #[tokio::test]
+    async fn cancel_removes_registered_request() {
+        let pending = PendingRequests::new();
+        let _rx = pending.register("a".to_string()).await;
+        assert_eq!(pending.len().await, 1);
+
+        assert!(pending.cancel("a").await);
+        assert!(pending.is_empty().await);
+        assert!(!pending.cancel("a").await);
     }
 
     #[tokio::test]

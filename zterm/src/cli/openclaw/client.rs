@@ -223,22 +223,29 @@ impl OpenClawClient {
         let req = RequestFrame::new(method, params);
         let id = req.id.clone();
         let rx = self.pending.register(id.clone()).await;
-        let tx = self
-            .outbound_tx
-            .as_ref()
-            .ok_or_else(|| anyhow!("openclaw: write loop dropped (connection closed)"))?;
-        tx.send(req)
-            .await
-            .map_err(|_| anyhow!("openclaw: write loop dropped (connection closed)"))?;
+        let Some(tx) = self.outbound_tx.as_ref() else {
+            self.pending.cancel(&id).await;
+            return Err(anyhow!("openclaw: write loop dropped (connection closed)"));
+        };
+        if tx.send(req).await.is_err() {
+            self.pending.cancel(&id).await;
+            return Err(anyhow!("openclaw: write loop dropped (connection closed)"));
+        }
 
         match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(frame)) => Ok(frame),
-            Ok(Err(_)) => Err(anyhow!(
-                "openclaw: request {id} abandoned (connection closed before response)"
-            )),
-            Err(_) => Err(anyhow!(
-                "openclaw: request {id} timed out after {timeout:?}"
-            )),
+            Ok(Err(_)) => {
+                self.pending.cancel(&id).await;
+                Err(anyhow!(
+                    "openclaw: request {id} abandoned (connection closed before response)"
+                ))
+            }
+            Err(_) => {
+                self.pending.cancel(&id).await;
+                Err(anyhow!(
+                    "openclaw: request {id} timed out after {timeout:?}"
+                ))
+            }
         }
     }
 
@@ -797,11 +804,20 @@ async fn read_loop(
                 }
                 Ok(Frame::Event(ev)) => {
                     if event_requires_reliable_delivery(&ev) {
-                        let event_name = ev.event.clone();
-                        if event_tx.send(ev).await.is_err() {
-                            tracing::debug!(
-                                "openclaw: event receiver closed while delivering reliable event {event_name}"
-                            );
+                        match event_tx.try_send(ev) {
+                            Ok(()) => {}
+                            Err(mpsc::error::TrySendError::Full(ev)) => {
+                                tracing::warn!(
+                                    "openclaw: reliable event channel full while delivering {}; closing connection",
+                                    ev.event
+                                );
+                                break;
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => {
+                                // Receiver dropped — no one cares about events.
+                                // Keep the read loop alive anyway so response
+                                // correlation still works.
+                            }
                         }
                     } else {
                         match event_tx.try_send(ev) {
@@ -3969,10 +3985,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_loop_backpressures_reliable_turn_events_until_delivered() {
+    async fn read_loop_closes_on_reliable_turn_event_backpressure() {
         let pending = PendingRequests::new();
         let response_id = "req-response-after-completion".to_string();
-        let mut response_rx = pending.register(response_id.clone()).await;
+        let response_rx = pending.register(response_id.clone()).await;
         let (event_tx, mut event_rx) = mpsc::channel::<super::super::wire::EventFrame>(1);
         event_tx
             .try_send(super::super::wire::EventFrame {
@@ -4006,11 +4022,12 @@ mod tests {
             event_tx,
             Arc::clone(&connected),
         ));
+        let response = tokio::time::timeout(Duration::from_millis(50), response_rx)
+            .await
+            .expect("pending response should be aborted when reliable event overflows");
         assert!(
-            tokio::time::timeout(Duration::from_millis(20), &mut response_rx)
-                .await
-                .is_err(),
-            "response should wait while reliable completion is backpressured"
+            response.is_err(),
+            "overflow must fail the connection instead of parking the reader"
         );
 
         let retained = event_rx
@@ -4018,20 +4035,13 @@ mod tests {
             .await
             .expect("pre-filled event should still be queued first");
         assert_eq!(retained.event, "already.full");
-        let delivered = tokio::time::timeout(Duration::from_millis(50), event_rx.recv())
-            .await
-            .expect("completion event should be delivered after pressure clears")
-            .expect("event channel should stay open");
-        assert_eq!(delivered.event, "session.run.completed");
-
-        let got = tokio::time::timeout(Duration::from_millis(50), response_rx)
-            .await
-            .expect("response should arrive after reliable event delivery")
-            .expect("response oneshot should deliver");
-        assert_eq!(got.id, response_id);
-        assert_eq!(got.payload.unwrap()["done"], true);
+        assert!(
+            event_rx.try_recv().is_err(),
+            "overflowed reliable event should not be silently dropped into the queue"
+        );
         read_task.await.expect("read loop should join");
         assert!(!connected.load(Ordering::Relaxed));
+        assert!(pending.is_empty().await);
     }
 
     #[tokio::test]
@@ -4044,7 +4054,7 @@ mod tests {
         let (_event_tx, event_rx) = mpsc::channel::<super::super::wire::EventFrame>(EVENT_CAPACITY);
 
         let client = OpenClawClient {
-            pending,
+            pending: pending.clone(),
             outbound_tx: Some(outbound_tx),
             event_rx: Some(event_rx),
             connected: Arc::new(AtomicBool::new(false)),
@@ -4075,7 +4085,7 @@ mod tests {
         let (_event_tx, event_rx) = mpsc::channel::<super::super::wire::EventFrame>(EVENT_CAPACITY);
 
         let client = OpenClawClient {
-            pending,
+            pending: pending.clone(),
             outbound_tx: Some(outbound_tx),
             event_rx: Some(event_rx),
             connected: Arc::new(AtomicBool::new(true)),
@@ -4092,6 +4102,28 @@ mod tests {
             .await
             .expect_err("dropped write loop should error");
         assert!(err.to_string().contains("write loop dropped"));
+        assert!(
+            pending.is_empty().await,
+            "failed sends must cancel their pending request entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_request_timeout_cancels_pending_request() {
+        let pending = PendingRequests::new();
+        let (outbound_tx, _outbound_rx) = mpsc::channel::<RequestFrame>(OUTBOUND_CAPACITY);
+        let client = tests_support_new_fake(pending.clone(), Some(outbound_tx), true);
+
+        let err = client
+            .send_request_with_timeout("models.list", None, Duration::from_millis(10))
+            .await
+            .expect_err("missing response should time out");
+
+        assert!(err.to_string().contains("timed out"));
+        assert!(
+            pending.is_empty().await,
+            "timed-out requests must not remain in the pending map"
+        );
     }
 
     #[tokio::test]
