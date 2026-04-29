@@ -1832,7 +1832,7 @@ impl AgentClient for OpenClawClient {
             })
             .await?;
         for row in &result.sessions {
-            if self.row_belongs_to_session_namespace(row)
+            if self.row_authorizes_session_operation(row)
                 && (row.key == session_id || row.session_id.as_deref() == Some(session_id))
             {
                 return Ok(row_into_session(row.clone()));
@@ -1903,7 +1903,7 @@ impl OpenClawClient {
             })
             .await?;
         for row in &result.sessions {
-            if row.key == key && self.row_belongs_to_session_namespace(row) {
+            if row.key == key && self.row_authorizes_session_operation(row) {
                 return Ok(row_into_session(row.clone()));
             }
         }
@@ -1933,6 +1933,10 @@ impl OpenClawClient {
             .as_deref()
             .map(|label| self.session_key_belongs_to_session_namespace(&row.key, label))
             .unwrap_or(false)
+    }
+
+    fn row_authorizes_session_operation(&self, row: &super::handshake::OpenClawSessionRow) -> bool {
+        self.stable_row_belongs_to_session_namespace(row)
     }
 
     fn legacy_server_key_session_rows(
@@ -2491,6 +2495,8 @@ mod tests {
             }),
         );
         assert!(client.legacy_server_key_row_belongs_to_session_namespace(&exact_namespace_row));
+        assert!(client.row_belongs_to_session_namespace(&exact_namespace_row));
+        assert!(!client.row_authorizes_session_operation(&exact_namespace_row));
 
         let exact_workspace_id_row = test_session_row_with_extra(
             "oc-server-exact-workspace-id",
@@ -2501,6 +2507,8 @@ mod tests {
             }),
         );
         assert!(client.legacy_server_key_row_belongs_to_session_namespace(&exact_workspace_id_row));
+        assert!(client.row_belongs_to_session_namespace(&exact_workspace_id_row));
+        assert!(!client.row_authorizes_session_operation(&exact_workspace_id_row));
 
         let spoofed_container_row = test_session_row_with_extra(
             "oc-server-spoofed-container",
@@ -4191,7 +4199,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_server_generated_session_keys_are_scoped_by_workspace_metadata() {
+    async fn legacy_server_generated_session_keys_are_display_only_by_workspace_metadata() {
         let pending = PendingRequests::new();
         let (outbound_tx, mut outbound_rx) = mpsc::channel::<RequestFrame>(OUTBOUND_CAPACITY);
         let mut client = tests_support_new_fake(pending.clone(), Some(outbound_tx), true);
@@ -4305,11 +4313,11 @@ mod tests {
                 error: None,
             })
             .await;
-        let loaded = load_task
+        let load_err = load_task
             .await
             .expect("load task should join")
-            .expect("metadata-gated server key should load");
-        assert_eq!(loaded.id, server_key);
+            .expect_err("metadata-only server key must not load");
+        assert!(load_err.to_string().contains("session not found"));
 
         let delete_client = Arc::clone(&client);
         let delete_task =
@@ -4339,27 +4347,17 @@ mod tests {
                 error: None,
             })
             .await;
-        let delete_req = outbound_rx
-            .recv()
-            .await
-            .expect("validated server-key delete should be sent");
-        assert_eq!(delete_req.method, "sessions.delete");
-        assert_eq!(
-            delete_req.params.as_ref().unwrap()["key"].as_str(),
-            Some(server_key)
-        );
-        pending
-            .resolve(ResponseFrame {
-                id: delete_req.id,
-                ok: true,
-                payload: Some(serde_json::json!({})),
-                error: None,
-            })
-            .await;
-        delete_task
+        let err = delete_task
             .await
             .expect("delete task should join")
-            .expect("metadata-gated server key should delete");
+            .expect_err("metadata-only server key must not delete");
+        assert!(err.to_string().contains("session not found"));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), outbound_rx.recv())
+                .await
+                .is_err(),
+            "metadata-only legacy delete must not send sessions.delete"
+        );
     }
 
     #[tokio::test]
