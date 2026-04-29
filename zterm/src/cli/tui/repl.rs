@@ -285,12 +285,36 @@ impl ReplLoop {
                     continue;
                 }
             };
+            let transcript_scope = match self.current_storage_scope().await {
+                Ok(scope) => Some(scope),
+                Err(e) => {
+                    warn!(
+                        "could not resolve transcript scope for session {}: {e}",
+                        session_id
+                    );
+                    None
+                }
+            };
+            append_repl_transcript_entry_best_effort(
+                transcript_scope.as_ref(),
+                &session_id,
+                "user",
+                &input,
+            );
             let turn_res = {
                 let mut guard = active_client.lock().await;
                 guard.submit_turn(&session_id, &input).await
             };
             match turn_res {
-                Ok(_response) => {
+                Ok(response) => {
+                    if !response.is_empty() {
+                        append_repl_transcript_entry_best_effort(
+                            transcript_scope.as_ref(),
+                            &session_id,
+                            "assistant",
+                            &response,
+                        );
+                    }
                     // Response already printed by streaming handler
                     // Update session metadata
                     if let Err(e) = self.update_session_metadata().await {
@@ -298,6 +322,12 @@ impl ReplLoop {
                     }
                 }
                 Err(e) => {
+                    append_repl_transcript_entry_best_effort(
+                        transcript_scope.as_ref(),
+                        &session_id,
+                        "error",
+                        &e.to_string(),
+                    );
                     eprintln!("\n❌ Error: {}", e);
                 }
             }
@@ -656,6 +686,22 @@ fn save_legacy_session_metadata(
         );
     }
     Ok(())
+}
+
+fn append_repl_transcript_entry_best_effort(
+    scope: Option<&storage::LocalWorkspaceScope>,
+    session_id: &str,
+    role: &str,
+    content: &str,
+) -> bool {
+    let Some(scope) = scope else {
+        return false;
+    };
+    if let Err(e) = storage::append_scoped_session_history(scope, session_id, role, content) {
+        warn!("could not append {role} transcript entry for session {session_id}: {e}");
+        return false;
+    }
+    true
 }
 
 #[cfg(test)]

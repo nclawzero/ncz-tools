@@ -555,6 +555,23 @@ pub async fn run(
                     };
                     match client_opt {
                         Some(client_arc) => {
+                            let transcript_scope =
+                                match local_storage_scope_for_active_workspace(&worker_app).await {
+                                    Ok(scope) => Some(scope),
+                                    Err(e) => {
+                                        warn!(
+                                        "could not resolve transcript scope for session {}: {e}",
+                                        worker_session_id
+                                    );
+                                        None
+                                    }
+                                };
+                            append_turn_transcript_entry_best_effort(
+                                transcript_scope.as_ref(),
+                                &worker_session_id,
+                                "user",
+                                &text,
+                            );
                             let mut client = client_arc.lock().await;
                             let (turn_sink, turn_rx) = mpsc::unbounded_channel::<TurnChunk>();
                             let observed_finished = Arc::new(AtomicBool::new(false));
@@ -569,6 +586,26 @@ pub async fn run(
                             let submit_result = client.submit_turn(&worker_session_id, &text).await;
                             client.set_stream_sink(Some(worker_sink.clone()));
                             drop(client);
+
+                            match &submit_result {
+                                Ok(response) if !response.is_empty() => {
+                                    append_turn_transcript_entry_best_effort(
+                                        transcript_scope.as_ref(),
+                                        &worker_session_id,
+                                        "assistant",
+                                        response,
+                                    );
+                                }
+                                Err(e) => {
+                                    append_turn_transcript_entry_best_effort(
+                                        transcript_scope.as_ref(),
+                                        &worker_session_id,
+                                        "error",
+                                        &e.to_string(),
+                                    );
+                                }
+                                _ => {}
+                            }
 
                             let saw_finished = match tokio::time::timeout(
                                 TURN_FORWARD_DRAIN_TIMEOUT,
@@ -1320,6 +1357,22 @@ where
             "not saving local metadata for unsafe session id: {}",
             metadata.id
         );
+        return false;
+    }
+    true
+}
+
+fn append_turn_transcript_entry_best_effort(
+    scope: Option<&storage::LocalWorkspaceScope>,
+    session_id: &str,
+    role: &str,
+    content: &str,
+) -> bool {
+    let Some(scope) = scope else {
+        return false;
+    };
+    if let Err(e) = storage::append_scoped_session_history(scope, session_id, role, content) {
+        warn!("could not append {role} transcript entry for session {session_id}: {e}");
         return false;
     }
     true

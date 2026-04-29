@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 
 /// Configuration directory: ~/.zeroclaw
@@ -305,6 +306,32 @@ pub fn save_scoped_session_metadata(
     Ok(())
 }
 
+/// Append one workspace-scoped transcript entry as JSONL.
+pub fn append_scoped_session_history(
+    scope: &LocalWorkspaceScope,
+    session_id: &str,
+    role: &str,
+    content: &str,
+) -> Result<()> {
+    if !is_safe_session_id(session_id) {
+        return Err(anyhow!("unsafe session id for local history append"));
+    }
+
+    ensure_scoped_session_dir(scope, session_id)?;
+    let file = scoped_session_history_file(scope, session_id)?;
+    let mut out = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&file)
+        .map_err(|e| anyhow!("Failed to open session history: {}", e))?;
+    let entry = serde_json::json!({
+        "role": role,
+        "content": content,
+    });
+    writeln!(out, "{entry}").map_err(|e| anyhow!("Failed to append session history: {}", e))?;
+    Ok(())
+}
+
 /// Load config from file
 pub fn load_config() -> Result<String> {
     let file = config_file()?;
@@ -573,6 +600,22 @@ mod tests {
             scoped_session_history_file(&before, "main").unwrap(),
             scoped_session_history_file(&after, "main").unwrap()
         );
+    }
+
+    #[test]
+    fn append_scoped_session_history_writes_transcript_entries() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let scope = scope(&format!("history-{}", uuid::Uuid::new_v4()));
+
+        append_scoped_session_history(&scope, "main", "user", "hello").unwrap();
+        append_scoped_session_history(&scope, "main", "assistant", "hi there").unwrap();
+
+        let history =
+            fs::read_to_string(scoped_session_history_file(&scope, "main").unwrap()).unwrap();
+        assert!(history.contains(r#""role":"user""#));
+        assert!(history.contains(r#""content":"hello""#));
+        assert!(history.contains(r#""role":"assistant""#));
+        assert!(history.contains(r#""content":"hi there""#));
     }
 
     #[test]

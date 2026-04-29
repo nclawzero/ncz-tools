@@ -1743,10 +1743,13 @@ impl OpenClawClient {
         &self,
         row: &super::handshake::OpenClawSessionRow,
     ) -> bool {
-        let Some(label) = row.label.as_deref() else {
-            return false;
-        };
-        self.session_key_belongs_to_session_namespace(&row.key, label)
+        if self.session_key_has_session_namespace_prefix(&row.key) {
+            return true;
+        }
+        row.label
+            .as_deref()
+            .map(|label| self.session_key_belongs_to_session_namespace(&row.key, label))
+            .unwrap_or(false)
     }
 
     fn legacy_server_key_session_rows(
@@ -1773,6 +1776,12 @@ impl OpenClawClient {
             key == stable_session_key(namespace, label)
                 || key == legacy_stable_session_key(namespace, label)
         })
+    }
+
+    fn session_key_has_session_namespace_prefix(&self, key: &str) -> bool {
+        self.session_namespaces()
+            .into_iter()
+            .any(|namespace| key.starts_with(&session_key_prefix(namespace)))
     }
 
     fn session_namespaces(&self) -> Vec<&str> {
@@ -2152,6 +2161,23 @@ mod tests {
         let client = tests_support_new_fake(PendingRequests::new(), None, true);
         let legacy_key = legacy_stable_session_key(DEFAULT_SESSION_NAMESPACE, "Research");
         assert!(client.session_key_belongs_to_session_namespace(&legacy_key, "Research"));
+    }
+
+    #[test]
+    fn stable_namespace_rows_do_not_require_optional_label() {
+        let client = tests_support_new_fake(PendingRequests::new(), None, true);
+        let row = super::super::handshake::OpenClawSessionRow {
+            key: stable_session_key(DEFAULT_SESSION_NAMESPACE, "Research"),
+            kind: "direct".to_string(),
+            label: None,
+            display_name: None,
+            derived_title: None,
+            updated_at: None,
+            session_id: None,
+            extra: serde_json::Map::new(),
+        };
+
+        assert!(client.row_belongs_to_session_namespace(&row));
     }
 
     fn assistant_event(

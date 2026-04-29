@@ -3052,6 +3052,39 @@ provider_settings = { tokens = ["array-token-1", "array-token-2"], name = "kept"
         storage::delete_scoped_session(&beta_scope, "main").unwrap();
     }
 
+    #[tokio::test]
+    async fn save_exports_transcript_appended_by_turn_paths() {
+        let suffix = uuid::Uuid::new_v4();
+        let workspace_name = format!("save-{suffix}");
+        let scope = storage::workspace_scope("zeroclaw", &workspace_name, None).unwrap();
+        storage::save_scoped_session_metadata(&scope, &metadata("main", "Main")).unwrap();
+        storage::append_scoped_session_history(&scope, "main", "user", "hello").unwrap();
+        storage::append_scoped_session_history(&scope, "main", "assistant", "hi there").unwrap();
+        let handler = super::CommandHandler::new(app_with_two_fake_clients(
+            &workspace_name,
+            FakeAgentClient {
+                sessions: vec![session("main", "Main")],
+                deleted: Arc::new(StdMutex::new(Vec::new())),
+            },
+            "other",
+            FakeAgentClient::default(),
+        ));
+        let tempdir = tempfile::tempdir().unwrap();
+        let save_path = tempdir.path().join("turn-transcript.txt");
+        let save_cmd = format!("/save {}", save_path.display());
+
+        let out = handler.handle(&save_cmd, "main").await.unwrap().unwrap();
+
+        assert!(out.contains("Session saved"));
+        let saved = std::fs::read_to_string(&save_path).unwrap();
+        assert!(saved.contains(r#""role":"user""#));
+        assert!(saved.contains(r#""content":"hello""#));
+        assert!(saved.contains(r#""role":"assistant""#));
+        assert!(saved.contains(r#""content":"hi there""#));
+
+        storage::delete_scoped_session(&scope, "main").unwrap();
+    }
+
     #[test]
     fn delete_resolver_prefers_backend_display_name_match() {
         let backend = vec![session("sess-123", "Research")];
