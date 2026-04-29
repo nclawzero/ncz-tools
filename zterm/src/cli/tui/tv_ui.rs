@@ -2124,6 +2124,7 @@ fn openclaw_submit_failure_requires_incomplete_transcript(message: &str) -> bool
 
 fn response_size_failure_requires_incomplete_transcript(message: &str) -> bool {
     message.contains("response exceeded")
+        || message.contains("response body exceeded")
         || message.contains("response frame exceeded")
         || message.contains("TUI stream limit")
 }
@@ -2138,6 +2139,7 @@ fn zeroclaw_post_send_failure_requires_incomplete_transcript(message: &str) -> b
 fn webhook_post_dispatch_failure_requires_incomplete_transcript(message: &str) -> bool {
     message.starts_with("Webhook request failed: HTTP ")
         || message.contains("Failed to parse response")
+        || message.contains("Failed to read response body")
         || message.contains("Webhook response missing string 'response' field")
 }
 
@@ -8027,22 +8029,30 @@ mod tests {
     }
 
     #[test]
-    fn oversized_response_submit_error_marks_history_incomplete_without_tokens() {
+    fn oversized_response_submit_errors_mark_history_incomplete_without_tokens() {
         let _env = crate::cli::test_env_lock().lock().unwrap();
-        let scope = storage::workspace_scope(
-            "zeroclaw",
-            &format!("oversized-webhook-transcript-{}", uuid::Uuid::new_v4()),
-            None,
-        )
-        .unwrap();
-        storage::append_scoped_session_history(&scope, "main", "user", "hello").unwrap();
-        let reason = "Webhook response exceeded 16 byte limit".to_string();
+        for reason in [
+            "Webhook response exceeded 16 byte limit",
+            "response body exceeded 65552 byte limit",
+            "Failed to read response body: connection reset",
+        ] {
+            let scope = storage::workspace_scope(
+                "zeroclaw",
+                &format!("oversized-webhook-transcript-{}", uuid::Uuid::new_v4()),
+                None,
+            )
+            .unwrap();
+            storage::append_scoped_session_history(&scope, "main", "user", "hello").unwrap();
 
-        assert!(submit_error_requires_incomplete_transcript(&reason, false));
-        let message = mark_turn_transcript_incomplete_reason(&scope, "main", &reason);
+            assert!(
+                submit_error_requires_incomplete_transcript(reason, false),
+                "{reason}"
+            );
+            let message = mark_turn_transcript_incomplete_reason(&scope, "main", reason);
 
-        assert!(message.contains("transcript marked incomplete"));
-        assert!(storage::scoped_session_history_is_incomplete(&scope, "main").unwrap());
+            assert!(message.contains("transcript marked incomplete"));
+            assert!(storage::scoped_session_history_is_incomplete(&scope, "main").unwrap());
+        }
     }
 
     #[test]
