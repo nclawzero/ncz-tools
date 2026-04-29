@@ -21,6 +21,7 @@ const ZEROCLAW_CRON_ERROR_BODY_MAX_BYTES: usize = 2 * 1024;
 const ZEROCLAW_CRON_LIST_BODY_MAX_BYTES: usize = 512 * 1024;
 const ZEROCLAW_CRON_MUTATION_BODY_MAX_BYTES: usize = 16 * 1024;
 const ZEROCLAW_CONFIG_BODY_MAX_BYTES: usize = 512 * 1024;
+const ZEROCLAW_SESSION_LOAD_BODY_MAX_BYTES: usize = 512 * 1024;
 const ZEROCLAW_SESSION_LIST_BODY_MAX_BYTES: usize = 512 * 1024;
 const ZEROCLAW_SESSION_LIST_MAX_ROWS: usize = 1_000;
 
@@ -1031,10 +1032,14 @@ impl ZeroclawClient {
             .map_err(|e| anyhow!("Failed to load session: {}", e))?;
 
         match res.status().as_u16() {
-            200 => res
-                .json::<Session>()
-                .await
-                .map_err(|e| anyhow!("Failed to parse session: {}", e)),
+            200 => {
+                let body =
+                    Self::read_response_body_limited(res, ZEROCLAW_SESSION_LOAD_BODY_MAX_BYTES)
+                        .await
+                        .map_err(|e| anyhow!("Failed to read session response: {}", e))?;
+                serde_json::from_slice::<Session>(&body)
+                    .map_err(|e| anyhow!("Failed to parse session: {}", e))
+            }
             404 => Err(anyhow!("Session not found")),
             _ => Err(anyhow!("Failed to load session: {}", res.status())),
         }
@@ -1577,6 +1582,30 @@ mod tests {
         let err = client.list_sessions().await.unwrap_err();
 
         assert!(err.to_string().contains("Failed to parse sessions"));
+    }
+
+    #[tokio::test]
+    async fn load_session_success_body_is_bounded_before_parsing() {
+        let mut server = mockito::Server::new_async().await;
+        let huge = format!(
+            "{{\"id\":\"main\",\"name\":\"{}tail-marker\",\"model\":\"primary\",\"provider\":\"zeroclaw\"}}",
+            "x".repeat(ZEROCLAW_SESSION_LOAD_BODY_MAX_BYTES + 512)
+        );
+        let _mock = server
+            .mock("GET", "/api/sessions/main")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(huge)
+            .create_async()
+            .await;
+        let client = ZeroclawClient::new(server.url(), "test_token".to_string());
+
+        let err = client.load_session("main").await.unwrap_err();
+
+        let msg = err.to_string();
+        assert!(msg.contains("Failed to read session response"));
+        assert!(msg.contains("response body exceeded"));
+        assert!(!msg.contains("tail-marker"));
     }
 
     #[tokio::test]

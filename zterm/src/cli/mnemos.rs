@@ -29,7 +29,7 @@
 
 use anyhow::{anyhow, Result};
 use futures::StreamExt;
-use reqwest::Client;
+use reqwest::{Client, Url};
 use serde_json::json;
 use std::time::Duration;
 
@@ -66,6 +66,21 @@ impl MnemosClient {
             return None;
         }
         Some(Self::new(url, token))
+    }
+
+    fn memory_item_url(&self, id: &str) -> Result<Url> {
+        Self::memory_item_url_for_base(&self.base_url, id)
+    }
+
+    fn memory_item_url_for_base(base_url: &str, id: &str) -> Result<Url> {
+        let mut url =
+            Url::parse(base_url).map_err(|e| anyhow!("MNEMOS base URL parse failed: {e}"))?;
+        url.set_query(None);
+        url.set_fragment(None);
+        url.path_segments_mut()
+            .map_err(|_| anyhow!("MNEMOS base URL cannot be used as a base URL"))?
+            .extend(["memories", id]);
+        Ok(url)
     }
 
     /// `POST /memories/search` — full-text / semantic search.
@@ -133,10 +148,10 @@ impl MnemosClient {
     /// `GET /memories/{id}` — fetch one. Returns None on 404 /
     /// transport failure.
     pub async fn get(&self, id: &str) -> Result<Option<serde_json::Value>> {
-        let url = format!("{}/memories/{}", self.base_url, id);
+        let url = self.memory_item_url(id)?;
         let res = self
             .http
-            .get(&url)
+            .get(url)
             .bearer_auth(&self.token)
             .timeout(MNEMOS_REQUEST_TIMEOUT)
             .send()
@@ -171,10 +186,10 @@ impl MnemosClient {
 
     /// `DELETE /memories/{id}`.
     pub async fn delete(&self, id: &str) -> Result<()> {
-        let url = format!("{}/memories/{}", self.base_url, id);
+        let url = self.memory_item_url(id)?;
         let r = self
             .http
-            .delete(&url)
+            .delete(url)
             .bearer_auth(&self.token)
             .timeout(MNEMOS_REQUEST_TIMEOUT)
             .send()
@@ -267,5 +282,27 @@ mod tests {
     fn new_trims_trailing_slash() {
         let c = MnemosClient::new("http://host:5002/", "tok");
         assert_eq!(c.base_url, "http://host:5002");
+    }
+
+    #[test]
+    fn memory_item_url_encodes_id_as_one_path_segment() {
+        assert_eq!(
+            MnemosClient::memory_item_url_for_base("http://host:5002", "a/b")
+                .unwrap()
+                .as_str(),
+            "http://host:5002/memories/a%2Fb"
+        );
+        assert_eq!(
+            MnemosClient::memory_item_url_for_base("http://host:5002", "x?y")
+                .unwrap()
+                .as_str(),
+            "http://host:5002/memories/x%3Fy"
+        );
+        assert_eq!(
+            MnemosClient::memory_item_url_for_base("http://host:5002", "frag#id")
+                .unwrap()
+                .as_str(),
+            "http://host:5002/memories/frag%23id"
+        );
     }
 }
