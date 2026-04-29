@@ -71,11 +71,18 @@ pub async fn run(
     // pairing block below are irrelevant and would spuriously fail
     // against port 8888 defaults. Synthesized (single-workspace) mode
     // keeps pairing as-is.
-    let has_multi_workspace = crate::cli::workspace::AppConfig::default_path()
-        .ok()
-        .and_then(|p| crate::cli::workspace::AppConfig::load(&p).ok())
-        .map(|cfg| !cfg.workspaces.is_empty())
-        .unwrap_or(false);
+    let has_multi_workspace = match crate::cli::workspace::AppConfig::default_path() {
+        Ok(path) => {
+            let cfg = crate::cli::workspace::AppConfig::load(&path).map_err(|e| {
+                anyhow!(
+                    "failed to load zterm workspace config from {}: {e:#}",
+                    path.display()
+                )
+            })?;
+            !cfg.workspaces.is_empty()
+        }
+        Err(_) => false,
+    };
 
     // If no token, consult the gateway's `require_pairing` flag before
     // attempting the interactive pairing flow. Zeroclaw gateways with
@@ -391,6 +398,7 @@ mod tests {
     use super::*;
     use crate::cli::agent::{AgentClient, StreamSink};
     use crate::cli::client::{Config, Model, Provider};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex as StdMutex};
     use tokio::sync::Mutex;
 
@@ -483,6 +491,72 @@ mod tests {
 
     fn boxed_client(fake: BootFakeClient) -> Arc<Mutex<Box<dyn AgentClient + Send + Sync>>> {
         Arc::new(Mutex::new(Box::new(fake)))
+    }
+
+    #[tokio::test]
+    async fn test_workspace_probe_does_not_pair_on_load_error() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::time::{sleep, timeout, Duration};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let server_hits = Arc::clone(&hits);
+        let server = tokio::spawn(async move {
+            while let Ok(Ok((mut stream, _))) =
+                timeout(Duration::from_millis(250), listener.accept()).await
+            {
+                server_hits.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0_u8; 1024];
+                let _ = stream.read(&mut buf).await;
+                let body = r#"{"require_pairing":false}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+
+        let home = tempfile::TempDir::new().unwrap();
+        let legacy_dir = home.path().join(".zeroclaw");
+        std::fs::create_dir_all(&legacy_dir).unwrap();
+        let legacy_config = format!("[gateway]\nurl = \"http://{addr}\"\n");
+        let legacy_config_path = legacy_dir.join("config.toml");
+        std::fs::write(&legacy_config_path, &legacy_config).unwrap();
+
+        let workspace_dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(workspace_dir.path().join("config.toml"), "[[workspaces]]\nname =")
+            .unwrap();
+
+        let prior_home = std::env::var_os("HOME");
+        let prior_zterm_config_dir = std::env::var_os("ZTERM_CONFIG_DIR");
+        std::env::set_var("HOME", home.path());
+        std::env::set_var("ZTERM_CONFIG_DIR", workspace_dir.path());
+
+        let result = run(None, None, None, None, true).await;
+
+        match prior_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+        match prior_zterm_config_dir {
+            Some(value) => std::env::set_var("ZTERM_CONFIG_DIR", value),
+            None => std::env::remove_var("ZTERM_CONFIG_DIR"),
+        }
+
+        let err = result.unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("failed to load zterm workspace config"));
+        let saved_config = std::fs::read_to_string(&legacy_config_path).unwrap();
+        assert!(!saved_config.contains("token"));
+        sleep(Duration::from_millis(50)).await;
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+        server.abort();
     }
 
     #[tokio::test]
