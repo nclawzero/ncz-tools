@@ -655,6 +655,15 @@ pub async fn run(
                                             );
                                         let _ = worker_sink.send(TurnChunk::Finished(Err(message)));
                                     }
+                                    if turn_collection_failure_requires_incomplete_transcript(
+                                        &error_text,
+                                    ) {
+                                        let _ = mark_turn_transcript_incomplete_reason(
+                                            &transcript_scope,
+                                            &worker_session_id,
+                                            &error_text,
+                                        );
+                                    }
                                 }
                                 _ => {}
                             }
@@ -1492,9 +1501,16 @@ fn mark_turn_transcript_incomplete_after_append_failure(
     session_id: &str,
     append_error: &anyhow::Error,
 ) -> String {
-    warn!("{append_error}");
-    let reason = append_error.to_string();
-    match storage::mark_scoped_session_history_incomplete(scope, session_id, &reason) {
+    mark_turn_transcript_incomplete_reason(scope, session_id, &append_error.to_string())
+}
+
+fn mark_turn_transcript_incomplete_reason(
+    scope: &storage::LocalWorkspaceScope,
+    session_id: &str,
+    reason: &str,
+) -> String {
+    warn!("{reason}");
+    match storage::mark_scoped_session_history_incomplete(scope, session_id, reason) {
         Ok(()) => {
             format!("{reason}; transcript marked incomplete and /save is disabled until /clear")
         }
@@ -1502,6 +1518,11 @@ fn mark_turn_transcript_incomplete_after_append_failure(
             format!("{reason}; additionally failed to mark transcript incomplete: {marker_error}")
         }
     }
+}
+
+fn turn_collection_failure_requires_incomplete_transcript(message: &str) -> bool {
+    message.contains("accepted assistant turn exceeded cap")
+        || message.contains("buffered runId-less assistant messages exceeded cap")
 }
 
 #[derive(Debug)]
@@ -4780,6 +4801,28 @@ mod tests {
 
         let message =
             mark_turn_transcript_incomplete_after_append_failure(&scope, "main", &append_error);
+
+        assert!(message.contains("transcript marked incomplete"));
+        assert!(storage::scoped_session_history_is_incomplete(&scope, "main").unwrap());
+    }
+
+    #[test]
+    fn turn_collection_overflow_marks_history_incomplete() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let scope = storage::workspace_scope(
+            "openclaw",
+            &format!("overflow-transcript-{}", uuid::Uuid::new_v4()),
+            None,
+        )
+        .unwrap();
+        storage::append_scoped_session_history(&scope, "main", "user", "hello").unwrap();
+        let reason =
+            "openclaw: turn collection failed; accepted assistant turn exceeded cap".to_string();
+
+        assert!(turn_collection_failure_requires_incomplete_transcript(
+            &reason
+        ));
+        let message = mark_turn_transcript_incomplete_reason(&scope, "main", &reason);
 
         assert!(message.contains("transcript marked incomplete"));
         assert!(storage::scoped_session_history_is_incomplete(&scope, "main").unwrap());

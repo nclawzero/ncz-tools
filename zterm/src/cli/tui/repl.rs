@@ -340,6 +340,13 @@ impl ReplLoop {
                             &append_error,
                         );
                     }
+                    if repl_turn_collection_failure_requires_incomplete_transcript(&error_text) {
+                        surface_repl_transcript_incomplete_reason(
+                            &transcript_scope,
+                            &session_id,
+                            &error_text,
+                        );
+                    }
                     eprintln!("\n❌ Error: {}", e);
                 }
             }
@@ -716,18 +723,30 @@ fn surface_repl_transcript_incomplete(
     session_id: &str,
     append_error: &anyhow::Error,
 ) {
-    warn!("{append_error}");
-    let reason = append_error.to_string();
-    match storage::mark_scoped_session_history_incomplete(scope, session_id, &reason) {
+    surface_repl_transcript_incomplete_reason(scope, session_id, &append_error.to_string());
+}
+
+fn surface_repl_transcript_incomplete_reason(
+    scope: &storage::LocalWorkspaceScope,
+    session_id: &str,
+    reason: &str,
+) {
+    warn!("{reason}");
+    match storage::mark_scoped_session_history_incomplete(scope, session_id, reason) {
         Ok(()) => ui::print_error(
             "transcript persistence failed; /save disabled until /clear",
-            Some(&reason),
+            Some(reason),
         ),
         Err(marker_error) => ui::print_error(
             "transcript persistence failed and incomplete marker could not be written",
             Some(&format!("{reason}; marker error: {marker_error}")),
         ),
     }
+}
+
+fn repl_turn_collection_failure_requires_incomplete_transcript(message: &str) -> bool {
+    message.contains("accepted assistant turn exceeded cap")
+        || message.contains("buffered runId-less assistant messages exceeded cap")
 }
 
 #[cfg(test)]
@@ -901,6 +920,27 @@ mod tests {
         );
 
         surface_repl_transcript_incomplete(&scope, "main", &append_error);
+
+        assert!(storage::scoped_session_history_is_incomplete(&scope, "main").unwrap());
+    }
+
+    #[test]
+    fn legacy_repl_collection_overflow_marks_history_incomplete() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let scope = storage::workspace_scope(
+            "openclaw",
+            &format!("legacy-overflow-transcript-{}", uuid::Uuid::new_v4()),
+            None,
+        )
+        .unwrap();
+        storage::append_scoped_session_history(&scope, "main", "user", "hello").unwrap();
+        let reason =
+            "openclaw: turn collection failed; accepted assistant turn exceeded cap".to_string();
+
+        assert!(repl_turn_collection_failure_requires_incomplete_transcript(
+            &reason
+        ));
+        surface_repl_transcript_incomplete_reason(&scope, "main", &reason);
 
         assert!(storage::scoped_session_history_is_incomplete(&scope, "main").unwrap());
     }

@@ -1110,7 +1110,7 @@ async fn collect_turn_result(
                     &mut pending_runless_messages,
                     &mut pending_runless_bytes,
                     expected_message_id.as_deref(),
-                );
+                )?;
                 if turn_can_finish(turn) {
                     return Ok(());
                 }
@@ -1148,7 +1148,7 @@ async fn collect_turn_result(
                     &mut pending_runless_messages,
                     &mut pending_runless_bytes,
                     expected_message_id.as_deref(),
-                );
+                )?;
             }
             Some(run_id) => {
                 tracing::debug!(
@@ -1195,7 +1195,7 @@ async fn collect_turn_result(
             }
         }
 
-        merge_assistant_message_into_turn(turn, payload, message);
+        merge_assistant_message_into_turn(turn, payload, message)?;
 
         let message_completed =
             message_marks_run_completed(payload, message) || saw_terminal_completion;
@@ -1226,31 +1226,33 @@ fn merge_buffered_runless_messages(
     pending: &mut Vec<BufferedAssistantMessage>,
     pending_bytes: &mut usize,
     expected_message_id: Option<&str>,
-) {
+) -> anyhow::Result<()> {
     let Some(expected_message_id) = expected_message_id else {
-        return;
+        return Ok(());
     };
     let mut idx = 0;
     while idx < pending.len() {
         if pending[idx].message_id == expected_message_id {
             let buffered = pending.remove(idx);
             *pending_bytes = pending_bytes.saturating_sub(buffered.byte_len);
-            merge_assistant_message_into_turn(turn, &buffered.payload, &buffered.message);
+            merge_assistant_message_into_turn(turn, &buffered.payload, &buffered.message)?;
         } else {
             idx += 1;
         }
     }
+    Ok(())
 }
 
 fn merge_assistant_message_into_turn(
     turn: &mut super::handshake::TurnResult,
     payload: &serde_json::Value,
     message: &serde_json::Value,
-) {
+) -> anyhow::Result<()> {
     let content = match message.get("content") {
         Some(v) => super::handshake::AssistantContent::parse(v),
         None => super::handshake::AssistantContent { parts: Vec::new() },
     };
+    ensure_assistant_message_within_turn_limits(turn, &content, payload, message)?;
 
     let previous_text = turn.text.clone();
     let content_text = content.display_text();
@@ -1263,6 +1265,64 @@ fn merge_assistant_message_into_turn(
     turn.usage = crate::cli::agent::TurnUsage::from_json_candidates(message)
         .or_else(|| crate::cli::agent::TurnUsage::from_json_candidates(payload))
         .or(turn.usage);
+    Ok(())
+}
+
+fn ensure_assistant_message_within_turn_limits(
+    turn: &super::handshake::TurnResult,
+    content: &super::handshake::AssistantContent,
+    payload: &serde_json::Value,
+    message: &serde_json::Value,
+) -> anyhow::Result<()> {
+    let content_text = content.display_text();
+    let projected_text_len = if content_text.is_empty() {
+        turn.text.len()
+    } else if message_is_text_delta(payload, message) {
+        turn.text.len().saturating_add(content_text.len())
+    } else {
+        content_text.len()
+    };
+    let incoming_thinking = content.thinking_text();
+    let projected_thinking_len = if incoming_thinking.is_empty() {
+        turn.thinking.len()
+    } else {
+        turn.thinking
+            .len()
+            .saturating_add(usize::from(!turn.thinking.is_empty()))
+            .saturating_add(incoming_thinking.len())
+    };
+    let mut projected_tool_items = turn
+        .tool_calls
+        .len()
+        .saturating_add(turn.tool_results.len());
+    let mut projected_tool_bytes = turn_result_tool_bytes(turn);
+    for part in &content.parts {
+        match part {
+            super::handshake::AssistantContentPart::ToolUse { raw, .. }
+            | super::handshake::AssistantContentPart::ToolResult { raw } => {
+                projected_tool_items = projected_tool_items.saturating_add(1);
+                projected_tool_bytes = projected_tool_bytes.saturating_add(raw.to_string().len());
+            }
+            _ => {}
+        }
+    }
+    let projected_bytes = projected_text_len
+        .saturating_add(projected_thinking_len)
+        .saturating_add(projected_tool_bytes);
+    if projected_bytes > ACCEPTED_TURN_MAX_BYTES
+        || projected_tool_items > ACCEPTED_TURN_MAX_TOOL_ITEMS
+    {
+        anyhow::bail!("openclaw: accepted assistant turn exceeded cap while collecting run output");
+    }
+    Ok(())
+}
+
+fn turn_result_tool_bytes(turn: &super::handshake::TurnResult) -> usize {
+    turn.tool_calls
+        .iter()
+        .chain(turn.tool_results.iter())
+        .map(|value| value.to_string().len())
+        .fold(0usize, usize::saturating_add)
 }
 
 fn runless_message_matches_expected_turn(
@@ -1578,6 +1638,8 @@ use crate::cli::client::{Config, Model, Provider, Session};
 const SUBMIT_TURN_DEFAULT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 const RUNLESS_BUFFER_MAX_MESSAGES: usize = 64;
 const RUNLESS_BUFFER_MAX_BYTES: usize = 256 * 1024;
+const ACCEPTED_TURN_MAX_BYTES: usize = 2 * 1024 * 1024;
+const ACCEPTED_TURN_MAX_TOOL_ITEMS: usize = 256;
 
 fn duration_millis_u64(duration: Duration) -> u64 {
     duration.as_millis().min(u128::from(u64::MAX)) as u64
@@ -2539,6 +2601,36 @@ mod tests {
         }
     }
 
+    fn assistant_many_tools_event(
+        session_key: &str,
+        run_id: &str,
+        count: usize,
+    ) -> super::super::wire::EventFrame {
+        let content = (0..count)
+            .map(|idx| {
+                serde_json::json!({
+                    "type": "tool_use",
+                    "name": "shell",
+                    "input": { "idx": idx }
+                })
+            })
+            .collect::<Vec<_>>();
+        super::super::wire::EventFrame {
+            event: "session.message".to_string(),
+            payload: Some(serde_json::json!({
+                "sessionKey": session_key,
+                "runId": run_id,
+                "message": {
+                    "role": "assistant",
+                    "runId": run_id,
+                    "content": content
+                }
+            })),
+            seq: None,
+            state_version: None,
+        }
+    }
+
     fn run_completed_event(session_key: &str, run_id: &str) -> super::super::wire::EventFrame {
         super::super::wire::EventFrame {
             event: "session.run.completed".to_string(),
@@ -2727,6 +2819,77 @@ mod tests {
         assert!(err
             .to_string()
             .contains("buffered runId-less assistant messages exceeded cap"));
+    }
+
+    #[tokio::test]
+    async fn collect_turn_result_caps_matching_run_text() {
+        let (event_tx, mut event_rx) = mpsc::channel::<super::super::wire::EventFrame>(1);
+        let oversized = "x".repeat(ACCEPTED_TURN_MAX_BYTES + 1);
+        event_tx
+            .send(assistant_delta_event(
+                "session-a",
+                "current-run",
+                "message-1",
+                &oversized,
+            ))
+            .await
+            .unwrap();
+
+        let mut turn = super::super::handshake::TurnResult {
+            run_id: Some("current-run".to_string()),
+            ..Default::default()
+        };
+        let err = collect_turn_result(
+            &mut event_rx,
+            "session-a",
+            "current-run",
+            None,
+            None,
+            Duration::from_secs(60),
+            &mut turn,
+        )
+        .await
+        .expect_err("matching-run assistant text should be capped before accumulation");
+
+        assert!(err
+            .to_string()
+            .contains("accepted assistant turn exceeded cap"));
+        assert!(turn.text.is_empty());
+    }
+
+    #[tokio::test]
+    async fn collect_turn_result_caps_matching_run_tool_items() {
+        let (event_tx, mut event_rx) = mpsc::channel::<super::super::wire::EventFrame>(1);
+        event_tx
+            .send(assistant_many_tools_event(
+                "session-a",
+                "current-run",
+                ACCEPTED_TURN_MAX_TOOL_ITEMS + 1,
+            ))
+            .await
+            .unwrap();
+
+        let mut turn = super::super::handshake::TurnResult {
+            run_id: Some("current-run".to_string()),
+            ..Default::default()
+        };
+        let err = collect_turn_result(
+            &mut event_rx,
+            "session-a",
+            "current-run",
+            None,
+            None,
+            Duration::from_secs(60),
+            &mut turn,
+        )
+        .await
+        .expect_err("matching-run assistant tool items should be capped before accumulation");
+
+        assert!(err
+            .to_string()
+            .contains("accepted assistant turn exceeded cap"));
+        assert!(turn.tool_calls.is_empty());
+        assert!(turn.tool_results.is_empty());
     }
 
     #[tokio::test]

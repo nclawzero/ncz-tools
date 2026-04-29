@@ -166,6 +166,21 @@ impl ZeroclawClient {
         Ok(url)
     }
 
+    fn cron_job_url(&self, action: &str, job_id: &str) -> Result<Url> {
+        Self::cron_job_url_for_base(&self.base_url, action, job_id)
+    }
+
+    fn cron_job_url_for_base(base_url: &str, action: &str, job_id: &str) -> Result<Url> {
+        let mut url = Url::parse(base_url)
+            .map_err(|e| anyhow!("Failed to parse zeroclaw base URL: {}", e))?;
+        url.set_query(None);
+        url.set_fragment(None);
+        url.path_segments_mut()
+            .map_err(|_| anyhow!("zeroclaw base URL cannot be used as a base URL"))?
+            .extend(["api", "cron", action, job_id]);
+        Ok(url)
+    }
+
     /// Fetch `[providers.models.*]` from the daemon's `/api/config`
     /// and replace this client's cached model list. Called once at
     /// boot from `tui::run`. Failure is non-fatal — the cached list
@@ -829,21 +844,24 @@ impl ZeroclawClient {
             .get(&url)
             .bearer_auth(&self.token)
             .send()
-            .await;
+            .await
+            .map_err(|e| anyhow!("Failed to list cron jobs: {}", e))?;
 
-        match res {
-            Ok(response) => {
-                if response.status().is_success() {
-                    match response.json::<Vec<serde_json::Value>>().await {
-                        Ok(jobs) => Ok(jobs),
-                        Err(_) => Ok(vec![]),
-                    }
-                } else {
-                    Ok(vec![])
-                }
+        let status = res.status();
+        if !status.is_success() {
+            let body = res
+                .text()
+                .await
+                .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
+            if body.trim().is_empty() {
+                return Err(anyhow!("Failed to list cron jobs: {status}"));
             }
-            Err(_) => Ok(vec![]),
+            return Err(anyhow!("Failed to list cron jobs: {status}: {body}"));
         }
+
+        res.json::<Vec<serde_json::Value>>()
+            .await
+            .map_err(|e| anyhow!("Failed to parse cron list response: {}", e))
     }
 
     /// Create a cron job
@@ -905,10 +923,10 @@ impl ZeroclawClient {
 
     /// Pause a cron job
     pub async fn pause_cron(&self, job_id: &str) -> Result<()> {
-        let url = format!("{}/api/cron/pause/{}", self.base_url, job_id);
+        let url = self.cron_job_url("pause", job_id)?;
         let res = self
             .http_client
-            .post(&url)
+            .post(url)
             .bearer_auth(&self.token)
             .send()
             .await
@@ -919,10 +937,10 @@ impl ZeroclawClient {
 
     /// Resume a cron job
     pub async fn resume_cron(&self, job_id: &str) -> Result<()> {
-        let url = format!("{}/api/cron/resume/{}", self.base_url, job_id);
+        let url = self.cron_job_url("resume", job_id)?;
         let res = self
             .http_client
-            .post(&url)
+            .post(url)
             .bearer_auth(&self.token)
             .send()
             .await
@@ -933,10 +951,10 @@ impl ZeroclawClient {
 
     /// Delete a cron job
     pub async fn delete_cron(&self, job_id: &str) -> Result<()> {
-        let url = format!("{}/api/cron/remove/{}", self.base_url, job_id);
+        let url = self.cron_job_url("remove", job_id)?;
         let res = self
             .http_client
-            .delete(&url)
+            .delete(url)
             .bearer_auth(&self.token)
             .send()
             .await
@@ -1113,6 +1131,64 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("500"));
         assert!(msg.contains("broken"));
+    }
+
+    #[tokio::test]
+    async fn list_cron_jobs_rejects_http_error_status() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("GET", "/api/cron/list")
+            .with_status(401)
+            .with_body("denied")
+            .create_async()
+            .await;
+        let client = ZeroclawClient::new(server.url(), "test_token".to_string());
+
+        let err = client.list_cron_jobs().await.unwrap_err();
+
+        let msg = err.to_string();
+        assert!(msg.contains("401"));
+        assert!(msg.contains("denied"));
+    }
+
+    #[tokio::test]
+    async fn list_cron_jobs_rejects_malformed_json() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("GET", "/api/cron/list")
+            .with_status(200)
+            .with_body("not-json")
+            .create_async()
+            .await;
+        let client = ZeroclawClient::new(server.url(), "test_token".to_string());
+
+        let err = client.list_cron_jobs().await.unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("Failed to parse cron list response"));
+    }
+
+    #[test]
+    fn cron_job_url_encodes_job_id_as_one_path_segment() {
+        assert_eq!(
+            ZeroclawClient::cron_job_url_for_base("https://example.test", "pause", "../x")
+                .unwrap()
+                .as_str(),
+            "https://example.test/api/cron/pause/..%2Fx"
+        );
+        assert_eq!(
+            ZeroclawClient::cron_job_url_for_base("https://example.test", "resume", "a/b")
+                .unwrap()
+                .as_str(),
+            "https://example.test/api/cron/resume/a%2Fb"
+        );
+        assert_eq!(
+            ZeroclawClient::cron_job_url_for_base("https://example.test", "remove", "x?y")
+                .unwrap()
+                .as_str(),
+            "https://example.test/api/cron/remove/x%3Fy"
+        );
     }
 
     #[test]
