@@ -1710,8 +1710,48 @@ fn redact_toml_value(value: &mut toml::Value) {
                 redact_toml_value(item);
             }
         }
+        toml::Value::String(text) => {
+            if let Some(redacted) = redact_url_string_value(text) {
+                *text = redacted;
+            }
+        }
         _ => {}
     }
+}
+
+fn redact_url_string_value(value: &str) -> Option<String> {
+    let mut url = reqwest::Url::parse(value).ok()?;
+    let mut changed = false;
+    if !url.username().is_empty() {
+        let _ = url.set_username("redacted");
+        changed = true;
+    }
+    if url.password().is_some() {
+        let _ = url.set_password(Some("redacted"));
+        changed = true;
+    }
+    if url.query().is_some() {
+        let pairs: Vec<(String, String)> = url
+            .query_pairs()
+            .map(|(key, value)| {
+                if is_sensitive_url_query_key(&key) {
+                    changed = true;
+                    (key.into_owned(), "REDACTED".to_string())
+                } else {
+                    (key.into_owned(), value.into_owned())
+                }
+            })
+            .collect();
+        url.set_query(None);
+        if !pairs.is_empty() {
+            url.query_pairs_mut().extend_pairs(
+                pairs
+                    .iter()
+                    .map(|(key, value)| (key.as_str(), value.as_str())),
+            );
+        }
+    }
+    changed.then(|| url.to_string())
 }
 
 fn split_line_ending(raw_line: &str) -> (&str, &str) {
@@ -1779,23 +1819,25 @@ fn redact_sensitive_config_pairs_in_line(line: &str) -> (String, Option<&'static
             continue;
         };
 
-        if !is_sensitive_config_key(&line[key_start..key_end]) {
-            search_from = eq_idx + 1;
-            continue;
-        }
-
         let value_start =
             eq_idx + 1 + line[eq_idx + 1..].len() - line[eq_idx + 1..].trim_start().len();
         let value_end = find_unquoted_value_end(line, value_start);
         let value_trimmed_end = line[..value_end].trim_end().len();
-        if delimiter.is_none() {
-            delimiter = multiline_secret_delimiter(&line[value_start..value_trimmed_end]);
-        }
+        let replacement = if is_sensitive_config_key(&line[key_start..key_end]) {
+            if delimiter.is_none() {
+                delimiter = multiline_secret_delimiter(&line[value_start..value_trimmed_end]);
+            }
+            Some(CONFIG_SECRET_MASK.to_string())
+        } else {
+            redact_url_value_literal(&line[value_start..value_trimmed_end])
+        };
+        let Some(replacement) = replacement else {
+            search_from = eq_idx + 1;
+            continue;
+        };
 
         redacted.push_str(&line[cursor..value_start]);
-        redacted.push('"');
-        redacted.push_str(CONFIG_SECRET_MASK);
-        redacted.push('"');
+        redacted.push_str(&toml_basic_string_literal(&replacement));
         redacted.push_str(&line[value_trimmed_end..value_end]);
         cursor = value_end;
         search_from = value_end.saturating_add(1);
@@ -1807,6 +1849,17 @@ fn redact_sensitive_config_pairs_in_line(line: &str) -> (String, Option<&'static
         redacted.push_str(&line[cursor..]);
         (redacted, delimiter)
     }
+}
+
+fn redact_url_value_literal(value: &str) -> Option<String> {
+    let parsed = toml::from_str::<toml::Value>(&format!("value = {}", value.trim())).ok()?;
+    let text = parsed.get("value")?.as_str()?;
+    redact_url_string_value(text)
+}
+
+fn toml_basic_string_literal(value: &str) -> String {
+    let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\"{escaped}\"")
 }
 
 fn config_key_bounds_before_equals(line: &str, eq_idx: usize) -> Option<(usize, usize)> {
@@ -1870,6 +1923,26 @@ fn is_sensitive_config_key(key: &str) -> bool {
     CONFIG_SECRET_KEY_FRAGMENTS
         .iter()
         .any(|fragment| lower.contains(fragment))
+}
+
+fn is_sensitive_url_query_key(key: &str) -> bool {
+    matches!(
+        normalize_config_key(key).as_str(),
+        "token"
+            | "accesstoken"
+            | "authtoken"
+            | "authorization"
+            | "auth"
+            | "bearer"
+            | "apikey"
+            | "key"
+            | "secret"
+            | "password"
+            | "pass"
+            | "jwt"
+            | "sig"
+            | "signature"
+    )
 }
 
 fn normalize_config_key(key: &str) -> String {
@@ -3583,8 +3656,8 @@ api_key = "persisted-api-key"
     #[test]
     fn config_output_masks_inline_table_secrets() {
         let out = super::format_config_output(Ok(r#"
-gateway = { url = "ws://gateway.example", token = "inline-token-value" }
-provider = { name = "openai", api_key = "inline-provider-api-key" }
+	gateway = { url = "ws://gateway.example", token = "inline-token-value" }
+	provider = { name = "openai", api_key = "inline-provider-api-key" }
 
 [providers]
 openai = { model = "gpt", api_key = "inline-api-key" }
@@ -3600,9 +3673,38 @@ openai = { model = "gpt", api_key = "inline-api-key" }
     }
 
     #[test]
+    fn config_output_redacts_url_embedded_credentials_in_valid_toml() {
+        let out = super::format_config_output(Ok(r#"
+	[gateway]
+	url = "wss://operator:embedded-password@gateway.example/ws?token=url-token&api_key=url-api-key&room=alpha"
+	"#
+        .to_string()));
+
+        assert!(out.contains("url = \"wss://redacted:redacted@gateway.example/ws?token=REDACTED&api_key=REDACTED&room=alpha\""));
+        for leaked in ["operator", "embedded-password", "url-token", "url-api-key"] {
+            assert!(!out.contains(leaked), "{leaked} leaked in {out}");
+        }
+    }
+
+    #[test]
+    fn config_output_redacts_legacy_url_env_values_in_valid_toml() {
+        let out = super::format_config_output(Ok(r#"
+	ZEROCLAW_URL = "wss://legacy:legacy-password@gateway.example/ws?access_token=legacy-token&model=gpt"
+	"#
+        .to_string()));
+
+        assert!(out.contains(
+            "ZEROCLAW_URL = \"wss://redacted:redacted@gateway.example/ws?access_token=REDACTED&model=gpt\""
+        ));
+        for leaked in ["legacy:legacy-password", "legacy-token"] {
+            assert!(!out.contains(leaked), "{leaked} leaked in {out}");
+        }
+    }
+
+    #[test]
     fn config_output_masks_common_api_and_private_key_spellings() {
         let out = super::format_config_output(Ok(r#"
-[providers.openai]
+	[providers.openai]
 apiKey = "camel-api-key"
 apikey = "flat-api-key"
 api-key = "dash-api-key"
@@ -3652,7 +3754,7 @@ private_key = "snake-private-key"
     fn fallback_config_redactor_masks_malformed_inline_table_secrets() {
         let out = super::redact_config_secrets(
             r#"
-[unterminated
+	[unterminated
 gateway = { url = "ws://gateway.example", token = "inline-token-value" }
 provider = { name = "openai", api_key = "inline-api-key", privateKey = "inline-private-key" }
 provider_settings = { tokens = ["array-token-1", "array-token-2"], name = "kept" }
@@ -3670,6 +3772,21 @@ provider_settings = { tokens = ["array-token-1", "array-token-2"], name = "kept"
         assert!(!out.contains("inline-private-key"));
         assert!(!out.contains("array-token-1"));
         assert!(!out.contains("array-token-2"));
+    }
+
+    #[test]
+    fn fallback_config_redactor_masks_url_embedded_credentials() {
+        let out = super::redact_config_secrets(
+            r#"
+	[unterminated
+	url = "wss://operator:embedded-password@gateway.example/ws?token=url-token&api_key=url-api-key&room=alpha"
+	"#,
+        );
+
+        assert!(out.contains("url = \"wss://redacted:redacted@gateway.example/ws?token=REDACTED&api_key=REDACTED&room=alpha\""));
+        for leaked in ["operator", "embedded-password", "url-token", "url-api-key"] {
+            assert!(!out.contains(leaked), "{leaked} leaked in {out}");
+        }
     }
 
     #[tokio::test]
