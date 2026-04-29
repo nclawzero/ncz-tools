@@ -1033,6 +1033,42 @@ async fn run_worker_command_with_deadline<F>(
     }
 }
 
+fn spawn_connect_splash_typewriter(
+    app: Arc<Mutex<App>>,
+    worker_sink: StreamSink,
+    workspace_name: String,
+    enabled: bool,
+) {
+    if !enabled {
+        return;
+    }
+
+    tokio::spawn(async move {
+        match connect_splash_for_workspace_if_enabled(
+            &app,
+            &workspace_name,
+            Some(worker_sink.clone()),
+            enabled,
+        )
+        .await
+        {
+            Ok(Some(splash)) => {
+                let _ =
+                    send_worker_chunk_reliably(&worker_sink, TurnChunk::Typewriter(splash)).await;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                warn!("connect-splash failed after workspace switch: {e}");
+                let message = format!(
+                    "⚠ connect-splash skipped after workspace switch: {}\n",
+                    sanitize_terminal_text(&e.to_string())
+                );
+                let _ = send_worker_chunk_reliably(&worker_sink, TurnChunk::Token(message)).await;
+            }
+        }
+    });
+}
+
 fn slash_command_deadline(cmdline: &str) -> SlashCommandDeadline {
     if slash_command_may_mutate_state(cmdline) {
         SlashCommandDeadline::mutating(MUTATING_COMMAND_WORKER_TIMEOUT)
@@ -1223,36 +1259,12 @@ async fn handle_worker_command_request(
                             return;
                         }
                         if let Some((name, _)) = switched_workspace {
-                            match connect_splash_for_workspace_if_enabled(
-                                worker_app,
-                                &name,
-                                Some(worker_sink.clone()),
+                            spawn_connect_splash_typewriter(
+                                Arc::clone(worker_app),
+                                worker_sink.clone(),
+                                name,
                                 connect_splash_enabled,
-                            )
-                            .await
-                            {
-                                Ok(Some(splash)) => {
-                                    let _ = send_worker_chunk_reliably(
-                                        worker_sink,
-                                        TurnChunk::Typewriter(splash),
-                                    )
-                                    .await;
-                                }
-                                Ok(None) => {}
-                                Err(e) => {
-                                    let detail = format!(
-                                        "workspace switched, but connect-splash cleanup failed: {e}"
-                                    );
-                                    send_worker_finished(
-                                        worker_sink,
-                                        Err(mutating_command_unknown_outcome_message(
-                                            &cmdline, &detail,
-                                        )),
-                                    )
-                                    .await;
-                                    return;
-                                }
-                            }
+                            );
                         }
                     }
                 }
@@ -8306,7 +8318,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_switch_connect_splash_cleanup_failure_is_terminal_error() {
+    fn workspace_switch_connect_splash_cleanup_failure_is_async_warning() {
         let _env = crate::cli::test_env_lock().lock().unwrap();
         let home = tempfile::tempdir().unwrap();
         let old_home = std::env::var_os("HOME");
@@ -8412,22 +8424,37 @@ mod tests {
             .await;
 
             let mut rendered = String::new();
+            let mut terminal_ok = false;
             let mut terminal_error = None;
             let mut typewriter_chunks = 0usize;
-            while let Ok(chunk) = rx.try_recv() {
+            for _ in 0..20 {
+                let chunk = match tokio::time::timeout(Duration::from_millis(25), rx.recv()).await {
+                    Ok(Some(chunk)) => chunk,
+                    Ok(None) | Err(_) => break,
+                };
                 match chunk {
                     TurnChunk::Token(text) => rendered.push_str(&text),
                     TurnChunk::Typewriter(_) => typewriter_chunks += 1,
+                    TurnChunk::Finished(Ok(_)) => terminal_ok = true,
                     TurnChunk::Finished(Err(message)) => terminal_error = Some(message),
                     _ => {}
+                }
+                if rendered.contains("connect-splash skipped after workspace switch") {
+                    break;
                 }
             }
 
             assert!(rendered.contains("switched to workspace: beta"));
-            let terminal_error = terminal_error.expect("cleanup failure should reach the UI");
-            assert!(terminal_error.contains("slash command outcome unknown"));
-            assert!(terminal_error.contains("connect-splash cleanup failed"));
-            assert!(terminal_error.contains("delete failed"));
+            assert!(
+                terminal_ok,
+                "workspace switch command should finish cleanly"
+            );
+            assert!(
+                terminal_error.is_none(),
+                "delighter cleanup failure should not become the switch terminal error"
+            );
+            assert!(rendered.contains("connect-splash skipped after workspace switch"));
+            assert!(rendered.contains("delete failed"));
             assert_eq!(typewriter_chunks, 0);
             assert_eq!(beta_submitted.lock().unwrap().len(), 1);
             assert_eq!(beta_deleted.lock().unwrap().len(), 1);
@@ -8436,6 +8463,139 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|session| { session.name.starts_with("zterm connect splash beta ") }));
+        });
+
+        match old_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    #[test]
+    fn workspace_switch_returns_before_pending_connect_splash() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let alpha_fake = WorkerSessionFakeClient {
+                listed_sessions: Vec::new(),
+                list_sessions_error: None,
+                loadable_sessions: Vec::new(),
+                load_reject_ids: Vec::new(),
+                created: Arc::new(StdMutex::new(Vec::new())),
+                deleted: Arc::new(StdMutex::new(Vec::new())),
+                submitted: Arc::new(StdMutex::new(Vec::new())),
+                list_calls: Arc::new(StdMutex::new(0)),
+                load_calls: Arc::new(StdMutex::new(Vec::new())),
+                submit_response: String::new(),
+                submit_error: None,
+                submit_never: false,
+                cancellation_safe: true,
+                sink_set_states: Arc::new(StdMutex::new(Vec::new())),
+                delete_error: None,
+            };
+            let beta_deleted = Arc::new(StdMutex::new(Vec::new()));
+            let beta_submitted = Arc::new(StdMutex::new(Vec::new()));
+            let beta_fake = WorkerSessionFakeClient {
+                listed_sessions: Vec::new(),
+                list_sessions_error: None,
+                loadable_sessions: Vec::new(),
+                load_reject_ids: Vec::new(),
+                created: Arc::new(StdMutex::new(Vec::new())),
+                deleted: Arc::clone(&beta_deleted),
+                submitted: Arc::clone(&beta_submitted),
+                list_calls: Arc::new(StdMutex::new(0)),
+                load_calls: Arc::new(StdMutex::new(Vec::new())),
+                submit_response: "SHOULD NOT BE USED".to_string(),
+                submit_error: None,
+                submit_never: true,
+                cancellation_safe: true,
+                sink_set_states: Arc::new(StdMutex::new(Vec::new())),
+                delete_error: None,
+            };
+            let app = Arc::new(Mutex::new(App {
+                workspaces: vec![
+                    crate::cli::workspace::Workspace {
+                        id: 0,
+                        config: crate::cli::workspace::WorkspaceConfig {
+                            id: Some("ws-alpha".to_string()),
+                            name: "alpha".to_string(),
+                            backend: crate::cli::workspace::Backend::Openclaw,
+                            url: "ws://alpha.example".to_string(),
+                            token_env: None,
+                            token: None,
+                            label: None,
+                            namespace_aliases: Vec::new(),
+                        },
+                        client: Some(Arc::new(Mutex::new(Box::new(alpha_fake)))),
+                        cron: None,
+                    },
+                    crate::cli::workspace::Workspace {
+                        id: 1,
+                        config: crate::cli::workspace::WorkspaceConfig {
+                            id: Some("ws-beta".to_string()),
+                            name: "beta".to_string(),
+                            backend: crate::cli::workspace::Backend::Openclaw,
+                            url: "ws://beta.example".to_string(),
+                            token_env: None,
+                            token: None,
+                            label: None,
+                            namespace_aliases: Vec::new(),
+                        },
+                        client: Some(Arc::new(Mutex::new(Box::new(beta_fake)))),
+                        cron: None,
+                    },
+                ],
+                active: 0,
+                shared_mnemos: None,
+                config_path: std::path::PathBuf::from("test-config.toml"),
+            }));
+            let active_session = Session {
+                id: "main".to_string(),
+                name: "Main".to_string(),
+                model: "model".to_string(),
+                provider: "provider".to_string(),
+            };
+            let workspace_key = current_workspace_binding_key(&app).await.unwrap();
+            let mut bindings = HashMap::new();
+            remember_worker_session(&mut bindings, workspace_key, &active_session);
+            let handler = CommandHandler::new(Arc::clone(&app));
+            let (sink, mut rx) = StreamSink::channel(32);
+
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                handle_worker_command_request(
+                    "/workspace switch beta".to_string(),
+                    &app,
+                    &mut bindings,
+                    &active_session.name,
+                    &sink,
+                    &handler,
+                    true,
+                ),
+            )
+            .await
+            .expect("workspace switch should not wait for pending connect splash");
+
+            let mut terminal_ok = false;
+            while let Ok(chunk) = rx.try_recv() {
+                if matches!(chunk, TurnChunk::Finished(Ok(_))) {
+                    terminal_ok = true;
+                }
+            }
+
+            assert!(terminal_ok);
+            assert_eq!(
+                app.lock().await.active_workspace().unwrap().config.name,
+                "beta"
+            );
+            tokio::task::yield_now().await;
+            if !beta_submitted.lock().unwrap().is_empty() {
+                assert!(beta_deleted.lock().unwrap().is_empty());
+            }
         });
 
         match old_home {
