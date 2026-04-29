@@ -42,6 +42,8 @@ use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Write};
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -748,6 +750,10 @@ fn save_app_config(path: &Path, cfg: &AppConfig) -> Result<()> {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating zterm config dir {}", parent.display()))?;
     }
+    #[cfg(unix)]
+    let existing_mode = std::fs::metadata(path)
+        .ok()
+        .map(|metadata| metadata.permissions().mode() & 0o7777);
     let body = toml::to_string_pretty(cfg).with_context(|| "serializing zterm config TOML")?;
     let file_name = path
         .file_name()
@@ -758,14 +764,24 @@ fn save_app_config(path: &Path, cfg: &AppConfig) -> Result<()> {
         uuid::Uuid::new_v4().simple()
     ));
     {
-        let mut tmp_file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
+        let mut open_options = OpenOptions::new();
+        open_options.write(true).create_new(true);
+        #[cfg(unix)]
+        if let Some(mode) = existing_mode {
+            open_options.mode(mode);
+        }
+        let mut tmp_file = open_options
             .open(&tmp_path)
             .with_context(|| format!("creating zterm config {}", tmp_path.display()))?;
         tmp_file
             .write_all(body.as_bytes())
             .with_context(|| format!("writing zterm config {}", tmp_path.display()))?;
+        #[cfg(unix)]
+        if let Some(mode) = existing_mode {
+            tmp_file
+                .set_permissions(std::fs::Permissions::from_mode(mode))
+                .with_context(|| format!("preserving zterm config mode {}", tmp_path.display()))?;
+        }
         tmp_file
             .sync_all()
             .with_context(|| format!("syncing zterm config {}", tmp_path.display()))?;
@@ -1386,6 +1402,34 @@ url = "ws://old.example"
 
         let reloaded = AppConfig::load(&path).unwrap();
         assert_eq!(reloaded.workspaces[0].id.as_deref(), Some(id));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_preserves_private_config_permissions_when_persisting_openclaw_id() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[[workspaces]]
+name = "alpha"
+backend = "openclaw"
+url = "ws://old.example"
+token = "inline-secret-token"
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let cfg = AppConfig::load(&path).unwrap();
+
+        assert!(cfg.workspaces[0].id.as_deref().unwrap().starts_with("ws_"));
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let saved_config = std::fs::read_to_string(&path).unwrap();
+        assert!(saved_config.contains("token = \"inline-secret-token\""));
+        assert!(saved_config.contains("id = \""));
     }
 
     #[test]

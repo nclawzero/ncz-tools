@@ -907,14 +907,14 @@ async fn collect_turn_result(
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
-            return finish_tool_only_or_timeout(timeout, turn);
+            return finish_tool_only_or_timeout(timeout, turn, saw_terminal_completion);
         }
 
         let rx_res = tokio::time::timeout(remaining, event_rx.recv()).await;
         let event = match rx_res {
             Ok(Some(ev)) => ev,
             Ok(None) => anyhow::bail!("openclaw: event channel closed mid-stream"),
-            Err(_) => return finish_tool_only_or_timeout(timeout, turn),
+            Err(_) => return finish_tool_only_or_timeout(timeout, turn, saw_terminal_completion),
         };
 
         if event.event != "session.message" {
@@ -1079,8 +1079,9 @@ fn turn_can_finish_without_text(turn: &super::handshake::TurnResult) -> bool {
 fn finish_tool_only_or_timeout(
     timeout: std::time::Duration,
     turn: &super::handshake::TurnResult,
+    saw_terminal_completion: bool,
 ) -> anyhow::Result<()> {
-    if turn_can_finish_without_text(turn) {
+    if saw_terminal_completion && turn_can_finish_without_text(turn) {
         return Ok(());
     }
     anyhow::bail!(
@@ -1693,7 +1694,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn collect_turn_result_returns_tool_only_result_instead_of_timeout() {
+    async fn collect_turn_result_errors_on_tool_only_turn_without_completion_marker() {
         let (event_tx, mut event_rx) = mpsc::channel::<super::super::wire::EventFrame>(4);
         event_tx
             .send(assistant_tool_event("session-a", "current-run"))
@@ -1704,7 +1705,7 @@ mod tests {
             run_id: Some("current-run".to_string()),
             ..Default::default()
         };
-        collect_turn_result(
+        let err = collect_turn_result(
             &mut event_rx,
             "session-a",
             "current-run",
@@ -1712,8 +1713,9 @@ mod tests {
             &mut turn,
         )
         .await
-        .expect("tool-only final run should return the collected TurnResult");
+        .expect_err("tool-only turn without completion marker should time out");
 
+        assert!(err.to_string().contains("timed out"));
         assert!(turn.text.is_empty());
         assert_eq!(turn.tool_calls.len(), 1);
         assert_eq!(turn.tool_results.len(), 1);
