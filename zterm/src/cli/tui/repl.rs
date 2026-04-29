@@ -11,13 +11,15 @@ use crate::cli::input::InputHistory;
 use crate::cli::storage;
 use crate::cli::theme::Theme;
 use crate::cli::tui::delighters;
-use crate::cli::tui::tv_ui::sanitize_terminal_text;
+use crate::cli::tui::tv_ui::{mutation_fence_command_descriptor, sanitize_terminal_text};
 use crate::cli::ui::{self, StatusBar};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 
 const LEGACY_MUTATING_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+const LEGACY_MUTATION_FENCE_COMMAND_MAX_CHARS: usize = 256;
+const LEGACY_MUTATION_FENCE_REASON_MAX_CHARS: usize = 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LegacyMutationFenceOwner {
@@ -144,21 +146,24 @@ impl ReplLoop {
         })
     }
 
+    async fn active_mutation_fence_clear_key(&self) -> Result<String> {
+        let workspace_key = self.current_mutation_fence_key().await?;
+        if legacy_mutation_fence_reason_for_key(&workspace_key).is_some() {
+            return Ok(workspace_key);
+        }
+        let global_key = crate::cli::tui::GLOBAL_MEMORY_MUTATION_FENCE_KEY.to_string();
+        if legacy_mutation_fence_reason_for_key(&global_key).is_some() {
+            Ok(global_key)
+        } else {
+            Ok(workspace_key)
+        }
+    }
+
     async fn mutation_fence_key_for_command(&self, cmdline: &str) -> Result<String> {
         if super::slash_command_uses_global_memory_fence(cmdline) {
             Ok(crate::cli::tui::GLOBAL_MEMORY_MUTATION_FENCE_KEY.to_string())
         } else {
             self.current_mutation_fence_key().await
-        }
-    }
-
-    async fn mutation_fence_clear_keys(&self) -> Result<Vec<String>> {
-        let workspace_key = self.current_mutation_fence_key().await?;
-        let global_key = crate::cli::tui::GLOBAL_MEMORY_MUTATION_FENCE_KEY.to_string();
-        if workspace_key == global_key {
-            Ok(vec![workspace_key])
-        } else {
-            Ok(vec![workspace_key, global_key])
         }
     }
 
@@ -189,9 +194,10 @@ impl ReplLoop {
         let dispatch_id = old_owner
             .map(|owner| owner.dispatch_id.as_str())
             .unwrap_or_default();
+        let safe_reason = legacy_redacted_mutation_fence_reason(reason);
         let fence = legacy_mutation_fence_state_with_dispatch(
-            &legacy_mutation_fence_command_from_reason(reason),
-            reason,
+            &legacy_mutation_fence_command_from_reason(&safe_reason),
+            &safe_reason,
             dispatch_id,
         );
         let result = if let Some(owner) = old_owner {
@@ -205,11 +211,11 @@ impl ReplLoop {
             delighters::set_mutation_fence_for_workspace(&key, fence).map(|_| true)
         };
         match result {
-            Ok(true) => reason.to_string(),
+            Ok(true) => safe_reason,
             Ok(false) => format!(
-                "{reason}; failed to persist fence: durable write-ahead fence is no longer owned by this dispatch"
+                "{safe_reason}; failed to persist fence: durable write-ahead fence is no longer owned by this dispatch"
             ),
-            Err(e) => format!("{reason}; failed to persist fence: {e}"),
+            Err(e) => format!("{safe_reason}; failed to persist fence: {e}"),
         }
     }
 
@@ -224,7 +230,8 @@ impl ReplLoop {
         let key = self.mutation_fence_key_for_command(cmdline).await?;
         let reason = legacy_write_ahead_mutation_fence_message(cmdline);
         let dispatch_id = delighters::new_mutation_fence_dispatch_id();
-        let fence = legacy_mutation_fence_state_with_dispatch(cmdline, &reason, &dispatch_id);
+        let command = mutation_fence_command_descriptor(cmdline);
+        let fence = legacy_mutation_fence_state_with_dispatch(&command, &reason, &dispatch_id);
         match delighters::acquire_mutation_fence_for_workspace(&key, fence)? {
             Ok(_) => Ok(LegacyMutationFenceOwner { key, dispatch_id }),
             Err(existing) => Err(anyhow::anyhow!(
@@ -247,12 +254,8 @@ impl ReplLoop {
         let force = tokens.len() == 2
             && matches!(tokens.get(1).map(String::as_str), Some("--force" | "force"));
         if force {
-            let mut result = None;
-            for key in self.mutation_fence_clear_keys().await? {
-                result = Some(delighters::force_clear_mutation_fence_for_workspace(&key)?);
-            }
-            let result =
-                result.ok_or_else(|| anyhow::anyhow!("no mutation fence keys resolved"))?;
+            let key = self.active_mutation_fence_clear_key().await?;
+            let result = delighters::force_clear_mutation_fence_for_workspace(&key)?;
             let message = if let Some(path) = result.quarantined_state_path {
                 format!(
                     "[sync] unreadable zterm state moved to {}; mutation fence cleared by explicit /resync --force\n",
@@ -1116,24 +1119,37 @@ fn legacy_mutation_fence_state_with_dispatch(
     dispatch_id: &str,
 ) -> delighters::MutationFenceState {
     delighters::MutationFenceState {
-        command: sanitize_terminal_text(command).replace('`', "'"),
-        reason: reason.to_string(),
+        command: legacy_cap_mutation_fence_text(command, LEGACY_MUTATION_FENCE_COMMAND_MAX_CHARS),
+        reason: legacy_cap_mutation_fence_text(reason, LEGACY_MUTATION_FENCE_REASON_MAX_CHARS),
         created_at_unix: legacy_mutation_fence_now_unix(),
         dispatch_id: dispatch_id.to_string(),
     }
 }
 
+fn legacy_cap_mutation_fence_text(input: &str, max_chars: usize) -> String {
+    let safe = sanitize_terminal_text(input).replace('`', "'");
+    if safe.chars().count() <= max_chars {
+        return safe;
+    }
+    const SUFFIX: &str = "... [truncated]";
+    let take_chars = max_chars.saturating_sub(SUFFIX.chars().count());
+    let mut capped = safe.chars().take(take_chars).collect::<String>();
+    capped.push_str(SUFFIX);
+    capped
+}
+
 fn legacy_write_ahead_mutation_fence_message(cmdline: &str) -> String {
+    let descriptor = mutation_fence_command_descriptor(cmdline);
     format!(
-        "mutating slash command dispatched for `{}`; backend outcome is pending. Run /resync to inspect state, or /resync --force to clear this fence after manual reconciliation.",
-        sanitize_terminal_text(cmdline).replace('`', "'")
+        "mutating slash command `{descriptor}` dispatched; backend outcome is pending. Run /resync to inspect state, or /resync --force to clear this fence after manual reconciliation."
     )
 }
 
 fn legacy_write_ahead_persist_failure_message(cmdline: &str, error: &anyhow::Error) -> String {
+    let descriptor = mutation_fence_command_descriptor(cmdline);
     format!(
         "could not persist durable mutation fence for `{}`; command not dispatched: {}",
-        sanitize_terminal_text(cmdline).replace('`', "'"),
+        descriptor,
         sanitize_terminal_text(&error.to_string())
     )
 }
@@ -1163,9 +1179,10 @@ fn legacy_output_with_blocked(mut output: String, reason: &str) -> String {
 }
 
 fn legacy_mutating_timeout_message(cmdline: &str) -> String {
+    let descriptor = mutation_fence_command_descriptor(cmdline);
     format!(
         "slash command outcome unknown for `{}` after {:?}; the backend may still have applied the mutation. Run /resync to inspect state, or /resync --force to clear this fence after manual reconciliation.",
-        sanitize_terminal_text(cmdline).replace('`', "'"),
+        descriptor,
         LEGACY_MUTATING_COMMAND_TIMEOUT
     )
 }
@@ -1182,10 +1199,26 @@ fn legacy_workspace_switch_session_setup_failure_message(
     cmdline: &str,
     error: &anyhow::Error,
 ) -> String {
+    let descriptor = mutation_fence_command_descriptor(cmdline);
     format!(
         "slash command outcome unknown for `{}`; workspace switch was applied, but session setup failed: {}. Run /resync to inspect state, or /resync --force to clear this fence after manual reconciliation.",
-        sanitize_terminal_text(cmdline).replace('`', "'"),
+        descriptor,
         sanitize_terminal_text(&error.to_string())
+    )
+}
+
+fn legacy_redacted_mutation_fence_reason(reason: &str) -> String {
+    let raw_command = legacy_mutation_fence_command_from_reason(reason);
+    if raw_command.is_empty() {
+        return legacy_cap_mutation_fence_text(reason, LEGACY_MUTATION_FENCE_REASON_MAX_CHARS);
+    }
+    let descriptor = mutation_fence_command_descriptor(&raw_command);
+    if descriptor.is_empty() || descriptor == raw_command {
+        return legacy_cap_mutation_fence_text(reason, LEGACY_MUTATION_FENCE_REASON_MAX_CHARS);
+    }
+    legacy_cap_mutation_fence_text(
+        &reason.replacen(&format!("`{raw_command}`"), &format!("`{descriptor}`"), 1),
+        LEGACY_MUTATION_FENCE_REASON_MAX_CHARS,
     )
 }
 
@@ -2024,6 +2057,81 @@ mod tests {
     }
 
     #[test]
+    fn legacy_repl_force_clear_preserves_unrelated_global_fence() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let workspace_fence = delighters::MutationFenceState {
+                command: "/workspace switch args#abc".to_string(),
+                reason: "workspace outcome unknown".to_string(),
+                created_at_unix: 42,
+                dispatch_id: "workspace-dispatch".to_string(),
+            };
+            let global_fence = delighters::MutationFenceState {
+                command: "/memory post args#def".to_string(),
+                reason: "global memory outcome unknown".to_string(),
+                created_at_unix: 43,
+                dispatch_id: "global-dispatch".to_string(),
+            };
+            delighters::set_mutation_fence_for_workspace("name:alpha", workspace_fence).unwrap();
+            delighters::set_mutation_fence_for_workspace(
+                crate::cli::tui::GLOBAL_MEMORY_MUTATION_FENCE_KEY,
+                global_fence.clone(),
+            )
+            .unwrap();
+            let submitted = Arc::new(StdMutex::new(Vec::new()));
+            let deleted = Arc::new(StdMutex::new(Vec::new()));
+            let alpha = session("alpha-session", "chat");
+            let app = Arc::new(Mutex::new(App {
+                workspaces: vec![workspace(
+                    0,
+                    "alpha",
+                    vec![alpha.clone()],
+                    Arc::clone(&submitted),
+                    Arc::clone(&deleted),
+                )],
+                active: 0,
+                shared_mnemos: None,
+                config_path: PathBuf::from("test-config.toml"),
+            }));
+            let mut repl = ReplLoop::new(
+                Arc::clone(&app),
+                alpha,
+                "model".to_string(),
+                "provider".to_string(),
+            )
+            .unwrap();
+
+            let cleared = repl
+                .handle_legacy_resync("/resync --force")
+                .await
+                .unwrap()
+                .unwrap();
+
+            assert!(cleared.contains("mutation fence cleared"));
+            assert!(delighters::mutation_fence_for_workspace("name:alpha")
+                .unwrap()
+                .is_none());
+            assert_eq!(
+                delighters::mutation_fence_for_workspace(
+                    crate::cli::tui::GLOBAL_MEMORY_MUTATION_FENCE_KEY
+                )
+                .unwrap(),
+                Some(global_fence)
+            );
+        });
+
+        match old_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    #[test]
     fn legacy_repl_global_memory_fence_blocks_from_other_workspace() {
         let _env = crate::cli::test_env_lock().lock().unwrap();
         let home = tempfile::tempdir().unwrap();
@@ -2123,16 +2231,22 @@ mod tests {
             .unwrap();
 
             let owner = repl
-                .write_ahead_mutation_fence_for_dispatch("/memory post remember this")
+                .write_ahead_mutation_fence_for_dispatch(
+                    "/memory post api_key=sk-legacy-secret remember this",
+                )
                 .await
                 .unwrap();
 
             assert_eq!(owner.key, crate::cli::tui::GLOBAL_MEMORY_MUTATION_FENCE_KEY);
-            assert!(delighters::mutation_fence_for_workspace(
-                crate::cli::tui::GLOBAL_MEMORY_MUTATION_FENCE_KEY
+            let fence = delighters::mutation_fence_for_workspace(
+                crate::cli::tui::GLOBAL_MEMORY_MUTATION_FENCE_KEY,
             )
             .unwrap()
-            .is_some());
+            .unwrap();
+            assert!(fence.command.starts_with("/memory post args#"));
+            assert!(!fence.command.contains("sk-legacy-secret"));
+            assert!(!fence.reason.contains("sk-legacy-secret"));
+            assert!(!fence.reason.contains("remember this"));
             assert!(delighters::mutation_fence_for_workspace("name:alpha")
                 .unwrap()
                 .is_none());
@@ -2177,7 +2291,9 @@ mod tests {
             .unwrap();
 
             let owner = repl
-                .write_ahead_mutation_fence_for_dispatch("/memory post remember this")
+                .write_ahead_mutation_fence_for_dispatch(
+                    "/cron add '* * * * *' 'curl https://example.test?token=cron-secret'",
+                )
                 .await
                 .unwrap();
 
@@ -2186,8 +2302,11 @@ mod tests {
             let fence = delighters::mutation_fence_for_workspace("name:alpha")
                 .unwrap()
                 .unwrap();
-            assert_eq!(fence.command, "/memory post remember this");
+            assert!(fence.command.starts_with("/cron add args#"));
             assert!(fence.reason.contains("backend outcome is pending"));
+            assert!(!fence.command.contains("cron-secret"));
+            assert!(!fence.reason.contains("cron-secret"));
+            assert!(!fence.reason.contains("curl https://example.test"));
             assert_eq!(fence.dispatch_id, owner.dispatch_id);
             assert!(submitted.lock().unwrap().is_empty());
         });

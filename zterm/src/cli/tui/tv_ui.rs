@@ -4551,7 +4551,7 @@ fn mutation_fence_state_for_command(command: &str, reason: &str) -> delighters::
     mutation_fence_state_for_command_with_dispatch(command, reason, "")
 }
 
-fn mutation_fence_command_descriptor(cmdline: &str) -> String {
+pub(crate) fn mutation_fence_command_descriptor(cmdline: &str) -> String {
     let tokens = tokenize_slash_command(cmdline)
         .unwrap_or_else(|_| cmdline.split_whitespace().map(str::to_string).collect());
     let Some(command) = tokens.first() else {
@@ -4825,27 +4825,20 @@ fn force_clear_mutation_fence(
     status_state: &mut StatusState,
     chat_lines: &Rc<RefCell<Vec<String>>>,
 ) {
-    let keys = mutation_fence_clear_keys_for_status(status_state);
-    let mut quarantined_state_path = None;
-    let mut remaining = 0;
-    for key in keys {
-        match delighters::force_clear_mutation_fence_for_workspace(&key) {
-            Ok(result) => {
-                if quarantined_state_path.is_none() {
-                    quarantined_state_path = result.quarantined_state_path;
-                }
-                remaining = result.state.mutation_fences.len();
-            }
-            Err(e) => {
-                status_state.set_toast("Mutation fence clear failed");
-                chat_lines
-                    .borrow_mut()
-                    .push(format!("[error] could not clear mutation fence: {e}"));
-                chat_lines.borrow_mut().push(String::new());
-                return;
-            }
+    let key = mutation_fence_clear_key_for_status(status_state);
+    let result = match delighters::force_clear_mutation_fence_for_workspace(&key) {
+        Ok(result) => result,
+        Err(e) => {
+            status_state.set_toast("Mutation fence clear failed");
+            chat_lines
+                .borrow_mut()
+                .push(format!("[error] could not clear mutation fence: {e}"));
+            chat_lines.borrow_mut().push(String::new());
+            return;
         }
-    }
+    };
+    let quarantined_state_path = result.quarantined_state_path;
+    let remaining = result.state.mutation_fences.len();
     status_state.mutation_fence =
         load_persisted_mutation_fence_for_status(status_state).map(|fence| fence.reason);
     if let Some(path) = quarantined_state_path {
@@ -4863,13 +4856,16 @@ fn force_clear_mutation_fence(
     chat_lines.borrow_mut().push(String::new());
 }
 
-fn mutation_fence_clear_keys_for_status(status_state: &StatusState) -> Vec<String> {
+fn mutation_fence_clear_key_for_status(status_state: &StatusState) -> String {
     let workspace_key = mutation_fence_key_for_status(status_state);
+    if load_persisted_mutation_fence_for_key(&workspace_key).is_some() {
+        return workspace_key;
+    }
     let global_key = crate::cli::tui::GLOBAL_MEMORY_MUTATION_FENCE_KEY.to_string();
-    if workspace_key == global_key {
-        vec![workspace_key]
+    if load_persisted_mutation_fence_for_key(&global_key).is_some() {
+        global_key
     } else {
-        vec![workspace_key, global_key]
+        workspace_key
     }
 }
 
@@ -8359,6 +8355,60 @@ mod tests {
             .unwrap()
             .is_none());
         assert!(lines.borrow().join("\n").contains("/resync --force"));
+
+        match old_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    #[test]
+    fn force_clear_mutation_fence_preserves_unrelated_global_fence() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+
+        let mut state = StatusState::new(
+            "default".to_string(),
+            "gpt-test".to_string(),
+            "borland".to_string(),
+            false,
+        );
+        let workspace_key = mutation_fence_key_for_status(&state);
+        let workspace_fence = delighters::MutationFenceState {
+            command: "/workspace switch args#abc".to_string(),
+            reason: "workspace outcome unknown".to_string(),
+            created_at_unix: 42,
+            dispatch_id: "workspace-dispatch".to_string(),
+        };
+        let global_fence = delighters::MutationFenceState {
+            command: "/memory post args#def".to_string(),
+            reason: "global memory outcome unknown".to_string(),
+            created_at_unix: 43,
+            dispatch_id: "global-dispatch".to_string(),
+        };
+        delighters::set_mutation_fence_for_workspace(&workspace_key, workspace_fence).unwrap();
+        delighters::set_mutation_fence_for_workspace(
+            crate::cli::tui::GLOBAL_MEMORY_MUTATION_FENCE_KEY,
+            global_fence.clone(),
+        )
+        .unwrap();
+        state.mutation_fence = Some("workspace outcome unknown".to_string());
+        let lines = Rc::new(RefCell::new(Vec::new()));
+
+        force_clear_mutation_fence(&mut state, &lines);
+
+        assert!(delighters::mutation_fence_for_workspace(&workspace_key)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            delighters::mutation_fence_for_workspace(
+                crate::cli::tui::GLOBAL_MEMORY_MUTATION_FENCE_KEY
+            )
+            .unwrap(),
+            Some(global_fence)
+        );
 
         match old_home {
             Some(home) => std::env::set_var("HOME", home),
