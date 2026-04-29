@@ -1475,16 +1475,18 @@ impl CommandHandler {
             .fetch_add(1, Ordering::SeqCst)
             + 1;
 
-        let activation = {
-            let mut app = self.app.lock().await;
+        let (activation, target_cron) = {
+            let app = self.app.lock().await;
             if !app.workspaces[target_idx].is_activated() {
-                Some(app.workspaces[target_idx].config.clone())
+                (
+                    Some(app.workspaces[target_idx].config.clone()),
+                    app.workspaces[target_idx].cron.clone(),
+                )
             } else {
                 if !self.workspace_switch_is_current(switch_generation) {
                     return Ok(Some(workspace_switch_superseded_message(name)));
                 }
-                app.active = target_idx;
-                None
+                (None, app.workspaces[target_idx].cron.clone())
             }
         };
 
@@ -1499,6 +1501,15 @@ impl CommandHandler {
                 }
             };
 
+            if let Some(cron) = &target_cron {
+                if let Some(message) = refresh_workspace_models_for_switch(name, cron).await {
+                    return Ok(Some(message));
+                }
+            }
+            if !self.workspace_switch_is_current(switch_generation) {
+                return Ok(Some(workspace_switch_superseded_message(name)));
+            }
+
             let mut app = self.app.lock().await;
             if !self.workspace_switch_is_current(switch_generation) {
                 return Ok(Some(workspace_switch_superseded_message(name)));
@@ -1512,9 +1523,44 @@ impl CommandHandler {
                 app.workspaces[target_idx].client = Some(activated_client);
             }
             app.active = target_idx;
+        } else {
+            if let Some(cron) = &target_cron {
+                if let Some(message) = refresh_workspace_models_for_switch(name, cron).await {
+                    return Ok(Some(message));
+                }
+            }
+            if !self.workspace_switch_is_current(switch_generation) {
+                return Ok(Some(workspace_switch_superseded_message(name)));
+            }
+
+            let mut app = self.app.lock().await;
+            if !self.workspace_switch_is_current(switch_generation) {
+                return Ok(Some(workspace_switch_superseded_message(name)));
+            }
+            let Some(target_idx) = app.workspaces.iter().position(|w| w.config.name == name) else {
+                return Ok(Some(format!(
+                    "❌ workspace \"{name}\" disappeared during activation\n"
+                )));
+            };
+            app.active = target_idx;
         }
 
         Ok(Some(format!("✅ 🗂  switched to workspace: {name}\n")))
+    }
+}
+
+async fn refresh_workspace_models_for_switch(
+    workspace_name: &str,
+    cron: &ZeroclawClient,
+) -> Option<String> {
+    match cron.refresh_models().await {
+        Ok(list) if list.is_empty() => Some(format!(
+            "❌ failed to refresh model state for \"{workspace_name}\": /api/config advertised no model keys\n"
+        )),
+        Ok(_) => None,
+        Err(e) => Some(format!(
+            "❌ failed to refresh model state for \"{workspace_name}\": {e}\n"
+        )),
     }
 }
 
@@ -3727,6 +3773,156 @@ token = "legacy-secret"
         let app = app.lock().await;
         assert_eq!(app.active_workspace().unwrap().config.name, "beta");
         assert!(app.active_workspace().unwrap().is_activated());
+    }
+
+    #[tokio::test]
+    async fn workspace_switch_refreshes_target_zeroclaw_model_state_before_activation() {
+        let mut beta_server = mockito::Server::new_async().await;
+        let beta_config = beta_server
+            .mock("GET", "/api/config")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "content": r#"
+[providers]
+fallback = "gemini"
+
+[providers.models.primary]
+name = "openai_compat"
+model = "gpt-test"
+
+[providers.models.consult]
+name = "gemini"
+model = "gemini-test"
+"#
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+
+        let alpha_client = ZeroclawClient::new("http://alpha.example".to_string(), String::new());
+        let beta_client = ZeroclawClient::new(beta_server.url(), String::new());
+        let beta_cron = beta_client.clone();
+        let app = Arc::new(Mutex::new(App {
+            workspaces: vec![
+                Workspace {
+                    id: 0,
+                    config: WorkspaceConfig {
+                        id: None,
+                        name: "alpha".to_string(),
+                        backend: Backend::Zeroclaw,
+                        url: "http://alpha.example".to_string(),
+                        token_env: None,
+                        token: None,
+                        label: None,
+                        namespace_aliases: Vec::new(),
+                    },
+                    client: Some(Arc::new(Mutex::new(Box::new(alpha_client)))),
+                    cron: None,
+                },
+                Workspace {
+                    id: 1,
+                    config: WorkspaceConfig {
+                        id: None,
+                        name: "beta".to_string(),
+                        backend: Backend::Zeroclaw,
+                        url: beta_server.url(),
+                        token_env: None,
+                        token: None,
+                        label: None,
+                        namespace_aliases: Vec::new(),
+                    },
+                    client: Some(Arc::new(Mutex::new(Box::new(beta_client)))),
+                    cron: Some(beta_cron.clone()),
+                },
+            ],
+            active: 0,
+            shared_mnemos: None,
+            config_path: PathBuf::from("test-config.toml"),
+        }));
+        let handler = super::CommandHandler::new(Arc::clone(&app));
+
+        assert_eq!(beta_cron.cached_model_key_for_tests(), None);
+        let out = handler
+            .handle("/workspace switch beta", "s")
+            .await
+            .expect("workspace switch should complete")
+            .expect("workspace switch should return output");
+
+        beta_config.assert_async().await;
+        assert!(out.contains("switched to workspace: beta"));
+        assert_eq!(
+            beta_cron.cached_model_key_for_tests().as_deref(),
+            Some("consult")
+        );
+        let app = app.lock().await;
+        assert_eq!(app.active_workspace().unwrap().config.name, "beta");
+    }
+
+    #[tokio::test]
+    async fn workspace_switch_surfaces_zeroclaw_model_refresh_failure_without_switching() {
+        let mut beta_server = mockito::Server::new_async().await;
+        let beta_config = beta_server
+            .mock("GET", "/api/config")
+            .with_status(500)
+            .with_header("content-type", "text/plain")
+            .with_body("boom")
+            .create_async()
+            .await;
+
+        let alpha_client = ZeroclawClient::new("http://alpha.example".to_string(), String::new());
+        let beta_client = ZeroclawClient::new(beta_server.url(), String::new());
+        let app = Arc::new(Mutex::new(App {
+            workspaces: vec![
+                Workspace {
+                    id: 0,
+                    config: WorkspaceConfig {
+                        id: None,
+                        name: "alpha".to_string(),
+                        backend: Backend::Zeroclaw,
+                        url: "http://alpha.example".to_string(),
+                        token_env: None,
+                        token: None,
+                        label: None,
+                        namespace_aliases: Vec::new(),
+                    },
+                    client: Some(Arc::new(Mutex::new(Box::new(alpha_client)))),
+                    cron: None,
+                },
+                Workspace {
+                    id: 1,
+                    config: WorkspaceConfig {
+                        id: None,
+                        name: "beta".to_string(),
+                        backend: Backend::Zeroclaw,
+                        url: beta_server.url(),
+                        token_env: None,
+                        token: None,
+                        label: None,
+                        namespace_aliases: Vec::new(),
+                    },
+                    client: Some(Arc::new(Mutex::new(Box::new(beta_client.clone())))),
+                    cron: Some(beta_client),
+                },
+            ],
+            active: 0,
+            shared_mnemos: None,
+            config_path: PathBuf::from("test-config.toml"),
+        }));
+        let handler = super::CommandHandler::new(Arc::clone(&app));
+
+        let out = handler
+            .handle("/workspace switch beta", "s")
+            .await
+            .expect("workspace switch should complete with rendered failure")
+            .expect("workspace switch should return output");
+
+        beta_config.assert_async().await;
+        assert!(out.contains("failed to refresh model state"));
+        let app = app.lock().await;
+        assert_eq!(app.active_workspace().unwrap().config.name, "alpha");
     }
 
     #[tokio::test]
