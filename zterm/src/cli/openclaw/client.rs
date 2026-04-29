@@ -2026,9 +2026,6 @@ impl OpenClawClient {
         &self,
         row: &super::handshake::OpenClawSessionRow,
     ) -> bool {
-        if self.session_key_has_session_namespace_prefix(&row.key) {
-            return true;
-        }
         row.label
             .as_deref()
             .map(|label| self.session_key_belongs_to_session_namespace(&row.key, label))
@@ -2059,12 +2056,6 @@ impl OpenClawClient {
             key == stable_session_key(namespace, label)
                 || key == legacy_stable_session_key(namespace, label)
         })
-    }
-
-    fn session_key_has_session_namespace_prefix(&self, key: &str) -> bool {
-        self.session_namespaces()
-            .into_iter()
-            .any(|namespace| key.starts_with(&session_key_prefix(namespace)))
     }
 
     fn session_namespaces(&self) -> Vec<&str> {
@@ -2458,7 +2449,7 @@ mod tests {
     }
 
     #[test]
-    fn stable_namespace_rows_do_not_require_optional_label() {
+    fn stable_namespace_rows_require_label_to_verify_derived_key() {
         let client = tests_support_new_fake(PendingRequests::new(), None, true);
         let row = super::super::handshake::OpenClawSessionRow {
             key: stable_session_key(DEFAULT_SESSION_NAMESPACE, "Research"),
@@ -2471,7 +2462,27 @@ mod tests {
             extra: serde_json::Map::new(),
         };
 
-        assert!(client.row_belongs_to_session_namespace(&row));
+        assert!(!client.row_belongs_to_session_namespace(&row));
+    }
+
+    #[test]
+    fn stable_namespace_rows_reject_spoofed_prefix_without_matching_label() {
+        let client = tests_support_new_fake(PendingRequests::new(), None, true);
+        let row = super::super::handshake::OpenClawSessionRow {
+            key: format!(
+                "{}spoofed-key",
+                session_key_prefix(DEFAULT_SESSION_NAMESPACE)
+            ),
+            kind: "direct".to_string(),
+            label: Some("Research".to_string()),
+            display_name: None,
+            derived_title: None,
+            updated_at: None,
+            session_id: None,
+            extra: serde_json::Map::new(),
+        };
+
+        assert!(!client.row_belongs_to_session_namespace(&row));
     }
 
     #[test]

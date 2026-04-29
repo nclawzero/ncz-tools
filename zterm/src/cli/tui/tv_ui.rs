@@ -2132,15 +2132,35 @@ fn run_event_loop(
 ) -> Result<()> {
     app.running = true;
     let mut last_size = app.terminal.size();
+    let mut pending_resize_exit: Option<((i16, i16), (i16, i16))> = None;
     let mut response_in_flight = false;
     let mut session_picker_state = SessionPickerState::default();
     while app.running {
+        if let Some((from_size, to_size)) = pending_resize_exit.as_ref().copied() {
+            if !resize_exit_is_blocked_by_inflight_turn(response_in_flight) {
+                app.terminal.clear();
+                eprintln!(
+                    "\n⚠️  Terminal resized ({}x{} → {}x{}). Please rerun `zterm tui` \
+                     at the new size.",
+                    from_size.0, from_size.1, to_size.0, to_size.1
+                );
+                app.running = false;
+                break;
+            }
+        }
+
         // Poll terminal size once per tick. On change, print a
         // user-facing notice and exit so the caller can relaunch
         // at the new size. Live-resize (rebuilding all view
         // bounds on the fly) is a larger refactor — pending.
         let cur_size = app.terminal.size();
         if cur_size != last_size {
+            if resize_exit_is_blocked_by_inflight_turn(response_in_flight) {
+                pending_resize_exit = Some((last_size, cur_size));
+                last_size = cur_size;
+                note_response_busy(status_state);
+                continue;
+            }
             app.terminal.clear();
             eprintln!(
                 "\n⚠️  Terminal resized ({}x{} → {}x{}). Please rerun `zterm tui` \
@@ -2630,6 +2650,10 @@ fn note_response_busy(status_state: &mut StatusState) {
 }
 
 fn quit_is_blocked_by_inflight_turn(response_in_flight: bool) -> bool {
+    response_in_flight
+}
+
+fn resize_exit_is_blocked_by_inflight_turn(response_in_flight: bool) -> bool {
     response_in_flight
 }
 
@@ -4687,6 +4711,12 @@ mod tests {
     fn quit_paths_are_blocked_while_turn_is_in_flight() {
         assert!(quit_is_blocked_by_inflight_turn(true));
         assert!(!quit_is_blocked_by_inflight_turn(false));
+    }
+
+    #[test]
+    fn resize_exit_is_blocked_while_turn_is_in_flight() {
+        assert!(resize_exit_is_blocked_by_inflight_turn(true));
+        assert!(!resize_exit_is_blocked_by_inflight_turn(false));
     }
 
     #[test]

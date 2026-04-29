@@ -12,6 +12,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 pub const CONNECT_SPLASH_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+pub const CONNECT_SPLASH_MAX_BYTES: u64 = 4 * 1024;
+const CONNECT_SPLASH_MAX_LINES: usize = 6;
+const CONNECT_SPLASH_MAX_LINE_CHARS: usize = 96;
 
 const WELCOME_QUOTES: &[&str] = &[
     "Turbo Pascal says: Hello, world!",
@@ -72,6 +75,9 @@ pub fn read_cached_connect_splash(path: &Path, now: SystemTime, ttl: Duration) -
     let metadata = fs::metadata(path).ok()?;
     let modified = metadata.modified().ok()?;
     if !is_cache_fresh(modified, now, ttl) {
+        return None;
+    }
+    if metadata.len() > CONNECT_SPLASH_MAX_BYTES {
         return None;
     }
     let text = fs::read_to_string(path).ok()?;
@@ -161,8 +167,13 @@ pub fn normalize_connect_splash(text: &str) -> String {
     text.lines()
         .map(str::trim_end)
         .filter(|line| !line.trim().is_empty())
-        .take(6)
-        .collect::<Vec<_>>()
+        .take(CONNECT_SPLASH_MAX_LINES)
+        .map(|line| {
+            line.chars()
+                .take(CONNECT_SPLASH_MAX_LINE_CHARS)
+                .collect::<String>()
+        })
+        .collect::<Vec<String>>()
         .join("\n")
 }
 
@@ -368,6 +379,24 @@ mod tests {
             normalize_connect_splash(input),
             "CONNECT 2400\nline2\nline3\nline4\nline5\nline6"
         );
+    }
+
+    #[test]
+    fn normalize_connect_splash_caps_line_length() {
+        let long_line = "x".repeat(CONNECT_SPLASH_MAX_LINE_CHARS + 10);
+        let normalized = normalize_connect_splash(&long_line);
+
+        assert_eq!(normalized.chars().count(), CONNECT_SPLASH_MAX_LINE_CHARS);
+    }
+
+    #[test]
+    fn connect_splash_cache_rejects_oversized_file_before_reading() {
+        let dir = tempdir().unwrap();
+        let path = connect_splash_cache_path(dir.path(), "prod typhon");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "x".repeat(CONNECT_SPLASH_MAX_BYTES as usize + 1)).unwrap();
+
+        assert!(read_cached_connect_splash(&path, SystemTime::now(), CONNECT_SPLASH_TTL).is_none());
     }
 
     #[test]
