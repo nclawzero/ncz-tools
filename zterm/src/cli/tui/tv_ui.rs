@@ -1384,10 +1384,15 @@ async fn generate_connect_splash_from_active_backend(
     .ok_or_else(|| anyhow::anyhow!("no active workspace client"))?;
 
     let mut locked = client.lock().await;
-    locked.set_stream_sink(None);
+    if !locked.submit_turn_is_cancellation_safe() {
+        anyhow::bail!("active backend does not support cancellable splash generation");
+    }
+    let (capture_sink, _capture_rx) = StreamSink::channel(TURN_STREAM_CAPACITY);
+    locked.set_stream_sink(Some(capture_sink));
     let result = generate_connect_splash_with_client(locked.as_mut(), workspace_name).await;
-    if let Some(sink) = restore_sink {
-        locked.set_stream_sink(Some(sink));
+    match restore_sink {
+        Some(sink) => locked.set_stream_sink(Some(sink)),
+        None => locked.set_stream_sink(None),
     }
     result
 }
@@ -1396,6 +1401,10 @@ async fn generate_connect_splash_with_client(
     client: &mut (dyn AgentClient + Send + Sync),
     workspace_name: &str,
 ) -> Result<String> {
+    if !client.submit_turn_is_cancellation_safe() {
+        anyhow::bail!("active backend does not support cancellable splash generation");
+    }
+
     let session_name = connect_splash_session_name(workspace_name);
     let session = tokio::time::timeout(
         CONNECT_SPLASH_GENERATION_TIMEOUT,
@@ -5229,6 +5238,7 @@ mod tests {
             let deleted = Arc::new(StdMutex::new(Vec::new()));
             let submitted = Arc::new(StdMutex::new(Vec::new()));
             let generated = "ZTERM LINK ESTABLISHED\nALPHA READY";
+            let sink_set_states = Arc::new(StdMutex::new(Vec::new()));
             let fake = WorkerSessionFakeClient {
                 listed_sessions: Vec::new(),
                 list_sessions_error: None,
@@ -5240,6 +5250,8 @@ mod tests {
                 list_calls: Arc::new(StdMutex::new(0)),
                 load_calls: Arc::new(StdMutex::new(Vec::new())),
                 submit_response: generated.to_string(),
+                cancellation_safe: true,
+                sink_set_states: Arc::clone(&sink_set_states),
             };
             let boxed: Box<dyn crate::cli::agent::AgentClient + Send + Sync> = Box::new(fake);
             let app = Arc::new(Mutex::new(App {
@@ -5277,6 +5289,7 @@ mod tests {
                 [(session_id.clone(), connect_splash_prompt("alpha"))]
             );
             assert_eq!(deleted.lock().unwrap().as_slice(), [session_id]);
+            assert_eq!(sink_set_states.lock().unwrap().as_slice(), [true, false]);
             let path = delighters::default_connect_splash_cache_path("alpha").unwrap();
             assert_eq!(
                 delighters::read_cached_connect_splash(
@@ -5287,6 +5300,72 @@ mod tests {
                 .as_deref(),
                 Some(expected.as_str())
             );
+        });
+
+        match old_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    #[test]
+    fn connect_splash_skips_non_cancellable_backend_generation() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let created = Arc::new(StdMutex::new(Vec::new()));
+            let deleted = Arc::new(StdMutex::new(Vec::new()));
+            let submitted = Arc::new(StdMutex::new(Vec::new()));
+            let sink_set_states = Arc::new(StdMutex::new(Vec::new()));
+            let fake = WorkerSessionFakeClient {
+                listed_sessions: Vec::new(),
+                list_sessions_error: None,
+                loadable_sessions: Vec::new(),
+                load_reject_ids: Vec::new(),
+                created: Arc::clone(&created),
+                deleted: Arc::clone(&deleted),
+                submitted: Arc::clone(&submitted),
+                list_calls: Arc::new(StdMutex::new(0)),
+                load_calls: Arc::new(StdMutex::new(Vec::new())),
+                submit_response: "SHOULD NOT BE USED".to_string(),
+                cancellation_safe: false,
+                sink_set_states: Arc::clone(&sink_set_states),
+            };
+            let boxed: Box<dyn crate::cli::agent::AgentClient + Send + Sync> = Box::new(fake);
+            let app = Arc::new(Mutex::new(App {
+                workspaces: vec![crate::cli::workspace::Workspace {
+                    id: 0,
+                    config: crate::cli::workspace::WorkspaceConfig {
+                        id: Some("ws-alpha".to_string()),
+                        name: "alpha".to_string(),
+                        backend: crate::cli::workspace::Backend::Openclaw,
+                        url: "ws://gateway.example".to_string(),
+                        token_env: None,
+                        token: None,
+                        label: None,
+                        namespace_aliases: Vec::new(),
+                    },
+                    client: Some(Arc::new(Mutex::new(boxed))),
+                    cron: None,
+                }],
+                active: 0,
+                shared_mnemos: None,
+                config_path: std::path::PathBuf::from("test-config.toml"),
+            }));
+
+            let splash = connect_splash_for_workspace(&app, "alpha", None).await;
+
+            assert_eq!(splash, delighters::local_connect_splash("alpha"));
+            assert!(created.lock().unwrap().is_empty());
+            assert!(submitted.lock().unwrap().is_empty());
+            assert!(deleted.lock().unwrap().is_empty());
+            assert!(sink_set_states.lock().unwrap().is_empty());
+            let path = delighters::default_connect_splash_cache_path("alpha").unwrap();
+            assert!(!path.exists());
         });
 
         match old_home {
@@ -7649,6 +7728,8 @@ mod tests {
         list_calls: Arc<StdMutex<usize>>,
         load_calls: Arc<StdMutex<Vec<String>>>,
         submit_response: String,
+        cancellation_safe: bool,
+        sink_set_states: Arc<StdMutex<Vec<bool>>>,
     }
 
     #[async_trait::async_trait]
@@ -7735,6 +7816,14 @@ mod tests {
                 .push((session_id.to_string(), message.to_string()));
             Ok(self.submit_response.clone())
         }
+
+        fn set_stream_sink(&mut self, sink: Option<StreamSink>) {
+            self.sink_set_states.lock().unwrap().push(sink.is_some());
+        }
+
+        fn submit_turn_is_cancellation_safe(&self) -> bool {
+            self.cancellation_safe
+        }
     }
 
     #[test]
@@ -7767,6 +7856,8 @@ mod tests {
                 list_calls,
                 load_calls: Arc::clone(&load_calls),
                 submit_response: String::new(),
+                cancellation_safe: true,
+                sink_set_states: Arc::new(StdMutex::new(Vec::new())),
             };
             let boxed: Box<dyn crate::cli::agent::AgentClient + Send + Sync> = Box::new(fake);
             let app = Arc::new(Mutex::new(App {
@@ -7838,6 +7929,8 @@ mod tests {
                 list_calls: Arc::clone(&list_calls),
                 load_calls: Arc::clone(&load_calls),
                 submit_response: String::new(),
+                cancellation_safe: true,
+                sink_set_states: Arc::new(StdMutex::new(Vec::new())),
             };
             let boxed: Box<dyn crate::cli::agent::AgentClient + Send + Sync> = Box::new(fake);
             let app = Arc::new(Mutex::new(App {
@@ -7922,6 +8015,8 @@ mod tests {
                 list_calls: Arc::clone(&list_calls),
                 load_calls: Arc::clone(&load_calls),
                 submit_response: String::new(),
+                cancellation_safe: true,
+                sink_set_states: Arc::new(StdMutex::new(Vec::new())),
             };
             let boxed: Box<dyn crate::cli::agent::AgentClient + Send + Sync> = Box::new(fake);
             let app = Arc::new(Mutex::new(App {
@@ -7995,6 +8090,8 @@ mod tests {
                 list_calls,
                 load_calls: Arc::clone(&load_calls),
                 submit_response: String::new(),
+                cancellation_safe: true,
+                sink_set_states: Arc::new(StdMutex::new(Vec::new())),
             };
             let boxed: Box<dyn crate::cli::agent::AgentClient + Send + Sync> = Box::new(fake);
             let app = Arc::new(Mutex::new(App {
@@ -8080,6 +8177,8 @@ mod tests {
             list_calls: Arc::new(StdMutex::new(0)),
             load_calls: Arc::new(StdMutex::new(Vec::new())),
             submit_response: String::new(),
+            cancellation_safe: true,
+            sink_set_states: Arc::new(StdMutex::new(Vec::new())),
         };
         let boxed: Box<dyn crate::cli::agent::AgentClient + Send + Sync> = Box::new(fake);
         let app = Arc::new(Mutex::new(App {
