@@ -88,6 +88,12 @@ enum WorkerRequest {
     SessionPickerList(SessionPickerWorkspace),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InFlightRequest {
+    label: String,
+    mutating_slash: bool,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum SubmissionStatus {
     Started,
@@ -323,6 +329,10 @@ struct StatusState {
     mutation_fence: Option<String>,
     /// True while an explicit `/resync` recovery request is in flight.
     resync_in_flight: bool,
+    /// Metadata for the worker request currently reflected by
+    /// `response_in_flight`. Used to fail closed if the worker dies
+    /// before it can type the final result.
+    in_flight_request: Option<InFlightRequest>,
 }
 
 impl StatusState {
@@ -341,6 +351,7 @@ impl StatusState {
             beep_on_error,
             mutation_fence: None,
             resync_in_flight: false,
+            in_flight_request: None,
         }
     }
 
@@ -2917,11 +2928,15 @@ fn drain_stream_events(
                     }
                     TurnChunk::Finished(result) => {
                         let was_resync = status_state.resync_in_flight;
+                        let in_flight_request = status_state.in_flight_request.take();
                         if result.is_err() {
                             saw_error = true;
                             if let Err(message) = result {
-                                if mutation_timeout_requires_fence(message) {
-                                    set_local_and_persisted_mutation_fence(status_state, message);
+                                if let Some(reason) = mutation_fence_reason_for_terminal_failure(
+                                    message,
+                                    in_flight_request.as_ref(),
+                                ) {
+                                    set_local_and_persisted_mutation_fence(status_state, &reason);
                                     status_state.set_toast(MUTATION_FENCE_TOAST);
                                 } else if was_resync {
                                     status_state
@@ -2955,18 +2970,25 @@ fn drain_stream_events(
             Err(mpsc::error::TryRecvError::Disconnected) => {
                 if *response_in_flight {
                     saw_error = true;
+                    let in_flight_request = status_state.in_flight_request.take();
+                    let disconnect_message =
+                        "worker channel disconnected before the request completed";
+                    let mut rendered_message = disconnect_message.to_string();
+                    if let Some(reason) = mutation_fence_reason_for_terminal_failure(
+                        disconnect_message,
+                        in_flight_request.as_ref(),
+                    ) {
+                        set_local_and_persisted_mutation_fence(status_state, &reason);
+                        status_state.set_toast(MUTATION_FENCE_TOAST);
+                        rendered_message = reason;
+                    }
                     if status_state.resync_in_flight {
                         status_state.set_toast("Resync failed: mutation fence remains active");
                     }
                     status_state.resync_in_flight = false;
                     status_state.end_turn();
                     *response_in_flight = false;
-                    apply_chunk(
-                        TurnChunk::Finished(Err(
-                            "worker channel disconnected before the request completed".to_string(),
-                        )),
-                        chat_lines,
-                    );
+                    apply_chunk(TurnChunk::Finished(Err(rendered_message)), chat_lines);
                 }
                 break;
             }
@@ -2977,6 +2999,23 @@ fn drain_stream_events(
 
 fn mutation_timeout_requires_fence(message: &str) -> bool {
     message.contains("slash command outcome unknown")
+}
+
+fn mutation_fence_reason_for_terminal_failure(
+    message: &str,
+    in_flight_request: Option<&InFlightRequest>,
+) -> Option<String> {
+    if mutation_timeout_requires_fence(message) {
+        return Some(message.to_string());
+    }
+    if message == COMMAND_ERROR_ALREADY_RENDERED {
+        return None;
+    }
+    let request = in_flight_request.filter(|request| request.mutating_slash)?;
+    Some(mutating_command_unknown_outcome_message(
+        &request.label,
+        message,
+    ))
 }
 
 fn note_response_busy(status_state: &mut StatusState) {
@@ -3019,6 +3058,7 @@ fn dispatch_worker_backed_submission(
         note_response_busy(status_state);
         return SubmissionStatus::Busy;
     }
+    let in_flight_request = in_flight_request_for_worker_request(label, &request);
 
     if let Some(toast) = toast {
         status_state.set_toast(toast);
@@ -3034,6 +3074,7 @@ fn dispatch_worker_backed_submission(
 
     if let Err(e) = req_tx.blocking_send(request) {
         *response_in_flight = false;
+        status_state.in_flight_request = None;
         // Undo the busy indicator; the request never made it to the worker.
         status_state.turn_start = None;
         chat_lines
@@ -3041,8 +3082,22 @@ fn dispatch_worker_backed_submission(
             .push(format!("[error] could not {error_context}: {e}"));
         return SubmissionStatus::DispatchFailed;
     }
+    status_state.in_flight_request = Some(in_flight_request);
 
     SubmissionStatus::Started
+}
+
+fn in_flight_request_for_worker_request(label: &str, request: &WorkerRequest) -> InFlightRequest {
+    let mutating_slash = match request {
+        WorkerRequest::Command(cmdline) => slash_command_may_mutate_state(cmdline),
+        WorkerRequest::Turn(_) | WorkerRequest::Resync | WorkerRequest::SessionPickerList(_) => {
+            false
+        }
+    };
+    InFlightRequest {
+        label: label.to_string(),
+        mutating_slash,
+    }
 }
 
 /// Apply a single streamed chunk to the chat buffer.
@@ -5408,10 +5463,109 @@ mod tests {
 
         assert!(!response_in_flight);
         assert!(state.turn_start.is_none());
+        assert!(state.in_flight_request.is_none());
+        assert!(state.mutation_fence.is_none());
         assert!(lines
             .borrow()
             .iter()
             .any(|line| line.contains("worker channel disconnected")));
+    }
+
+    #[test]
+    fn worker_disconnect_sets_mutation_fence_for_inflight_mutating_command() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+
+        let mut state = StatusState::new(
+            "default".to_string(),
+            "gpt-test".to_string(),
+            "borland".to_string(),
+            false,
+        );
+        state.begin_busy(false);
+        state.in_flight_request = Some(InFlightRequest {
+            label: "/memory post hello".to_string(),
+            mutating_slash: true,
+        });
+        let lines = Rc::new(RefCell::new(vec![
+            "> /memory post hello".to_string(),
+            String::new(),
+        ]));
+        let mut typewriter_state = None;
+        let mut response_in_flight = true;
+        let mut session_picker_state = SessionPickerState::default();
+        let (tx, mut rx) = mpsc::channel::<TurnChunk>(8);
+        drop(tx);
+
+        let events_drained = drain_stream_events(
+            &mut rx,
+            &lines,
+            &mut state,
+            &mut typewriter_state,
+            &mut response_in_flight,
+            &mut session_picker_state,
+        );
+
+        let local_fence = state.mutation_fence.clone();
+        let key = mutation_fence_key_for_status(&state);
+        let persisted = delighters::mutation_fence_for_workspace(&key);
+        let rendered = lines.borrow().join("\n");
+
+        match old_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+
+        assert!(events_drained);
+        assert!(!response_in_flight);
+        assert!(state.turn_start.is_none());
+        assert!(state.in_flight_request.is_none());
+        let fence = local_fence
+            .as_deref()
+            .expect("mutating disconnect should set a local fence");
+        assert!(fence.contains("/memory post hello"));
+        assert!(fence.contains("worker channel disconnected"));
+        let persisted = persisted
+            .unwrap()
+            .expect("mutating disconnect should persist a fence");
+        assert!(persisted.reason.contains("/memory post hello"));
+        assert!(persisted.reason.contains("worker channel disconnected"));
+        assert_eq!(persisted.command, "/memory post hello");
+        assert!(rendered.contains("worker channel disconnected"));
+        assert!(rendered.contains("/resync --force"));
+    }
+
+    #[test]
+    fn terminal_worker_failure_fences_only_mutating_requests() {
+        let readonly = InFlightRequest {
+            label: "/models list".to_string(),
+            mutating_slash: false,
+        };
+        assert!(mutation_fence_reason_for_terminal_failure(
+            "worker channel disconnected before the request completed",
+            Some(&readonly)
+        )
+        .is_none());
+
+        let mutating = InFlightRequest {
+            label: "/workspace switch prod".to_string(),
+            mutating_slash: true,
+        };
+        assert!(mutation_fence_reason_for_terminal_failure(
+            COMMAND_ERROR_ALREADY_RENDERED,
+            Some(&mutating)
+        )
+        .is_none());
+
+        let reason = mutation_fence_reason_for_terminal_failure(
+            "worker channel disconnected before the request completed",
+            Some(&mutating),
+        )
+        .expect("mutating terminal failure should produce a fence reason");
+        assert!(reason.contains("/workspace switch prod"));
+        assert!(reason.contains("worker channel disconnected"));
     }
 
     #[tokio::test]
