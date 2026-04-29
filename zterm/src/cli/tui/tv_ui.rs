@@ -1572,6 +1572,9 @@ async fn generate_connect_splash_from_client(
     restore_sink: Option<StreamSink>,
 ) -> Result<String> {
     let mut locked = client.lock().await;
+    if !locked.supports_side_effect_free_splash_generation() {
+        anyhow::bail!("active backend does not support side-effect-free splash generation");
+    }
     if !locked.submit_turn_is_cancellation_safe() {
         anyhow::bail!("active backend does not support cancellable splash generation");
     }
@@ -1589,6 +1592,9 @@ async fn generate_connect_splash_with_client(
     client: &mut (dyn AgentClient + Send + Sync),
     workspace_name: &str,
 ) -> Result<String> {
+    if !client.supports_side_effect_free_splash_generation() {
+        anyhow::bail!("active backend does not support side-effect-free splash generation");
+    }
     if !client.submit_turn_is_cancellation_safe() {
         anyhow::bail!("active backend does not support cancellable splash generation");
     }
@@ -1624,9 +1630,21 @@ async fn generate_connect_splash_with_named_session_timeout(
         anyhow::bail!("connect-splash scratch session already exists");
     }
 
-    let session = tokio::time::timeout(timeout, client.create_session(session_name))
-        .await
-        .map_err(|_| anyhow::anyhow!("connect-splash session create timed out"))??;
+    let session = match tokio::time::timeout(timeout, client.create_session(session_name)).await {
+        Ok(Ok(session)) => session,
+        Ok(Err(e)) => {
+            return Err(ConnectSplashCleanupFailure::new(format!(
+                "connect-splash scratch session `{session_name}` create failed after dispatch; backend outcome unknown: {e}"
+            ))
+            .into());
+        }
+        Err(_) => {
+            return Err(ConnectSplashCleanupFailure::new(format!(
+                "connect-splash scratch session `{session_name}` create timed out; backend outcome unknown"
+            ))
+            .into());
+        }
+    };
     let owned_session = !before.iter().any(|existing| existing.id == session.id);
     if !owned_session {
         anyhow::bail!("connect-splash session id existed before activation");
@@ -5792,6 +5810,56 @@ mod tests {
     }
 
     #[test]
+    fn connect_splash_skips_backends_without_side_effect_free_generation() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let client = crate::cli::client::ZeroclawClient::new(
+                "http://gateway.example".to_string(),
+                "token".to_string(),
+            );
+            let boxed: Box<dyn crate::cli::agent::AgentClient + Send + Sync> = Box::new(client);
+            let app = Arc::new(Mutex::new(App {
+                workspaces: vec![crate::cli::workspace::Workspace {
+                    id: 0,
+                    config: crate::cli::workspace::WorkspaceConfig {
+                        id: Some("ws-alpha".to_string()),
+                        name: "alpha".to_string(),
+                        backend: crate::cli::workspace::Backend::Zeroclaw,
+                        url: "http://gateway.example".to_string(),
+                        token_env: None,
+                        token: Some("token".to_string()),
+                        label: None,
+                        namespace_aliases: Vec::new(),
+                    },
+                    client: Some(Arc::new(Mutex::new(boxed))),
+                    cron: None,
+                }],
+                active: 0,
+                shared_mnemos: None,
+                config_path: std::path::PathBuf::from("test-config.toml"),
+            }));
+
+            let splash = connect_splash_for_workspace(&app, "alpha", None)
+                .await
+                .unwrap();
+
+            assert_eq!(splash, delighters::local_connect_splash("alpha"));
+            let path = delighters::default_connect_splash_cache_path("alpha").unwrap();
+            assert!(!path.exists());
+        });
+
+        match old_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    #[test]
     fn connect_splash_skips_non_cancellable_backend_generation() {
         let _env = crate::cli::test_env_lock().lock().unwrap();
         let home = tempfile::tempdir().unwrap();
@@ -6044,6 +6112,90 @@ mod tests {
                 deleted.lock().unwrap().is_empty(),
                 "timed-out submitted splash turns must not be treated as safe to delete"
             );
+        });
+    }
+
+    #[test]
+    fn connect_splash_create_timeout_is_cleanup_unknown_failure() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let created = Arc::new(StdMutex::new(Vec::new()));
+            let deleted = Arc::new(StdMutex::new(Vec::new()));
+            let submitted = Arc::new(StdMutex::new(Vec::new()));
+            let mut fake = WorkerSessionFakeClient {
+                listed_sessions: Vec::new(),
+                list_sessions_error: None,
+                loadable_sessions: Vec::new(),
+                load_reject_ids: Vec::new(),
+                created: Arc::clone(&created),
+                deleted: Arc::clone(&deleted),
+                submitted: Arc::clone(&submitted),
+                list_calls: Arc::new(StdMutex::new(0)),
+                load_calls: Arc::new(StdMutex::new(Vec::new())),
+                submit_response: "SHOULD NOT BE USED".to_string(),
+                submit_error: None,
+                submit_never: false,
+                cancellation_safe: true,
+                sink_set_states: Arc::new(StdMutex::new(Vec::new())),
+                delete_error: None,
+            };
+
+            let err = generate_connect_splash_with_named_session_timeout(
+                &mut fake,
+                "alpha",
+                "zterm connect splash create-timeout",
+                Duration::from_millis(1),
+            )
+            .await
+            .unwrap_err();
+
+            assert!(is_connect_splash_cleanup_failure(&err));
+            assert!(err.to_string().contains("backend outcome unknown"));
+            assert_eq!(created.lock().unwrap().len(), 1);
+            assert!(submitted.lock().unwrap().is_empty());
+            assert!(deleted.lock().unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn connect_splash_create_error_is_cleanup_unknown_failure() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let created = Arc::new(StdMutex::new(Vec::new()));
+            let deleted = Arc::new(StdMutex::new(Vec::new()));
+            let submitted = Arc::new(StdMutex::new(Vec::new()));
+            let mut fake = WorkerSessionFakeClient {
+                listed_sessions: Vec::new(),
+                list_sessions_error: None,
+                loadable_sessions: Vec::new(),
+                load_reject_ids: Vec::new(),
+                created: Arc::clone(&created),
+                deleted: Arc::clone(&deleted),
+                submitted: Arc::clone(&submitted),
+                list_calls: Arc::new(StdMutex::new(0)),
+                load_calls: Arc::new(StdMutex::new(Vec::new())),
+                submit_response: "SHOULD NOT BE USED".to_string(),
+                submit_error: None,
+                submit_never: false,
+                cancellation_safe: true,
+                sink_set_states: Arc::new(StdMutex::new(Vec::new())),
+                delete_error: None,
+            };
+
+            let err = generate_connect_splash_with_named_session_timeout(
+                &mut fake,
+                "alpha",
+                "zterm connect splash create-error",
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap_err();
+
+            assert!(is_connect_splash_cleanup_failure(&err));
+            assert!(err.to_string().contains("backend outcome unknown"));
+            assert_eq!(created.lock().unwrap().len(), 1);
+            assert!(submitted.lock().unwrap().is_empty());
+            assert!(deleted.lock().unwrap().is_empty());
         });
     }
 
@@ -8514,6 +8666,12 @@ mod tests {
                 provider: "provider".to_string(),
             };
             self.created.lock().unwrap().push(session.clone());
+            if name.contains("create-timeout") {
+                std::future::pending::<()>().await;
+            }
+            if name.contains("create-error") {
+                anyhow::bail!("create failed after dispatch");
+            }
             Ok(session)
         }
 
@@ -8567,6 +8725,10 @@ mod tests {
 
         fn submit_turn_is_cancellation_safe(&self) -> bool {
             self.cancellation_safe
+        }
+
+        fn supports_side_effect_free_splash_generation(&self) -> bool {
+            true
         }
     }
 

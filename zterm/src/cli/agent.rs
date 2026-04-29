@@ -360,6 +360,12 @@ pub trait AgentClient: Send + Sync {
         true
     }
 
+    /// Whether `submit_turn` can be used for cosmetic splash generation
+    /// without allowing tools, external actions, or other side effects.
+    fn supports_side_effect_free_splash_generation(&self) -> bool {
+        false
+    }
+
     // ---------- streaming sink ----------
 
     /// Install or clear the streaming sink used by `submit_turn`.
