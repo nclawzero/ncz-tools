@@ -10,6 +10,7 @@ use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
@@ -79,8 +80,14 @@ pub fn discover_file_sources(
         &mut sources,
         "/etc/nclawzero/providers.d",
         &paths.providers_dir(),
+        !include_secrets,
     )?;
-    collect_json_dir(&mut sources, "/etc/nclawzero/mcp.d", &paths.mcp_dir())?;
+    collect_json_dir(
+        &mut sources,
+        "/etc/nclawzero/mcp.d",
+        &paths.mcp_dir(),
+        !include_secrets,
+    )?;
     collect_file(
         &mut sources,
         "/etc/nclawzero/agent",
@@ -118,6 +125,7 @@ fn collect_json_dir(
     sources: &mut Vec<ArchiveSource>,
     manifest_dir: &str,
     real_dir: &Path,
+    redact_inline_secrets: bool,
 ) -> Result<(), NczError> {
     let mut files = Vec::new();
     match fs::read_dir(real_dir) {
@@ -139,8 +147,37 @@ fn collect_json_dir(
         let Some(name) = file.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
-        collect_file(sources, &format!("{manifest_dir}/{name}"), &file, false)?;
+        collect_json_file(
+            sources,
+            &format!("{manifest_dir}/{name}"),
+            &file,
+            redact_inline_secrets,
+        )?;
     }
+    Ok(())
+}
+
+fn collect_json_file(
+    sources: &mut Vec<ArchiveSource>,
+    manifest_path: &str,
+    real_path: &Path,
+    redact_inline_secrets: bool,
+) -> Result<(), NczError> {
+    let contents = match fs::read(real_path) {
+        Ok(contents) => contents,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(NczError::Io(e)),
+    };
+    if redact_inline_secrets {
+        if let Ok(mut value) = serde_json::from_slice::<Value>(&contents) {
+            if redact_inline_json_secrets(&mut value) {
+                let contents = serde_json::to_vec_pretty(&value)?;
+                sources.push(source(manifest_path.to_string(), true, contents));
+                return Ok(());
+            }
+        }
+    }
+    sources.push(source(manifest_path.to_string(), false, contents));
     Ok(())
 }
 
@@ -209,6 +246,50 @@ fn source(path: String, redacted: bool, contents: Vec<u8>) -> ArchiveSource {
         },
         archive_path,
         contents,
+    }
+}
+
+fn redact_inline_json_secrets(value: &mut Value) -> bool {
+    match value {
+        Value::Object(map) => {
+            let mut redacted = false;
+            for (key, child) in map {
+                if is_inline_secret_key(key) && json_value_is_non_empty(child) {
+                    *child = Value::String(format!("REDACTED:{key}"));
+                    redacted = true;
+                } else if redact_inline_json_secrets(child) {
+                    redacted = true;
+                }
+            }
+            redacted
+        }
+        Value::Array(items) => {
+            let mut redacted = false;
+            for item in items {
+                if redact_inline_json_secrets(item) {
+                    redacted = true;
+                }
+            }
+            redacted
+        }
+        _ => false,
+    }
+}
+
+fn is_inline_secret_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    ["apikey", "api_key", "token", "secret", "password", "bearer"]
+        .iter()
+        .any(|needle| key.contains(needle))
+}
+
+fn json_value_is_non_empty(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::String(value) => !value.is_empty(),
+        Value::Array(value) => !value.is_empty(),
+        Value::Object(value) => !value.is_empty(),
+        Value::Bool(_) | Value::Number(_) => true,
     }
 }
 

@@ -1,7 +1,8 @@
 //! backup — create, verify, and restore host-side nclawzero state archives.
 
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
 use serde::Serialize;
@@ -177,6 +178,18 @@ pub fn create(
     include_secrets: bool,
     exclude_volumes: bool,
 ) -> Result<BackupCreateReport, NczError> {
+    create_with_options(ctx, paths, archive, include_secrets, exclude_volumes, false)
+}
+
+fn create_with_options(
+    ctx: &Context,
+    paths: &Paths,
+    archive: &Path,
+    include_secrets: bool,
+    exclude_volumes: bool,
+    unsafe_live_volumes: bool,
+) -> Result<BackupCreateReport, NczError> {
+    let _lock = state::acquire_lock(&paths.lock_path)?;
     if include_secrets {
         eprintln!(
             "ncz: audit: backup create includes unredacted secrets in {}",
@@ -185,7 +198,7 @@ pub fn create(
     }
     let mut sources = backup_state::discover_file_sources(paths, include_secrets)?;
     if !exclude_volumes {
-        sources.extend(volume_sources(ctx)?);
+        sources.extend(volume_sources(ctx, unsafe_live_volumes)?);
     }
     let hostname = hostname(ctx);
     let manifest = backup_state::manifest(hostname, &sources);
@@ -241,23 +254,18 @@ pub fn restore(
             failed.join(", ")
         )));
     }
-    if !force && archive_restores_unredacted_agent_env(&manifest) && non_empty(&paths.agent_env())?
-    {
-        return Err(NczError::Precondition(format!(
-            "{} exists and is non-empty; pass --force to overwrite",
-            paths.agent_env().display()
-        )));
+    if !force {
+        let collisions = restore_collisions(ctx, paths, &manifest, &entries)?;
+        if !collisions.is_empty() {
+            return Err(NczError::Precondition(collisions.describe()));
+        }
     }
 
-    let staging = std::env::temp_dir().join("ncz-restore-staging");
-    if !dry_run {
-        match fs::remove_dir_all(&staging) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(NczError::Io(e)),
-        }
-        fs::create_dir_all(&staging)?;
-    }
+    let staging = if dry_run {
+        None
+    } else {
+        Some(restore_staging_dir()?)
+    };
 
     let mut actions = Vec::new();
     let mut skipped_redacted_agent_env_keys = Vec::new();
@@ -291,7 +299,7 @@ pub fn restore(
                 },
             });
             if !dry_run {
-                restore_volume(ctx, &staging, volume, &entry.contents)?;
+                restore_volume(ctx, staging.as_ref().unwrap().path(), volume, &entry.contents)?;
             }
             restored_count += 1;
             continue;
@@ -307,11 +315,7 @@ pub fn restore(
             },
         });
         if !dry_run {
-            let staging_path = staging.join(source.path.trim_start_matches('/'));
-            if let Some(parent) = staging_path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            fs::write(&staging_path, &entry.contents)?;
+            write_staging_file(staging.as_ref().unwrap().path(), &source.path, &entry.contents)?;
             let mode = if source.path == backup_state::AGENT_ENV_PATH {
                 0o600
             } else {
@@ -342,7 +346,10 @@ fn hostname(ctx: &Context) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-fn volume_sources(ctx: &Context) -> Result<Vec<backup_state::ArchiveSource>, NczError> {
+fn volume_sources(
+    ctx: &Context,
+    unsafe_live_volumes: bool,
+) -> Result<Vec<backup_state::ArchiveSource>, NczError> {
     let mut sources = Vec::new();
     for volume in backup_state::VOLUME_NAMES {
         let exists = ctx.runner.run("podman", &["volume", "exists", volume])?;
@@ -352,25 +359,192 @@ fn volume_sources(ctx: &Context) -> Result<Vec<backup_state::ArchiveSource>, Ncz
         let path =
             std::env::temp_dir().join(format!("ncz-backup-{volume}-{}.tar", std::process::id()));
         let path_text = path.display().to_string();
-        let out = ctx.runner.run(
-            "podman",
-            &["volume", "export", "--output", &path_text, volume],
-        )?;
-        if !out.ok() {
-            return Err(NczError::Exec {
-                cmd: format!("podman volume export {volume}"),
-                msg: if out.stderr.is_empty() {
-                    out.stdout
-                } else {
-                    out.stderr
-                },
-            });
-        }
+        export_volume(ctx, volume, &path_text, unsafe_live_volumes)?;
         let contents = fs::read(&path)?;
         let _ = fs::remove_file(&path);
         sources.push(backup_state::volume_source(volume, contents));
     }
     Ok(sources)
+}
+
+fn export_volume(
+    ctx: &Context,
+    volume: &str,
+    output: &str,
+    unsafe_live_volumes: bool,
+) -> Result<(), NczError> {
+    let unit = backup_state::volume_agent(volume).map(agent::service_for);
+    let was_active = if !unsafe_live_volumes {
+        if let Some(unit) = unit.as_deref() {
+            let was_active = systemd::is_active_checked(ctx.runner, unit)?;
+            if was_active {
+                systemd::stop(ctx.runner, unit)?;
+            }
+            was_active
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    let export_result = podman_export_volume(ctx, volume, output);
+    if was_active {
+        let start_result = systemd::start(ctx.runner, unit.as_deref().unwrap());
+        if export_result.is_ok() {
+            start_result?;
+        }
+    }
+    export_result
+}
+
+fn podman_export_volume(ctx: &Context, volume: &str, output: &str) -> Result<(), NczError> {
+    let out = ctx
+        .runner
+        .run("podman", &["volume", "export", "--output", output, volume])?;
+    if !out.ok() {
+        return Err(NczError::Exec {
+            cmd: format!("podman volume export {volume}"),
+            msg: if out.stderr.is_empty() {
+                out.stdout
+            } else {
+                out.stderr
+            },
+        });
+    }
+    Ok(())
+}
+
+fn restore_staging_dir() -> Result<tempfile::TempDir, NczError> {
+    Ok(tempfile::Builder::new()
+        .prefix("ncz-restore-staging-")
+        .tempdir()?)
+}
+
+#[derive(Debug, Default)]
+struct RestoreCollisions {
+    paths: Vec<String>,
+}
+
+impl RestoreCollisions {
+    fn is_empty(&self) -> bool {
+        self.paths.is_empty()
+    }
+
+    fn describe(&self) -> String {
+        format!(
+            "restore would overwrite non-empty state; pass --force to overwrite: {}",
+            self.paths.join(", ")
+        )
+    }
+}
+
+fn restore_collisions(
+    ctx: &Context,
+    paths: &Paths,
+    manifest: &backup_state::BackupManifest,
+    entries: &[backup_state::ArchiveEntry],
+) -> Result<RestoreCollisions, NczError> {
+    let mut collisions = RestoreCollisions::default();
+    for source in &manifest.sources {
+        if !backup_state::is_supported_source_path(&source.path) {
+            return Err(NczError::Inconsistent(format!(
+                "backup archive source is outside nclawzero state: {}",
+                source.path
+            )));
+        }
+        if source.path == backup_state::AGENT_ENV_PATH && source.redacted {
+            continue;
+        }
+        if let Some(volume) = backup_state::source_is_volume(&source.path) {
+            if volume_has_existing_files(ctx, volume)? {
+                collisions.paths.push(source.path.clone());
+            }
+            continue;
+        }
+        let entry = backup_state::archive_entry(entries, &source.path).ok_or_else(|| {
+            NczError::Inconsistent(format!("backup archive missing {}", source.path))
+        })?;
+        let target = backup_state::real_path(paths, &source.path);
+        if existing_file_differs(&target, &entry.contents)? {
+            collisions.paths.push(target.display().to_string());
+        }
+    }
+    Ok(collisions)
+}
+
+fn existing_file_differs(path: &Path, contents: &[u8]) -> Result<bool, NczError> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(NczError::Io(e)),
+    };
+    if metadata.len() == 0 {
+        return Ok(false);
+    }
+    Ok(fs::read(path)? != contents)
+}
+
+fn volume_has_existing_files(ctx: &Context, volume: &str) -> Result<bool, NczError> {
+    let exists = ctx.runner.run("podman", &["volume", "exists", volume])?;
+    if !exists.ok() {
+        return Ok(false);
+    }
+    let out = ctx.runner.run(
+        "podman",
+        &["volume", "inspect", "--format", "{{.Mountpoint}}", volume],
+    )?;
+    if !out.ok() {
+        return Err(NczError::Exec {
+            cmd: format!("podman volume inspect {volume}"),
+            msg: if out.stderr.is_empty() {
+                out.stdout
+            } else {
+                out.stderr
+            },
+        });
+    }
+    let mountpoint = out.stdout.trim();
+    if mountpoint.is_empty() {
+        return Ok(false);
+    }
+    dir_has_any_entry(Path::new(mountpoint))
+}
+
+fn dir_has_any_entry(path: &Path) -> Result<bool, NczError> {
+    let entries = match fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(NczError::Io(e)),
+    };
+    for entry in entries {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            if dir_has_any_entry(&entry.path())? {
+                return Ok(true);
+            }
+        } else {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn write_staging_file(staging: &Path, source_path: &str, contents: &[u8]) -> Result<(), NczError> {
+    let staging_path = staging.join(source_path.trim_start_matches('/'));
+    if let Some(parent) = staging_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if source_path == backup_state::AGENT_ENV_PATH {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&staging_path)?;
+        file.write_all(contents)?;
+        return Ok(());
+    }
+    fs::write(&staging_path, contents)?;
+    Ok(())
 }
 
 fn restore_volume(
@@ -382,9 +556,24 @@ fn restore_volume(
     let volume_archive = staging.join(format!("{volume}.tar"));
     fs::write(&volume_archive, contents)?;
     let unit = backup_state::volume_agent(volume).map(agent::service_for);
-    if let Some(unit) = unit.as_deref() {
+    let was_active = if let Some(unit) = unit.as_deref() {
+        let was_active = systemd::is_active_checked(ctx.runner, unit)?;
         systemd::stop(ctx.runner, unit)?;
+        was_active
+    } else {
+        false
+    };
+    let import_result = import_volume(ctx, volume, &volume_archive);
+    if was_active {
+        let start_result = systemd::start(ctx.runner, unit.as_deref().unwrap());
+        if import_result.is_ok() {
+            start_result?;
+        }
     }
+    import_result
+}
+
+fn import_volume(ctx: &Context, volume: &str, volume_archive: &Path) -> Result<(), NczError> {
     let volume_archive_text = volume_archive.display().to_string();
     let out = ctx.runner.run(
         "podman",
@@ -400,35 +589,20 @@ fn restore_volume(
             },
         });
     }
-    if let Some(unit) = unit.as_deref() {
-        systemd::start(ctx.runner, unit)?;
-    }
     Ok(())
-}
-
-fn archive_restores_unredacted_agent_env(manifest: &backup_state::BackupManifest) -> bool {
-    manifest
-        .sources
-        .iter()
-        .any(|source| source.path == backup_state::AGENT_ENV_PATH && !source.redacted)
-}
-
-fn non_empty(path: &Path) -> Result<bool, NczError> {
-    match fs::metadata(path) {
-        Ok(metadata) => Ok(metadata.len() > 0),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
-        Err(e) => Err(NczError::Io(e)),
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::Mutex;
 
     use crate::cmd::common::{out, test_paths};
     use crate::sys::fake::FakeRunner;
 
     use super::*;
+
+    static VOLUME_EXPORT_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn ctx<'a>(runner: &'a FakeRunner) -> Context<'a> {
         Context {
@@ -440,6 +614,28 @@ mod tests {
 
     fn expect_hostname(runner: &FakeRunner) {
         runner.expect("hostname", &[], out(0, "test-host\n", ""));
+    }
+
+    fn expect_unit_state(runner: &FakeRunner, unit: &str, active: &str, sub: &str) {
+        runner.expect(
+            "systemctl",
+            &[
+                "show",
+                unit,
+                "--property=LoadState",
+                "--property=ActiveState",
+                "--property=SubState",
+            ],
+            out(
+                0,
+                &format!("LoadState=loaded\nActiveState={active}\nSubState={sub}\n"),
+                "",
+            ),
+        );
+    }
+
+    fn backup_volume_export_path(volume: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("ncz-backup-{volume}-{}.tar", std::process::id()))
     }
 
     fn write_archive(
@@ -516,6 +712,141 @@ mod tests {
     }
 
     #[test]
+    fn backup_create_redacts_inline_apikey_in_provider_json_by_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        fs::create_dir_all(paths.providers_dir()).unwrap();
+        fs::write(
+            paths.providers_dir().join("legacy.json"),
+            r#"{"name":"legacy","api_key":"sk-live","nested":{"token":"tok-live"}}"#,
+        )
+        .unwrap();
+        let archive = tmp.path().join("backup.tar.gz");
+        let runner = FakeRunner::new();
+        expect_hostname(&runner);
+
+        let report = create(&ctx(&runner), &paths, &archive, false, true).unwrap();
+        let (manifest, entries) = backup_state::read_archive(&archive).unwrap();
+        let entry =
+            backup_state::archive_entry(&entries, "/etc/nclawzero/providers.d/legacy.json")
+                .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&entry.contents).unwrap();
+
+        assert_eq!(report.redacted_count, 1);
+        assert!(manifest.sources[0].redacted);
+        assert_eq!(json["api_key"], "REDACTED:api_key");
+        assert_eq!(json["nested"]["token"], "REDACTED:token");
+        runner.assert_done();
+    }
+
+    #[test]
+    fn backup_create_with_include_secrets_preserves_inline_apikey_verbatim() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        fs::create_dir_all(paths.providers_dir()).unwrap();
+        let provider = r#"{"name":"legacy","api_key":"sk-live"}"#;
+        fs::write(paths.providers_dir().join("legacy.json"), provider).unwrap();
+        let archive = tmp.path().join("backup.tar.gz");
+        let runner = FakeRunner::new();
+        expect_hostname(&runner);
+
+        let report = create(&ctx(&runner), &paths, &archive, true, true).unwrap();
+        let (manifest, entries) = backup_state::read_archive(&archive).unwrap();
+        let entry =
+            backup_state::archive_entry(&entries, "/etc/nclawzero/providers.d/legacy.json")
+                .unwrap();
+
+        assert_eq!(report.redacted_count, 0);
+        assert!(!manifest.sources[0].redacted);
+        assert_eq!(String::from_utf8(entry.contents.clone()).unwrap(), provider);
+        runner.assert_done();
+    }
+
+    #[test]
+    fn backup_create_quiesces_active_volume_unit_during_export() {
+        let _guard = VOLUME_EXPORT_TEST_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        let archive = tmp.path().join("backup.tar.gz");
+        let export_path = backup_volume_export_path("zeroclaw-data");
+        let _ = fs::remove_file(&export_path);
+        fs::write(&export_path, b"volume tar").unwrap();
+        let runner = FakeRunner::new();
+        runner.expect("podman", &["volume", "exists", "zeroclaw-data"], out(0, "", ""));
+        runner.expect(
+            "systemctl",
+            &["is-active", "--quiet", "zeroclaw.service"],
+            out(0, "", ""),
+        );
+        expect_unit_state(&runner, "zeroclaw.service", "active", "running");
+        runner.expect(
+            "sudo",
+            &["systemctl", "stop", "zeroclaw.service"],
+            out(0, "", ""),
+        );
+        expect_unit_state(&runner, "zeroclaw.service", "inactive", "dead");
+        runner.expect(
+            "podman",
+            &[
+                "volume",
+                "export",
+                "--output",
+                &export_path.display().to_string(),
+                "zeroclaw-data",
+            ],
+            out(0, "", ""),
+        );
+        runner.expect(
+            "sudo",
+            &["systemctl", "start", "zeroclaw.service"],
+            out(0, "", ""),
+        );
+        runner.expect("podman", &["volume", "exists", "openclaw-data"], out(1, "", ""));
+        runner.expect("podman", &["volume", "exists", "hermes-data"], out(1, "", ""));
+        expect_hostname(&runner);
+
+        let report = create(&ctx(&runner), &paths, &archive, false, false).unwrap();
+
+        assert_eq!(report.source_count, 1);
+        assert!(!export_path.exists());
+        runner.assert_done();
+    }
+
+    #[test]
+    fn backup_create_with_unsafe_live_volumes_skips_quiesce() {
+        let _guard = VOLUME_EXPORT_TEST_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        let archive = tmp.path().join("backup.tar.gz");
+        let export_path = backup_volume_export_path("zeroclaw-data");
+        let _ = fs::remove_file(&export_path);
+        fs::write(&export_path, b"volume tar").unwrap();
+        let runner = FakeRunner::new();
+        runner.expect("podman", &["volume", "exists", "zeroclaw-data"], out(0, "", ""));
+        runner.expect(
+            "podman",
+            &[
+                "volume",
+                "export",
+                "--output",
+                &export_path.display().to_string(),
+                "zeroclaw-data",
+            ],
+            out(0, "", ""),
+        );
+        runner.expect("podman", &["volume", "exists", "openclaw-data"], out(1, "", ""));
+        runner.expect("podman", &["volume", "exists", "hermes-data"], out(1, "", ""));
+        expect_hostname(&runner);
+
+        let report = create_with_options(&ctx(&runner), &paths, &archive, false, false, true)
+            .unwrap();
+
+        assert_eq!(report.source_count, 1);
+        assert!(!export_path.exists());
+        runner.assert_done();
+    }
+
+    #[test]
     fn restore_refuses_on_non_empty_state() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = test_paths(tmp.path());
@@ -527,6 +858,89 @@ mod tests {
 
         let err = restore(&ctx(&runner), &paths, &archive, false, false).unwrap_err();
         assert!(matches!(err, NczError::Precondition(_)));
+    }
+
+    #[test]
+    fn restore_refuses_when_existing_provider_json_differs_unless_force() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        fs::create_dir_all(paths.providers_dir()).unwrap();
+        fs::write(paths.providers_dir().join("legacy.json"), br#"{"name":"old"}"#).unwrap();
+        let archive = tmp.path().join("backup.tar.gz");
+        write_archive(
+            &archive,
+            "/etc/nclawzero/providers.d/legacy.json",
+            br#"{"name":"new"}"#,
+            false,
+        );
+        let runner = FakeRunner::new();
+
+        let err = restore(&ctx(&runner), &paths, &archive, false, false).unwrap_err();
+
+        assert!(matches!(err, NczError::Precondition(_)));
+        assert_eq!(
+            fs::read(paths.providers_dir().join("legacy.json")).unwrap(),
+            br#"{"name":"old"}"#
+        );
+        runner.assert_done();
+    }
+
+    #[test]
+    fn restore_refuses_when_existing_volume_non_empty_unless_force() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        let volume_dir = tmp.path().join("volume");
+        fs::create_dir_all(&volume_dir).unwrap();
+        fs::write(volume_dir.join("data.db"), b"existing").unwrap();
+        let archive = tmp.path().join("backup.tar.gz");
+        write_archive(
+            &archive,
+            "podman://volume/zeroclaw-data",
+            b"tar contents",
+            false,
+        );
+        let runner = FakeRunner::new();
+        runner.expect("podman", &["volume", "exists", "zeroclaw-data"], out(0, "", ""));
+        runner.expect(
+            "podman",
+            &[
+                "volume",
+                "inspect",
+                "--format",
+                "{{.Mountpoint}}",
+                "zeroclaw-data",
+            ],
+            out(0, &format!("{}\n", volume_dir.display()), ""),
+        );
+
+        let err = restore(&ctx(&runner), &paths, &archive, false, false).unwrap_err();
+
+        assert!(matches!(err, NczError::Precondition(_)));
+        runner.assert_done();
+    }
+
+    #[test]
+    fn restore_with_force_overwrites_collisions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        fs::create_dir_all(paths.providers_dir()).unwrap();
+        fs::write(paths.providers_dir().join("legacy.json"), br#"{"name":"old"}"#).unwrap();
+        let archive = tmp.path().join("backup.tar.gz");
+        write_archive(
+            &archive,
+            "/etc/nclawzero/providers.d/legacy.json",
+            br#"{"name":"new"}"#,
+            false,
+        );
+        let runner = FakeRunner::new();
+
+        restore(&ctx(&runner), &paths, &archive, false, true).unwrap();
+
+        assert_eq!(
+            fs::read(paths.providers_dir().join("legacy.json")).unwrap(),
+            br#"{"name":"new"}"#
+        );
+        runner.assert_done();
     }
 
     #[test]
@@ -565,5 +979,92 @@ mod tests {
             vec!["OPENAI_API_KEY".to_string()]
         );
         assert!(!paths.agent_env().exists());
+    }
+
+    #[test]
+    fn restore_staging_dir_is_cleaned_up_after_completion() {
+        let staging_path = {
+            let staging = restore_staging_dir().unwrap();
+            let staging_path = staging.path().to_path_buf();
+            assert!(staging_path.exists());
+            staging_path
+        };
+
+        assert!(!staging_path.exists());
+    }
+
+    #[test]
+    fn restore_staging_files_have_0600_mode_for_agent_env() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        write_staging_file(
+            tmp.path(),
+            backup_state::AGENT_ENV_PATH,
+            b"OPENAI_API_KEY=sk-live\n",
+        )
+        .unwrap();
+
+        let path = tmp.path().join("etc/nclawzero/agent-env");
+        assert_eq!(fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+
+    #[test]
+    fn restore_volume_leaves_inactive_unit_inactive_after_restore() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runner = FakeRunner::new();
+        runner.expect(
+            "systemctl",
+            &["is-active", "--quiet", "zeroclaw.service"],
+            out(3, "", ""),
+        );
+        expect_unit_state(&runner, "zeroclaw.service", "inactive", "dead");
+        runner.expect(
+            "sudo",
+            &["systemctl", "stop", "zeroclaw.service"],
+            out(0, "", ""),
+        );
+        expect_unit_state(&runner, "zeroclaw.service", "inactive", "dead");
+        runner.expect_prefix(
+            "podman",
+            &["volume", "import", "zeroclaw-data"],
+            out(0, "", ""),
+        );
+
+        restore_volume(&ctx(&runner), tmp.path(), "zeroclaw-data", b"tar").unwrap();
+
+        runner.assert_done();
+    }
+
+    #[test]
+    fn restore_volume_restarts_active_unit_even_on_import_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runner = FakeRunner::new();
+        runner.expect(
+            "systemctl",
+            &["is-active", "--quiet", "zeroclaw.service"],
+            out(0, "", ""),
+        );
+        expect_unit_state(&runner, "zeroclaw.service", "active", "running");
+        runner.expect(
+            "sudo",
+            &["systemctl", "stop", "zeroclaw.service"],
+            out(0, "", ""),
+        );
+        expect_unit_state(&runner, "zeroclaw.service", "inactive", "dead");
+        runner.expect_prefix(
+            "podman",
+            &["volume", "import", "zeroclaw-data"],
+            out(1, "", "import failed"),
+        );
+        runner.expect(
+            "sudo",
+            &["systemctl", "start", "zeroclaw.service"],
+            out(0, "", ""),
+        );
+
+        let err = restore_volume(&ctx(&runner), tmp.path(), "zeroclaw-data", b"tar").unwrap_err();
+
+        assert!(matches!(err, NczError::Exec { .. }));
+        runner.assert_done();
     }
 }
