@@ -1284,9 +1284,21 @@ fn clear_repl_transcript_pending_marker(
     session_id: &str,
     marker_id: &str,
 ) -> Result<()> {
-    storage::clear_scoped_session_history_pending_turn_marker(scope, session_id, marker_id)
-        .map(|_| ())
-        .map_err(|e| anyhow::anyhow!("could not clear pending transcript marker: {e}"))
+    match storage::clear_scoped_session_history_pending_turn_marker(scope, session_id, marker_id) {
+        Ok(true) => Ok(()),
+        Ok(false) => {
+            let reason = format!(
+                "pending transcript marker {marker_id} was missing before turn completion; transcript may have been cleared concurrently"
+            );
+            surface_repl_transcript_incomplete_reason(scope, session_id, &reason);
+            Err(anyhow::anyhow!(
+                "{reason}; transcript marked incomplete and /save is disabled until /clear"
+            ))
+        }
+        Err(e) => Err(anyhow::anyhow!(
+            "could not clear pending transcript marker: {e}"
+        )),
+    }
 }
 
 fn surface_repl_transcript_incomplete(
@@ -1586,6 +1598,29 @@ mod tests {
 
         surface_repl_transcript_incomplete(&scope, "main", &append_error);
 
+        assert!(storage::scoped_session_history_is_incomplete(&scope, "main").unwrap());
+    }
+
+    #[test]
+    fn legacy_repl_missing_pending_marker_marks_history_incomplete() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let scope = storage::workspace_scope(
+            "zeroclaw",
+            &format!("legacy-pending-cleared-{}", uuid::Uuid::new_v4()),
+            None,
+        )
+        .unwrap();
+
+        let turn = mark_repl_transcript_pending(&scope, "main").unwrap();
+        append_repl_transcript_entry(&scope, "main", "user", "hello").unwrap();
+        storage::clear_scoped_session_history(&scope, "main").unwrap();
+        append_repl_transcript_entry(&scope, "main", "assistant", "hi").unwrap();
+
+        let err = clear_repl_transcript_pending_marker(&scope, "main", &turn).unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("was missing before turn completion"));
         assert!(storage::scoped_session_history_is_incomplete(&scope, "main").unwrap());
     }
 

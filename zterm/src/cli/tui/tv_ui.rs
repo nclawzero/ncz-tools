@@ -2090,9 +2090,19 @@ fn clear_turn_transcript_pending_marker(
     session_id: &str,
     marker_id: &str,
 ) -> Result<()> {
-    storage::clear_scoped_session_history_pending_turn_marker(scope, session_id, marker_id)
-        .map(|_| ())
-        .map_err(|e| anyhow::anyhow!("could not clear pending transcript marker: {e}"))
+    match storage::clear_scoped_session_history_pending_turn_marker(scope, session_id, marker_id) {
+        Ok(true) => Ok(()),
+        Ok(false) => {
+            let reason = format!(
+                "pending transcript marker {marker_id} was missing before turn completion; transcript may have been cleared concurrently"
+            );
+            let message = mark_turn_transcript_incomplete_reason(scope, session_id, &reason);
+            Err(anyhow::anyhow!("{reason}; {message}"))
+        }
+        Err(e) => Err(anyhow::anyhow!(
+            "could not clear pending transcript marker: {e}"
+        )),
+    }
 }
 
 fn mark_turn_transcript_incomplete_after_append_failure(
@@ -8055,6 +8065,32 @@ mod tests {
 
         clear_turn_transcript_pending_marker(&scope, "main", &turn_b).unwrap();
         assert!(!storage::scoped_session_history_is_incomplete(&scope, "main").unwrap());
+    }
+
+    #[test]
+    fn missing_pending_turn_marker_marks_transcript_incomplete() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let scope = storage::workspace_scope(
+            "zeroclaw",
+            &format!("pending-cleared-turn-{}", uuid::Uuid::new_v4()),
+            None,
+        )
+        .unwrap();
+
+        let turn = mark_turn_transcript_pending(&scope, "main").unwrap();
+        append_turn_transcript_entry(&scope, "main", "user", "hello").unwrap();
+        storage::clear_scoped_session_history(&scope, "main").unwrap();
+        append_turn_transcript_entry(&scope, "main", "assistant", "hi").unwrap();
+
+        let err = clear_turn_transcript_pending_marker(&scope, "main", &turn).unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("was missing before turn completion"));
+        assert!(storage::scoped_session_history_is_incomplete(&scope, "main").unwrap());
+        let complete_err = storage::ensure_scoped_session_history_complete(&scope, "main")
+            .expect_err("concurrently cleared transcript must block save/reuse");
+        assert!(complete_err.to_string().contains("run /clear"));
     }
 
     #[test]
