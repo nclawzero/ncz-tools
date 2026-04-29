@@ -225,13 +225,17 @@ impl ReplLoop {
         ) {
             return Ok(None);
         }
-        let force = matches!(tokens.get(1).map(String::as_str), Some("--force" | "force"));
+        let force = tokens.len() == 2
+            && matches!(tokens.get(1).map(String::as_str), Some("--force" | "force"));
         if force {
             let key = self.current_mutation_fence_key().await?;
             delighters::clear_mutation_fence_for_workspace(&key)?;
             return Ok(Some(
                 "[sync] mutation fence cleared by explicit /resync --force\n".to_string(),
             ));
+        }
+        if tokens.len() > 1 {
+            return Ok(Some("[error] usage: /resync [--force]\n".to_string()));
         }
 
         let workspace = self
@@ -1918,7 +1922,7 @@ mod tests {
                 shared_mnemos: None,
                 config_path: PathBuf::from("test-config.toml"),
             }));
-            let repl = ReplLoop::new(
+            let mut repl = ReplLoop::new(
                 Arc::clone(&app),
                 alpha,
                 "model".to_string(),
@@ -1974,6 +1978,15 @@ mod tests {
                     "{input} should stay blocked while mutation outcome is unknown"
                 );
             }
+            let usage = repl
+                .handle_legacy_resync("/resync --force extra")
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(usage.contains("usage: /resync [--force]"));
+            assert!(delighters::mutation_fence_for_workspace("name:alpha")
+                .unwrap()
+                .is_some());
             assert!(submitted.lock().unwrap().is_empty());
         });
 
