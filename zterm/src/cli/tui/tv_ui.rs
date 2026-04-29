@@ -569,9 +569,13 @@ pub async fn run(
                     {
                         Ok(session_id) => session_id,
                         Err(e) => {
-                            let _ = worker_sink.send(TurnChunk::Finished(Err(format!(
-                                "could not prepare session for active workspace: {e}"
-                            ))));
+                            send_worker_finished(
+                                &worker_sink,
+                                Err(format!(
+                                    "could not prepare session for active workspace: {e}"
+                                )),
+                            )
+                            .await;
                             continue;
                         }
                     };
@@ -588,10 +592,14 @@ pub async fn run(
                             {
                                 Ok(scope) => scope,
                                 Err(e) => {
-                                    let _ = worker_sink.send(TurnChunk::Finished(Err(format!(
-                                        "could not resolve transcript scope for session {}; turn not submitted: {e}",
-                                        worker_session_id
-                                    ))));
+                                    send_worker_finished(
+                                        &worker_sink,
+                                        Err(format!(
+                                            "could not resolve transcript scope for session {}; turn not submitted: {e}",
+                                            worker_session_id
+                                        )),
+                                    )
+                                    .await;
                                     continue;
                                 }
                             };
@@ -601,9 +609,11 @@ pub async fn run(
                                 "user",
                                 &text,
                             ) {
-                                let _ = worker_sink.send(TurnChunk::Finished(Err(format!(
-                                    "{e}; turn not submitted"
-                                ))));
+                                send_worker_finished(
+                                    &worker_sink,
+                                    Err(format!("{e}; turn not submitted")),
+                                )
+                                .await;
                                 continue;
                             }
                             let mut client = client_arc.lock().await;
@@ -636,7 +646,7 @@ pub async fn run(
                                                 &worker_session_id,
                                                 &e,
                                             );
-                                        let _ = worker_sink.send(TurnChunk::Finished(Err(message)));
+                                        send_worker_finished(&worker_sink, Err(message)).await;
                                     }
                                 }
                                 Err(e) => {
@@ -653,7 +663,7 @@ pub async fn run(
                                                 &worker_session_id,
                                                 &append_error,
                                             );
-                                        let _ = worker_sink.send(TurnChunk::Finished(Err(message)));
+                                        send_worker_finished(&worker_sink, Err(message)).await;
                                     }
                                     if turn_collection_failure_requires_incomplete_transcript(
                                         &error_text,
@@ -680,31 +690,39 @@ pub async fn run(
                                     observed_finished.load(Ordering::Acquire)
                                 }
                                 Err(_) => {
-                                    forward_task.abort();
-                                    let _ = forward_task.await;
                                     warn!(
                                         "tv_ui: turn stream forwarder did not drain after \
-                                         submit_turn returned"
+                                         submit_turn returned; waiting for terminal frame"
                                     );
-                                    observed_finished.load(Ordering::Acquire)
+                                    match forward_task.await {
+                                        Ok(saw_finished) => saw_finished,
+                                        Err(e) => {
+                                            warn!("tv_ui: turn stream forwarder failed: {e}");
+                                            observed_finished.load(Ordering::Acquire)
+                                        }
+                                    }
                                 }
                             };
-                            for chunk in submit_turn_fallback_chunks(
-                                &submit_result,
-                                saw_finished,
-                                forwarded_token.load(Ordering::Acquire),
-                            ) {
-                                let _ = worker_sink.send(chunk);
-                            }
+                            send_worker_chunks_reliably(
+                                &worker_sink,
+                                submit_turn_fallback_chunks(
+                                    &submit_result,
+                                    saw_finished,
+                                    forwarded_token.load(Ordering::Acquire),
+                                ),
+                            )
+                            .await;
                         }
                         None => {
                             // Only branch where `submit_turn` was
                             // never called — emit the terminal
                             // frame ourselves so the UI can unstick
                             // the placeholder line.
-                            let _ = worker_sink.send(TurnChunk::Finished(Err(
-                                "no active workspace client".to_string(),
-                            )));
+                            send_worker_finished(
+                                &worker_sink,
+                                Err("no active workspace client".to_string()),
+                            )
+                            .await;
                         }
                     }
                 }
@@ -739,7 +757,7 @@ pub async fn run(
                     // inside the full-screen TUI.
                     if let Some(message) = stdout_only_slash_command_block_message(&cmdline) {
                         let _ = worker_sink.send(TurnChunk::Token(message));
-                        let _ = worker_sink.send(TurnChunk::Finished(Ok(String::new())));
+                        send_worker_finished(&worker_sink, Ok(String::new())).await;
                         continue;
                     }
                     if let Some(target) = active_worker_session_delete_target(
@@ -749,9 +767,13 @@ pub async fn run(
                     )
                     .await
                     {
-                        let _ = worker_sink.send(TurnChunk::Finished(Err(format!(
-                            "cannot delete active session `{target}`; switch to another session before deleting it"
-                        ))));
+                        send_worker_finished(
+                            &worker_sink,
+                            Err(format!(
+                                "cannot delete active session `{target}`; switch to another session before deleting it"
+                            )),
+                        )
+                        .await;
                         continue;
                     }
                     let preflight = command_session_preflight(&cmdline);
@@ -777,9 +799,13 @@ pub async fn run(
                         {
                             Ok(session_id) => session_id,
                             Err(e) => {
-                                let _ = worker_sink.send(TurnChunk::Finished(Err(format!(
-                                    "could not prepare session for active workspace: {e}"
-                                ))));
+                                send_worker_finished(
+                                    &worker_sink,
+                                    Err(format!(
+                                        "could not prepare session for active workspace: {e}"
+                                    )),
+                                )
+                                .await;
                                 continue;
                             }
                         };
@@ -812,17 +838,25 @@ pub async fn run(
                                         session_switched = true;
                                     }
                                     Err(e) => {
-                                        let _ = worker_sink.send(TurnChunk::Finished(Err(format!(
-                                            "could not bind session `{target_session}` to workspace: {e}"
-                                        ))));
+                                        send_worker_finished(
+                                            &worker_sink,
+                                            Err(format!(
+                                                "could not bind session `{target_session}` to workspace: {e}"
+                                            )),
+                                        )
+                                        .await;
                                         continue;
                                     }
                                 }
                             }
                             Err(e) => {
-                                let _ = worker_sink.send(TurnChunk::Finished(Err(format!(
-                                    "could not {action_label} `{target_session}`: {e}"
-                                ))));
+                                send_worker_finished(
+                                    &worker_sink,
+                                    Err(format!(
+                                        "could not {action_label} `{target_session}`: {e}"
+                                    )),
+                                )
+                                .await;
                                 continue;
                             }
                         }
@@ -855,10 +889,13 @@ pub async fn run(
                                     .await
                                     {
                                         let _ = worker_sink.send(TurnChunk::ClearUsage);
-                                        let _ =
-                                            worker_sink.send(TurnChunk::Finished(Err(format!(
+                                        send_worker_finished(
+                                            &worker_sink,
+                                            Err(format!(
                                                 "workspace switched, but session setup failed: {e}"
-                                            ))));
+                                            )),
+                                        )
+                                        .await;
                                         continue;
                                     }
                                     if let Some(name) = switched_workspace {
@@ -884,7 +921,7 @@ pub async fn run(
                                     });
                                 }
                             }
-                            let _ = worker_sink.send(TurnChunk::Finished(Ok(String::new())));
+                            send_worker_finished(&worker_sink, Ok(String::new())).await;
                         }
                         Ok(None) => {
                             let _ = worker_sink.send(TurnChunk::Token(format!(
@@ -893,7 +930,7 @@ pub async fn run(
                             if should_clear_usage_after_command(false, session_switched, false) {
                                 let _ = worker_sink.send(TurnChunk::ClearUsage);
                             }
-                            let _ = worker_sink.send(TurnChunk::Finished(Ok(String::new())));
+                            send_worker_finished(&worker_sink, Ok(String::new())).await;
                         }
                         Err(e) if e.to_string() == "EXIT" => {
                             // `/exit` bubbled up; mirror the
@@ -908,13 +945,13 @@ pub async fn run(
                                  the TUI)"
                                     .to_string(),
                             ));
-                            let _ = worker_sink.send(TurnChunk::Finished(Ok(String::new())));
+                            send_worker_finished(&worker_sink, Ok(String::new())).await;
                         }
                         Err(e) => {
                             if should_clear_usage_after_command(false, session_switched, false) {
                                 let _ = worker_sink.send(TurnChunk::ClearUsage);
                             }
-                            let _ = worker_sink.send(TurnChunk::Finished(Err(e.to_string())));
+                            send_worker_finished(&worker_sink, Err(e.to_string())).await;
                         }
                     }
                 }
@@ -1049,6 +1086,28 @@ async fn flush_forwarded_token(
         forwarded_token.store(true, Ordering::Release);
         true
     } else {
+        false
+    }
+}
+
+async fn send_worker_finished(ui_sink: &StreamSink, result: Result<String, String>) -> bool {
+    send_worker_chunk_reliably(ui_sink, TurnChunk::Finished(result)).await
+}
+
+async fn send_worker_chunks_reliably(ui_sink: &StreamSink, chunks: Vec<TurnChunk>) -> bool {
+    for chunk in chunks {
+        if !send_worker_chunk_reliably(ui_sink, chunk).await {
+            return false;
+        }
+    }
+    true
+}
+
+async fn send_worker_chunk_reliably(ui_sink: &StreamSink, chunk: TurnChunk) -> bool {
+    if ui_sink.send_async(chunk).await.is_ok() {
+        true
+    } else {
+        warn!("tv_ui: worker event channel closed before terminal chunk delivery");
         false
     }
 }
@@ -4210,6 +4269,45 @@ mod tests {
 
         drop(sink);
         assert!(rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn reliable_finished_delivery_waits_for_saturated_ui_queue_and_clears_inflight() {
+        let (sink, mut rx) = StreamSink::channel(1);
+        sink.send(TurnChunk::Token("queued".to_string())).unwrap();
+
+        let send_sink = sink.clone();
+        let send_task =
+            tokio::spawn(async move { send_worker_finished(&send_sink, Ok(String::new())).await });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(!send_task.is_finished());
+
+        match rx.recv().await {
+            Some(TurnChunk::Token(text)) => assert_eq!(text, "queued"),
+            other => panic!("expected saturated queue token, got {other:?}"),
+        }
+        assert!(send_task.await.unwrap());
+
+        let lines = Rc::new(RefCell::new(vec![String::new()]));
+        let mut state = StatusState::new(
+            "workspace".to_string(),
+            "primary".to_string(),
+            "borland".to_string(),
+            false,
+        );
+        let mut typewriter_state = None;
+        let mut response_in_flight = true;
+        let mut session_picker_state = SessionPickerState::default();
+
+        assert!(!drain_stream_events(
+            &mut rx,
+            &lines,
+            &mut state,
+            &mut typewriter_state,
+            &mut response_in_flight,
+            &mut session_picker_state
+        ));
+        assert!(!response_in_flight);
     }
 
     #[tokio::test]
