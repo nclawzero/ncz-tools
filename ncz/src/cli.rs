@@ -68,6 +68,11 @@ pub enum Command {
         #[command(subcommand)]
         action: McpAction,
     },
+    /// Manage scheduled zeroclaw cron tasks.
+    Cron {
+        #[command(subcommand)]
+        action: CronAction,
+    },
     /// Inspect or manage the sandbox runtime policy.
     Sandbox {
         #[command(subcommand)]
@@ -238,6 +243,95 @@ pub enum McpAction {
     Remove { name: String },
     /// Show an MCP server declaration.
     Show { name: String },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum CronAction {
+    /// List scheduled cron entries.
+    List {
+        /// Optional agent name (defaults to the active agent).
+        #[arg(long)]
+        agent: Option<String>,
+    },
+    /// Add a cron expression schedule.
+    Add {
+        /// Cron entry id.
+        id: String,
+        /// Cron expression.
+        #[arg(long)]
+        schedule: String,
+        /// Command to run.
+        #[arg(long)]
+        command: String,
+        /// Optional agent name (defaults to the active agent).
+        #[arg(long)]
+        agent: Option<String>,
+    },
+    /// Add a one-shot RFC3339 schedule.
+    AddAt {
+        /// Cron entry id.
+        id: String,
+        /// RFC3339 timestamp.
+        #[arg(long)]
+        at: String,
+        /// Command to run.
+        #[arg(long)]
+        command: String,
+    },
+    /// Add a fixed-interval schedule.
+    AddEvery {
+        /// Cron entry id.
+        id: String,
+        /// Duration string.
+        #[arg(long)]
+        every: String,
+        /// Command to run.
+        #[arg(long)]
+        command: String,
+    },
+    /// Add a one-shot immediate task.
+    Once {
+        /// Cron entry id.
+        id: String,
+        /// Command to run.
+        #[arg(long)]
+        command: String,
+    },
+    /// Remove a cron entry.
+    Remove {
+        /// Cron entry id.
+        id: String,
+        /// Optional agent name (defaults to the active agent).
+        #[arg(long)]
+        agent: Option<String>,
+    },
+    /// Update a cron entry.
+    Update {
+        /// Cron entry id.
+        id: String,
+        /// New cron expression.
+        #[arg(long)]
+        schedule: Option<String>,
+        /// New command.
+        #[arg(long)]
+        command: Option<String>,
+    },
+    /// Pause a cron entry.
+    Pause {
+        /// Cron entry id.
+        id: String,
+        /// Optional agent name (defaults to the active agent).
+        #[arg(long)]
+        agent: Option<String>,
+    },
+    /// Resume a cron entry.
+    Resume {
+        /// Cron entry id.
+        id: String,
+        /// Optional agent name (defaults to the active agent).
+        #[arg(long)]
+        agent: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
