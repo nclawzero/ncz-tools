@@ -282,16 +282,10 @@ pub async fn run(
         .and_then(|v| v.get("splash_screen"))
         .and_then(|v| v.as_bool())
         .unwrap_or(true); // Default: show splash
-    let backend_connect_splash_requested = config
-        .get("ui")
-        .and_then(|v| v.get("connect_splash_backend"))
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    if backend_connect_splash_requested {
-        warn!(
-            "[ui].connect_splash_backend is reserved until an agent client exposes side-effect-free splash generation; using local connect splash"
-        );
-    }
+                          // v0.3.1 production connect splashes are local-only. The guarded
+                          // backend generator remains test-covered in tv_ui for a future
+                          // side-effect-free AgentClient capability, but there is no user-facing
+                          // opt-in flag in this release.
     let backend_connect_splash = false;
 
     if show_splash {

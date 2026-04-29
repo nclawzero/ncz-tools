@@ -58,6 +58,8 @@ use tokio_tungstenite::{
     tungstenite::{Error as WsError, Message as WsMessage},
 };
 
+use crate::cli::url_safety::is_sensitive_url_query_key;
+
 use super::wire::{Frame, PendingRequests, RequestFrame, ResponseFrame};
 
 /// Default timeout for a single RPC round-trip. Applies to any caller
@@ -317,31 +319,6 @@ pub(crate) fn redacted_openclaw_url_for_error(url: &str) -> String {
         }
     }
     parsed.to_string()
-}
-
-fn is_sensitive_url_query_key(key: &str) -> bool {
-    let normalized: String = key
-        .chars()
-        .filter(|ch| ch.is_ascii_alphanumeric())
-        .flat_map(char::to_lowercase)
-        .collect();
-    matches!(
-        normalized.as_str(),
-        "token"
-            | "accesstoken"
-            | "authtoken"
-            | "authorization"
-            | "auth"
-            | "bearer"
-            | "apikey"
-            | "key"
-            | "secret"
-            | "password"
-            | "pass"
-            | "jwt"
-            | "sig"
-            | "signature"
-    )
 }
 
 impl OpenClawClient {
@@ -2383,17 +2360,21 @@ mod tests {
     #[test]
     fn openclaw_error_url_redaction_masks_credentials_and_sensitive_query() {
         let redacted = redacted_openclaw_url_for_error(
-            "wss://operator:secret@gateway.example/ws?token=abc&api_key=def&room=alpha",
+            "wss://operator:embedded-password@gateway.example/ws?api_token=abc&refresh_token=def&client_secret=ghi&session_token=jkl&room=alpha",
         );
 
         assert!(redacted.contains("redacted:redacted@gateway.example"));
-        assert!(redacted.contains("token=REDACTED"));
-        assert!(redacted.contains("api_key=REDACTED"));
+        assert!(redacted.contains("api_token=REDACTED"));
+        assert!(redacted.contains("refresh_token=REDACTED"));
+        assert!(redacted.contains("client_secret=REDACTED"));
+        assert!(redacted.contains("session_token=REDACTED"));
         assert!(redacted.contains("room=alpha"));
         assert!(!redacted.contains("operator"));
-        assert!(!redacted.contains("secret"));
+        assert!(!redacted.contains("embedded-password"));
         assert!(!redacted.contains("abc"));
         assert!(!redacted.contains("def"));
+        assert!(!redacted.contains("ghi"));
+        assert!(!redacted.contains("jkl"));
     }
 
     #[test]

@@ -17,6 +17,7 @@ use crate::cli::client::ZeroclawClient;
 use crate::cli::client::{Model, Provider, Session};
 use crate::cli::input::InputHistory;
 use crate::cli::storage;
+use crate::cli::url_safety::is_sensitive_url_query_key;
 use crate::cli::workspace::{Backend, Workspace, WorkspaceConfig};
 
 type AgentClientHandle = Arc<Mutex<Box<dyn AgentClient + Send + Sync>>>;
@@ -1925,26 +1926,6 @@ fn is_sensitive_config_key(key: &str) -> bool {
         .any(|fragment| lower.contains(fragment))
 }
 
-fn is_sensitive_url_query_key(key: &str) -> bool {
-    matches!(
-        normalize_config_key(key).as_str(),
-        "token"
-            | "accesstoken"
-            | "authtoken"
-            | "authorization"
-            | "auth"
-            | "bearer"
-            | "apikey"
-            | "key"
-            | "secret"
-            | "password"
-            | "pass"
-            | "jwt"
-            | "sig"
-            | "signature"
-    )
-}
-
 fn normalize_config_key(key: &str) -> String {
     key.chars()
         .filter(|ch| ch.is_ascii_alphanumeric())
@@ -3676,12 +3657,19 @@ openai = { model = "gpt", api_key = "inline-api-key" }
     fn config_output_redacts_url_embedded_credentials_in_valid_toml() {
         let out = super::format_config_output(Ok(r#"
 	[gateway]
-	url = "wss://operator:embedded-password@gateway.example/ws?token=url-token&api_key=url-api-key&room=alpha"
-	"#
+		url = "wss://operator:embedded-password@gateway.example/ws?api_token=url-api-token&refresh_token=url-refresh-token&client_secret=url-client-secret&session_token=url-session-token&room=alpha"
+		"#
         .to_string()));
 
-        assert!(out.contains("url = \"wss://redacted:redacted@gateway.example/ws?token=REDACTED&api_key=REDACTED&room=alpha\""));
-        for leaked in ["operator", "embedded-password", "url-token", "url-api-key"] {
+        assert!(out.contains("url = \"wss://redacted:redacted@gateway.example/ws?api_token=REDACTED&refresh_token=REDACTED&client_secret=REDACTED&session_token=REDACTED&room=alpha\""));
+        for leaked in [
+            "operator",
+            "embedded-password",
+            "url-api-token",
+            "url-refresh-token",
+            "url-client-secret",
+            "url-session-token",
+        ] {
             assert!(!out.contains(leaked), "{leaked} leaked in {out}");
         }
     }
@@ -3779,12 +3767,19 @@ provider_settings = { tokens = ["array-token-1", "array-token-2"], name = "kept"
         let out = super::redact_config_secrets(
             r#"
 	[unterminated
-	url = "wss://operator:embedded-password@gateway.example/ws?token=url-token&api_key=url-api-key&room=alpha"
-	"#,
+		url = "wss://operator:embedded-password@gateway.example/ws?api_token=url-api-token&refresh_token=url-refresh-token&client_secret=url-client-secret&session_token=url-session-token&room=alpha"
+		"#,
         );
 
-        assert!(out.contains("url = \"wss://redacted:redacted@gateway.example/ws?token=REDACTED&api_key=REDACTED&room=alpha\""));
-        for leaked in ["operator", "embedded-password", "url-token", "url-api-key"] {
+        assert!(out.contains("url = \"wss://redacted:redacted@gateway.example/ws?api_token=REDACTED&refresh_token=REDACTED&client_secret=REDACTED&session_token=REDACTED&room=alpha\""));
+        for leaked in [
+            "operator",
+            "embedded-password",
+            "url-api-token",
+            "url-refresh-token",
+            "url-client-secret",
+            "url-session-token",
+        ] {
             assert!(!out.contains(leaked), "{leaked} leaked in {out}");
         }
     }

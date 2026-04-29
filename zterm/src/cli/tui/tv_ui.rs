@@ -5744,7 +5744,7 @@ mod tests {
     }
 
     #[test]
-    fn connect_splash_backend_generation_is_opt_in() {
+    fn connect_splash_backend_generation_stays_disabled_by_policy() {
         let _env = crate::cli::test_env_lock().lock().unwrap();
         let home = tempfile::tempdir().unwrap();
         let old_home = std::env::var_os("HOME");

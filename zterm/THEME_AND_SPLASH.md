@@ -10,13 +10,11 @@
 > runtime palette presets, `~/.zterm/theme.toml`, cached
 > connect-splash text at `~/.zterm/cache/connect-splash/`, and
 > `~/.zterm/state.toml` for launch count plus `beep_on_error`. The
-> v0.3.1 connect splash defaults to a local modem sequence. Setting
-> `[ui].connect_splash_backend = true` opts into asking the active
-> backend for period-style text through a bounded scratch session,
-> caching only confirmed generated output for 24h, and falling back to
-> local text on backend errors before scratch-session cleanup. Cleanup
-> failures after backend state is created are surfaced to the UI
-> instead of silently falling back. Setting `[ui].splash_screen = false`
+> v0.3.1 connect splash is local-only in production and renders a
+> period modem sequence. The guarded backend generator remains
+> test-covered for future side-effect-free clients, but there is no
+> user-facing backend opt-in flag in v0.3.1. Setting
+> `[ui].splash_screen = false`
 > disables both the legacy ANSI splash and the TV connect-splash path.
 > State writes use a
 > bounded lock wait, and the TV path persists a mutation fence after

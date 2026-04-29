@@ -49,6 +49,7 @@ use tokio::sync::Mutex;
 
 use crate::cli::agent::AgentClient;
 use crate::cli::client::ZeroclawClient;
+use crate::cli::url_safety::is_sensitive_url_query_key;
 
 /// Backend identifier as written in `~/.zterm/config.toml`.
 /// Lower-case string enum for TOML ergonomics.
@@ -1683,7 +1684,7 @@ fn validate_workspace_url_safety(config: &WorkspaceConfig) -> Result<()> {
     if let Some(key) = url
         .query_pairs()
         .map(|(key, _)| key.into_owned())
-        .find(|key| is_sensitive_workspace_url_query_key(key))
+        .find(|key| is_sensitive_url_query_key(key))
     {
         return Err(anyhow!(
             "workspace `{}` url must not contain sensitive query parameter `{key}`; use token_env or token instead",
@@ -1691,31 +1692,6 @@ fn validate_workspace_url_safety(config: &WorkspaceConfig) -> Result<()> {
         ));
     }
     Ok(())
-}
-
-fn is_sensitive_workspace_url_query_key(key: &str) -> bool {
-    let normalized: String = key
-        .chars()
-        .filter(|ch| ch.is_ascii_alphanumeric())
-        .flat_map(char::to_lowercase)
-        .collect();
-    matches!(
-        normalized.as_str(),
-        "token"
-            | "accesstoken"
-            | "authtoken"
-            | "authorization"
-            | "auth"
-            | "bearer"
-            | "apikey"
-            | "key"
-            | "secret"
-            | "password"
-            | "pass"
-            | "jwt"
-            | "sig"
-            | "signature"
-    )
 }
 
 fn validate_zeroclaw_workspace_tokens(cfg: &AppConfig) -> Result<()> {
@@ -2605,7 +2581,7 @@ namespace_aliases = ["backend=openclaw;workspace_id=ws_alpha"]
 [[workspaces]]
 name = "oc"
 backend = "openclaw"
-url = "ws://127.0.0.1:18789/ws?token=secret&room=alpha"
+url = "ws://127.0.0.1:18789/ws?client_secret=credential-value&room=alpha"
 "#,
         )
         .unwrap();
@@ -2616,8 +2592,8 @@ url = "ws://127.0.0.1:18789/ws?token=secret&room=alpha"
         };
 
         let msg = err.to_string();
-        assert!(msg.contains("sensitive query parameter `token`"));
-        assert!(!msg.contains("secret"));
+        assert!(msg.contains("sensitive query parameter `client_secret`"));
+        assert!(!msg.contains("credential-value"));
     }
 
     #[tokio::test]
@@ -2820,14 +2796,14 @@ url = "ws://c"
         }
 
         let query_err = match App::synthesize_single_zeroclaw(
-            "https://example.com/ws?token=url-token",
+            "https://example.com/ws?refresh_token=url-token",
             Some("bearer-token".to_string()),
         ) {
             Ok(_) => panic!("token query synthetic zeroclaw URL should fail closed"),
             Err(err) => err,
         };
         let query_msg = query_err.to_string();
-        assert!(query_msg.contains("sensitive query parameter `token`"));
+        assert!(query_msg.contains("sensitive query parameter `refresh_token`"));
         assert!(!query_msg.contains("url-token"));
     }
 

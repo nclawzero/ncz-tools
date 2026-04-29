@@ -18,6 +18,7 @@ pub mod streaming;
 pub mod theme;
 pub mod tui;
 pub mod ui;
+pub(crate) mod url_safety;
 pub mod websocket;
 pub mod workspace;
 
