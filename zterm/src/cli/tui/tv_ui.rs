@@ -1062,25 +1062,56 @@ fn spawn_connect_splash_typewriter(
             policy,
         )
         .await;
-        if !workspace_still_active(&app, &workspace_name, workspace_id.as_deref()).await {
-            return;
-        }
-        match result {
-            Ok(Some(splash)) => {
-                let _ =
-                    send_worker_chunk_reliably(&worker_sink, TurnChunk::Typewriter(splash)).await;
-            }
-            Ok(None) => {}
-            Err(e) => {
-                warn!("connect-splash failed after workspace switch: {e}");
-                let message = format!(
-                    "⚠ connect-splash skipped after workspace switch: {}\n",
-                    sanitize_terminal_text(&e.to_string())
-                );
-                let _ = send_worker_chunk_reliably(&worker_sink, TurnChunk::Token(message)).await;
-            }
-        }
+        handle_connect_splash_typewriter_result(
+            &app,
+            &worker_sink,
+            &workspace_name,
+            workspace_id.as_deref(),
+            result,
+        )
+        .await;
     });
+}
+
+async fn handle_connect_splash_typewriter_result(
+    app: &Arc<Mutex<App>>,
+    worker_sink: &StreamSink,
+    workspace_name: &str,
+    workspace_id: Option<&str>,
+    result: Result<Option<String>>,
+) {
+    let still_active = workspace_still_active(app, workspace_name, workspace_id).await;
+    match result {
+        Ok(Some(splash)) if still_active => {
+            let _ = send_worker_chunk_reliably(worker_sink, TurnChunk::Typewriter(splash)).await;
+        }
+        Ok(_) => {}
+        Err(e) if still_active => {
+            warn!("connect-splash failed after workspace switch: {e}");
+            let message = format!(
+                "⚠ connect-splash skipped after workspace switch: {}\n",
+                sanitize_terminal_text(&e.to_string())
+            );
+            let _ = send_worker_chunk_reliably(worker_sink, TurnChunk::Token(message)).await;
+        }
+        Err(e) if is_connect_splash_cleanup_failure(&e) => {
+            let safe_workspace = sanitize_terminal_text(workspace_name);
+            let safe_error = sanitize_terminal_text(&e.to_string());
+            warn!(
+                "connect-splash cleanup failed after workspace {safe_workspace} became inactive: {safe_error}"
+            );
+            let message = format!(
+                "⚠ connect-splash cleanup failed for inactive workspace `{safe_workspace}`: {safe_error}\n"
+            );
+            let _ = send_worker_chunk_reliably(worker_sink, TurnChunk::Token(message)).await;
+        }
+        Err(e) => {
+            warn!(
+                "stale connect-splash result discarded after workspace switch away from {}: {e}",
+                sanitize_terminal_text(workspace_name)
+            );
+        }
+    }
 }
 
 fn slash_command_deadline(cmdline: &str) -> SlashCommandDeadline {
@@ -6100,6 +6131,67 @@ mod tests {
             Some(home) => std::env::set_var("HOME", home),
             None => std::env::remove_var("HOME"),
         }
+    }
+
+    #[test]
+    fn stale_connect_splash_cleanup_failure_sends_workspace_warning() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let app = Arc::new(Mutex::new(App {
+                workspaces: vec![
+                    crate::cli::workspace::Workspace {
+                        id: 0,
+                        config: crate::cli::workspace::WorkspaceConfig {
+                            id: Some("ws-alpha".to_string()),
+                            name: "alpha".to_string(),
+                            backend: crate::cli::workspace::Backend::Openclaw,
+                            url: "ws://alpha.example".to_string(),
+                            token_env: None,
+                            token: None,
+                            label: None,
+                            namespace_aliases: Vec::new(),
+                        },
+                        client: None,
+                        cron: None,
+                    },
+                    crate::cli::workspace::Workspace {
+                        id: 1,
+                        config: crate::cli::workspace::WorkspaceConfig {
+                            id: Some("ws-beta".to_string()),
+                            name: "beta".to_string(),
+                            backend: crate::cli::workspace::Backend::Openclaw,
+                            url: "ws://beta.example".to_string(),
+                            token_env: None,
+                            token: None,
+                            label: None,
+                            namespace_aliases: Vec::new(),
+                        },
+                        client: None,
+                        cron: None,
+                    },
+                ],
+                active: 1,
+                shared_mnemos: None,
+                config_path: std::path::PathBuf::from("test-config.toml"),
+            }));
+            let (sink, mut rx) = StreamSink::channel(4);
+
+            handle_connect_splash_typewriter_result(
+                &app,
+                &sink,
+                "alpha",
+                Some("ws-alpha"),
+                Err(ConnectSplashCleanupFailure::new("delete failed").into()),
+            )
+            .await;
+
+            let chunk = rx.recv().await.expect("warning chunk should be sent");
+            let TurnChunk::Token(message) = chunk else {
+                panic!("expected warning token");
+            };
+            assert!(message.contains("inactive workspace `alpha`"));
+            assert!(message.contains("delete failed"));
+        });
     }
 
     #[test]
