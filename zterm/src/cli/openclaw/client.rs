@@ -962,9 +962,8 @@ async fn collect_turn_result(
             }
             None => {
                 tracing::debug!(
-                    "openclaw: ignoring assistant message for session {session_key} without runId; expected {expected_run_id}"
+                    "openclaw: accepting assistant message for session {session_key} without runId; waiting for completion of expected runId {expected_run_id}"
                 );
-                continue;
             }
         }
         if expected_message_id.is_none() {
@@ -1971,6 +1970,24 @@ mod tests {
         }
     }
 
+    fn assistant_event_without_run_id(
+        session_key: &str,
+        text: &str,
+    ) -> super::super::wire::EventFrame {
+        super::super::wire::EventFrame {
+            event: "session.message".to_string(),
+            payload: Some(serde_json::json!({
+                "sessionKey": session_key,
+                "message": {
+                    "role": "assistant",
+                    "content": [{ "type": "text", "text": text }]
+                }
+            })),
+            seq: None,
+            state_version: None,
+        }
+    }
+
     fn assistant_tool_event(session_key: &str, run_id: &str) -> super::super::wire::EventFrame {
         super::super::wire::EventFrame {
             event: "session.message".to_string(),
@@ -2054,6 +2071,36 @@ mod tests {
 
         assert_eq!(turn.run_id.as_deref(), Some("current-run"));
         assert_eq!(turn.text, "hello world");
+    }
+
+    #[tokio::test]
+    async fn collect_turn_result_accepts_run_id_less_text_until_completion() {
+        let (event_tx, mut event_rx) = mpsc::channel::<super::super::wire::EventFrame>(4);
+        event_tx
+            .send(assistant_event_without_run_id("session-a", "compat text"))
+            .await
+            .unwrap();
+        event_tx
+            .send(run_completed_event("session-a", "current-run"))
+            .await
+            .unwrap();
+
+        let mut turn = super::super::handshake::TurnResult {
+            run_id: Some("current-run".to_string()),
+            ..Default::default()
+        };
+        collect_turn_result(
+            &mut event_rx,
+            "session-a",
+            "current-run",
+            Duration::from_millis(50),
+            &mut turn,
+        )
+        .await
+        .expect("runId-less text followed by expected completion should collect");
+
+        assert_eq!(turn.run_id.as_deref(), Some("current-run"));
+        assert_eq!(turn.text, "compat text");
     }
 
     #[tokio::test]
