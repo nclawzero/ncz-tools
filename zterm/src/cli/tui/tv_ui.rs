@@ -596,9 +596,12 @@ pub async fn run(
     let (req_tx, mut req_rx) = mpsc::channel::<WorkerRequest>(32);
     let (event_tx, event_rx) = StreamSink::channel(UI_EVENT_CAPACITY);
 
-    let connect_splash =
-        connect_splash_for_workspace_if_enabled(&app, &workspace_name, None, connect_splash_policy)
-            .await?;
+    let connect_splash = startup_connect_splash_for_workspace_if_enabled(
+        &app,
+        &workspace_name,
+        connect_splash_policy,
+    )
+    .await;
 
     // Install the streaming sink on the boot workspace. The worker
     // also reinstalls before every submitted turn and after every
@@ -1485,6 +1488,22 @@ async fn connect_splash_for_workspace_if_enabled(
     connect_splash_for_workspace(app, workspace_name, restore_sink)
         .await
         .map(Some)
+}
+
+async fn startup_connect_splash_for_workspace_if_enabled(
+    app: &Arc<Mutex<App>>,
+    workspace_name: &str,
+    policy: ConnectSplashPolicy,
+) -> Option<String> {
+    match connect_splash_for_workspace_if_enabled(app, workspace_name, None, policy).await {
+        Ok(splash) => splash,
+        Err(e) => {
+            warn!("connect-splash startup failed: {e}; using local fallback");
+            policy
+                .display
+                .then(|| delighters::local_connect_splash(workspace_name))
+        }
+    }
 }
 
 async fn connect_splash_for_captured_workspace(
@@ -6018,6 +6037,84 @@ mod tests {
             assert!(is_connect_splash_cleanup_failure(&err));
             assert!(err.to_string().contains("cleanup failed"));
             assert!(err.to_string().contains("delete failed"));
+            assert_eq!(created.lock().unwrap().len(), 1);
+            assert_eq!(submitted.lock().unwrap().len(), 1);
+            assert_eq!(deleted.lock().unwrap().len(), 1);
+            let path = delighters::default_connect_splash_cache_path("alpha").unwrap();
+            assert!(!path.exists());
+        });
+
+        match old_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    #[test]
+    fn startup_connect_splash_cleanup_failure_uses_local_fallback() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let created = Arc::new(StdMutex::new(Vec::new()));
+            let deleted = Arc::new(StdMutex::new(Vec::new()));
+            let submitted = Arc::new(StdMutex::new(Vec::new()));
+            let fake = WorkerSessionFakeClient {
+                listed_sessions: Vec::new(),
+                list_sessions_error: None,
+                loadable_sessions: Vec::new(),
+                load_reject_ids: Vec::new(),
+                created: Arc::clone(&created),
+                deleted: Arc::clone(&deleted),
+                submitted: Arc::clone(&submitted),
+                list_calls: Arc::new(StdMutex::new(0)),
+                load_calls: Arc::new(StdMutex::new(Vec::new())),
+                submit_response: "GENERATED\nSPLASH".to_string(),
+                submit_error: None,
+                submit_never: false,
+                cancellation_safe: true,
+                sink_set_states: Arc::new(StdMutex::new(Vec::new())),
+                delete_error: Some("delete failed".to_string()),
+            };
+            let boxed: Box<dyn crate::cli::agent::AgentClient + Send + Sync> = Box::new(fake);
+            let app = Arc::new(Mutex::new(App {
+                workspaces: vec![crate::cli::workspace::Workspace {
+                    id: 0,
+                    config: crate::cli::workspace::WorkspaceConfig {
+                        id: Some("ws-alpha".to_string()),
+                        name: "alpha".to_string(),
+                        backend: crate::cli::workspace::Backend::Openclaw,
+                        url: "ws://gateway.example".to_string(),
+                        token_env: None,
+                        token: None,
+                        label: None,
+                        namespace_aliases: Vec::new(),
+                    },
+                    client: Some(Arc::new(Mutex::new(boxed))),
+                    cron: None,
+                }],
+                active: 0,
+                shared_mnemos: None,
+                config_path: std::path::PathBuf::from("test-config.toml"),
+            }));
+
+            let splash = startup_connect_splash_for_workspace_if_enabled(
+                &app,
+                "alpha",
+                ConnectSplashPolicy {
+                    display: true,
+                    backend: true,
+                },
+            )
+            .await;
+
+            assert_eq!(
+                splash.as_deref(),
+                Some(delighters::local_connect_splash("alpha").as_str())
+            );
             assert_eq!(created.lock().unwrap().len(), 1);
             assert_eq!(submitted.lock().unwrap().len(), 1);
             assert_eq!(deleted.lock().unwrap().len(), 1);
