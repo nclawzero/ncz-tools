@@ -1062,11 +1062,11 @@ async fn handle_worker_command_request(
     if let Some(target) =
         active_worker_session_delete_target(&cmdline, worker_app, worker_sessions).await
     {
-        send_worker_finished(
+        send_known_safe_worker_error(
             worker_sink,
-            Err(format!(
+            format!(
                 "cannot delete active session `{target}`; switch to another session before deleting it"
-            )),
+            ),
         )
         .await;
         return;
@@ -1088,11 +1088,9 @@ async fn handle_worker_command_request(
             match verify_session_for_active_workspace(worker_app, worker_sessions).await {
                 Ok(session_id) => session_id,
                 Err(e) => {
-                    send_worker_finished(
+                    send_known_safe_worker_error(
                         worker_sink,
-                        Err(format!(
-                            "could not prepare session for active workspace: {e}"
-                        )),
+                        format!("could not prepare session for active workspace: {e}"),
                     )
                     .await;
                     return;
@@ -1446,6 +1444,11 @@ async fn flush_forwarded_token(
 
 async fn send_worker_finished(ui_sink: &StreamSink, result: Result<String, String>) -> bool {
     send_worker_chunk_reliably(ui_sink, TurnChunk::Finished(result)).await
+}
+
+async fn send_known_safe_worker_error(ui_sink: &StreamSink, message: String) -> bool {
+    let _ = send_worker_command_output_reliably(ui_sink, format!("❌ {message}\n")).await;
+    send_worker_finished(ui_sink, Err(COMMAND_ERROR_ALREADY_RENDERED.to_string())).await
 }
 
 async fn send_worker_chunks_reliably(ui_sink: &StreamSink, chunks: Vec<TurnChunk>) -> bool {
@@ -7629,19 +7632,152 @@ mod tests {
             )
             .await;
 
+            let mut rendered = String::new();
             let mut terminal_error = None;
             while let Ok(chunk) = rx.try_recv() {
-                if let TurnChunk::Finished(Err(message)) = chunk {
-                    terminal_error = Some(message);
+                match chunk {
+                    TurnChunk::Token(text) => rendered.push_str(&text),
+                    TurnChunk::Finished(Err(message)) => terminal_error = Some(message),
+                    _ => {}
                 }
             }
 
             let terminal_error = terminal_error.expect("preflight should reject stale binding");
-            assert!(terminal_error.contains("could not prepare session for active workspace"));
+            assert_eq!(terminal_error, COMMAND_ERROR_ALREADY_RENDERED);
+            assert!(rendered.contains("could not prepare session for active workspace"));
             assert_eq!(load_calls.lock().unwrap().as_slice(), ["stale-id"]);
             assert!(created.lock().unwrap().is_empty());
             assert!(deleted.lock().unwrap().is_empty());
         });
+    }
+
+    #[test]
+    fn active_session_delete_rejection_clears_write_ahead_fence() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let active = Session {
+            id: "active-id".to_string(),
+            name: "Main".to_string(),
+            model: "model".to_string(),
+            provider: "provider".to_string(),
+        };
+        let created = Arc::new(StdMutex::new(Vec::new()));
+        let deleted = Arc::new(StdMutex::new(Vec::new()));
+        let submitted = Arc::new(StdMutex::new(Vec::new()));
+        let fake = WorkerSessionFakeClient {
+            listed_sessions: vec![active.clone()],
+            list_sessions_error: None,
+            loadable_sessions: vec![active.clone()],
+            load_reject_ids: Vec::new(),
+            created,
+            deleted: Arc::clone(&deleted),
+            submitted,
+            list_calls: Arc::new(StdMutex::new(0)),
+            load_calls: Arc::new(StdMutex::new(Vec::new())),
+        };
+        let boxed: Box<dyn crate::cli::agent::AgentClient + Send + Sync> = Box::new(fake);
+        let app = Arc::new(Mutex::new(App {
+            workspaces: vec![crate::cli::workspace::Workspace {
+                id: 0,
+                config: crate::cli::workspace::WorkspaceConfig {
+                    id: Some("ws-active-delete".to_string()),
+                    name: "delete-ws".to_string(),
+                    backend: crate::cli::workspace::Backend::Zeroclaw,
+                    url: "http://gateway.example".to_string(),
+                    token_env: None,
+                    token: None,
+                    label: None,
+                    namespace_aliases: Vec::new(),
+                },
+                client: Some(Arc::new(Mutex::new(boxed))),
+                cron: None,
+            }],
+            active: 0,
+            shared_mnemos: None,
+            config_path: std::path::PathBuf::from("test-config.toml"),
+        }));
+        let workspace_key = runtime
+            .block_on(current_workspace_binding_key(&app))
+            .unwrap();
+        let mut worker_sessions = HashMap::new();
+        remember_worker_session(&mut worker_sessions, workspace_key, &active);
+
+        let lines = Rc::new(RefCell::new(Vec::new()));
+        let (req_tx, mut req_rx) = mpsc::channel(4);
+        let (event_tx, mut event_rx) = StreamSink::channel(8);
+        let mut status = StatusState::new(
+            "delete-ws".to_string(),
+            "model".to_string(),
+            "borland".to_string(),
+            false,
+        );
+        status.workspace_id = Some("ws-active-delete".to_string());
+        let mut response_in_flight = false;
+        let mut typewriter_state = None;
+        let mut session_picker_state = SessionPickerState::default();
+
+        let submit_status = dispatch_worker_backed_submission(
+            "/session delete Main",
+            WorkerRequest::Command("/session delete Main".to_string()),
+            &lines,
+            &req_tx,
+            &mut status,
+            &mut response_in_flight,
+            false,
+            None,
+            "dispatch command",
+        );
+        assert_eq!(submit_status, SubmissionStatus::Started);
+        let key = mutation_fence_key_for_status(&status);
+        assert!(delighters::mutation_fence_for_workspace(&key)
+            .unwrap()
+            .is_some());
+        let request = req_rx.try_recv().unwrap();
+        let WorkerRequest::Command(cmdline) = request else {
+            panic!("expected command worker request");
+        };
+        let handler = CommandHandler::new(Arc::clone(&app));
+
+        runtime.block_on(async {
+            handle_worker_command_request(
+                cmdline,
+                &app,
+                &mut worker_sessions,
+                &active.name,
+                &event_tx,
+                &handler,
+            )
+            .await;
+        });
+
+        drain_stream_events(
+            &mut event_rx,
+            &lines,
+            &mut status,
+            &mut typewriter_state,
+            &mut response_in_flight,
+            &mut session_picker_state,
+        );
+
+        assert!(deleted.lock().unwrap().is_empty());
+        assert!(lines
+            .borrow()
+            .join("\n")
+            .contains("cannot delete active session"));
+        assert!(!response_in_flight);
+        assert!(status.mutation_fence.is_none());
+        assert!(delighters::mutation_fence_for_workspace(&key)
+            .unwrap()
+            .is_none());
+
+        match old_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
     }
 
     #[test]
