@@ -58,7 +58,7 @@ use turbo_vision::views::view::{write_line_to_terminal, View};
 use turbo_vision::views::window::WindowBuilder;
 
 use crate::cli::agent::{
-    SessionPickerListResult, SessionPickerWorkspace, StreamSink, TurnChunk, TurnUsage,
+    AgentClient, SessionPickerListResult, SessionPickerWorkspace, StreamSink, TurnChunk, TurnUsage,
 };
 use crate::cli::client::Session;
 use crate::cli::commands::{tokenize_slash_command, CommandHandler};
@@ -157,6 +157,7 @@ const TURN_SUBMIT_WORKER_TIMEOUT: Duration = Duration::from_secs(180);
 const SESSION_PICKER_LIST_TIMEOUT: Duration = Duration::from_secs(5);
 const COMMAND_WORKER_TIMEOUT: Duration = Duration::from_secs(30);
 const MUTATING_COMMAND_WORKER_TIMEOUT: Duration = Duration::from_secs(30);
+const CONNECT_SPLASH_GENERATION_TIMEOUT: Duration = Duration::from_secs(6);
 const RESPONSE_BUSY_TOAST: &str = "Busy: response in progress";
 const UI_EVENT_CAPACITY: usize = 512;
 const TURN_STREAM_CAPACITY: usize = 128;
@@ -579,7 +580,7 @@ pub async fn run(
     let (req_tx, mut req_rx) = mpsc::channel::<WorkerRequest>(32);
     let (event_tx, event_rx) = StreamSink::channel(UI_EVENT_CAPACITY);
 
-    let connect_splash = Some(connect_splash_for_workspace(&workspace_name));
+    let connect_splash = Some(connect_splash_for_workspace(&app, &workspace_name, None).await);
 
     // Install the streaming sink on the boot workspace. The worker
     // also reinstalls before every submitted turn and after every
@@ -1210,7 +1211,12 @@ async fn handle_worker_command_request(
                             return;
                         }
                         if let Some((name, _)) = switched_workspace {
-                            let splash = connect_splash_for_workspace(&name);
+                            let splash = connect_splash_for_workspace(
+                                worker_app,
+                                &name,
+                                Some(worker_sink.clone()),
+                            )
+                            .await;
                             let _ = send_worker_chunk_reliably(
                                 worker_sink,
                                 TurnChunk::Typewriter(splash),
@@ -1334,7 +1340,11 @@ async fn resync_worker_state(
     })
 }
 
-fn connect_splash_for_workspace(workspace_name: &str) -> String {
+async fn connect_splash_for_workspace(
+    app: &Arc<Mutex<App>>,
+    workspace_name: &str,
+    restore_sink: Option<StreamSink>,
+) -> String {
     let cache_path = delighters::default_connect_splash_cache_path(workspace_name);
     if let Some(path) = &cache_path {
         if let Some(cached) = delighters::read_cached_connect_splash(
@@ -1346,16 +1356,92 @@ fn connect_splash_for_workspace(workspace_name: &str) -> String {
         }
     }
 
-    let fallback = delighters::local_connect_splash(workspace_name);
-    if let Some(path) = cache_path {
-        let fallback_for_cache = fallback.clone();
-        let _ = std::thread::spawn(move || {
-            if let Err(e) = delighters::write_connect_splash_cache(&path, &fallback_for_cache) {
-                warn!("connect-splash cache write failed: {e}");
+    match generate_connect_splash_from_active_backend(app, workspace_name, restore_sink).await {
+        Ok(generated) => {
+            if let Some(path) = cache_path {
+                if let Err(e) = delighters::write_connect_splash_cache(&path, &generated) {
+                    warn!("connect-splash cache write failed: {e}");
+                }
             }
-        });
+            generated
+        }
+        Err(e) => {
+            warn!("connect-splash backend generation failed: {e}; using local fallback");
+            delighters::local_connect_splash(workspace_name)
+        }
     }
-    fallback
+}
+
+async fn generate_connect_splash_from_active_backend(
+    app: &Arc<Mutex<App>>,
+    workspace_name: &str,
+    restore_sink: Option<StreamSink>,
+) -> Result<String> {
+    let client = {
+        let guard = app.lock().await;
+        guard.active_workspace().and_then(|w| w.client.clone())
+    }
+    .ok_or_else(|| anyhow::anyhow!("no active workspace client"))?;
+
+    let mut locked = client.lock().await;
+    locked.set_stream_sink(None);
+    let result = generate_connect_splash_with_client(locked.as_mut(), workspace_name).await;
+    if let Some(sink) = restore_sink {
+        locked.set_stream_sink(Some(sink));
+    }
+    result
+}
+
+async fn generate_connect_splash_with_client(
+    client: &mut (dyn AgentClient + Send + Sync),
+    workspace_name: &str,
+) -> Result<String> {
+    let session_name = connect_splash_session_name(workspace_name);
+    let session = tokio::time::timeout(
+        CONNECT_SPLASH_GENERATION_TIMEOUT,
+        client.create_session(&session_name),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("connect-splash session create timed out"))??;
+
+    let prompt = connect_splash_prompt(workspace_name);
+    let generated = tokio::time::timeout(
+        CONNECT_SPLASH_GENERATION_TIMEOUT,
+        client.submit_turn(&session.id, &prompt),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("connect-splash generation timed out"));
+
+    match tokio::time::timeout(
+        CONNECT_SPLASH_GENERATION_TIMEOUT,
+        client.delete_session(&session.id),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => warn!("connect-splash scratch session cleanup failed: {e}"),
+        Err(_) => warn!("connect-splash scratch session cleanup timed out"),
+    }
+
+    let generated = generated??;
+    let normalized = delighters::normalize_connect_splash(&generated);
+    if normalized.is_empty() {
+        anyhow::bail!("connect-splash generation returned empty output");
+    }
+    Ok(normalized)
+}
+
+fn connect_splash_session_name(workspace_name: &str) -> String {
+    format!(
+        "zterm connect splash {}",
+        delighters::sanitize_workspace_name(workspace_name)
+    )
+}
+
+fn connect_splash_prompt(workspace_name: &str) -> String {
+    format!(
+        "Generate a Paradox 4.5 / dBASE V style modem connect splash for the zterm workspace named `{workspace_name}`. Return only 2 to 4 short plain ASCII lines, no markdown, no ANSI escapes, no explanation."
+    )
 }
 
 async fn submit_turn_with_worker_timeout<F>(submit: F, timeout: Duration) -> Result<String>
@@ -3537,24 +3623,13 @@ fn handle_command(
         CMD_HELP | CMD_ABOUT | CMD_WORKSPACE_LIST | CMD_WORKSPACE_INFO | CMD_MODELS_LIST
         | CMD_MODELS_STATUS | CMD_PROVIDERS_LIST | CMD_MEMORY_SEARCH | CMD_MEMORY_STATS
         | CMD_MCP_STATUS | CMD_SESSION_LIST => {
-            if status_state.mutation_fence.is_some() && command != CMD_HELP {
+            let Some(cmdline) = menu_command_cmdline(command) else {
+                return;
+            };
+            if status_state.mutation_fence.is_some() && !mutation_fence_allows_input(cmdline) {
                 note_mutation_fence(status_state, chat_lines);
                 return;
             }
-            let cmdline = match command {
-                CMD_HELP => "/help",
-                CMD_ABOUT => "/info",
-                CMD_WORKSPACE_LIST => "/workspace list",
-                CMD_WORKSPACE_INFO => "/workspace info",
-                CMD_MODELS_LIST => "/models list",
-                CMD_MODELS_STATUS => "/models status",
-                CMD_PROVIDERS_LIST => "/providers",
-                CMD_MEMORY_SEARCH => "/memory list",
-                CMD_MEMORY_STATS => "/memory stats",
-                CMD_MCP_STATUS => "/mcp status",
-                CMD_SESSION_LIST => "/session list",
-                _ => return,
-            };
             dispatch_command(
                 cmdline,
                 chat_lines,
@@ -3661,6 +3736,23 @@ fn handle_command(
             );
         }
         _ => {}
+    }
+}
+
+fn menu_command_cmdline(command: u16) -> Option<&'static str> {
+    match command {
+        CMD_HELP => Some("/help"),
+        CMD_ABOUT => Some("/info"),
+        CMD_WORKSPACE_LIST => Some("/workspace list"),
+        CMD_WORKSPACE_INFO => Some("/workspace info"),
+        CMD_MODELS_LIST => Some("/models list"),
+        CMD_MODELS_STATUS => Some("/models status"),
+        CMD_PROVIDERS_LIST => Some("/providers"),
+        CMD_MEMORY_SEARCH => Some("/memory list"),
+        CMD_MEMORY_STATS => Some("/memory stats"),
+        CMD_MCP_STATUS => Some("/mcp status"),
+        CMD_SESSION_LIST => Some("/session list"),
+        _ => None,
     }
 }
 
@@ -5125,6 +5217,85 @@ mod tests {
     }
 
     #[test]
+    fn connect_splash_generation_uses_backend_and_caches_output() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let created = Arc::new(StdMutex::new(Vec::new()));
+            let deleted = Arc::new(StdMutex::new(Vec::new()));
+            let submitted = Arc::new(StdMutex::new(Vec::new()));
+            let generated = "ZTERM LINK ESTABLISHED\nALPHA READY";
+            let fake = WorkerSessionFakeClient {
+                listed_sessions: Vec::new(),
+                list_sessions_error: None,
+                loadable_sessions: Vec::new(),
+                load_reject_ids: Vec::new(),
+                created: Arc::clone(&created),
+                deleted: Arc::clone(&deleted),
+                submitted: Arc::clone(&submitted),
+                list_calls: Arc::new(StdMutex::new(0)),
+                load_calls: Arc::new(StdMutex::new(Vec::new())),
+                submit_response: generated.to_string(),
+            };
+            let boxed: Box<dyn crate::cli::agent::AgentClient + Send + Sync> = Box::new(fake);
+            let app = Arc::new(Mutex::new(App {
+                workspaces: vec![crate::cli::workspace::Workspace {
+                    id: 0,
+                    config: crate::cli::workspace::WorkspaceConfig {
+                        id: Some("ws-alpha".to_string()),
+                        name: "alpha".to_string(),
+                        backend: crate::cli::workspace::Backend::Openclaw,
+                        url: "ws://gateway.example".to_string(),
+                        token_env: None,
+                        token: None,
+                        label: None,
+                        namespace_aliases: Vec::new(),
+                    },
+                    client: Some(Arc::new(Mutex::new(boxed))),
+                    cron: None,
+                }],
+                active: 0,
+                shared_mnemos: None,
+                config_path: std::path::PathBuf::from("test-config.toml"),
+            }));
+
+            let splash = connect_splash_for_workspace(&app, "alpha", None).await;
+            let expected = delighters::normalize_connect_splash(generated);
+
+            assert_eq!(splash, expected);
+            assert_eq!(
+                created.lock().unwrap()[0].name,
+                connect_splash_session_name("alpha")
+            );
+            let session_id = format!("created-{}", connect_splash_session_name("alpha"));
+            assert_eq!(
+                submitted.lock().unwrap().as_slice(),
+                [(session_id.clone(), connect_splash_prompt("alpha"))]
+            );
+            assert_eq!(deleted.lock().unwrap().as_slice(), [session_id]);
+            let path = delighters::default_connect_splash_cache_path("alpha").unwrap();
+            assert_eq!(
+                delighters::read_cached_connect_splash(
+                    &path,
+                    std::time::SystemTime::now(),
+                    delighters::CONNECT_SPLASH_TTL,
+                )
+                .as_deref(),
+                Some(expected.as_str())
+            );
+        });
+
+        match old_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    #[test]
     fn session_picker_entry_builds_switch_command_from_backend_id() {
         let entry = SessionPickerEntry {
             id: "sess-123".to_string(),
@@ -5702,6 +5873,32 @@ mod tests {
         assert!(!mutation_fence_allows_input("/models set primary"));
         assert!(!mutation_fence_allows_input("/clear"));
         assert!(!mutation_fence_allows_input("/save out.txt"));
+    }
+
+    #[test]
+    fn menu_recovery_commands_follow_mutation_fence_allowlist() {
+        for command in [
+            CMD_HELP,
+            CMD_WORKSPACE_LIST,
+            CMD_WORKSPACE_INFO,
+            CMD_MODELS_LIST,
+            CMD_MODELS_STATUS,
+            CMD_PROVIDERS_LIST,
+            CMD_MEMORY_SEARCH,
+            CMD_MEMORY_STATS,
+            CMD_MCP_STATUS,
+            CMD_SESSION_LIST,
+        ] {
+            let cmdline = menu_command_cmdline(command).unwrap();
+            assert!(
+                mutation_fence_allows_input(cmdline),
+                "{cmdline} should be available from the menu during recovery"
+            );
+        }
+
+        assert!(!mutation_fence_allows_input(
+            menu_command_cmdline(CMD_ABOUT).unwrap()
+        ));
     }
 
     #[test]
@@ -7451,6 +7648,7 @@ mod tests {
         submitted: Arc<StdMutex<Vec<(String, String)>>>,
         list_calls: Arc<StdMutex<usize>>,
         load_calls: Arc<StdMutex<Vec<String>>>,
+        submit_response: String,
     }
 
     #[async_trait::async_trait]
@@ -7535,7 +7733,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((session_id.to_string(), message.to_string()));
-            Ok(String::new())
+            Ok(self.submit_response.clone())
         }
     }
 
@@ -7568,6 +7766,7 @@ mod tests {
                 submitted: Arc::clone(&submitted),
                 list_calls,
                 load_calls: Arc::clone(&load_calls),
+                submit_response: String::new(),
             };
             let boxed: Box<dyn crate::cli::agent::AgentClient + Send + Sync> = Box::new(fake);
             let app = Arc::new(Mutex::new(App {
@@ -7638,6 +7837,7 @@ mod tests {
                 submitted: Arc::clone(&submitted),
                 list_calls: Arc::clone(&list_calls),
                 load_calls: Arc::clone(&load_calls),
+                submit_response: String::new(),
             };
             let boxed: Box<dyn crate::cli::agent::AgentClient + Send + Sync> = Box::new(fake);
             let app = Arc::new(Mutex::new(App {
@@ -7721,6 +7921,7 @@ mod tests {
                 submitted,
                 list_calls: Arc::clone(&list_calls),
                 load_calls: Arc::clone(&load_calls),
+                submit_response: String::new(),
             };
             let boxed: Box<dyn crate::cli::agent::AgentClient + Send + Sync> = Box::new(fake);
             let app = Arc::new(Mutex::new(App {
@@ -7793,6 +7994,7 @@ mod tests {
                 submitted,
                 list_calls,
                 load_calls: Arc::clone(&load_calls),
+                submit_response: String::new(),
             };
             let boxed: Box<dyn crate::cli::agent::AgentClient + Send + Sync> = Box::new(fake);
             let app = Arc::new(Mutex::new(App {
@@ -7877,6 +8079,7 @@ mod tests {
             submitted,
             list_calls: Arc::new(StdMutex::new(0)),
             load_calls: Arc::new(StdMutex::new(Vec::new())),
+            submit_response: String::new(),
         };
         let boxed: Box<dyn crate::cli::agent::AgentClient + Send + Sync> = Box::new(fake);
         let app = Arc::new(Mutex::new(App {
