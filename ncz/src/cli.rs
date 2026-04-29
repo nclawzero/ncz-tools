@@ -73,6 +73,11 @@ pub enum Command {
         #[command(subcommand)]
         action: McpAction,
     },
+    /// Create, verify, and restore host-side nclawzero backups.
+    Backup {
+        #[command(subcommand)]
+        action: BackupAction,
+    },
     /// Inspect or manage the sandbox runtime policy.
     Sandbox {
         #[command(subcommand)]
@@ -284,6 +289,38 @@ pub enum McpAction {
     Remove { name: String },
     /// Show an MCP server declaration.
     Show { name: String },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum BackupAction {
+    /// Create a tar.gz backup archive.
+    Create {
+        /// Archive path to write.
+        #[arg(long)]
+        to: std::path::PathBuf,
+        /// Include real API keys and tokens instead of redacting agent-env.
+        #[arg(long)]
+        include_secrets: bool,
+        /// Skip Podman volume exports.
+        #[arg(long)]
+        exclude_volumes: bool,
+    },
+    /// Verify manifest hashes in a backup archive.
+    Verify {
+        /// Archive path to verify.
+        archive: std::path::PathBuf,
+    },
+    /// Restore a backup archive.
+    Restore {
+        /// Archive path to restore.
+        archive: std::path::PathBuf,
+        /// Print writes and service actions without modifying the host.
+        #[arg(long)]
+        dry_run: bool,
+        /// Restore even if existing credential state is non-empty.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]

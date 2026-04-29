@@ -11,6 +11,7 @@
 
 pub mod agent;
 pub mod agent_env;
+pub mod backup;
 pub mod channel;
 pub mod mcp;
 pub mod providers;

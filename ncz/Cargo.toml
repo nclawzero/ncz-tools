@@ -1,7 +1,7 @@
 [package]
 name = "ncz"
-version = "0.3.0-alpha.1"
-description = "nclawzero device-ops umbrella CLI: status, set-agent, logs, api, providers, models, mcp, sandbox, integrity, update, channel, health, inspect, selftest"
+version = "0.3.0-alpha.2"
+description = "nclawzero device-ops umbrella CLI: status, set-agent, logs, api, providers, models, mcp, sandbox, backup, sessions, integrity, update, channel, health, inspect, selftest"
 keywords = ["nclawzero", "edge", "device-ops", "podman", "systemd"]
 categories = ["command-line-utilities"]
 edition.workspace = true
@@ -27,6 +27,8 @@ rustix = { version = "0.38", features = ["fs", "process"] }
 tempfile = "3.10"
 time = { version = "0.3", default-features = false, features = ["formatting", "macros"] }
 secrecy = { version = "0.8", features = ["serde"] }
+flate2 = "1.1"
+sha2 = "0.10"
 
 [dev-dependencies]
 tempfile = "3.10"
