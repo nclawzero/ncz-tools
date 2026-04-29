@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{mpsc, Mutex};
 use tracing::{info, warn};
 
 use turbo_vision::app::Application;
@@ -168,7 +168,6 @@ const SESSION_PICKER_LIST_TIMEOUT: Duration = Duration::from_secs(5);
 const COMMAND_WORKER_TIMEOUT: Duration = Duration::from_secs(30);
 const MUTATING_COMMAND_WORKER_TIMEOUT: Duration = Duration::from_secs(30);
 const CONNECT_SPLASH_GENERATION_TIMEOUT: Duration = Duration::from_secs(6);
-const CONNECT_SPLASH_STARTUP_TIMEOUT: Duration = Duration::from_millis(750);
 const RESPONSE_BUSY_TOAST: &str = "Busy: response in progress";
 const UI_EVENT_CAPACITY: usize = 512;
 const TURN_STREAM_CAPACITY: usize = 128;
@@ -1503,88 +1502,21 @@ async fn connect_splash_for_workspace_if_enabled(
 }
 
 async fn startup_connect_splash_for_workspace_if_enabled(
-    app: &Arc<Mutex<App>>,
+    _app: &Arc<Mutex<App>>,
     workspace_name: &str,
     policy: ConnectSplashPolicy,
-) -> Option<String> {
-    startup_connect_splash_for_workspace_if_enabled_with_timeout(
-        app,
-        workspace_name,
-        policy,
-        CONNECT_SPLASH_STARTUP_TIMEOUT,
-    )
-    .await
-}
-
-async fn startup_connect_splash_for_workspace_if_enabled_with_timeout(
-    app: &Arc<Mutex<App>>,
-    workspace_name: &str,
-    policy: ConnectSplashPolicy,
-    startup_timeout: Duration,
 ) -> Option<String> {
     if !policy.display {
         return None;
     }
-    if !policy.backend {
-        return Some(delighters::local_connect_splash(workspace_name));
+    if policy.backend {
+        let (_, cached) = read_connect_splash_cache(workspace_name);
+        if let Some(cached) = cached {
+            return Some(cached);
+        }
+        warn!("connect-splash startup cache miss; using local fallback to avoid blocking launch");
     }
-
-    let (tx, rx) = oneshot::channel();
-    let app = Arc::clone(app);
-    let workspace_name_owned = workspace_name.to_string();
-    tokio::spawn(async move {
-        let result =
-            connect_splash_for_workspace_if_enabled(&app, &workspace_name_owned, None, policy)
-                .await;
-        let _ = tx.send(result);
-    });
-
-    match tokio::time::timeout(startup_timeout, rx).await {
-        Ok(Ok(result)) => startup_connect_splash_result_fallback(workspace_name, policy, result),
-        Ok(Err(_)) => {
-            warn!("connect-splash startup worker dropped before returning; using local fallback");
-            Some(delighters::local_connect_splash(workspace_name))
-        }
-        Err(_) => {
-            warn!(
-                "connect-splash startup exceeded {:?}; using local fallback while cache generation continues",
-                startup_timeout
-            );
-            Some(format!(
-                "{}\n[warning] connect-splash backend generation exceeded startup budget; local splash shown while cache generation continues.\n",
-                delighters::local_connect_splash(workspace_name)
-            ))
-        }
-    }
-}
-
-fn startup_connect_splash_result_fallback(
-    workspace_name: &str,
-    policy: ConnectSplashPolicy,
-    result: Result<Option<String>>,
-) -> Option<String> {
-    match result {
-        Ok(splash) => splash,
-        Err(e) if is_connect_splash_cleanup_failure(&e) => {
-            let safe_error = sanitize_terminal_text(&e.to_string());
-            warn!(
-                "connect-splash startup cleanup failed: {safe_error}; using local fallback with visible warning"
-            );
-            policy.display.then(|| {
-                format!(
-                    "{}\n[warning] connect-splash backend cleanup failed; scratch session may remain.\n[warning] {}\n",
-                    delighters::local_connect_splash(workspace_name),
-                    safe_error
-                )
-            })
-        }
-        Err(e) => {
-            warn!("connect-splash startup failed: {e}; using local fallback");
-            policy
-                .display
-                .then(|| delighters::local_connect_splash(workspace_name))
-        }
-    }
+    Some(delighters::local_connect_splash(workspace_name))
 }
 
 async fn connect_splash_for_captured_workspace(
@@ -6132,7 +6064,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_connect_splash_cleanup_failure_renders_warning_and_local_fallback() {
+    fn startup_connect_splash_cache_miss_uses_local_without_backend_calls() {
         let _env = crate::cli::test_env_lock().lock().unwrap();
         let home = tempfile::tempdir().unwrap();
         let old_home = std::env::var_os("HOME");
@@ -6143,6 +6075,7 @@ mod tests {
             let created = Arc::new(StdMutex::new(Vec::new()));
             let deleted = Arc::new(StdMutex::new(Vec::new()));
             let submitted = Arc::new(StdMutex::new(Vec::new()));
+            let list_calls = Arc::new(StdMutex::new(0));
             let fake = WorkerSessionFakeClient {
                 listed_sessions: Vec::new(),
                 list_sessions_error: None,
@@ -6151,7 +6084,7 @@ mod tests {
                 created: Arc::clone(&created),
                 deleted: Arc::clone(&deleted),
                 submitted: Arc::clone(&submitted),
-                list_calls: Arc::new(StdMutex::new(0)),
+                list_calls: Arc::clone(&list_calls),
                 load_calls: Arc::new(StdMutex::new(Vec::new())),
                 submit_response: "GENERATED\nSPLASH".to_string(),
                 submit_error: None,
@@ -6192,14 +6125,14 @@ mod tests {
             )
             .await;
 
-            let splash = splash.expect("startup should render warning fallback");
-            assert!(splash.contains(&delighters::local_connect_splash("alpha")));
-            assert!(splash.contains("connect-splash backend cleanup failed"));
-            assert!(splash.contains("scratch session may remain"));
-            assert!(splash.contains("delete failed"));
-            assert_eq!(created.lock().unwrap().len(), 1);
-            assert_eq!(submitted.lock().unwrap().len(), 1);
-            assert_eq!(deleted.lock().unwrap().len(), 1);
+            assert_eq!(
+                splash.as_deref(),
+                Some(delighters::local_connect_splash("alpha").as_str())
+            );
+            assert_eq!(*list_calls.lock().unwrap(), 0);
+            assert!(created.lock().unwrap().is_empty());
+            assert!(submitted.lock().unwrap().is_empty());
+            assert!(deleted.lock().unwrap().is_empty());
             let path = delighters::default_connect_splash_cache_path("alpha").unwrap();
             assert!(!path.exists());
         });
@@ -6211,7 +6144,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_connect_splash_timeout_uses_local_fallback_without_waiting_for_generation() {
+    fn startup_connect_splash_cache_hit_uses_cached_text_without_backend_calls() {
         let _env = crate::cli::test_env_lock().lock().unwrap();
         let home = tempfile::tempdir().unwrap();
         let old_home = std::env::var_os("HOME");
@@ -6219,6 +6152,9 @@ mod tests {
 
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
+            let cache_path = delighters::default_connect_splash_cache_path("alpha").unwrap();
+            delighters::write_connect_splash_cache(&cache_path, "CACHED\nSPLASH").unwrap();
+            let list_calls = Arc::new(StdMutex::new(0));
             let fake = WorkerSessionFakeClient {
                 listed_sessions: Vec::new(),
                 list_sessions_error: None,
@@ -6227,7 +6163,7 @@ mod tests {
                 created: Arc::new(StdMutex::new(Vec::new())),
                 deleted: Arc::new(StdMutex::new(Vec::new())),
                 submitted: Arc::new(StdMutex::new(Vec::new())),
-                list_calls: Arc::new(StdMutex::new(0)),
+                list_calls: Arc::clone(&list_calls),
                 load_calls: Arc::new(StdMutex::new(Vec::new())),
                 submit_response: "GENERATED\nSPLASH".to_string(),
                 submit_error: None,
@@ -6258,25 +6194,19 @@ mod tests {
                 config_path: std::path::PathBuf::from("test-config.toml"),
             }));
 
-            let splash = tokio::time::timeout(
-                Duration::from_secs(1),
-                startup_connect_splash_for_workspace_if_enabled_with_timeout(
-                    &app,
-                    "alpha",
-                    ConnectSplashPolicy {
-                        display: true,
-                        backend: true,
-                    },
-                    Duration::from_millis(20),
-                ),
+            let splash = startup_connect_splash_for_workspace_if_enabled(
+                &app,
+                "alpha",
+                ConnectSplashPolicy {
+                    display: true,
+                    backend: true,
+                },
             )
             .await
-            .expect("startup splash should respect the outer startup timeout")
-            .expect("startup should render local fallback");
+            .expect("startup should render cached splash");
 
-            assert!(splash.contains(&delighters::local_connect_splash("alpha")));
-            assert!(splash.contains("exceeded startup budget"));
-            assert!(splash.contains("cache generation continues"));
+            assert_eq!(splash, "CACHED\nSPLASH");
+            assert_eq!(*list_calls.lock().unwrap(), 0);
         });
 
         match old_home {
@@ -7119,8 +7049,6 @@ mod tests {
         assert!(mutation_fence_allows_input("/sync"));
         assert!(mutation_fence_allows_input("/resync --force"));
         assert!(mutation_fence_allows_input("/sync force"));
-        assert!(mutation_fence_allows_input("/clear --force"));
-        assert!(mutation_fence_allows_input("/clear force"));
         assert!(mutation_fence_allows_input("/cron list"));
         assert!(mutation_fence_allows_input("/memory list"));
         assert!(mutation_fence_allows_input("/memory search deploy"));
@@ -7145,12 +7073,14 @@ mod tests {
         assert!(!mutation_fence_allows_input("/session create scratch"));
         assert!(!mutation_fence_allows_input("/models set primary"));
         assert!(!mutation_fence_allows_input("/clear"));
+        assert!(!mutation_fence_allows_input("/clear --force"));
+        assert!(!mutation_fence_allows_input("/clear force"));
         assert!(!mutation_fence_allows_input("/clear now"));
         assert!(!mutation_fence_allows_input("/save out.txt"));
     }
 
     #[test]
-    fn force_clear_recovery_dispatches_under_existing_mutation_fence() {
+    fn force_clear_recovery_is_blocked_by_existing_mutation_fence() {
         let _env = crate::cli::test_env_lock().lock().unwrap();
         let home = tempfile::tempdir().unwrap();
         let old_home = std::env::var_os("HOME");
@@ -7173,47 +7103,10 @@ mod tests {
         state.mutation_fence = Some(existing.reason.clone());
 
         let lines = Rc::new(RefCell::new(Vec::new()));
-        let (req_tx, mut req_rx) = mpsc::channel(4);
-        let mut response_in_flight = false;
-        assert_eq!(
-            dispatch_worker_backed_submission(
-                "/clear --force",
-                WorkerRequest::Command("/clear --force".to_string()),
-                &lines,
-                &req_tx,
-                &mut state,
-                &mut response_in_flight,
-                false,
-                None,
-                "dispatch",
-            ),
-            SubmissionStatus::Started
-        );
-        let WorkerRequest::Command(cmdline) = req_rx.try_recv().unwrap() else {
-            panic!("expected command request");
-        };
-        assert_eq!(cmdline, "/clear --force");
-        let request = state.in_flight_request.as_ref().unwrap();
-        assert!(!request.mutating_slash);
-        assert!(request.mutation_fence_owner.is_none());
-        assert_eq!(
-            delighters::mutation_fence_for_workspace(&key).unwrap(),
-            Some(existing.clone())
-        );
-
-        let (event_tx, mut event_rx) = mpsc::channel(4);
-        event_tx
-            .try_send(TurnChunk::Finished(Ok(String::new())))
-            .unwrap();
-        let mut typewriter_state = None;
-        let mut session_picker_state = SessionPickerState::default();
-        assert!(!drain_stream_events(
-            &mut event_rx,
-            &lines,
+        assert!(mutation_fence_blocks_submission(
             &mut state,
-            &mut typewriter_state,
-            &mut response_in_flight,
-            &mut session_picker_state
+            "/clear --force",
+            &lines
         ));
         let persisted_after = delighters::mutation_fence_for_workspace(&key).unwrap();
 
@@ -7222,8 +7115,11 @@ mod tests {
             None => std::env::remove_var("HOME"),
         }
 
-        assert!(!response_in_flight);
         assert_eq!(persisted_after, Some(existing));
+        assert!(lines
+            .borrow()
+            .join("\n")
+            .contains("mutation outcome is unknown"));
     }
 
     #[test]

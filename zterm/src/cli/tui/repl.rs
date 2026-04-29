@@ -1910,7 +1910,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_repl_force_clear_runs_under_existing_mutation_fence() {
+    fn legacy_repl_force_clear_is_blocked_by_existing_mutation_fence() {
         let _env = crate::cli::test_env_lock().lock().unwrap();
         let home = tempfile::tempdir().unwrap();
         let old_home = std::env::var_os("HOME");
@@ -1973,9 +1973,9 @@ mod tests {
                 .unwrap()
                 .unwrap();
 
-            assert!(out.contains("force-cleared"));
-            assert!(!history.exists());
-            assert!(!lock_dir.exists());
+            assert!(out.contains("mutation outcome is unknown"));
+            assert!(history.exists());
+            assert!(lock_dir.exists());
             assert_eq!(
                 delighters::mutation_fence_for_workspace("name:alpha").unwrap(),
                 Some(existing)

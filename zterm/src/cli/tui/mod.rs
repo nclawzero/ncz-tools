@@ -26,9 +26,6 @@ pub(crate) fn mutation_fence_allows_recovery_input(input: &str) -> bool {
         || (tokens.len() == 2
             && matches!(tokens[0].as_str(), "/resync" | "/sync")
             && matches!(tokens[1].as_str(), "--force" | "force"))
-        || (tokens.len() == 2
-            && tokens[0] == "/clear"
-            && matches!(tokens[1].as_str(), "--force" | "force"))
         || mutation_fence_allows_read_only_inspection(&tokens)
 }
 
