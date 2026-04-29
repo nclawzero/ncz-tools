@@ -1406,12 +1406,31 @@ async fn generate_connect_splash_with_client(
     }
 
     let session_name = connect_splash_session_name(workspace_name);
+    generate_connect_splash_with_named_session(client, workspace_name, &session_name).await
+}
+
+async fn generate_connect_splash_with_named_session(
+    client: &mut (dyn AgentClient + Send + Sync),
+    workspace_name: &str,
+    session_name: &str,
+) -> Result<String> {
+    let before = tokio::time::timeout(CONNECT_SPLASH_GENERATION_TIMEOUT, client.list_sessions())
+        .await
+        .map_err(|_| anyhow::anyhow!("connect-splash session inventory timed out"))??;
+    if before.iter().any(|session| session.name == session_name) {
+        anyhow::bail!("connect-splash scratch session already exists");
+    }
+
     let session = tokio::time::timeout(
         CONNECT_SPLASH_GENERATION_TIMEOUT,
-        client.create_session(&session_name),
+        client.create_session(session_name),
     )
     .await
     .map_err(|_| anyhow::anyhow!("connect-splash session create timed out"))??;
+    let owned_session = !before.iter().any(|existing| existing.id == session.id);
+    if !owned_session {
+        anyhow::bail!("connect-splash session id existed before activation");
+    }
 
     let prompt = connect_splash_prompt(workspace_name);
     let generated = tokio::time::timeout(
@@ -1421,15 +1440,17 @@ async fn generate_connect_splash_with_client(
     .await
     .map_err(|_| anyhow::anyhow!("connect-splash generation timed out"));
 
-    match tokio::time::timeout(
-        CONNECT_SPLASH_GENERATION_TIMEOUT,
-        client.delete_session(&session.id),
-    )
-    .await
-    {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => warn!("connect-splash scratch session cleanup failed: {e}"),
-        Err(_) => warn!("connect-splash scratch session cleanup timed out"),
+    if owned_session {
+        match tokio::time::timeout(
+            CONNECT_SPLASH_GENERATION_TIMEOUT,
+            client.delete_session(&session.id),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => warn!("connect-splash scratch session cleanup failed: {e}"),
+            Err(_) => warn!("connect-splash scratch session cleanup timed out"),
+        }
     }
 
     let generated = generated??;
@@ -1442,8 +1463,9 @@ async fn generate_connect_splash_with_client(
 
 fn connect_splash_session_name(workspace_name: &str) -> String {
     format!(
-        "zterm connect splash {}",
-        delighters::sanitize_workspace_name(workspace_name)
+        "zterm connect splash {} {}",
+        delighters::sanitize_workspace_name(workspace_name),
+        uuid::Uuid::new_v4()
     )
 }
 
@@ -3219,13 +3241,15 @@ fn should_open_slash_popup(key_code: u16, _input_empty: bool) -> bool {
 }
 
 fn worker_request_for_submitted_text(submitted: &str) -> (bool, WorkerRequest, Option<String>) {
-    let is_turn = !submitted.starts_with('/');
+    let command_text = submitted.trim_start();
+    let is_command = command_text.starts_with('/');
+    let is_turn = !is_command;
     let request = if is_turn {
         WorkerRequest::Turn(submitted.to_string())
     } else {
-        WorkerRequest::Command(submitted.to_string())
+        WorkerRequest::Command(command_text.to_string())
     };
-    let toast = (!is_turn).then(|| format!("Command: {submitted}"));
+    let toast = is_command.then(|| format!("Command: {command_text}"));
     (is_turn, request, toast)
 }
 
@@ -5279,11 +5303,9 @@ mod tests {
             let expected = delighters::normalize_connect_splash(generated);
 
             assert_eq!(splash, expected);
-            assert_eq!(
-                created.lock().unwrap()[0].name,
-                connect_splash_session_name("alpha")
-            );
-            let session_id = format!("created-{}", connect_splash_session_name("alpha"));
+            let created_name = created.lock().unwrap()[0].name.clone();
+            assert!(created_name.starts_with("zterm connect splash alpha "));
+            let session_id = format!("created-{created_name}");
             assert_eq!(
                 submitted.lock().unwrap().as_slice(),
                 [(session_id.clone(), connect_splash_prompt("alpha"))]
@@ -5372,6 +5394,49 @@ mod tests {
             Some(home) => std::env::set_var("HOME", home),
             None => std::env::remove_var("HOME"),
         }
+    }
+
+    #[test]
+    fn connect_splash_does_not_delete_preexisting_scratch_name() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let protected_name = "zterm connect splash alpha protected";
+            let protected = Session {
+                id: "real-session".to_string(),
+                name: protected_name.to_string(),
+                model: "model".to_string(),
+                provider: "provider".to_string(),
+            };
+            let created = Arc::new(StdMutex::new(Vec::new()));
+            let deleted = Arc::new(StdMutex::new(Vec::new()));
+            let submitted = Arc::new(StdMutex::new(Vec::new()));
+            let mut fake = WorkerSessionFakeClient {
+                listed_sessions: vec![protected],
+                list_sessions_error: None,
+                loadable_sessions: Vec::new(),
+                load_reject_ids: Vec::new(),
+                created: Arc::clone(&created),
+                deleted: Arc::clone(&deleted),
+                submitted: Arc::clone(&submitted),
+                list_calls: Arc::new(StdMutex::new(0)),
+                load_calls: Arc::new(StdMutex::new(Vec::new())),
+                submit_response: "SHOULD NOT BE USED".to_string(),
+                cancellation_safe: true,
+                sink_set_states: Arc::new(StdMutex::new(Vec::new())),
+            };
+
+            let err =
+                generate_connect_splash_with_named_session(&mut fake, "alpha", protected_name)
+                    .await
+                    .unwrap_err();
+
+            assert!(err
+                .to_string()
+                .contains("connect-splash scratch session already exists"));
+            assert!(created.lock().unwrap().is_empty());
+            assert!(submitted.lock().unwrap().is_empty());
+            assert!(deleted.lock().unwrap().is_empty());
+        });
     }
 
     #[test]
@@ -7308,6 +7373,15 @@ mod tests {
             toast,
             Some("Command: /cron add \"*/5 * * * *\" echo ok".to_string())
         );
+
+        let (is_turn, request, toast) = worker_request_for_submitted_text("  /clear");
+        assert!(!is_turn);
+        assert!(matches!(request, WorkerRequest::Command(cmd) if cmd == "/clear"));
+        assert_eq!(toast, Some("Command: /clear".to_string()));
+
+        let (is_turn, request, _) = worker_request_for_submitted_text(" \t/memory post secret");
+        assert!(!is_turn);
+        assert!(matches!(request, WorkerRequest::Command(cmd) if cmd == "/memory post secret"));
     }
 
     #[test]
