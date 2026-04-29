@@ -101,6 +101,8 @@ pub struct PrunedSession {
     pub agent: String,
     pub last_modified: String,
     pub deleted: bool,
+    pub skipped_due_to_change: bool,
+    pub already_gone: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -163,12 +165,18 @@ impl Render for SessionsExportReport {
 
 impl Render for SessionsPruneReport {
     fn render_text(&self, w: &mut dyn Write) -> io::Result<()> {
-        let action = if self.dry_run {
-            "would delete"
-        } else {
-            "deleted"
-        };
         for session in &self.sessions {
+            let action = if self.dry_run {
+                "would delete"
+            } else if session.skipped_due_to_change {
+                "skipped_due_to_change"
+            } else if session.already_gone {
+                "already gone"
+            } else if session.deleted {
+                "deleted"
+            } else {
+                "skipped"
+            };
             writeln!(
                 w,
                 "{} {}:{} last_modified={}",
@@ -307,6 +315,7 @@ pub fn prune(
     dry_run: bool,
 ) -> Result<SessionsPruneReport, NczError> {
     validate_cutoff(before)?;
+    let _lock = state::acquire_lock(&paths.lock_path)?;
     let (sessions, skipped_agents) = collect_sessions(ctx, paths, requested_agent)?;
     let mut candidates: Vec<PrunedSession> = sessions
         .into_iter()
@@ -318,14 +327,29 @@ pub fn prune(
             agent: session.agent,
             last_modified: session.last_modified,
             deleted: false,
+            skipped_due_to_change: false,
+            already_gone: false,
         })
         .collect();
 
     if !dry_run && !candidates.is_empty() {
-        let _lock = state::acquire_lock(&paths.lock_path)?;
         for session in &mut candidates {
-            delete_session(ctx, paths, &session.agent, &session.id)?;
-            session.deleted = true;
+            match fetch_session_last_modified(ctx, paths, &session.agent, &session.id)? {
+                SessionLastModified::Found(Some(last_modified))
+                    if last_modified == session.last_modified => {}
+                SessionLastModified::Found(_) => {
+                    session.skipped_due_to_change = true;
+                    continue;
+                }
+                SessionLastModified::AlreadyGone => {
+                    session.already_gone = true;
+                    continue;
+                }
+            }
+            match delete_session(ctx, paths, &session.agent, &session.id)? {
+                DeleteSessionResult::Deleted => session.deleted = true,
+                DeleteSessionResult::AlreadyGone => session.already_gone = true,
+            }
         }
     }
 
@@ -381,7 +405,7 @@ fn active_agents(ctx: &Context, requested_agent: Option<&str>) -> Result<Vec<Str
 
 fn list_zeroclaw_sessions(ctx: &Context, paths: &Paths) -> Result<Vec<SessionSummary>, NczError> {
     let port = zeroclaw_gateway_port(paths)?;
-    let value = get_zeroclaw_json(ctx, port, "/sessions")?;
+    let value = get_zeroclaw_json(ctx, port, "/api/sessions")?;
     parse_sessions(value, ZEROCLAW_AGENT)
 }
 
@@ -397,9 +421,57 @@ fn fetch_session_content(
         )));
     }
     let port = zeroclaw_gateway_port(paths)?;
-    let path = format!("/sessions/{}", percent_encode_path_segment(session_id));
-    let value = get_zeroclaw_json(ctx, port, &path)?;
-    Ok(content_from_value(value))
+    let session_id = percent_encode_path_segment(session_id);
+    let state_path = format!("/api/sessions/{session_id}/state");
+    let messages_path = format!("/api/sessions/{session_id}/messages");
+    let state = get_zeroclaw_json(ctx, port, &state_path)?;
+    let messages = get_zeroclaw_json(ctx, port, &messages_path)?;
+    Ok(content_from_parts(state, messages))
+}
+
+enum DeleteSessionResult {
+    Deleted,
+    AlreadyGone,
+}
+
+enum SessionLastModified {
+    Found(Option<String>),
+    AlreadyGone,
+}
+
+fn fetch_session_last_modified(
+    ctx: &Context,
+    paths: &Paths,
+    agent_name: &str,
+    session_id: &str,
+) -> Result<SessionLastModified, NczError> {
+    if agent_name != ZEROCLAW_AGENT {
+        return Err(NczError::Precondition(format!(
+            "{agent_name}: {UNSUPPORTED_REASON}"
+        )));
+    }
+    let port = zeroclaw_gateway_port(paths)?;
+    let path = format!(
+        "/api/sessions/{}/state",
+        percent_encode_path_segment(session_id)
+    );
+    let (status, body) = ctx.runner.http_get_local_body(
+        port,
+        &path,
+        SESSION_API_TIMEOUT_SECS,
+        SESSION_API_MAX_BYTES,
+    )?;
+    if status == 404 {
+        return Ok(SessionLastModified::AlreadyGone);
+    }
+    if status != 200 {
+        return Err(NczError::Exec {
+            cmd: "http_get_local_body".into(),
+            msg: format!("GET {path} returned HTTP {status}"),
+        });
+    }
+    let value: Value = serde_json::from_str(&body)?;
+    Ok(SessionLastModified::Found(last_modified_from_state(&value)))
 }
 
 fn delete_session(
@@ -407,25 +479,35 @@ fn delete_session(
     paths: &Paths,
     agent_name: &str,
     session_id: &str,
-) -> Result<(), NczError> {
+) -> Result<DeleteSessionResult, NczError> {
     if agent_name != ZEROCLAW_AGENT {
         return Err(NczError::Precondition(format!(
             "{agent_name}: {UNSUPPORTED_REASON}"
         )));
     }
     let port = zeroclaw_gateway_port(paths)?;
-    let path = format!("/sessions/{}", percent_encode_path_segment(session_id));
+    let path = format!("/api/sessions/{}", percent_encode_path_segment(session_id));
     let status = ctx
         .runner
         .http_delete_local(port, &path, SESSION_API_TIMEOUT_SECS)?;
-    if (200..300).contains(&status) || status == 404 {
-        Ok(())
+    if (200..300).contains(&status) {
+        Ok(DeleteSessionResult::Deleted)
+    } else if status == 404 {
+        Ok(DeleteSessionResult::AlreadyGone)
     } else {
         Err(NczError::Exec {
             cmd: "http_delete_local".into(),
             msg: format!("DELETE {path} returned HTTP {status}"),
         })
     }
+}
+
+fn last_modified_from_state(value: &Value) -> Option<String> {
+    string_field(value, &["last_modified", "updated_at", "modified_at"]).or_else(|| {
+        value.get("session").and_then(|session| {
+            string_field(session, &["last_modified", "updated_at", "modified_at"])
+        })
+    })
 }
 
 fn get_zeroclaw_json(ctx: &Context, port: u16, path: &str) -> Result<Value, NczError> {
@@ -478,7 +560,7 @@ fn parse_sessions(value: Value, agent_name: &str) -> Result<Vec<SessionSummary>,
         array
     } else {
         return Err(NczError::Precondition(
-            "zeroclaw /sessions response did not contain a sessions array".to_string(),
+            "zeroclaw /api/sessions response did not contain a sessions array".to_string(),
         ));
     };
 
@@ -505,25 +587,26 @@ fn parse_sessions(value: Value, agent_name: &str) -> Result<Vec<SessionSummary>,
     Ok(sessions)
 }
 
-fn content_from_value(value: Value) -> SessionContent {
-    let session = value
+fn content_from_parts(state: Value, message_body: Value) -> SessionContent {
+    let session = state
         .get("session")
         .cloned()
-        .unwrap_or_else(|| value.clone());
-    let messages = value
+        .unwrap_or_else(|| state.clone());
+    let messages = message_body
         .get("messages")
         .or_else(|| {
-            value
+            message_body
                 .get("session")
                 .and_then(|session| session.get("messages"))
         })
         .and_then(Value::as_array)
         .cloned()
+        .or_else(|| message_body.as_array().cloned())
         .unwrap_or_default();
-    let metadata = value
+    let metadata = state
         .get("metadata")
         .or_else(|| {
-            value
+            state
                 .get("session")
                 .and_then(|session| session.get("metadata"))
         })
@@ -571,6 +654,8 @@ fn redact_value(value: &mut Value) {
         Value::String(text) => {
             if common::redact_path(Path::new(text)) {
                 *text = "***".to_string();
+            } else if let Some(redacted) = redact_secret_value_patterns(text) {
+                *text = redacted;
             } else {
                 *text = common::redact_line(text, false);
             }
@@ -582,15 +667,108 @@ fn redact_value(value: &mut Value) {
 fn is_secret_key(key: &str) -> bool {
     let key = key.to_ascii_lowercase();
     key == "key"
+        || key.contains("aws_access_key_id")
+        || key.contains("aws_secret_access_key")
+        || key.contains("accesskeyid")
+        || key.contains("secretaccesskey")
+        || key.contains("sessiontoken")
+        || key.contains("cookie")
         || key.contains("token")
         || key.contains("secret")
         || key.contains("password")
         || key.contains("authorization")
+        || key.contains("bearer")
+        || key.contains("x-api-key")
+        || key.contains("x_api_key")
         || key.contains("api_key")
         || key.contains("api-key")
         || key.contains("apikey")
         || key.ends_with("_key")
         || key.ends_with("-key")
+}
+
+fn redact_secret_value_patterns(text: &str) -> Option<String> {
+    let ranges = secret_value_ranges(text);
+    if ranges.is_empty() {
+        return None;
+    }
+    let mut redacted = String::with_capacity(text.len());
+    let mut cursor = 0;
+    for (start, end) in ranges {
+        if start < cursor {
+            continue;
+        }
+        redacted.push_str(&text[cursor..start]);
+        redacted.push_str("***");
+        cursor = end;
+    }
+    redacted.push_str(&text[cursor..]);
+    Some(redacted)
+}
+
+fn secret_value_ranges(text: &str) -> Vec<(usize, usize)> {
+    let bytes = text.as_bytes();
+    let mut ranges = Vec::new();
+    let mut idx = 0;
+    while idx < bytes.len() {
+        if bytes[idx..].starts_with(b"sk-") {
+            let end = scan_while(bytes, idx + 3, |byte| byte.is_ascii_alphanumeric());
+            if end - (idx + 3) >= 20 {
+                ranges.push((idx, end));
+                idx = end;
+                continue;
+            }
+        } else if bytes[idx..].starts_with(b"ghp_") {
+            let end = scan_while(bytes, idx + 4, |byte| {
+                byte.is_ascii_uppercase() || byte.is_ascii_digit()
+            });
+            if end - (idx + 4) >= 36 {
+                ranges.push((idx, end));
+                idx = end;
+                continue;
+            }
+        } else if bytes[idx..].starts_with(b"xoxb-") {
+            let end = scan_while(bytes, idx + 5, |byte| {
+                byte.is_ascii_digit() || byte == b'-'
+            });
+            if end > idx + 5 {
+                ranges.push((idx, end));
+                idx = end;
+                continue;
+            }
+        } else if bytes[idx..].starts_with(b"AIza") {
+            let end = scan_while(bytes, idx + 4, |byte| {
+                byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-'
+            });
+            if end - (idx + 4) >= 35 {
+                ranges.push((idx, end));
+                idx = end;
+                continue;
+            }
+        } else if bytes[idx..].starts_with(b"AKIA") {
+            let end = scan_while(bytes, idx + 4, |byte| {
+                byte.is_ascii_uppercase() || byte.is_ascii_digit()
+            });
+            if end - (idx + 4) >= 16 {
+                ranges.push((idx, end));
+                idx = end;
+                continue;
+            }
+        }
+        idx += 1;
+    }
+    ranges
+}
+
+fn scan_while(
+    bytes: &[u8],
+    mut idx: usize,
+    mut predicate: impl FnMut(u8) -> bool,
+) -> usize {
+    while idx < bytes.len() && predicate(bytes[idx]) {
+        idx += 1;
+    }
+    idx
 }
 
 fn string_field(value: &Value, keys: &[&str]) -> Option<String> {
@@ -735,17 +913,35 @@ mod tests {
         r#"{"sessions":[{"id":"s-new","workspace":"/work/new","last_modified":"2026-04-01T00:00:00Z","message_count":3},{"id":"s-old","workspace":"/work/old","last_modified":"2025-01-01T00:00:00Z","message_count":2}]}"#
     }
 
-    fn session_body(secret: &str) -> String {
+    fn session_state_body(secret: &str) -> String {
         format!(
             r#"{{
                 "session": {{"id":"s-new","workspace":"/work/new","secret_path":"/tmp/token/file"}},
-                "messages": [
-                    {{"role":"user","content":"OPENAI_API_KEY={secret}"}},
-                    {{"role":"assistant","content":"done","token":"{secret}"}}
-                ],
                 "metadata": {{"api_key":"{secret}","path":"/tmp/secret/config"}}
             }}"#
         )
+    }
+
+    fn session_messages_body(secret: &str) -> String {
+        format!(
+            r#"{{
+                "messages": [
+                    {{"role":"user","content":"OPENAI_API_KEY={secret}"}},
+                    {{"role":"assistant","content":"done","token":"{secret}"}}
+                ]
+            }}"#
+        )
+    }
+
+    fn session_last_modified_body(session_id: &str, last_modified: &str) -> String {
+        format!(r#"{{"session":{{"id":"{session_id}","last_modified":"{last_modified}"}}}}"#)
+    }
+
+    fn expect_show_session(runner: &FakeRunner, state_body: &str, messages_body: &str) {
+        expect_one_active(runner, "zeroclaw", true);
+        runner.expect_http_body(42617, "/api/sessions", 200, sessions_body());
+        runner.expect_http_body(42617, "/api/sessions/s-new/state", 200, state_body);
+        runner.expect_http_body(42617, "/api/sessions/s-new/messages", 200, messages_body);
     }
 
     #[test]
@@ -755,7 +951,7 @@ mod tests {
         fs::create_dir_all(&paths.etc_dir).unwrap();
         let runner = FakeRunner::new();
         expect_active(&runner, &["zeroclaw", "openclaw"]);
-        runner.expect_http_body(42617, "/sessions", 200, sessions_body());
+        runner.expect_http_body(42617, "/api/sessions", 200, sessions_body());
 
         let report = list(&ctx(&runner, false), &paths, None).unwrap();
 
@@ -773,7 +969,7 @@ mod tests {
         fs::create_dir_all(&paths.etc_dir).unwrap();
         let runner = FakeRunner::new();
         expect_one_active(&runner, "zeroclaw", true);
-        runner.expect_http_body(42617, "/sessions", 200, sessions_body());
+        runner.expect_http_body(42617, "/api/sessions", 200, sessions_body());
 
         let report = list(&ctx(&runner, false), &paths, Some("zeroclaw")).unwrap();
 
@@ -789,8 +985,19 @@ mod tests {
         fs::create_dir_all(&paths.etc_dir).unwrap();
         let runner = FakeRunner::new();
         expect_one_active(&runner, "zeroclaw", true);
-        runner.expect_http_body(42617, "/sessions", 200, sessions_body());
-        runner.expect_http_body(42617, "/sessions/s-new", 200, &session_body("sk-live"));
+        runner.expect_http_body(42617, "/api/sessions", 200, sessions_body());
+        runner.expect_http_body(
+            42617,
+            "/api/sessions/s-new/state",
+            200,
+            &session_state_body("sk-live"),
+        );
+        runner.expect_http_body(
+            42617,
+            "/api/sessions/s-new/messages",
+            200,
+            &session_messages_body("sk-live"),
+        );
 
         let report = show(&ctx(&runner, false), &paths, "s-new", Some("zeroclaw")).unwrap();
         let json = serde_json::to_string(&report).unwrap();
@@ -807,13 +1014,121 @@ mod tests {
         fs::create_dir_all(&paths.etc_dir).unwrap();
         let runner = FakeRunner::new();
         expect_one_active(&runner, "zeroclaw", true);
-        runner.expect_http_body(42617, "/sessions", 200, sessions_body());
-        runner.expect_http_body(42617, "/sessions/s-new", 200, &session_body("sk-live"));
+        runner.expect_http_body(42617, "/api/sessions", 200, sessions_body());
+        runner.expect_http_body(
+            42617,
+            "/api/sessions/s-new/state",
+            200,
+            &session_state_body("sk-live"),
+        );
+        runner.expect_http_body(
+            42617,
+            "/api/sessions/s-new/messages",
+            200,
+            &session_messages_body("sk-live"),
+        );
 
         let report = show(&ctx(&runner, true), &paths, "s-new", Some("zeroclaw")).unwrap();
         let json = serde_json::to_string(&report).unwrap();
 
         assert!(json.contains("sk-live"));
+        runner.assert_done();
+    }
+
+    #[test]
+    fn show_redacts_aws_access_key_in_message_body() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        fs::create_dir_all(&paths.etc_dir).unwrap();
+        let aws_key = "AKIAABCDEFGHIJKLMNOP";
+        let messages = format!(
+            r#"{{"messages":[{{"role":"tool","body":{{"AWS_ACCESS_KEY_ID":"{aws_key}"}}}}]}}"#
+        );
+        let runner = FakeRunner::new();
+        expect_show_session(&runner, r#"{"session":{"id":"s-new"}}"#, &messages);
+
+        let report = show(&ctx(&runner, false), &paths, "s-new", Some("zeroclaw")).unwrap();
+        let json = serde_json::to_string(&report).unwrap();
+
+        assert!(!json.contains(aws_key));
+        assert!(json.contains("***"));
+        runner.assert_done();
+    }
+
+    #[test]
+    fn show_redacts_camelcase_apikey_field() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        fs::create_dir_all(&paths.etc_dir).unwrap();
+        let state = r#"{"session":{"id":"s-new"},"metadata":{"apiKey":"camel-secret"}}"#;
+        let runner = FakeRunner::new();
+        expect_show_session(&runner, state, r#"{"messages":[]}"#);
+
+        let report = show(&ctx(&runner, false), &paths, "s-new", Some("zeroclaw")).unwrap();
+        let json = serde_json::to_string(&report).unwrap();
+
+        assert!(!json.contains("camel-secret"));
+        assert!(json.contains("***"));
+        runner.assert_done();
+    }
+
+    #[test]
+    fn show_redacts_bare_openai_sk_token_in_message_text() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        fs::create_dir_all(&paths.etc_dir).unwrap();
+        let openai_key = "sk-abcdefghijklmnopqrstuvwxyz";
+        let messages =
+            format!(r#"{{"messages":[{{"role":"user","content":"use {openai_key} now"}}]}}"#);
+        let runner = FakeRunner::new();
+        expect_show_session(&runner, r#"{"session":{"id":"s-new"}}"#, &messages);
+
+        let report = show(&ctx(&runner, false), &paths, "s-new", Some("zeroclaw")).unwrap();
+        let json = serde_json::to_string(&report).unwrap();
+
+        assert!(!json.contains(openai_key));
+        assert!(json.contains("use *** now"));
+        runner.assert_done();
+    }
+
+    #[test]
+    fn show_redacts_cookie_header_value() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        fs::create_dir_all(&paths.etc_dir).unwrap();
+        let state = r#"{"session":{"id":"s-new"},"metadata":{"headers":{"Cookie":"session=clear-cookie"}}}"#;
+        let runner = FakeRunner::new();
+        expect_show_session(&runner, state, r#"{"messages":[]}"#);
+
+        let report = show(&ctx(&runner, false), &paths, "s-new", Some("zeroclaw")).unwrap();
+        let json = serde_json::to_string(&report).unwrap();
+
+        assert!(!json.contains("clear-cookie"));
+        assert!(json.contains("***"));
+        runner.assert_done();
+    }
+
+    #[test]
+    fn show_with_show_secrets_emits_them_unredacted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        fs::create_dir_all(&paths.etc_dir).unwrap();
+        let aws_key = "AKIAABCDEFGHIJKLMNOP";
+        let openai_key = "sk-abcdefghijklmnopqrstuvwxyz";
+        let state = r#"{"session":{"id":"s-new"},"metadata":{"apiKey":"camel-secret","Cookie":"session=clear-cookie"}}"#;
+        let messages = format!(
+            r#"{{"messages":[{{"role":"tool","body":{{"AWS_ACCESS_KEY_ID":"{aws_key}"}}}},{{"role":"user","content":"use {openai_key} now"}}]}}"#
+        );
+        let runner = FakeRunner::new();
+        expect_show_session(&runner, state, &messages);
+
+        let report = show(&ctx(&runner, true), &paths, "s-new", Some("zeroclaw")).unwrap();
+        let json = serde_json::to_string(&report).unwrap();
+
+        assert!(json.contains(aws_key));
+        assert!(json.contains(openai_key));
+        assert!(json.contains("camel-secret"));
+        assert!(json.contains("clear-cookie"));
         runner.assert_done();
     }
 
@@ -825,8 +1140,19 @@ mod tests {
         let to = tmp.path().join("bundle.json");
         let runner = FakeRunner::new();
         expect_one_active(&runner, "zeroclaw", true);
-        runner.expect_http_body(42617, "/sessions", 200, sessions_body());
-        runner.expect_http_body(42617, "/sessions/s-new", 200, &session_body("sk-live"));
+        runner.expect_http_body(42617, "/api/sessions", 200, sessions_body());
+        runner.expect_http_body(
+            42617,
+            "/api/sessions/s-new/state",
+            200,
+            &session_state_body("sk-live"),
+        );
+        runner.expect_http_body(
+            42617,
+            "/api/sessions/s-new/messages",
+            200,
+            &session_messages_body("sk-live"),
+        );
         runner.expect(
             "date",
             &["-u", "+%Y-%m-%dT%H:%M:%SZ"],
@@ -853,7 +1179,7 @@ mod tests {
         fs::create_dir_all(&paths.etc_dir).unwrap();
         let runner = FakeRunner::new();
         expect_one_active(&runner, "zeroclaw", true);
-        runner.expect_http_body(42617, "/sessions", 200, sessions_body());
+        runner.expect_http_body(42617, "/api/sessions", 200, sessions_body());
 
         let report = prune(
             &ctx(&runner, false),
@@ -866,7 +1192,7 @@ mod tests {
 
         assert_eq!(report.sessions.len(), 1);
         assert!(!report.sessions[0].deleted);
-        assert!(!paths.lock_path.exists());
+        assert!(paths.lock_path.exists());
         runner.assert_done();
     }
 
@@ -877,8 +1203,14 @@ mod tests {
         fs::create_dir_all(&paths.etc_dir).unwrap();
         let runner = FakeRunner::new();
         expect_one_active(&runner, "zeroclaw", true);
-        runner.expect_http_body(42617, "/sessions", 200, sessions_body());
-        runner.expect_http_delete(42617, "/sessions/s-old", 204);
+        runner.expect_http_body(42617, "/api/sessions", 200, sessions_body());
+        runner.expect_http_body(
+            42617,
+            "/api/sessions/s-old/state",
+            200,
+            &session_last_modified_body("s-old", "2025-01-01T00:00:00Z"),
+        );
+        runner.expect_http_delete(42617, "/api/sessions/s-old", 204);
 
         let report = prune(
             &ctx(&runner, false),
@@ -892,6 +1224,71 @@ mod tests {
         assert!(paths.lock_path.exists());
         assert_eq!(report.sessions.len(), 1);
         assert!(report.sessions[0].deleted);
+        assert!(!report.sessions[0].skipped_due_to_change);
+        assert!(!report.sessions[0].already_gone);
+        runner.assert_done();
+    }
+
+    #[test]
+    fn prune_skips_candidate_whose_last_modified_changed_under_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        fs::create_dir_all(&paths.etc_dir).unwrap();
+        let runner = FakeRunner::new();
+        expect_one_active(&runner, "zeroclaw", true);
+        runner.expect_http_body(42617, "/api/sessions", 200, sessions_body());
+        runner.expect_http_body(
+            42617,
+            "/api/sessions/s-old/state",
+            200,
+            &session_last_modified_body("s-old", "2026-02-01T00:00:00Z"),
+        );
+
+        let report = prune(
+            &ctx(&runner, false),
+            &paths,
+            "2026-01-01",
+            Some("zeroclaw"),
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(report.sessions.len(), 1);
+        assert!(!report.sessions[0].deleted);
+        assert!(report.sessions[0].skipped_due_to_change);
+        assert!(!report.sessions[0].already_gone);
+        runner.assert_done();
+    }
+
+    #[test]
+    fn prune_404_reported_as_already_gone_not_deleted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        fs::create_dir_all(&paths.etc_dir).unwrap();
+        let runner = FakeRunner::new();
+        expect_one_active(&runner, "zeroclaw", true);
+        runner.expect_http_body(42617, "/api/sessions", 200, sessions_body());
+        runner.expect_http_body(
+            42617,
+            "/api/sessions/s-old/state",
+            200,
+            &session_last_modified_body("s-old", "2025-01-01T00:00:00Z"),
+        );
+        runner.expect_http_delete(42617, "/api/sessions/s-old", 404);
+
+        let report = prune(
+            &ctx(&runner, false),
+            &paths,
+            "2026-01-01",
+            Some("zeroclaw"),
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(report.sessions.len(), 1);
+        assert!(!report.sessions[0].deleted);
+        assert!(!report.sessions[0].skipped_due_to_change);
+        assert!(report.sessions[0].already_gone);
         runner.assert_done();
     }
 
@@ -902,7 +1299,7 @@ mod tests {
         fs::create_dir_all(&paths.etc_dir).unwrap();
         let runner = FakeRunner::new();
         expect_active(&runner, &["zeroclaw", "hermes"]);
-        runner.expect_http_body(42617, "/sessions", 200, sessions_body());
+        runner.expect_http_body(42617, "/api/sessions", 200, sessions_body());
 
         let report = prune(&ctx(&runner, false), &paths, "2026-01-01", None, true).unwrap();
 
