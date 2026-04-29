@@ -1492,6 +1492,18 @@ fn write_private_export_atomically<F>(path: &Path, write_content: F) -> io::Resu
 where
     F: FnOnce(&mut fs::File) -> io::Result<()>,
 {
+    write_private_export_atomically_with_sync(path, write_content, sync_parent_dir)
+}
+
+fn write_private_export_atomically_with_sync<F, S>(
+    path: &Path,
+    write_content: F,
+    sync_parent: S,
+) -> io::Result<()>
+where
+    F: FnOnce(&mut fs::File) -> io::Result<()>,
+    S: Fn(&Path) -> io::Result<()>,
+{
     if path.exists() {
         return Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
@@ -1506,11 +1518,27 @@ where
         temp_file.sync_all()?;
         drop(temp_file);
         fs::hard_link(&temp_path, path)?;
+        sync_parent(path)?;
         Ok(())
     })();
 
     let _ = fs::remove_file(&temp_path);
+    let _ = sync_parent(&temp_path);
     result
+}
+
+#[cfg(unix)]
+fn sync_parent_dir(path: &Path) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::File::open(parent)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_parent_dir(_path: &Path) -> io::Result<()> {
+    Ok(())
 }
 
 fn create_private_export_temp_file(path: &Path) -> io::Result<(PathBuf, fs::File)> {
@@ -3860,6 +3888,27 @@ provider_settings = { tokens = ["array-token-1", "array-token-2"], name = "kept"
             leftovers.is_empty(),
             "atomic export left temporary files behind: {leftovers:?}"
         );
+    }
+
+    #[test]
+    fn private_export_atomic_write_reports_parent_sync_failure() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let save_path = tempdir.path().join("sync-failure-export.txt");
+
+        let err = super::write_private_export_atomically_with_sync(
+            &save_path,
+            |dst| {
+                use std::io::Write;
+
+                dst.write_all(b"transcript")?;
+                Ok(())
+            },
+            |_path| Err(std::io::Error::other("injected parent sync failure")),
+        )
+        .unwrap_err();
+
+        assert_eq!(err.kind(), std::io::ErrorKind::Other);
+        assert!(err.to_string().contains("injected parent sync failure"));
     }
 
     #[tokio::test]
