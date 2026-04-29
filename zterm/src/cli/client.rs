@@ -7,7 +7,16 @@ use std::io::{self, Write};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use tokio::net::TcpStream;
-use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::{
+    connect_async,
+    tungstenite::{
+        client::IntoClientRequest,
+        handshake::client::Request,
+        http::{header::AUTHORIZATION, HeaderValue},
+        Message,
+    },
+    MaybeTlsStream, WebSocketStream,
+};
 
 use crate::cli::agent::{StreamSink, TurnChunk, TurnUsage};
 
@@ -551,9 +560,9 @@ impl ZeroclawClient {
     pub async fn submit_turn(&self, session_id: &str, message: &str) -> Result<String> {
         let model = self.current_model_key();
 
-        if let Ok(url) = self.ws_chat_url(session_id) {
+        if let Ok(request) = self.ws_chat_request(session_id) {
             if let Ok(Ok((ws_stream, _))) =
-                tokio::time::timeout(ZEROCLAW_WS_CONNECT_TIMEOUT, connect_async(url.as_str())).await
+                tokio::time::timeout(ZEROCLAW_WS_CONNECT_TIMEOUT, connect_async(request)).await
             {
                 return self
                     .submit_turn_ws_connected(ws_stream, session_id, message, &model)
@@ -587,12 +596,23 @@ impl ZeroclawClient {
                 pairs.append_pair("session_id", session_id);
                 pairs.append_pair("name", session_id);
             }
-            if !self.token.is_empty() {
-                pairs.append_pair("token", &self.token);
-            }
         }
 
         Ok(url.to_string())
+    }
+
+    fn ws_chat_request(&self, session_id: &str) -> Result<Request> {
+        let url = self.ws_chat_url(session_id)?;
+        let mut request = url
+            .as_str()
+            .into_client_request()
+            .map_err(|e| anyhow!("Failed to build zeroclaw WebSocket request: {e}"))?;
+        if !self.token.is_empty() {
+            let value = HeaderValue::from_str(&format!("Bearer {}", self.token))
+                .map_err(|e| anyhow!("Invalid zeroclaw auth token for WebSocket header: {e}"))?;
+            request.headers_mut().insert(AUTHORIZATION, value);
+        }
+        Ok(request)
     }
 
     async fn submit_turn_ws_connected(
@@ -2036,13 +2056,14 @@ fallback = "gemini"
     }
 
     #[test]
-    fn ws_chat_url_targets_chat_endpoint_with_session_and_token() {
+    fn ws_chat_request_targets_chat_endpoint_without_query_token() {
         let client = ZeroclawClient::new(
             "http://localhost:42617".to_string(),
             "test_token".to_string(),
         );
 
-        let url = client.ws_chat_url("main session").unwrap();
+        let request = client.ws_chat_request("main session").unwrap();
+        let url = request.uri().to_string();
         let parsed = reqwest::Url::parse(&url).unwrap();
         let pairs: std::collections::BTreeMap<_, _> = parsed.query_pairs().into_owned().collect();
 
@@ -2055,7 +2076,14 @@ fallback = "gemini"
             Some("main session")
         );
         assert_eq!(pairs.get("name").map(String::as_str), Some("main session"));
-        assert_eq!(pairs.get("token").map(String::as_str), Some("test_token"));
+        assert!(!pairs.contains_key("token"));
+        assert_eq!(
+            request
+                .headers()
+                .get(AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer test_token")
+        );
     }
 
     #[test]

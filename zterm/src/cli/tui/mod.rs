@@ -282,11 +282,17 @@ pub async fn run(
         .and_then(|v| v.get("splash_screen"))
         .and_then(|v| v.as_bool())
         .unwrap_or(true); // Default: show splash
-    let backend_connect_splash = config
+    let backend_connect_splash_requested = config
         .get("ui")
         .and_then(|v| v.get("connect_splash_backend"))
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    if backend_connect_splash_requested {
+        warn!(
+            "[ui].connect_splash_backend is reserved until an agent client exposes side-effect-free splash generation; using local connect splash"
+        );
+    }
+    let backend_connect_splash = false;
 
     if show_splash {
         splash::display_splash(&session_name, &active_gateway_url, &model, &provider);
