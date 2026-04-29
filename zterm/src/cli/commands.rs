@@ -666,6 +666,7 @@ impl CommandHandler {
                 let limit = rest
                     .first()
                     .and_then(|s| s.parse::<usize>().ok())
+                    .map(cap_memory_limit)
                     .unwrap_or(10);
                 out.push_str(&format!("\n📚 Recent memories (limit {limit}):\n"));
                 let res = match self.current_mnemos().await {
@@ -1550,6 +1551,8 @@ fn harden_private_export_file(_path: &Path) -> io::Result<()> {
 }
 
 const CONFIG_SECRET_MASK: &str = "***REDACTED***";
+const CONFIG_OUTPUT_MAX_BYTES: u64 = 512 * 1024;
+const MEMORY_LIST_LIMIT_MAX: usize = 50;
 const CONFIG_SECRET_KEY_FRAGMENTS: &[&str] = &[
     "token",
     "secret",
@@ -1560,6 +1563,16 @@ const CONFIG_SECRET_KEY_FRAGMENTS: &[&str] = &[
 ];
 
 fn load_config_at(path: &Path) -> Result<String> {
+    let metadata = fs::metadata(path)
+        .map_err(|e| anyhow!("Failed to read config {}: {}", path.display(), e))?;
+    if metadata.len() > CONFIG_OUTPUT_MAX_BYTES {
+        anyhow::bail!(
+            "config {} is {} bytes, exceeding the {} byte display limit",
+            path.display(),
+            metadata.len(),
+            CONFIG_OUTPUT_MAX_BYTES
+        );
+    }
     fs::read_to_string(path).map_err(|e| anyhow!("Failed to read config {}: {}", path.display(), e))
 }
 
@@ -2376,10 +2389,14 @@ fn parse_search_args(rest: &[&str]) -> (String, usize) {
     if let Some(last) = rest.last() {
         if let Ok(n) = last.parse::<usize>() {
             let query = rest[..rest.len() - 1].join(" ");
-            return (query, n);
+            return (query, cap_memory_limit(n));
         }
     }
     (rest.join(" "), 10)
+}
+
+fn cap_memory_limit(limit: usize) -> usize {
+    limit.min(MEMORY_LIST_LIMIT_MAX)
 }
 
 fn parse_post_args(rest: &[&str]) -> (String, Option<String>) {
@@ -2651,6 +2668,64 @@ mod tests {
             .output
             .unwrap()
             .contains("Memory saved: (unknown id)"));
+    }
+
+    #[tokio::test]
+    async fn memory_get_oversized_body_renders_bounded_not_found() {
+        let mut server = mockito::Server::new_async().await;
+        let body = format!(
+            "{{\"id\":\"mem-big\",\"content\":\"{}\"}}",
+            "x".repeat(600 * 1024)
+        );
+        let _mock = server
+            .mock("GET", "/memories/mem-big")
+            .with_status(200)
+            .with_body(body)
+            .create_async()
+            .await;
+        let mnemos = crate::cli::mnemos::MnemosClient::new(server.url(), "test_token");
+        let handler = super::CommandHandler::new(app_with_fake_client_and_mnemos(mnemos).await);
+
+        let output = handler
+            .handle_with_outcome("/memory get mem-big", "main")
+            .await
+            .unwrap()
+            .output
+            .unwrap();
+
+        assert!(output.contains("Memory not found: mem-big"));
+        assert!(output.len() < 4096);
+    }
+
+    #[tokio::test]
+    async fn memory_stats_oversized_body_renders_bounded_unavailable() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("GET", "/stats")
+            .with_status(200)
+            .with_body("x".repeat(600 * 1024))
+            .create_async()
+            .await;
+        let mnemos = crate::cli::mnemos::MnemosClient::new(server.url(), "test_token");
+        let handler = super::CommandHandler::new(app_with_fake_client_and_mnemos(mnemos).await);
+
+        let output = handler
+            .handle_with_outcome("/memory stats", "main")
+            .await
+            .unwrap()
+            .output
+            .unwrap();
+
+        assert!(output.contains("unavailable"));
+        assert!(output.len() < 4096);
+    }
+
+    #[test]
+    fn memory_search_limit_is_capped() {
+        let (query, limit) = super::parse_search_args(&["semantic", "999999"]);
+
+        assert_eq!(query, "semantic");
+        assert_eq!(limit, super::MEMORY_LIST_LIMIT_MAX);
     }
 
     #[test]

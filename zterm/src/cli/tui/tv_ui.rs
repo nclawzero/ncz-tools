@@ -156,6 +156,7 @@ const UI_EVENT_CAPACITY: usize = 512;
 const TURN_STREAM_CAPACITY: usize = 128;
 const TURN_TOKEN_COALESCE_BYTES: usize = 4096;
 const TURN_STREAM_MAX_BYTES: usize = 2 * 1024 * 1024;
+const WORKER_COMMAND_OUTPUT_MAX_BYTES: usize = TURN_STREAM_MAX_BYTES;
 const COMMAND_ERROR_ALREADY_RENDERED: &str = "__zterm_command_error_already_rendered__";
 const PARTIAL_STREAM_INCOMPLETE_REASON: &str =
     "partial response incomplete; backend stream ended without a finished frame";
@@ -1151,7 +1152,7 @@ async fn handle_worker_command_request(
                     &text,
                     command_output.mutation_outcome_unknown,
                 );
-                let _ = worker_sink.send(TurnChunk::Token(text));
+                let _ = worker_sink.send(TurnChunk::Token(cap_worker_command_output(text)));
                 let mut workspace_switched = false;
                 if preflight == CommandSessionPreflight::AfterWorkspaceSwitch {
                     let switched_workspace = {
@@ -1511,6 +1512,33 @@ fn command_output_indicates_error(output: &str) -> bool {
             let line = line.trim_start();
             line.starts_with("❌") || line.contains(" is only supported")
         })
+}
+
+fn cap_worker_command_output(text: String) -> String {
+    if text.len() <= WORKER_COMMAND_OUTPUT_MAX_BYTES {
+        return text;
+    }
+
+    let notice = format!(
+        "\n\n[output truncated at {} byte TUI command output limit]\n",
+        WORKER_COMMAND_OUTPUT_MAX_BYTES
+    );
+    let prefix_limit = WORKER_COMMAND_OUTPUT_MAX_BYTES.saturating_sub(notice.len());
+    let mut capped = truncate_string_to_byte_limit(text, prefix_limit);
+    capped.push_str(&notice);
+    capped
+}
+
+fn truncate_string_to_byte_limit(mut text: String, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text;
+    }
+    let mut truncate_at = max_bytes;
+    while truncate_at > 0 && !text.is_char_boundary(truncate_at) {
+        truncate_at -= 1;
+    }
+    text.truncate(truncate_at);
+    text
 }
 
 fn command_terminal_error_for_output(
@@ -6368,6 +6396,23 @@ mod tests {
             other => panic!("expected captured stream-limit error, got {other:?}"),
         }
         assert!(ui_rx.recv().await.is_none());
+    }
+
+    #[test]
+    fn worker_command_output_cap_truncates_large_generic_output() {
+        let capped = cap_worker_command_output("x".repeat(WORKER_COMMAND_OUTPUT_MAX_BYTES + 1));
+
+        assert!(capped.len() <= WORKER_COMMAND_OUTPUT_MAX_BYTES);
+        assert!(capped.contains("output truncated"));
+    }
+
+    #[test]
+    fn worker_command_output_cap_preserves_utf8_boundaries() {
+        let capped = cap_worker_command_output("é".repeat(WORKER_COMMAND_OUTPUT_MAX_BYTES));
+
+        assert!(capped.len() <= WORKER_COMMAND_OUTPUT_MAX_BYTES);
+        assert!(capped.is_char_boundary(capped.len()));
+        assert!(capped.contains("output truncated"));
     }
 
     #[test]

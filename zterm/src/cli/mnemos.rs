@@ -28,11 +28,13 @@
 //! and removes the duplicated methods on `ZeroclawClient`.
 
 use anyhow::{anyhow, Result};
+use futures::StreamExt;
 use reqwest::Client;
 use serde_json::json;
 use std::time::Duration;
 
 const MNEMOS_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const MNEMOS_RESPONSE_MAX_BYTES: usize = 512 * 1024;
 
 /// MNEMOS v3.0 REST client. Cheap to clone — wraps a reqwest
 /// client + a base URL + a bearer token.
@@ -81,7 +83,7 @@ impl MnemosClient {
             .send()
             .await;
         match res {
-            Ok(r) if r.status().is_success() => match r.json::<serde_json::Value>().await {
+            Ok(r) if r.status().is_success() => match response_json_bounded(r).await {
                 Ok(data) => Ok(unwrap_memory_envelope(&data)),
                 Err(_) => Ok(vec![]),
             },
@@ -102,8 +104,7 @@ impl MnemosClient {
             .send()
             .await;
         match res {
-            Ok(r) => r
-                .json::<serde_json::Value>()
+            Ok(r) => response_json_bounded(r)
                 .await
                 .or_else(|_| Ok(json!({ "status": "unavailable" }))),
             Err(_) => Ok(json!({ "status": "offline" })),
@@ -122,7 +123,7 @@ impl MnemosClient {
             .await;
         match res {
             Ok(r) if r.status().is_success() => {
-                let data: serde_json::Value = r.json().await.unwrap_or(json!({}));
+                let data: serde_json::Value = response_json_bounded(r).await.unwrap_or(json!({}));
                 Ok(unwrap_memory_envelope(&data))
             }
             _ => Ok(vec![]),
@@ -141,7 +142,7 @@ impl MnemosClient {
             .send()
             .await;
         match res {
-            Ok(r) if r.status().is_success() => Ok(r.json::<serde_json::Value>().await.ok()),
+            Ok(r) if r.status().is_success() => Ok(response_json_bounded(r).await.ok()),
             _ => Ok(None),
         }
     }
@@ -162,7 +163,7 @@ impl MnemosClient {
             .send()
             .await?;
         if r.status().is_success() {
-            Ok(r.json::<serde_json::Value>().await.unwrap_or(json!({})))
+            Ok(response_json_bounded(r).await.unwrap_or(json!({})))
         } else {
             Err(anyhow!("MNEMOS create failed: HTTP {}", r.status()))
         }
@@ -184,6 +185,24 @@ impl MnemosClient {
             Err(anyhow!("MNEMOS delete failed: HTTP {}", r.status()))
         }
     }
+}
+
+async fn response_json_bounded(res: reqwest::Response) -> Result<serde_json::Value> {
+    let body = response_text_bounded(res, MNEMOS_RESPONSE_MAX_BYTES).await?;
+    serde_json::from_str(&body).map_err(|e| anyhow!("MNEMOS JSON parse failed: {e}"))
+}
+
+async fn response_text_bounded(res: reqwest::Response, max_bytes: usize) -> Result<String> {
+    let mut body = Vec::new();
+    let mut stream = res.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| anyhow!("MNEMOS response read failed: {e}"))?;
+        if body.len().saturating_add(chunk.len()) > max_bytes {
+            anyhow::bail!("MNEMOS response exceeded {max_bytes} byte limit");
+        }
+        body.extend_from_slice(&chunk);
+    }
+    String::from_utf8(body).map_err(|e| anyhow!("MNEMOS response was not UTF-8: {e}"))
 }
 
 /// Normalize MNEMOS v3.0 response envelopes into a plain

@@ -18,6 +18,7 @@ const ZEROCLAW_TURN_RESPONSE_MAX_BYTES: usize = 2 * 1024 * 1024;
 const ZEROCLAW_WEBHOOK_ENVELOPE_MAX_BYTES: usize = 64 * 1024;
 const ZEROCLAW_WEBHOOK_ERROR_BODY_MAX_BYTES: usize = 8 * 1024;
 const ZEROCLAW_CRON_ERROR_BODY_MAX_BYTES: usize = 2 * 1024;
+const ZEROCLAW_CONFIG_BODY_MAX_BYTES: usize = 512 * 1024;
 
 /// One row from the daemon's `[providers.models.<key>]` config table.
 ///
@@ -320,9 +321,8 @@ impl ZeroclawClient {
 
         match res.status().as_u16() {
             200 => {
-                let config = res
-                    .json::<Config>()
-                    .await
+                let body = read_bounded_response_body(res, ZEROCLAW_CONFIG_BODY_MAX_BYTES).await;
+                let config = serde_json::from_str::<Config>(&body)
                     .map_err(|e| anyhow!("Failed to parse config: {}", e))?;
                 Ok(config)
             }
@@ -419,9 +419,8 @@ impl ZeroclawClient {
             .map_err(|e| anyhow!(ClientError::Network(e.to_string())))?;
         match res.status().as_u16() {
             200 => {
-                let envelope = res
-                    .json::<ConfigEnvelope>()
-                    .await
+                let body = read_bounded_response_body(res, ZEROCLAW_CONFIG_BODY_MAX_BYTES).await;
+                let envelope = serde_json::from_str::<ConfigEnvelope>(&body)
                     .map_err(|e| anyhow!("Failed to parse /api/config envelope: {}", e))?;
                 Ok(envelope.content)
             }
@@ -1471,6 +1470,28 @@ mod tests {
         assert!(msg.contains("truncated"));
         assert!(!msg.contains("tail-marker"));
         assert!(msg.len() < ZEROCLAW_CRON_ERROR_BODY_MAX_BYTES + 256);
+    }
+
+    #[tokio::test]
+    async fn config_fetch_body_is_bounded_before_parsing() {
+        let mut server = mockito::Server::new_async().await;
+        let huge = format!(
+            "{{\"content\":\"{}tail-marker\"}}",
+            "x".repeat(ZEROCLAW_CONFIG_BODY_MAX_BYTES + 512)
+        );
+        let _mock = server
+            .mock("GET", "/api/config")
+            .with_status(200)
+            .with_body(huge)
+            .create_async()
+            .await;
+        let client = ZeroclawClient::new(server.url(), "test_token".to_string());
+
+        let err = client.list_providers().await.unwrap_err();
+
+        let msg = err.to_string();
+        assert!(msg.contains("Failed to parse /api/config envelope"));
+        assert!(!msg.contains("tail-marker"));
     }
 
     #[tokio::test]
