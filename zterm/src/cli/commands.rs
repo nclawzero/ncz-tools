@@ -1227,8 +1227,14 @@ impl CommandHandler {
 }
 
 const CONFIG_SECRET_MASK: &str = "***REDACTED***";
-const CONFIG_SECRET_KEY_FRAGMENTS: &[&str] =
-    &["token", "secret", "password", "api_key", "authorization"];
+const CONFIG_SECRET_KEY_FRAGMENTS: &[&str] = &[
+    "token",
+    "secret",
+    "password",
+    "apikey",
+    "authorization",
+    "privatekey",
+];
 
 fn format_config_output(config: Result<String>) -> String {
     let mut out = "\n⚙️  Configuration:\n".to_string();
@@ -1350,10 +1356,17 @@ fn redact_config_line(line: &str) -> (String, Option<&'static str>) {
 }
 
 fn is_sensitive_config_key(key: &str) -> bool {
-    let lower = key.to_ascii_lowercase();
+    let lower = normalize_config_key(key);
     CONFIG_SECRET_KEY_FRAGMENTS
         .iter()
         .any(|fragment| lower.contains(fragment))
+}
+
+fn normalize_config_key(key: &str) -> String {
+    key.chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .map(|ch| ch.to_ascii_lowercase())
+        .collect()
 }
 
 fn multiline_secret_delimiter(value: &str) -> Option<&'static str> {
@@ -2443,6 +2456,55 @@ openai = { model = "gpt", api_key = "inline-api-key" }
         assert!(!out.contains("inline-token-value"));
         assert!(!out.contains("inline-provider-api-key"));
         assert!(!out.contains("inline-api-key"));
+    }
+
+    #[test]
+    fn config_output_masks_common_api_and_private_key_spellings() {
+        let out = super::format_config_output(Ok(r#"
+[providers.openai]
+apiKey = "camel-api-key"
+apikey = "flat-api-key"
+api-key = "dash-api-key"
+private_key = "snake-private-key"
+private-key = "dash-private-key"
+
+[providers.inline]
+openai = { model = "gpt", apiKey = "inline-camel-key", private-key = "inline-private-key" }
+"#
+        .to_string()));
+
+        for leaked in [
+            "camel-api-key",
+            "flat-api-key",
+            "dash-api-key",
+            "snake-private-key",
+            "dash-private-key",
+            "inline-camel-key",
+            "inline-private-key",
+        ] {
+            assert!(!out.contains(leaked), "{leaked} leaked in {out}");
+        }
+        assert!(out.contains("model = \"gpt\""));
+        assert!(out.matches("***REDACTED***").count() >= 7);
+    }
+
+    #[test]
+    fn fallback_config_redactor_normalizes_separators_and_case() {
+        let out = super::redact_config_secrets(
+            r#"
+[unterminated
+apiKey = "camel-api-key"
+api-key = "dash-api-key"
+private_key = "snake-private-key"
+"#,
+        );
+
+        assert!(out.contains("apiKey = \"***REDACTED***\""));
+        assert!(out.contains("api-key = \"***REDACTED***\""));
+        assert!(out.contains("private_key = \"***REDACTED***\""));
+        assert!(!out.contains("camel-api-key"));
+        assert!(!out.contains("dash-api-key"));
+        assert!(!out.contains("snake-private-key"));
     }
 
     #[tokio::test]

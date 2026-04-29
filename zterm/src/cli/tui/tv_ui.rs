@@ -2012,6 +2012,12 @@ fn run_event_loop(
         if event.what == EventType::Keyboard && event.key_code == KB_ENTER {
             let submitted = input_data.borrow().clone();
             if !submitted.is_empty() {
+                if is_exit_command(&submitted) {
+                    append_prompt_placeholder(&submitted, &chat_lines);
+                    input_line.borrow_mut().set_text(String::new());
+                    app.running = false;
+                    continue;
+                }
                 if response_in_flight {
                     note_response_busy(status_state);
                     continue;
@@ -2205,6 +2211,14 @@ fn run_slash_popup(app: &mut Application) -> u16 {
 
 fn should_open_slash_popup(key_code: u16, input_empty: bool) -> bool {
     input_empty && key_code == KB_CTRL_K
+}
+
+fn is_exit_command(input: &str) -> bool {
+    tokenize_slash_command(input)
+        .ok()
+        .and_then(|parts| parts.first().cloned())
+        .map(|command| command == "/exit")
+        .unwrap_or(false)
 }
 
 /// Non-blocking drain of the worker → TUI event channel. Called at
@@ -3997,6 +4011,15 @@ mod tests {
         assert!(should_open_slash_popup(KB_CTRL_K, true));
         assert!(!should_open_slash_popup(KB_SLASH, true));
         assert!(!should_open_slash_popup(KB_CTRL_K, false));
+    }
+
+    #[test]
+    fn typed_exit_command_is_tui_local_quit() {
+        assert!(is_exit_command("/exit"));
+        assert!(is_exit_command("/exit now"));
+        assert!(is_exit_command(" /exit"));
+        assert!(!is_exit_command("/exitnow"));
+        assert!(!is_exit_command("hello /exit"));
     }
 
     #[test]
