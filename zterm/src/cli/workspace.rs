@@ -185,6 +185,7 @@ impl AppConfig {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading zterm config from {}", path.display()))?;
         let mut cfg = Self::parse(&text)?;
+        validate_workspace_urls(&cfg)?;
         apply_workspace_state(path, &mut cfg)?;
         cfg.validate()?;
         Ok(cfg)
@@ -1897,6 +1898,34 @@ unknown_workspace_field = { nested = "also ignored" }
         let reloaded = AppConfig::load(&path).unwrap();
         assert_eq!(reloaded.workspaces[0].id.as_deref(), Some(id));
         assert_eq!(std::fs::read(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn load_rejects_unsafe_openclaw_url_without_writing_workspace_state() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[[workspaces]]
+name = "alpha"
+backend = "openclaw"
+url = "wss://old.example/ws?api_token=credential-value"
+"#,
+        )
+        .unwrap();
+        let state_path = workspace_state_path_for_config(&path);
+
+        let err = AppConfig::load(&path).unwrap_err();
+
+        let msg = err.to_string();
+        assert!(msg.contains("sensitive query parameter `api_token`"));
+        assert!(!msg.contains("credential-value"));
+        assert!(
+            !state_path.exists(),
+            "unsafe config must fail before creating {}",
+            state_path.display()
+        );
     }
 
     #[cfg(unix)]
