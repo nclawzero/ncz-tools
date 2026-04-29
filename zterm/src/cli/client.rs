@@ -12,7 +12,7 @@ use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, Web
 use crate::cli::agent::{StreamSink, TurnChunk, TurnUsage};
 
 const ZEROCLAW_WS_TURN_TIMEOUT: Duration = Duration::from_secs(120);
-const ZEROCLAW_WS_RESPONSE_MAX_BYTES: usize = 2 * 1024 * 1024;
+const ZEROCLAW_TURN_RESPONSE_MAX_BYTES: usize = 2 * 1024 * 1024;
 
 /// One row from the daemon's `[providers.models.<key>]` config table.
 ///
@@ -580,7 +580,7 @@ impl ZeroclawClient {
             message,
             model,
             ZEROCLAW_WS_TURN_TIMEOUT,
-            ZEROCLAW_WS_RESPONSE_MAX_BYTES,
+            ZEROCLAW_TURN_RESPONSE_MAX_BYTES,
         )
         .await
     }
@@ -761,6 +761,22 @@ impl ZeroclawClient {
         message: &str,
         model: &str,
     ) -> Result<String> {
+        self.submit_turn_webhook_with_limit(
+            session_id,
+            message,
+            model,
+            ZEROCLAW_TURN_RESPONSE_MAX_BYTES,
+        )
+        .await
+    }
+
+    async fn submit_turn_webhook_with_limit(
+        &self,
+        session_id: &str,
+        message: &str,
+        model: &str,
+        max_response_bytes: usize,
+    ) -> Result<String> {
         let url = format!("{}/webhook", self.base_url);
         let payload = serde_json::json!({
             "message": message,
@@ -791,6 +807,15 @@ impl ZeroclawClient {
             .and_then(|v| v.as_str())
             .unwrap_or("(no response)")
             .to_string();
+
+        if text.len() > max_response_bytes {
+            let wrapped = anyhow!(
+                "Webhook response exceeded {} byte limit",
+                max_response_bytes
+            );
+            self.emit_failure(&wrapped);
+            return Err(wrapped);
+        }
 
         match &self.stream_sink {
             Some(sink) => {
@@ -1246,6 +1271,35 @@ mod tests {
         assert!(err
             .to_string()
             .contains("Failed to parse cron list response"));
+    }
+
+    #[tokio::test]
+    async fn webhook_submit_rejects_oversized_response_before_streaming() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/webhook")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(serde_json::json!({ "response": "12345678901234567" }).to_string())
+            .create_async()
+            .await;
+        let mut client = ZeroclawClient::new(server.url(), String::new());
+        let (sink, mut rx) = StreamSink::channel(8);
+        client.set_stream_sink(Some(sink));
+
+        let err = client
+            .submit_turn_webhook_with_limit("main", "hello", "primary", 16)
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("Webhook response exceeded"));
+        match rx.recv().await {
+            Some(TurnChunk::Finished(Err(message))) => {
+                assert!(message.contains("Webhook response exceeded"));
+            }
+            other => panic!("expected oversized webhook error, got {other:?}"),
+        }
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

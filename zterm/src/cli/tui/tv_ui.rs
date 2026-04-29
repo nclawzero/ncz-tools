@@ -626,11 +626,13 @@ pub async fn run(
                             let (turn_sink, turn_rx) =
                                 StreamSink::turn_channel(TURN_STREAM_CAPACITY);
                             let observed_finished = Arc::new(AtomicBool::new(false));
+                            let observed_finished_error = Arc::new(AtomicBool::new(false));
                             let forwarded_token = Arc::new(AtomicBool::new(false));
                             let mut forward_task = tokio::spawn(forward_turn_chunks(
                                 turn_rx,
                                 worker_sink.clone(),
                                 Arc::clone(&observed_finished),
+                                Arc::clone(&observed_finished_error),
                                 Arc::clone(&forwarded_token),
                             ));
                             client.set_stream_sink(Some(turn_sink));
@@ -639,43 +641,6 @@ pub async fn run(
                             drop(client);
                             let submit_error_text =
                                 submit_result.as_ref().err().map(|e| e.to_string());
-
-                            match &submit_result {
-                                Ok(response) if !response.is_empty() => {
-                                    if let Err(e) = append_turn_transcript_entry(
-                                        &transcript_scope,
-                                        &worker_session_id,
-                                        "assistant",
-                                        response,
-                                    ) {
-                                        let message =
-                                            mark_turn_transcript_incomplete_after_append_failure(
-                                                &transcript_scope,
-                                                &worker_session_id,
-                                                &e,
-                                            );
-                                        send_worker_finished(&worker_sink, Err(message)).await;
-                                    }
-                                }
-                                Err(e) => {
-                                    let error_text = e.to_string();
-                                    if let Err(append_error) = append_turn_transcript_entry(
-                                        &transcript_scope,
-                                        &worker_session_id,
-                                        "error",
-                                        &error_text,
-                                    ) {
-                                        let message =
-                                            mark_turn_transcript_incomplete_after_append_failure(
-                                                &transcript_scope,
-                                                &worker_session_id,
-                                                &append_error,
-                                            );
-                                        send_worker_finished(&worker_sink, Err(message)).await;
-                                    }
-                                }
-                                _ => {}
-                            }
 
                             let saw_finished = match tokio::time::timeout(
                                 TURN_FORWARD_DRAIN_TIMEOUT,
@@ -703,6 +668,52 @@ pub async fn run(
                                 }
                             };
                             let forwarded_any = forwarded_token.load(Ordering::Acquire);
+                            let forwarded_terminal_error =
+                                observed_finished_error.load(Ordering::Acquire);
+                            if forwarded_terminal_error && submit_result.is_ok() {
+                                let _ = mark_turn_transcript_incomplete_reason(
+                                    &transcript_scope,
+                                    &worker_session_id,
+                                    "assistant response stream was rejected before transcript persistence",
+                                );
+                            } else {
+                                match &submit_result {
+                                    Ok(response) if !response.is_empty() => {
+                                        if let Err(e) = append_turn_transcript_entry(
+                                            &transcript_scope,
+                                            &worker_session_id,
+                                            "assistant",
+                                            response,
+                                        ) {
+                                            let message =
+                                                mark_turn_transcript_incomplete_after_append_failure(
+                                                    &transcript_scope,
+                                                    &worker_session_id,
+                                                    &e,
+                                                );
+                                            send_worker_finished(&worker_sink, Err(message)).await;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        let error_text = e.to_string();
+                                        if let Err(append_error) = append_turn_transcript_entry(
+                                            &transcript_scope,
+                                            &worker_session_id,
+                                            "error",
+                                            &error_text,
+                                        ) {
+                                            let message =
+                                                mark_turn_transcript_incomplete_after_append_failure(
+                                                    &transcript_scope,
+                                                    &worker_session_id,
+                                                    &append_error,
+                                                );
+                                            send_worker_finished(&worker_sink, Err(message)).await;
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
                             if let Some(error_text) = submit_error_text.as_deref() {
                                 if submit_error_requires_incomplete_transcript(
                                     error_text,
@@ -1017,6 +1028,7 @@ async fn forward_turn_chunks(
     mut turn_rx: mpsc::Receiver<TurnChunk>,
     ui_sink: StreamSink,
     observed_finished: Arc<AtomicBool>,
+    observed_finished_error: Arc<AtomicBool>,
     forwarded_token: Arc<AtomicBool>,
 ) -> bool {
     let mut saw_finished = false;
@@ -1043,6 +1055,7 @@ async fn forward_turn_chunks(
                     {
                         saw_finished = true;
                         observed_finished.store(true, Ordering::Release);
+                        observed_finished_error.store(true, Ordering::Release);
                     }
                     return saw_finished;
                 }
@@ -1057,6 +1070,7 @@ async fn forward_turn_chunks(
                 if saw_finished {
                     continue;
                 }
+                let is_error = result.is_err();
                 if !flush_forwarded_token(&ui_sink, &forwarded_token, &mut pending_token).await {
                     return saw_finished;
                 }
@@ -1067,6 +1081,9 @@ async fn forward_turn_chunks(
                 {
                     saw_finished = true;
                     observed_finished.store(true, Ordering::Release);
+                    if is_error {
+                        observed_finished_error.store(true, Ordering::Release);
+                    }
                 } else {
                     return saw_finished;
                 }
@@ -1597,7 +1614,15 @@ fn turn_collection_failure_requires_incomplete_transcript(message: &str) -> bool
 }
 
 fn submit_error_requires_incomplete_transcript(message: &str, forwarded_token: bool) -> bool {
-    forwarded_token || turn_collection_failure_requires_incomplete_transcript(message)
+    forwarded_token
+        || turn_collection_failure_requires_incomplete_transcript(message)
+        || response_size_failure_requires_incomplete_transcript(message)
+}
+
+fn response_size_failure_requires_incomplete_transcript(message: &str) -> bool {
+    message.contains("response exceeded")
+        || message.contains("response frame exceeded")
+        || message.contains("TUI stream limit")
 }
 
 #[derive(Debug)]
@@ -4227,6 +4252,7 @@ mod tests {
         let (turn_tx, turn_rx) = mpsc::channel(8);
         let (ui_tx, mut ui_rx) = StreamSink::channel(8);
         let observed_finished = Arc::new(AtomicBool::new(false));
+        let observed_finished_error = Arc::new(AtomicBool::new(false));
         let forwarded_token = Arc::new(AtomicBool::new(false));
 
         turn_tx
@@ -4242,11 +4268,13 @@ mod tests {
                 turn_rx,
                 ui_tx,
                 Arc::clone(&observed_finished),
+                Arc::clone(&observed_finished_error),
                 Arc::clone(&forwarded_token),
             )
             .await
         );
         assert!(observed_finished.load(Ordering::Acquire));
+        assert!(!observed_finished_error.load(Ordering::Acquire));
         assert!(!forwarded_token.load(Ordering::Acquire));
 
         match ui_rx.recv().await {
@@ -4261,6 +4289,7 @@ mod tests {
         let (turn_tx, turn_rx) = mpsc::channel(8);
         let (ui_tx, mut ui_rx) = StreamSink::channel(8);
         let observed_finished = Arc::new(AtomicBool::new(false));
+        let observed_finished_error = Arc::new(AtomicBool::new(false));
         let forwarded_token = Arc::new(AtomicBool::new(false));
 
         turn_tx
@@ -4273,11 +4302,13 @@ mod tests {
                 turn_rx,
                 ui_tx,
                 Arc::clone(&observed_finished),
+                Arc::clone(&observed_finished_error),
                 Arc::clone(&forwarded_token),
             )
             .await
         );
         assert!(!observed_finished.load(Ordering::Acquire));
+        assert!(!observed_finished_error.load(Ordering::Acquire));
         assert!(forwarded_token.load(Ordering::Acquire));
 
         match ui_rx.recv().await {
@@ -4356,6 +4387,7 @@ mod tests {
         let (turn_sink, turn_rx) = StreamSink::turn_channel(1);
         let (ui_tx, mut ui_rx) = StreamSink::channel(8);
         let observed_finished = Arc::new(AtomicBool::new(false));
+        let observed_finished_error = Arc::new(AtomicBool::new(false));
         let forwarded_token = Arc::new(AtomicBool::new(false));
 
         assert!(turn_sink
@@ -4373,11 +4405,13 @@ mod tests {
             turn_rx,
             ui_tx,
             Arc::clone(&observed_finished),
+            Arc::clone(&observed_finished_error),
             Arc::clone(&forwarded_token),
         )
         .await;
         assert!(!saw_finished);
         assert!(!observed_finished.load(Ordering::Acquire));
+        assert!(!observed_finished_error.load(Ordering::Acquire));
         assert!(forwarded_token.load(Ordering::Acquire));
 
         match ui_rx.recv().await {
@@ -4400,6 +4434,7 @@ mod tests {
         let (turn_tx, turn_rx) = mpsc::channel(8);
         let (ui_tx, mut ui_rx) = StreamSink::channel(8);
         let observed_finished = Arc::new(AtomicBool::new(false));
+        let observed_finished_error = Arc::new(AtomicBool::new(false));
         let forwarded_token = Arc::new(AtomicBool::new(false));
 
         turn_tx
@@ -4415,10 +4450,12 @@ mod tests {
                 turn_rx,
                 ui_tx,
                 Arc::clone(&observed_finished),
+                Arc::clone(&observed_finished_error),
                 Arc::clone(&forwarded_token),
             )
             .await
         );
+        assert!(!observed_finished_error.load(Ordering::Acquire));
         assert!(forwarded_token.load(Ordering::Acquire));
         match ui_rx.recv().await {
             Some(TurnChunk::Token(text)) => assert_eq!(text, "hello"),
@@ -4432,6 +4469,7 @@ mod tests {
         let (turn_tx, turn_rx) = mpsc::channel(2);
         let (ui_tx, mut ui_rx) = StreamSink::channel(8);
         let observed_finished = Arc::new(AtomicBool::new(false));
+        let observed_finished_error = Arc::new(AtomicBool::new(false));
         let forwarded_token = Arc::new(AtomicBool::new(false));
 
         turn_tx
@@ -4444,11 +4482,13 @@ mod tests {
                 turn_rx,
                 ui_tx,
                 Arc::clone(&observed_finished),
+                Arc::clone(&observed_finished_error),
                 Arc::clone(&forwarded_token),
             )
             .await
         );
         assert!(observed_finished.load(Ordering::Acquire));
+        assert!(observed_finished_error.load(Ordering::Acquire));
         assert!(!forwarded_token.load(Ordering::Acquire));
         match ui_rx.recv().await {
             Some(TurnChunk::Finished(Err(message))) => {
@@ -4980,6 +5020,25 @@ mod tests {
         let reason = "WebSocket read failed: reset".to_string();
 
         assert!(submit_error_requires_incomplete_transcript(&reason, true));
+        let message = mark_turn_transcript_incomplete_reason(&scope, "main", &reason);
+
+        assert!(message.contains("transcript marked incomplete"));
+        assert!(storage::scoped_session_history_is_incomplete(&scope, "main").unwrap());
+    }
+
+    #[test]
+    fn oversized_response_submit_error_marks_history_incomplete_without_tokens() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let scope = storage::workspace_scope(
+            "zeroclaw",
+            &format!("oversized-webhook-transcript-{}", uuid::Uuid::new_v4()),
+            None,
+        )
+        .unwrap();
+        storage::append_scoped_session_history(&scope, "main", "user", "hello").unwrap();
+        let reason = "Webhook response exceeded 16 byte limit".to_string();
+
+        assert!(submit_error_requires_incomplete_transcript(&reason, false));
         let message = mark_turn_transcript_incomplete_reason(&scope, "main", &reason);
 
         assert!(message.contains("transcript marked incomplete"));
