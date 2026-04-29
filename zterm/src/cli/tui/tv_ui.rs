@@ -4113,7 +4113,8 @@ fn handle_command(
         // without changing what's on screen.
         CMD_PERSIST_THEME => {
             let name = status_state.current_theme.clone();
-            match themes::save_preset(&name) {
+            let current_palette = turbo_vision::core::palette::palettes::get_app_palette();
+            match persist_current_theme(&name, &current_palette) {
                 Ok(_) => {
                     status_state.set_toast(format!("💾 Saved: theme = {name}"));
                 }
@@ -4261,6 +4262,20 @@ fn menu_command_cmdline(command: u16) -> Option<&'static str> {
         CMD_MCP_STATUS => Some("/mcp status"),
         CMD_SESSION_LIST => Some("/session list"),
         _ => None,
+    }
+}
+
+fn persist_current_theme(name: &str, current_palette: &[u8]) -> std::io::Result<()> {
+    if name == "custom" {
+        let palette: [u8; 63] = current_palette.try_into().map_err(|_| {
+            std::io::Error::other(format!(
+                "custom palette has {} bytes; expected 63",
+                current_palette.len()
+            ))
+        })?;
+        themes::save_custom(&palette)
+    } else {
+        themes::save_preset(name)
     }
 }
 
@@ -9112,6 +9127,30 @@ mod tests {
         assert_eq!(parse_beep_toggle("beep on"), Some(true));
         assert_eq!(parse_beep_toggle("BEEP OFF"), Some(false));
         assert_eq!(parse_beep_toggle("amber"), None);
+    }
+
+    #[test]
+    fn persist_current_theme_preserves_custom_palette_payload() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+
+        let mut custom = *themes::DEFAULT.palette;
+        custom[0] = custom[0].wrapping_add(1);
+        custom[62] = 0x5a;
+        themes::save_custom(&custom).unwrap();
+
+        persist_current_theme("custom", &custom).unwrap();
+        let (loaded_palette, loaded_name) = themes::load_persisted();
+
+        match old_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+
+        assert_eq!(loaded_name, "custom");
+        assert_eq!(loaded_palette, custom.to_vec());
     }
 
     #[test]
