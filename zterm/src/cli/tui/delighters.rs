@@ -222,6 +222,15 @@ pub fn save_state(path: &Path, state: &ZtermState) -> io::Result<()> {
 }
 
 fn save_state_unlocked(path: &Path, state: &ZtermState) -> io::Result<()> {
+    save_state_unlocked_with(path, state, |file| file.sync_all(), sync_state_parent_dir)
+}
+
+fn save_state_unlocked_with(
+    path: &Path,
+    state: &ZtermState,
+    sync_file: impl FnOnce(&fs::File) -> io::Result<()>,
+    sync_parent: impl FnOnce(&Path) -> io::Result<()>,
+) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         create_private_state_dir(parent)?;
     }
@@ -239,13 +248,31 @@ fn save_state_unlocked(path: &Path, state: &ZtermState) -> io::Result<()> {
         opts.mode(0o600);
     }
     let mut file = opts.open(&tmp_path)?;
-    file.write_all(body.as_bytes())?;
+    let write_result = (|| {
+        file.write_all(body.as_bytes())?;
+        sync_file(&file)
+    })();
     drop(file);
+    if let Err(e) = write_result {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(e);
+    }
     if let Err(e) = fs::rename(&tmp_path, path) {
         let _ = fs::remove_file(&tmp_path);
         return Err(e);
     }
-    harden_private_state_file(path)
+    harden_private_state_file(path)?;
+    sync_parent(parent)
+}
+
+#[cfg(unix)]
+fn sync_state_parent_dir(parent: &Path) -> io::Result<()> {
+    fs::File::open(parent)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_state_parent_dir(_parent: &Path) -> io::Result<()> {
+    Ok(())
 }
 
 fn with_state_lock<T>(path: &Path, update: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
@@ -574,6 +601,64 @@ mod tests {
         assert_eq!(state.launches, 1);
         assert!(state.beep_on_error);
         assert!(load_state(&path).beep_on_error);
+    }
+
+    #[test]
+    fn state_save_propagates_temp_file_sync_failure_without_final_state() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("state.toml");
+        let state = ZtermState {
+            launches: 7,
+            beep_on_error: true,
+            mutation_fences: BTreeMap::new(),
+        };
+
+        let err = save_state_unlocked_with(
+            &path,
+            &state,
+            |_| Err(io::Error::other("injected temp sync failure")),
+            |_| Ok(()),
+        )
+        .unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+        assert!(!path.exists());
+        let leftovers = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(".state.toml."))
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            leftovers.is_empty(),
+            "state save left temporary files after sync failure: {leftovers:?}"
+        );
+    }
+
+    #[test]
+    fn state_save_propagates_parent_directory_sync_failure() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("state.toml");
+        let state = ZtermState {
+            launches: 7,
+            beep_on_error: true,
+            mutation_fences: BTreeMap::new(),
+        };
+
+        let err = save_state_unlocked_with(
+            &path,
+            &state,
+            |_| Ok(()),
+            |_| Err(io::Error::other("injected directory sync failure")),
+        )
+        .unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+        assert_eq!(load_state_checked(&path).unwrap().launches, 7);
     }
 
     #[test]
