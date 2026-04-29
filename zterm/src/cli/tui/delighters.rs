@@ -5,7 +5,7 @@ use std::io::{self, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
@@ -15,6 +15,8 @@ pub const CONNECT_SPLASH_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 pub const CONNECT_SPLASH_MAX_BYTES: u64 = 4 * 1024;
 const CONNECT_SPLASH_MAX_LINES: usize = 6;
 const CONNECT_SPLASH_MAX_LINE_CHARS: usize = 96;
+const STATE_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
+const STATE_LOCK_POLL: Duration = Duration::from_millis(20);
 
 const WELCOME_QUOTES: &[&str] = &[
     "Turbo Pascal says: Hello, world!",
@@ -232,6 +234,15 @@ fn save_state_unlocked(path: &Path, state: &ZtermState) -> io::Result<()> {
 }
 
 fn with_state_lock<T>(path: &Path, update: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
+    with_state_lock_timeout(path, STATE_LOCK_TIMEOUT, STATE_LOCK_POLL, update)
+}
+
+fn with_state_lock_timeout<T>(
+    path: &Path,
+    timeout: Duration,
+    poll: Duration,
+    update: impl FnOnce() -> io::Result<T>,
+) -> io::Result<T> {
     if let Some(parent) = path.parent() {
         create_private_state_dir(parent)?;
     }
@@ -243,7 +254,26 @@ fn with_state_lock<T>(path: &Path, update: impl FnOnce() -> io::Result<T>) -> io
         opts.mode(0o600);
     }
     let lock_file = opts.open(&lock_path)?;
-    lock_file.lock()?;
+    let started = Instant::now();
+    loop {
+        match lock_file.try_lock() {
+            Ok(()) => break,
+            Err(fs::TryLockError::WouldBlock) => {
+                if started.elapsed() >= timeout {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!(
+                            "timed out after {:?} waiting for zterm state lock {}",
+                            timeout,
+                            lock_path.display()
+                        ),
+                    ));
+                }
+                std::thread::sleep(poll);
+            }
+            Err(fs::TryLockError::Error(e)) => return Err(e),
+        }
+    }
     let result = update();
     let unlock_result = lock_file.unlock();
     match result {
@@ -460,6 +490,33 @@ mod tests {
         assert_eq!(state.launches, 1);
         assert!(state.beep_on_error);
         assert!(load_state(&path).beep_on_error);
+    }
+
+    #[test]
+    fn state_lock_times_out_instead_of_blocking_indefinitely() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("state.toml");
+        create_private_state_dir(path.parent().unwrap()).unwrap();
+        let lock_path = state_lock_path(&path);
+        let lock_file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap();
+        lock_file.lock().unwrap();
+
+        let err = with_state_lock_timeout(
+            &path,
+            Duration::from_millis(20),
+            Duration::from_millis(1),
+            || Ok(()),
+        )
+        .unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        lock_file.unlock().unwrap();
     }
 
     #[test]

@@ -80,6 +80,9 @@ enum WorkerRequest {
     /// through the shared `CommandHandler`. Structured
     /// `Ok(Some(text))` output is forwarded to the chat pane.
     Command(String),
+    /// Explicit user recovery after a mutating slash command times
+    /// out with unknown backend outcome.
+    Resync,
     /// Fetch backend sessions for the modal picker on the async
     /// worker path. The sync TUI thread must not call backend I/O.
     SessionPickerList(SessionPickerWorkspace),
@@ -109,6 +112,7 @@ const CMD_WORKSPACE_INFO: u16 = 1011;
 const CMD_MODELS_STATUS: u16 = 1012;
 const CMD_MEMORY_STATS: u16 = 1013;
 const CMD_SESSION_LIST: u16 = 1014;
+const CMD_RESYNC: u16 = 1015;
 /// Slash-popup theme entries occupy `[CMD_THEME_BASE, +PRESETS.len())`.
 /// The selected index is mapped back to `themes::PRESETS[i]` on
 /// return so palette application lives in one place
@@ -147,6 +151,7 @@ const TURN_STREAM_MAX_BYTES: usize = 2 * 1024 * 1024;
 const COMMAND_ERROR_ALREADY_RENDERED: &str = "__zterm_command_error_already_rendered__";
 const PARTIAL_STREAM_INCOMPLETE_REASON: &str =
     "partial response incomplete; backend stream ended without a finished frame";
+const MUTATION_FENCE_TOAST: &str = "Mutation state unknown: run /resync";
 const STATUS_LABEL_MAX_CHARS: usize = 48;
 const STATUS_TOAST_MAX_CHARS: usize = 96;
 const WORKSPACE_PICKER_LABEL_MAX_CHARS: usize = 48;
@@ -313,6 +318,11 @@ struct StatusState {
     usage: Option<TurnUsage>,
     /// Whether terminal bell should ring on error frames.
     beep_on_error: bool,
+    /// Present after a mutating slash command times out with unknown
+    /// backend outcome. Blocks further backend actions until `/resync`.
+    mutation_fence: Option<String>,
+    /// True while an explicit `/resync` recovery request is in flight.
+    resync_in_flight: bool,
 }
 
 impl StatusState {
@@ -329,6 +339,8 @@ impl StatusState {
             current_theme,
             usage: None,
             beep_on_error,
+            mutation_fence: None,
+            resync_in_flight: false,
         }
     }
 
@@ -813,6 +825,31 @@ pub async fn run(
                     );
                     run_worker_command_with_deadline(&worker_sink, deadline, command).await;
                 }
+                WorkerRequest::Resync => {
+                    let result = tokio::time::timeout(
+                        COMMAND_WORKER_TIMEOUT,
+                        resync_worker_state(&worker_app, &mut worker_sessions, &worker_sink),
+                    )
+                    .await
+                    .map_err(|_| {
+                        anyhow::anyhow!(
+                            "resync timed out after {:?}; mutation fence remains active",
+                            COMMAND_WORKER_TIMEOUT
+                        )
+                    })
+                    .and_then(|result| result)
+                    .map_err(|e| e.to_string());
+
+                    match result {
+                        Ok(message) => {
+                            let _ = worker_sink.send(TurnChunk::Token(message));
+                            send_worker_finished(&worker_sink, Ok(String::new())).await;
+                        }
+                        Err(message) => {
+                            send_worker_finished(&worker_sink, Err(message)).await;
+                        }
+                    }
+                }
             }
         }
     });
@@ -868,7 +905,7 @@ impl SlashCommandDeadline {
                 format!("slash command timed out after {:?}", self.timeout)
             }
             SlashCommandDeadlineKind::Mutating => format!(
-                "slash command outcome unknown after {:?}; the backend may still have applied the mutation. Check backend state before retrying.",
+                "slash command outcome unknown after {:?}; the backend may still have applied the mutation. Run /resync before retrying.",
                 self.timeout
             ),
         }
@@ -1111,6 +1148,50 @@ async fn handle_worker_command_request(
             send_worker_finished(worker_sink, Err(e.to_string())).await;
         }
     }
+}
+
+async fn resync_worker_state(
+    worker_app: &Arc<Mutex<App>>,
+    worker_sessions: &mut HashMap<String, WorkerSessionBinding>,
+    worker_sink: &StreamSink,
+) -> Result<String> {
+    install_stream_sink_on_active_client(worker_app, worker_sink.clone()).await;
+
+    let workspace_key = current_workspace_binding_key(worker_app).await.ok();
+    let active_client = {
+        let guard = worker_app.lock().await;
+        guard.active_workspace().and_then(|w| w.client.clone())
+    };
+    let mut session_count = None;
+    if let Some(client) = active_client {
+        let sessions = client.lock().await.list_sessions().await?;
+        session_count = Some(sessions.len());
+        if let Some(key) = workspace_key.as_ref() {
+            let remembered_exists = worker_sessions
+                .get(key)
+                .map(|binding| sessions.iter().any(|session| session.id == binding.id))
+                .unwrap_or(true);
+            if !remembered_exists {
+                worker_sessions.remove(key);
+            }
+        }
+    }
+
+    let (workspace, model) = status_snapshot_for_worker(worker_app)
+        .await
+        .unwrap_or_else(|| ("<unknown>".to_string(), "<unknown>".to_string()));
+    let _ = worker_sink.send(TurnChunk::Status {
+        workspace: Some(workspace.clone()),
+        model: Some(model.clone()),
+    });
+    Ok(match session_count {
+        Some(count) => format!(
+            "[sync] refreshed workspace `{workspace}`, model `{model}`, and {count} backend sessions"
+        ),
+        None => format!(
+            "[sync] refreshed workspace `{workspace}` and model `{model}`; no active backend client"
+        ),
+    })
 }
 
 fn connect_splash_for_workspace(workspace_name: &str) -> String {
@@ -2487,6 +2568,23 @@ fn run_event_loop(
                     note_response_busy(status_state);
                     continue;
                 }
+                if is_resync_command(&submitted) {
+                    let status = dispatch_resync(
+                        &chat_lines,
+                        &req_tx,
+                        status_state,
+                        &mut response_in_flight,
+                    );
+                    if status != SubmissionStatus::Busy {
+                        input_line.borrow_mut().set_text(String::new());
+                    }
+                    continue;
+                }
+                if status_state.mutation_fence.is_some() && !mutation_fence_allows_input(&submitted)
+                {
+                    note_mutation_fence(status_state, &chat_lines);
+                    continue;
+                }
                 // `/theme …` is a TUI-only concern — it toggles the
                 // live `TPalette` and has no meaning on the
                 // rustyline path. Intercept before routing to the
@@ -2637,6 +2735,7 @@ fn run_slash_popup(app: &mut Application) -> u16 {
         MenuItem::with_shortcut("Memor~y~ recent", CMD_MEMORY_SEARCH, 0, "/memory list", 0),
         MenuItem::with_shortcut("Memory s~t~ats", CMD_MEMORY_STATS, 0, "/memory stats", 0),
         MenuItem::with_shortcut("~M~CP status", CMD_MCP_STATUS, 0, "/mcp status", 0),
+        MenuItem::with_shortcut("~R~esync state", CMD_RESYNC, 0, "/resync", 0),
         MenuItem::separator(),
         MenuItem::with_shortcut("Session ~l~ist", CMD_SESSION_LIST, 0, "/session list", 0),
         MenuItem::with_shortcut("Session ~n~ew", CMD_SESSION_NEW, 0, "/session <new>", 0),
@@ -2742,9 +2841,23 @@ fn drain_stream_events(
                         );
                     }
                     TurnChunk::Finished(result) => {
+                        let was_resync = status_state.resync_in_flight;
                         if result.is_err() {
                             saw_error = true;
+                            if let Err(message) = result {
+                                if mutation_timeout_requires_fence(message) {
+                                    status_state.mutation_fence = Some(message.clone());
+                                    status_state.set_toast(MUTATION_FENCE_TOAST);
+                                } else if was_resync {
+                                    status_state
+                                        .set_toast("Resync failed: mutation fence remains active");
+                                }
+                            }
+                        } else if was_resync {
+                            status_state.mutation_fence = None;
+                            status_state.set_toast("Resync complete: commands re-enabled");
                         }
+                        status_state.resync_in_flight = false;
                         status_state.end_turn();
                         *response_in_flight = false;
                     }
@@ -2762,6 +2875,10 @@ fn drain_stream_events(
             Err(mpsc::error::TryRecvError::Disconnected) => {
                 if *response_in_flight {
                     saw_error = true;
+                    if status_state.resync_in_flight {
+                        status_state.set_toast("Resync failed: mutation fence remains active");
+                    }
+                    status_state.resync_in_flight = false;
                     status_state.end_turn();
                     *response_in_flight = false;
                     apply_chunk(
@@ -2778,8 +2895,24 @@ fn drain_stream_events(
     saw_error
 }
 
+fn mutation_timeout_requires_fence(message: &str) -> bool {
+    message.contains("slash command outcome unknown")
+}
+
 fn note_response_busy(status_state: &mut StatusState) {
     status_state.set_toast(RESPONSE_BUSY_TOAST);
+}
+
+fn note_mutation_fence(status_state: &mut StatusState, chat_lines: &Rc<RefCell<Vec<String>>>) {
+    status_state.set_toast(MUTATION_FENCE_TOAST);
+    let detail = status_state
+        .mutation_fence
+        .as_deref()
+        .unwrap_or("a mutating slash command timed out with unknown backend outcome");
+    chat_lines.borrow_mut().push(format!(
+        "[blocked] mutation outcome is unknown; run /resync before submitting more commands. Last status: {detail}"
+    ));
+    chat_lines.borrow_mut().push(String::new());
 }
 
 fn quit_is_blocked_by_inflight_turn(response_in_flight: bool) -> bool {
@@ -2940,12 +3073,19 @@ fn handle_command(
                 }
             }
         }
+        CMD_RESYNC => {
+            let _ = dispatch_resync(chat_lines, req_tx, status_state, response_in_flight);
+        }
         // Commands whose CommandHandler implementations return
         // `Ok(Some(String))` route cleanly through the worker and
         // append into the chat pane.
         CMD_HELP | CMD_ABOUT | CMD_WORKSPACE_LIST | CMD_WORKSPACE_INFO | CMD_MODELS_LIST
         | CMD_MODELS_STATUS | CMD_PROVIDERS_LIST | CMD_MEMORY_SEARCH | CMD_MEMORY_STATS
         | CMD_MCP_STATUS | CMD_SESSION_LIST => {
+            if status_state.mutation_fence.is_some() && command != CMD_HELP {
+                note_mutation_fence(status_state, chat_lines);
+                return;
+            }
             let cmdline = match command {
                 CMD_HELP => "/help",
                 CMD_ABOUT => "/info",
@@ -2974,6 +3114,10 @@ fn handle_command(
         // status-line read (E-4) picks up the new workspace on the
         // next tick.
         CMD_WORKSPACE_SWITCH => {
+            if status_state.mutation_fence.is_some() {
+                note_mutation_fence(status_state, chat_lines);
+                return;
+            }
             if *response_in_flight {
                 note_response_busy(status_state);
                 return;
@@ -3030,6 +3174,10 @@ fn handle_command(
             }
         }
         CMD_SESSION_NEW => {
+            if status_state.mutation_fence.is_some() {
+                note_mutation_fence(status_state, chat_lines);
+                return;
+            }
             let cmdline = new_session_command(Utc::now(), uuid::Uuid::new_v4());
             dispatch_command(
                 &cmdline,
@@ -3040,6 +3188,10 @@ fn handle_command(
             );
         }
         CMD_SESSION_OPEN => {
+            if status_state.mutation_fence.is_some() {
+                note_mutation_fence(status_state, chat_lines);
+                return;
+            }
             if *response_in_flight {
                 note_response_busy(status_state);
                 return;
@@ -3254,6 +3406,43 @@ fn dispatch_command(
         Some(format!("Command: {cmdline}")),
         "dispatch command",
     );
+}
+
+fn dispatch_resync(
+    chat_lines: &Rc<RefCell<Vec<String>>>,
+    req_tx: &mpsc::Sender<WorkerRequest>,
+    status_state: &mut StatusState,
+    response_in_flight: &mut bool,
+) -> SubmissionStatus {
+    let status = dispatch_worker_backed_submission(
+        "/resync",
+        WorkerRequest::Resync,
+        chat_lines,
+        req_tx,
+        status_state,
+        response_in_flight,
+        false,
+        Some("Resyncing backend state".to_string()),
+        "dispatch resync",
+    );
+    if status == SubmissionStatus::Started {
+        status_state.resync_in_flight = true;
+    }
+    status
+}
+
+fn is_resync_command(input: &str) -> bool {
+    let Ok(tokens) = tokenize_slash_command(input) else {
+        return false;
+    };
+    tokens.len() == 1 && matches!(tokens[0].as_str(), "/resync" | "/sync")
+}
+
+fn mutation_fence_allows_input(input: &str) -> bool {
+    let Ok(tokens) = tokenize_slash_command(input) else {
+        return false;
+    };
+    tokens.len() == 1 && matches!(tokens[0].as_str(), "/help" | "/resync" | "/sync")
 }
 
 fn append_prompt_placeholder(label: &str, chat_lines: &Rc<RefCell<Vec<String>>>) {
@@ -4653,7 +4842,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn timed_out_mutating_worker_command_reports_unknown_outcome_and_unblocks_ui() {
+    async fn timed_out_mutating_worker_command_sets_resync_fence() {
         let (sink, mut rx) = StreamSink::channel(4);
 
         run_worker_command_with_deadline(
@@ -4686,9 +4875,57 @@ mod tests {
 
         assert!(!response_in_flight);
         assert!(state.turn_start.is_none());
+        assert!(state.mutation_fence.is_some());
         let rendered = lines.borrow().join("\n");
         assert!(rendered.contains("outcome unknown"));
-        assert!(rendered.contains("Check backend state before retrying"));
+        assert!(rendered.contains("Run /resync before retrying"));
+    }
+
+    #[test]
+    fn mutation_fence_only_allows_help_and_resync_input() {
+        assert!(mutation_fence_allows_input("/help"));
+        assert!(mutation_fence_allows_input("/resync"));
+        assert!(mutation_fence_allows_input("/sync"));
+
+        assert!(!mutation_fence_allows_input("hello"));
+        assert!(!mutation_fence_allows_input("/session list"));
+        assert!(!mutation_fence_allows_input("/memory post hello"));
+    }
+
+    #[test]
+    fn resync_finished_clears_mutation_fence() {
+        let mut state = StatusState::new(
+            "default".to_string(),
+            "gpt-test".to_string(),
+            "borland".to_string(),
+            false,
+        );
+        state.begin_busy(false);
+        state.mutation_fence = Some("slash command outcome unknown".to_string());
+        state.resync_in_flight = true;
+        let lines = Rc::new(RefCell::new(vec!["> /resync".to_string()]));
+        let mut typewriter_state = None;
+        let mut response_in_flight = true;
+        let mut session_picker_state = SessionPickerState::default();
+        let (tx, mut rx) = mpsc::channel(8);
+        tx.try_send(TurnChunk::Finished(Ok(String::new()))).unwrap();
+
+        assert!(!drain_stream_events(
+            &mut rx,
+            &lines,
+            &mut state,
+            &mut typewriter_state,
+            &mut response_in_flight,
+            &mut session_picker_state
+        ));
+
+        assert!(!response_in_flight);
+        assert!(state.mutation_fence.is_none());
+        assert!(!state.resync_in_flight);
+        assert_eq!(
+            state.toast.as_ref().map(|(message, _)| message.as_str()),
+            Some("Resync complete: commands re-enabled")
+        );
     }
 
     #[test]
