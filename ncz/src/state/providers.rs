@@ -984,11 +984,7 @@ fn parse_legacy_json(value: Value, fallback_name: String) -> ParsedProvider {
     }
 }
 
-fn parse_env(
-    body: &str,
-    fallback_name: String,
-    source: &Path,
-) -> Result<ParsedProvider, NczError> {
+fn parse_env(body: &str, fallback_name: String, source: &Path) -> Result<ParsedProvider, NczError> {
     let pairs = env_pairs(body, source)?;
 
     let name = lookup(&pairs, &["PROVIDER_NAME", "NAME"]).unwrap_or(fallback_name);
@@ -1506,9 +1502,7 @@ mod tests {
 
         let err = inline_credential_replacements(&paths, "local").unwrap_err();
 
-        assert!(
-            matches!(err, NczError::Precondition(message) if message.contains("local.env"))
-        );
+        assert!(matches!(err, NczError::Precondition(message) if message.contains("local.env")));
         assert!(paths.providers_dir().join("local.env").exists());
         assert!(!paths.providers_dir().join("local.json").exists());
     }
@@ -1664,9 +1658,7 @@ mod tests {
 
         let err = migrate_legacy(&paths).unwrap_err();
 
-        assert!(
-            matches!(err, NczError::Precondition(message) if message.contains("local.env"))
-        );
+        assert!(matches!(err, NczError::Precondition(message) if message.contains("local.env")));
         assert!(paths.providers_dir().join("local.env").exists());
         assert!(!paths.providers_dir().join("local.json").exists());
         assert!(!paths.agent_env().exists());
