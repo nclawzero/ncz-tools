@@ -725,6 +725,27 @@ where
         return Err(anyhow!("unsafe session id for local history clear"));
     }
 
+    let lock_dir = scoped_session_history_turn_lock_dir(scope, session_id)?;
+    match fs::metadata(&lock_dir) {
+        Ok(metadata) if metadata.is_dir() => {
+            return Err(anyhow!(
+                "session `{session_id}` has a turn in progress; /clear refused to preserve transcript lock"
+            ));
+        }
+        Ok(_) => {
+            return Err(anyhow!(
+                "session `{session_id}` has an invalid transcript turn lock; resolve it before /clear"
+            ));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(anyhow!(
+                "Failed to inspect session history turn lock before clear: {}",
+                e
+            ));
+        }
+    }
+
     let mut removed = false;
     for file in [
         scoped_session_history_file(scope, session_id)?,
@@ -789,20 +810,6 @@ where
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(anyhow!("Failed to clear session history: {}", e)),
-    }
-    let lock_dir = scoped_session_history_turn_lock_dir(scope, session_id)?;
-    match fs::remove_dir(&lock_dir) {
-        Ok(()) => {
-            removed = true;
-            sync_removed_path_parent(&lock_dir).map_err(|e| {
-                anyhow!(
-                    "Failed to sync session history turn lock parent after clear: {}",
-                    e
-                )
-            })?;
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(anyhow!("Failed to clear session history turn lock: {}", e)),
     }
     Ok(removed)
 }
@@ -1320,7 +1327,7 @@ mod tests {
     }
 
     #[test]
-    fn clear_scoped_history_removes_turn_lock() {
+    fn clear_scoped_history_refuses_live_turn_lock() {
         let _env = crate::cli::test_env_lock().lock().unwrap();
         let scope = scope(&format!("clear-turn-lock-{}", uuid::Uuid::new_v4()));
 
@@ -1331,12 +1338,16 @@ mod tests {
             .unwrap()
             .exists());
 
-        assert!(clear_scoped_session_history(&scope, "main").unwrap());
-        assert!(!scoped_session_history_turn_lock_dir(&scope, "main")
+        let err = clear_scoped_session_history(&scope, "main").unwrap_err();
+        assert!(err.to_string().contains("turn in progress"));
+        assert!(scoped_session_history_turn_lock_dir(&scope, "main")
             .unwrap()
             .exists());
+        assert!(scoped_session_history_is_incomplete(&scope, "main").unwrap());
+
+        assert!(lock.release().unwrap());
+        assert!(clear_scoped_session_history(&scope, "main").unwrap());
         assert!(!scoped_session_history_is_incomplete(&scope, "main").unwrap());
-        assert!(!lock.release().unwrap());
     }
 
     #[test]

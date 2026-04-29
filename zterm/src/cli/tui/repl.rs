@@ -518,20 +518,11 @@ impl ReplLoop {
                     continue;
                 }
             };
-            if let Err(e) =
-                storage::ensure_scoped_session_history_complete(&transcript_scope, &session_id)
-            {
-                ui::print_error("turn not submitted", Some(&e.to_string()));
-                continue;
-            }
-            let pending_marker_id =
-                match mark_repl_transcript_pending(&transcript_scope, &session_id) {
-                    Ok(marker_id) => marker_id,
+            let (pending_marker_id, turn_lock) =
+                match acquire_repl_transcript_lock(&transcript_scope, &session_id) {
+                    Ok(lock) => lock,
                     Err(e) => {
-                        ui::print_error(
-                            "could not persist pending transcript marker; turn not submitted",
-                            Some(&e.to_string()),
-                        );
+                        ui::print_error("turn not submitted", Some(&e.to_string()));
                         continue;
                     }
                 };
@@ -544,10 +535,16 @@ impl ReplLoop {
                     &pending_marker_id,
                 )
                 .err();
+                let release_error = turn_lock.release().err();
                 let mut detail = e.to_string();
                 if let Some(clear_error) = clear_error {
                     detail.push_str(&format!(
                         "; additionally failed to clear pending transcript marker: {clear_error}"
+                    ));
+                }
+                if let Some(release_error) = release_error {
+                    detail.push_str(&format!(
+                        "; additionally failed to release transcript turn lock: {release_error}"
                     ));
                 }
                 ui::print_error(
@@ -583,6 +580,12 @@ impl ReplLoop {
                                 Some(&e.to_string()),
                             );
                         }
+                    }
+                    if let Err(e) = turn_lock.release() {
+                        ui::print_error(
+                            "terminal transcript state finalized, but turn lock could not be released",
+                            Some(&e.to_string()),
+                        );
                     }
                     // Response already printed by streaming handler
                     // Update session metadata
@@ -625,6 +628,12 @@ impl ReplLoop {
                                 Some(&e.to_string()),
                             );
                         }
+                    }
+                    if let Err(e) = turn_lock.release() {
+                        ui::print_error(
+                            "terminal transcript state finalized, but turn lock could not be released",
+                            Some(&e.to_string()),
+                        );
                     }
                     eprintln!("\n❌ Error: {}", e);
                 }
@@ -1255,6 +1264,21 @@ fn mark_repl_transcript_pending(
     Ok(marker_id)
 }
 
+fn acquire_repl_transcript_lock(
+    scope: &storage::LocalWorkspaceScope,
+    session_id: &str,
+) -> Result<(String, storage::ScopedSessionTurnLock)> {
+    let marker_id = format!("turn-{}", uuid::Uuid::new_v4());
+    let lock = storage::acquire_scoped_session_history_turn_lock(
+        scope,
+        session_id,
+        &marker_id,
+        "turn submitted to backend; terminal transcript entry pending",
+    )
+    .map_err(|e| anyhow::anyhow!("could not acquire transcript turn lock: {e}"))?;
+    Ok((marker_id, lock))
+}
+
 fn clear_repl_transcript_pending_marker(
     scope: &storage::LocalWorkspaceScope,
     session_id: &str,
@@ -1660,6 +1684,26 @@ mod tests {
             .to_string()
             .contains("was missing before turn completion"));
         assert!(storage::scoped_session_history_is_incomplete(&scope, "main").unwrap());
+    }
+
+    #[test]
+    fn legacy_repl_turn_lock_blocks_second_submission_owner() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let scope = storage::workspace_scope(
+            "zeroclaw",
+            &format!("legacy-turn-lock-{}", uuid::Uuid::new_v4()),
+            None,
+        )
+        .unwrap();
+
+        let (marker_id, lock) = acquire_repl_transcript_lock(&scope, "main").unwrap();
+        let err = acquire_repl_transcript_lock(&scope, "main").unwrap_err();
+
+        assert!(err.to_string().contains("turn in progress"));
+        assert!(lock.release().unwrap());
+        clear_repl_transcript_pending_marker(&scope, "main", &marker_id).unwrap();
+        let (_, next_lock) = acquire_repl_transcript_lock(&scope, "main").unwrap();
+        assert!(next_lock.release().unwrap());
     }
 
     #[test]
