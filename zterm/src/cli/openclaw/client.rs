@@ -1776,37 +1776,6 @@ impl AgentClient for OpenClawClient {
                 }
             }
         }
-        let legacy_result = match self
-            .rpc_sessions_list(SessionsListOpts {
-                limit: Some(500),
-                include_derived_titles: true,
-                ..Default::default()
-            })
-            .await
-        {
-            Ok(result) => result,
-            Err(e) if !sessions.is_empty() => {
-                tracing::warn!(
-                    "openclaw: legacy session compatibility scan failed; returning scoped sessions only: {e}"
-                );
-                return Ok(sessions);
-            }
-            Err(e) => return Err(e),
-        };
-        if let Err(e) = ensure_session_list_not_truncated(&legacy_result, 500) {
-            if sessions.is_empty() {
-                return Err(e);
-            }
-            tracing::warn!(
-                "openclaw: legacy session compatibility scan was truncated; returning scoped sessions only: {e}"
-            );
-            return Ok(sessions);
-        }
-        for row in self.legacy_server_key_session_rows(legacy_result.sessions) {
-            if seen.insert(row.key.clone()) {
-                sessions.push(row_into_session(row));
-            }
-        }
         Ok(sessions)
     }
 
@@ -1937,10 +1906,11 @@ impl OpenClawClient {
         rows: Vec<super::handshake::OpenClawSessionRow>,
     ) -> Vec<super::handshake::OpenClawSessionRow> {
         rows.into_iter()
-            .filter(|row| self.row_belongs_to_session_namespace(row))
+            .filter(|row| self.row_authorizes_session_operation(row))
             .collect()
     }
 
+    #[cfg(test)]
     fn row_belongs_to_session_namespace(&self, row: &super::handshake::OpenClawSessionRow) -> bool {
         self.stable_row_belongs_to_session_namespace(row)
             || self.legacy_server_key_row_belongs_to_session_namespace(row)
@@ -1960,18 +1930,7 @@ impl OpenClawClient {
         self.stable_row_belongs_to_session_namespace(row)
     }
 
-    fn legacy_server_key_session_rows(
-        &self,
-        rows: Vec<super::handshake::OpenClawSessionRow>,
-    ) -> Vec<super::handshake::OpenClawSessionRow> {
-        rows.into_iter()
-            .filter(|row| {
-                !self.stable_row_belongs_to_session_namespace(row)
-                    && self.legacy_server_key_row_belongs_to_session_namespace(row)
-            })
-            .collect()
-    }
-
+    #[cfg(test)]
     fn legacy_server_key_row_belongs_to_session_namespace(
         &self,
         row: &super::handshake::OpenClawSessionRow,
@@ -1993,6 +1952,7 @@ impl OpenClawClient {
         namespaces
     }
 
+    #[cfg(test)]
     fn row_metadata_matches_session_namespace(
         &self,
         row: &super::handshake::OpenClawSessionRow,
@@ -2020,6 +1980,7 @@ impl OpenClawClient {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 struct SessionNamespaceIdentity<'a> {
     namespace: &'a str,
@@ -2028,6 +1989,7 @@ struct SessionNamespaceIdentity<'a> {
     workspace_url: Option<&'a str>,
 }
 
+#[cfg(test)]
 impl<'a> SessionNamespaceIdentity<'a> {
     fn from_namespace(namespace: &'a str) -> Self {
         let legacy_workspace = legacy_namespace_workspace_identity(namespace);
@@ -2071,6 +2033,7 @@ impl<'a> SessionNamespaceIdentity<'a> {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Default)]
 struct RowIdentityMetadata {
     session_namespaces: Vec<String>,
@@ -2079,6 +2042,7 @@ struct RowIdentityMetadata {
     workspace_urls: Vec<String>,
 }
 
+#[cfg(test)]
 impl RowIdentityMetadata {
     fn is_empty(&self) -> bool {
         self.session_namespaces.is_empty()
@@ -2088,6 +2052,7 @@ impl RowIdentityMetadata {
     }
 }
 
+#[cfg(test)]
 fn canonical_namespace_workspace_id(namespace: &str) -> Option<&str> {
     let mut parts = namespace.trim().split(';');
     let backend = parts.next()?;
@@ -2100,6 +2065,7 @@ fn canonical_namespace_workspace_id(namespace: &str) -> Option<&str> {
     (key == "workspace_id").then_some(value)
 }
 
+#[cfg(test)]
 fn legacy_namespace_workspace_identity(namespace: &str) -> Option<(&str, &str)> {
     let mut parts = namespace.trim().split(';');
     let backend = parts.next()?;
@@ -2118,16 +2084,19 @@ fn legacy_namespace_workspace_identity(namespace: &str) -> Option<(&str, &str)> 
     }
 }
 
+#[cfg(test)]
 fn namespace_key_value(part: &str) -> Option<(&str, &str)> {
     let (key, value) = part.split_once('=')?;
     let value = value.trim();
     (!value.is_empty()).then_some((key, value))
 }
 
+#[cfg(test)]
 fn urls_equivalent(actual: &str, expected: &str) -> bool {
     actual.trim_end_matches('/') == expected.trim_end_matches('/')
 }
 
+#[cfg(test)]
 fn row_identity_metadata(row: &super::handshake::OpenClawSessionRow) -> RowIdentityMetadata {
     let mut out = RowIdentityMetadata::default();
 
@@ -2146,6 +2115,7 @@ fn row_identity_metadata(row: &super::handshake::OpenClawSessionRow) -> RowIdent
     out
 }
 
+#[cfg(test)]
 fn collect_identity_metadata_for_key(
     key: &str,
     value: &serde_json::Value,
@@ -2158,6 +2128,7 @@ fn collect_identity_metadata_for_key(
     }
 }
 
+#[cfg(test)]
 fn collect_identity_metadata_values(value: &serde_json::Value, target: &mut Vec<String>) {
     match value {
         serde_json::Value::String(s) => {
@@ -2175,6 +2146,7 @@ fn collect_identity_metadata_values(value: &serde_json::Value, target: &mut Vec<
     }
 }
 
+#[cfg(test)]
 fn normalize_metadata_key(key: &str) -> String {
     key.chars()
         .filter(|ch| ch.is_ascii_alphanumeric())
@@ -2182,6 +2154,7 @@ fn normalize_metadata_key(key: &str) -> String {
         .collect()
 }
 
+#[cfg(test)]
 fn identity_metadata_target<'a>(
     key: &str,
     metadata: &'a mut RowIdentityMetadata,
@@ -4148,8 +4121,6 @@ mod tests {
                 error: None,
             })
             .await;
-        resolve_empty_legacy_session_scan(&pending, &mut outbound_rx).await;
-
         let sessions = list_task
             .await
             .expect("list task should join")
@@ -4286,8 +4257,6 @@ mod tests {
                 error: None,
             })
             .await;
-        resolve_empty_legacy_session_scan(&pending, &mut outbound_rx).await;
-
         let sessions = list_task
             .await
             .expect("list task should join")
@@ -4298,7 +4267,60 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_sessions_filters_by_active_namespace_before_global_cap() {
+    async fn list_sessions_filters_display_only_legacy_duplicate_names() {
+        let pending = PendingRequests::new();
+        let (outbound_tx, mut outbound_rx) = mpsc::channel::<RequestFrame>(OUTBOUND_CAPACITY);
+        let mut client = tests_support_new_fake(pending.clone(), Some(outbound_tx), true);
+        let active_namespace = "backend=openclaw;workspace_id=ws_active";
+        client.set_session_namespace(active_namespace);
+
+        let active_key = stable_session_key(active_namespace, "Research");
+        let display_only_key = "oc-server-generated-duplicate";
+        let list_task = tokio::spawn(async move { client.list_sessions().await });
+        let list_req = outbound_rx
+            .recv()
+            .await
+            .expect("list request should be sent");
+        pending
+            .resolve(ResponseFrame {
+                id: list_req.id,
+                ok: true,
+                payload: Some(serde_json::json!({
+                    "ts": 1,
+                    "path": "sessions.jsonl",
+                    "count": 2,
+                    "defaults": {},
+                    "sessions": [
+                        {
+                            "key": display_only_key,
+                            "kind": "direct",
+                            "label": "Research",
+                            "metadata": {
+                                "zterm": { "sessionNamespace": active_namespace }
+                            }
+                        },
+                        {
+                            "key": active_key.clone(),
+                            "kind": "direct",
+                            "label": "Research"
+                        }
+                    ]
+                })),
+                error: None,
+            })
+            .await;
+
+        let sessions = list_task
+            .await
+            .expect("list task should join")
+            .expect("list should succeed");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, active_key);
+        assert_eq!(sessions[0].name, "Research");
+    }
+
+    #[tokio::test]
+    async fn list_sessions_uses_only_actionable_namespace_scans() {
         let pending = PendingRequests::new();
         let (outbound_tx, mut outbound_rx) = mpsc::channel::<RequestFrame>(OUTBOUND_CAPACITY);
         let mut client = tests_support_new_fake(pending.clone(), Some(outbound_tx), true);
@@ -4337,35 +4359,21 @@ mod tests {
                 error: None,
             })
             .await;
-        let legacy_req = outbound_rx
-            .recv()
-            .await
-            .expect("legacy compatibility scan should be sent");
-        assert_eq!(legacy_req.method, "sessions.list");
-        assert_eq!(legacy_req.params.as_ref().unwrap()["limit"], 500);
-        assert!(legacy_req.params.as_ref().unwrap().get("search").is_none());
-        pending
-            .resolve(ResponseFrame {
-                id: legacy_req.id,
-                ok: true,
-                payload: Some(serde_json::json!({
-                    "ts": 1,
-                    "path": "sessions.jsonl",
-                    "count": 600,
-                    "defaults": {},
-                    "sessions": []
-                })),
-                error: None,
-            })
-            .await;
-
         let sessions = list_task
             .await
             .expect("list task should join")
-            .expect("active namespace list should not fail on truncated legacy global scan");
+            .expect("active namespace list should succeed without a global legacy scan");
         assert_eq!(sessions.len(), 2);
         assert_eq!(sessions[0].name, "Research");
         assert_eq!(sessions[1].name, "Planning");
+        assert!(
+            matches!(
+                tokio::time::timeout(std::time::Duration::from_millis(50), outbound_rx.recv())
+                    .await,
+                Err(_) | Ok(None)
+            ),
+            "list_sessions should not issue a global legacy compatibility scan"
+        );
     }
 
     #[tokio::test]
@@ -4374,10 +4382,8 @@ mod tests {
         let (outbound_tx, mut outbound_rx) = mpsc::channel::<RequestFrame>(OUTBOUND_CAPACITY);
         let mut client = tests_support_new_fake(pending.clone(), Some(outbound_tx), true);
         let active_namespace = "backend=openclaw;workspace_id=ws_active";
-        let foreign_namespace = "backend=openclaw;workspace_id=ws_foreign";
         client.set_session_namespace(active_namespace);
         let server_key = "oc-server-generated-123";
-        let foreign_server_key = "oc-server-generated-foreign";
         let client = Arc::new(client);
 
         let list_client = Arc::clone(&client);
@@ -4405,52 +4411,22 @@ mod tests {
             })
             .await;
 
-        let legacy_req = outbound_rx
-            .recv()
-            .await
-            .expect("legacy server-key scan should be sent");
-        assert_eq!(legacy_req.method, "sessions.list");
-        assert_eq!(legacy_req.params.as_ref().unwrap()["limit"], 500);
-        assert!(legacy_req.params.as_ref().unwrap().get("search").is_none());
-        pending
-            .resolve(ResponseFrame {
-                id: legacy_req.id,
-                ok: true,
-                payload: Some(serde_json::json!({
-                    "ts": 1,
-                    "path": "sessions.jsonl",
-                    "count": 2,
-                    "defaults": {},
-                    "sessions": [
-                        {
-                            "key": foreign_server_key,
-                            "kind": "direct",
-                            "label": "Research",
-                            "metadata": {
-                                "zterm": { "sessionNamespace": foreign_namespace }
-                            }
-                        },
-                        {
-                            "key": server_key,
-                            "kind": "direct",
-                            "label": "Research",
-                            "metadata": {
-                                "zterm": { "sessionNamespace": active_namespace }
-                            }
-                        }
-                    ]
-                })),
-                error: None,
-            })
-            .await;
-
         let sessions = list_task
             .await
             .expect("list task should join")
-            .expect("legacy server-key list should succeed");
-        assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].id, server_key);
-        assert_eq!(sessions[0].name, "Research");
+            .expect("legacy server-key list should not fail");
+        assert!(
+            sessions.is_empty(),
+            "display-only legacy server-key rows must not be actionable list results"
+        );
+        assert!(
+            matches!(
+                tokio::time::timeout(std::time::Duration::from_millis(50), outbound_rx.recv())
+                    .await,
+                Err(_) | Ok(None)
+            ),
+            "list_sessions should not issue a global legacy server-key scan"
+        );
 
         let load_client = Arc::clone(&client);
         let load_task = tokio::spawn(async move { load_client.load_session(server_key).await });
@@ -4565,38 +4541,19 @@ mod tests {
             })
             .await;
 
-        let legacy_req = outbound_rx
-            .recv()
-            .await
-            .expect("legacy compatibility scan should be sent");
-        pending
-            .resolve(ResponseFrame {
-                id: legacy_req.id,
-                ok: true,
-                payload: Some(serde_json::json!({
-                    "ts": 1,
-                    "path": "sessions.jsonl",
-                    "count": 1,
-                    "defaults": {},
-                    "sessions": [{
-                        "key": foreign_server_key,
-                        "kind": "direct",
-                        "label": "alpha",
-                        "displayName": "alpha ws://shared",
-                        "derivedTitle": title,
-                        "metadata": {
-                            "zterm": { "sessionNamespace": foreign_namespace }
-                        }
-                    }]
-                })),
-                error: None,
-            })
-            .await;
         let sessions = list_task
             .await
             .expect("list task should join")
             .expect("legacy title-spoof list should succeed");
         assert!(sessions.is_empty());
+        assert!(
+            matches!(
+                tokio::time::timeout(std::time::Duration::from_millis(50), outbound_rx.recv())
+                    .await,
+                Err(_) | Ok(None)
+            ),
+            "list_sessions should not issue a title-derived legacy compatibility scan"
+        );
 
         let load_client = Arc::clone(&client);
         let load_task =
@@ -4896,37 +4853,6 @@ mod tests {
                 }
             ]
         })
-    }
-
-    async fn resolve_empty_legacy_session_scan(
-        pending: &PendingRequests,
-        outbound_rx: &mut mpsc::Receiver<RequestFrame>,
-    ) {
-        let req = outbound_rx
-            .recv()
-            .await
-            .expect("legacy compatibility scan should be sent");
-        assert_eq!(req.method, "sessions.list");
-        assert_eq!(req.params.as_ref().unwrap()["limit"], 500);
-        assert_eq!(
-            req.params.as_ref().unwrap()["includeDerivedTitles"],
-            serde_json::json!(true)
-        );
-        assert!(req.params.as_ref().unwrap().get("search").is_none());
-        pending
-            .resolve(ResponseFrame {
-                id: req.id,
-                ok: true,
-                payload: Some(serde_json::json!({
-                    "ts": 1,
-                    "path": "sessions.jsonl",
-                    "count": 0,
-                    "defaults": {},
-                    "sessions": []
-                })),
-                error: None,
-            })
-            .await;
     }
 
     #[tokio::test]

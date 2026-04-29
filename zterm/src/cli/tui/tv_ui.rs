@@ -1524,6 +1524,14 @@ async fn generate_connect_splash_with_named_session(
         .await
         {
             Ok(Ok(())) => {}
+            Ok(Err(e))
+                if connect_splash_generation_failed(&generated) && session_not_found_error(&e) =>
+            {
+                warn!(
+                    "connect-splash scratch session `{}` was not found during cleanup after generation failure: {e}",
+                    session.id
+                );
+            }
             Ok(Err(e)) => {
                 return Err(ConnectSplashCleanupFailure::new(format!(
                     "connect-splash scratch session `{}` cleanup failed: {e}",
@@ -1547,6 +1555,20 @@ async fn generate_connect_splash_with_named_session(
         anyhow::bail!("connect-splash generation returned empty output");
     }
     Ok(normalized)
+}
+
+fn connect_splash_generation_failed(
+    generated: &Result<anyhow::Result<String>, anyhow::Error>,
+) -> bool {
+    match generated {
+        Ok(Ok(_)) => false,
+        Ok(Err(_)) | Err(_) => true,
+    }
+}
+
+fn session_not_found_error(error: &anyhow::Error) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("session not found") || message.contains("404")
 }
 
 fn connect_splash_session_name(workspace_name: &str) -> String {
@@ -5362,6 +5384,7 @@ mod tests {
                 list_calls: Arc::new(StdMutex::new(0)),
                 load_calls: Arc::new(StdMutex::new(Vec::new())),
                 submit_response: generated.to_string(),
+                submit_error: None,
                 cancellation_safe: true,
                 sink_set_states: Arc::clone(&sink_set_states),
                 delete_error: None,
@@ -5448,6 +5471,7 @@ mod tests {
                 list_calls: Arc::new(StdMutex::new(0)),
                 load_calls: Arc::new(StdMutex::new(Vec::new())),
                 submit_response: "SHOULD NOT BE USED".to_string(),
+                submit_error: None,
                 cancellation_safe: true,
                 sink_set_states: Arc::clone(&sink_set_states),
                 delete_error: None,
@@ -5519,6 +5543,7 @@ mod tests {
                 list_calls: Arc::new(StdMutex::new(0)),
                 load_calls: Arc::new(StdMutex::new(Vec::new())),
                 submit_response: "SHOULD NOT BE USED".to_string(),
+                submit_error: None,
                 cancellation_safe: false,
                 sink_set_states: Arc::clone(&sink_set_states),
                 delete_error: None,
@@ -5587,6 +5612,7 @@ mod tests {
                 list_calls: Arc::new(StdMutex::new(0)),
                 load_calls: Arc::new(StdMutex::new(Vec::new())),
                 submit_response: "GENERATED\nSPLASH".to_string(),
+                submit_error: None,
                 cancellation_safe: true,
                 sink_set_states: Arc::new(StdMutex::new(Vec::new())),
                 delete_error: Some("delete failed".to_string()),
@@ -5634,6 +5660,74 @@ mod tests {
     }
 
     #[test]
+    fn connect_splash_submit_failure_with_delete_not_found_uses_fallback() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let created = Arc::new(StdMutex::new(Vec::new()));
+            let deleted = Arc::new(StdMutex::new(Vec::new()));
+            let submitted = Arc::new(StdMutex::new(Vec::new()));
+            let fake = WorkerSessionFakeClient {
+                listed_sessions: Vec::new(),
+                list_sessions_error: None,
+                loadable_sessions: Vec::new(),
+                load_reject_ids: Vec::new(),
+                created: Arc::clone(&created),
+                deleted: Arc::clone(&deleted),
+                submitted: Arc::clone(&submitted),
+                list_calls: Arc::new(StdMutex::new(0)),
+                load_calls: Arc::new(StdMutex::new(Vec::new())),
+                submit_response: "SHOULD NOT BE USED".to_string(),
+                submit_error: Some("websocket auth failed before dispatch".to_string()),
+                cancellation_safe: true,
+                sink_set_states: Arc::new(StdMutex::new(Vec::new())),
+                delete_error: Some("Session not found".to_string()),
+            };
+            let boxed: Box<dyn crate::cli::agent::AgentClient + Send + Sync> = Box::new(fake);
+            let app = Arc::new(Mutex::new(App {
+                workspaces: vec![crate::cli::workspace::Workspace {
+                    id: 0,
+                    config: crate::cli::workspace::WorkspaceConfig {
+                        id: Some("ws-alpha".to_string()),
+                        name: "alpha".to_string(),
+                        backend: crate::cli::workspace::Backend::Openclaw,
+                        url: "ws://gateway.example".to_string(),
+                        token_env: None,
+                        token: None,
+                        label: None,
+                        namespace_aliases: Vec::new(),
+                    },
+                    client: Some(Arc::new(Mutex::new(boxed))),
+                    cron: None,
+                }],
+                active: 0,
+                shared_mnemos: None,
+                config_path: std::path::PathBuf::from("test-config.toml"),
+            }));
+
+            let splash = connect_splash_for_workspace(&app, "alpha", None)
+                .await
+                .unwrap();
+
+            assert_eq!(splash, delighters::local_connect_splash("alpha"));
+            assert_eq!(created.lock().unwrap().len(), 1);
+            assert_eq!(submitted.lock().unwrap().len(), 1);
+            assert_eq!(deleted.lock().unwrap().len(), 1);
+            let path = delighters::default_connect_splash_cache_path("alpha").unwrap();
+            assert!(!path.exists());
+        });
+
+        match old_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    #[test]
     fn connect_splash_does_not_delete_preexisting_scratch_name() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
@@ -5658,6 +5752,7 @@ mod tests {
                 list_calls: Arc::new(StdMutex::new(0)),
                 load_calls: Arc::new(StdMutex::new(Vec::new())),
                 submit_response: "SHOULD NOT BE USED".to_string(),
+                submit_error: None,
                 cancellation_safe: true,
                 sink_set_states: Arc::new(StdMutex::new(Vec::new())),
                 delete_error: None,
@@ -8041,6 +8136,7 @@ mod tests {
         list_calls: Arc<StdMutex<usize>>,
         load_calls: Arc<StdMutex<Vec<String>>>,
         submit_response: String,
+        submit_error: Option<String>,
         cancellation_safe: bool,
         sink_set_states: Arc<StdMutex<Vec<bool>>>,
         delete_error: Option<String>,
@@ -8131,6 +8227,9 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((session_id.to_string(), message.to_string()));
+            if let Some(error) = &self.submit_error {
+                anyhow::bail!("{error}");
+            }
             Ok(self.submit_response.clone())
         }
 
@@ -8163,6 +8262,7 @@ mod tests {
                 list_calls: Arc::new(StdMutex::new(0)),
                 load_calls: Arc::new(StdMutex::new(Vec::new())),
                 submit_response: String::new(),
+                submit_error: None,
                 cancellation_safe: true,
                 sink_set_states: Arc::new(StdMutex::new(Vec::new())),
                 delete_error: None,
@@ -8181,6 +8281,7 @@ mod tests {
                 list_calls: Arc::new(StdMutex::new(0)),
                 load_calls: Arc::new(StdMutex::new(Vec::new())),
                 submit_response: "GENERATED\nSPLASH".to_string(),
+                submit_error: None,
                 cancellation_safe: true,
                 sink_set_states: Arc::new(StdMutex::new(Vec::new())),
                 delete_error: Some("delete failed".to_string()),
@@ -8308,6 +8409,7 @@ mod tests {
                 list_calls,
                 load_calls: Arc::clone(&load_calls),
                 submit_response: String::new(),
+                submit_error: None,
                 cancellation_safe: true,
                 sink_set_states: Arc::new(StdMutex::new(Vec::new())),
                 delete_error: None,
@@ -8382,6 +8484,7 @@ mod tests {
                 list_calls: Arc::clone(&list_calls),
                 load_calls: Arc::clone(&load_calls),
                 submit_response: String::new(),
+                submit_error: None,
                 cancellation_safe: true,
                 sink_set_states: Arc::new(StdMutex::new(Vec::new())),
                 delete_error: None,
@@ -8469,6 +8572,7 @@ mod tests {
                 list_calls: Arc::clone(&list_calls),
                 load_calls: Arc::clone(&load_calls),
                 submit_response: String::new(),
+                submit_error: None,
                 cancellation_safe: true,
                 sink_set_states: Arc::new(StdMutex::new(Vec::new())),
                 delete_error: None,
@@ -8545,6 +8649,7 @@ mod tests {
                 list_calls,
                 load_calls: Arc::clone(&load_calls),
                 submit_response: String::new(),
+                submit_error: None,
                 cancellation_safe: true,
                 sink_set_states: Arc::new(StdMutex::new(Vec::new())),
                 delete_error: None,
@@ -8634,6 +8739,7 @@ mod tests {
             list_calls: Arc::new(StdMutex::new(0)),
             load_calls: Arc::new(StdMutex::new(Vec::new())),
             submit_response: String::new(),
+            submit_error: None,
             cancellation_safe: true,
             sink_set_states: Arc::new(StdMutex::new(Vec::new())),
             delete_error: None,
