@@ -17,6 +17,8 @@
 
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
+use std::error::Error as StdError;
+use std::fmt;
 use std::future::Future;
 use std::rc::Rc;
 use std::sync::{
@@ -587,7 +589,7 @@ pub async fn run(
         None,
         connect_splash_enabled,
     )
-    .await;
+    .await?;
 
     // Install the streaming sink on the boot workspace. The worker
     // also reinstalls before every submitted turn and after every
@@ -1221,7 +1223,7 @@ async fn handle_worker_command_request(
                             return;
                         }
                         if let Some((name, _)) = switched_workspace {
-                            if let Some(splash) = connect_splash_for_workspace_if_enabled(
+                            match connect_splash_for_workspace_if_enabled(
                                 worker_app,
                                 &name,
                                 Some(worker_sink.clone()),
@@ -1229,11 +1231,27 @@ async fn handle_worker_command_request(
                             )
                             .await
                             {
-                                let _ = send_worker_chunk_reliably(
-                                    worker_sink,
-                                    TurnChunk::Typewriter(splash),
-                                )
-                                .await;
+                                Ok(Some(splash)) => {
+                                    let _ = send_worker_chunk_reliably(
+                                        worker_sink,
+                                        TurnChunk::Typewriter(splash),
+                                    )
+                                    .await;
+                                }
+                                Ok(None) => {}
+                                Err(e) => {
+                                    let detail = format!(
+                                        "workspace switched, but connect-splash cleanup failed: {e}"
+                                    );
+                                    send_worker_finished(
+                                        worker_sink,
+                                        Err(mutating_command_unknown_outcome_message(
+                                            &cmdline, &detail,
+                                        )),
+                                    )
+                                    .await;
+                                    return;
+                                }
                             }
                         }
                     }
@@ -1353,11 +1371,38 @@ async fn resync_worker_state(
     })
 }
 
+#[derive(Debug)]
+struct ConnectSplashCleanupFailure {
+    message: String,
+}
+
+impl ConnectSplashCleanupFailure {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for ConnectSplashCleanupFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl StdError for ConnectSplashCleanupFailure {}
+
+fn is_connect_splash_cleanup_failure(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<ConnectSplashCleanupFailure>()
+        .is_some()
+}
+
 async fn connect_splash_for_workspace(
     app: &Arc<Mutex<App>>,
     workspace_name: &str,
     restore_sink: Option<StreamSink>,
-) -> String {
+) -> Result<String> {
     let cache_path = delighters::default_connect_splash_cache_path(workspace_name);
     if let Some(path) = &cache_path {
         if let Some(cached) = delighters::read_cached_connect_splash(
@@ -1365,7 +1410,7 @@ async fn connect_splash_for_workspace(
             std::time::SystemTime::now(),
             delighters::CONNECT_SPLASH_TTL,
         ) {
-            return cached;
+            return Ok(cached);
         }
     }
 
@@ -1376,11 +1421,15 @@ async fn connect_splash_for_workspace(
                     warn!("connect-splash cache write failed: {e}");
                 }
             }
-            generated
+            Ok(generated)
+        }
+        Err(e) if is_connect_splash_cleanup_failure(&e) => {
+            warn!("connect-splash cleanup failed after creating backend state: {e}");
+            Err(e)
         }
         Err(e) => {
             warn!("connect-splash backend generation failed: {e}; using local fallback");
-            delighters::local_connect_splash(workspace_name)
+            Ok(delighters::local_connect_splash(workspace_name))
         }
     }
 }
@@ -1390,11 +1439,13 @@ async fn connect_splash_for_workspace_if_enabled(
     workspace_name: &str,
     restore_sink: Option<StreamSink>,
     enabled: bool,
-) -> Option<String> {
+) -> Result<Option<String>> {
     if !enabled {
-        return None;
+        return Ok(None);
     }
-    Some(connect_splash_for_workspace(app, workspace_name, restore_sink).await)
+    connect_splash_for_workspace(app, workspace_name, restore_sink)
+        .await
+        .map(Some)
 }
 
 async fn generate_connect_splash_from_active_backend(
@@ -1473,8 +1524,20 @@ async fn generate_connect_splash_with_named_session(
         .await
         {
             Ok(Ok(())) => {}
-            Ok(Err(e)) => anyhow::bail!("connect-splash scratch session cleanup failed: {e}"),
-            Err(_) => anyhow::bail!("connect-splash scratch session cleanup timed out"),
+            Ok(Err(e)) => {
+                return Err(ConnectSplashCleanupFailure::new(format!(
+                    "connect-splash scratch session `{}` cleanup failed: {e}",
+                    session.id
+                ))
+                .into());
+            }
+            Err(_) => {
+                return Err(ConnectSplashCleanupFailure::new(format!(
+                    "connect-splash scratch session `{}` cleanup timed out",
+                    session.id
+                ))
+                .into());
+            }
         }
     }
 
@@ -5325,7 +5388,9 @@ mod tests {
                 config_path: std::path::PathBuf::from("test-config.toml"),
             }));
 
-            let splash = connect_splash_for_workspace(&app, "alpha", None).await;
+            let splash = connect_splash_for_workspace(&app, "alpha", None)
+                .await
+                .unwrap();
             let expected = delighters::normalize_connect_splash(generated);
 
             assert_eq!(splash, expected);
@@ -5409,7 +5474,9 @@ mod tests {
                 config_path: std::path::PathBuf::from("test-config.toml"),
             }));
 
-            let splash = connect_splash_for_workspace_if_enabled(&app, "alpha", None, false).await;
+            let splash = connect_splash_for_workspace_if_enabled(&app, "alpha", None, false)
+                .await
+                .unwrap();
 
             assert!(splash.is_none());
             assert!(
@@ -5478,7 +5545,9 @@ mod tests {
                 config_path: std::path::PathBuf::from("test-config.toml"),
             }));
 
-            let splash = connect_splash_for_workspace(&app, "alpha", None).await;
+            let splash = connect_splash_for_workspace(&app, "alpha", None)
+                .await
+                .unwrap();
 
             assert_eq!(splash, delighters::local_connect_splash("alpha"));
             assert!(created.lock().unwrap().is_empty());
@@ -5496,7 +5565,7 @@ mod tests {
     }
 
     #[test]
-    fn connect_splash_cleanup_failure_falls_back_without_cache() {
+    fn connect_splash_cleanup_failure_surfaces_without_cache() {
         let _env = crate::cli::test_env_lock().lock().unwrap();
         let home = tempfile::tempdir().unwrap();
         let old_home = std::env::var_os("HOME");
@@ -5544,9 +5613,13 @@ mod tests {
                 config_path: std::path::PathBuf::from("test-config.toml"),
             }));
 
-            let splash = connect_splash_for_workspace(&app, "alpha", None).await;
+            let err = connect_splash_for_workspace(&app, "alpha", None)
+                .await
+                .unwrap_err();
 
-            assert_eq!(splash, delighters::local_connect_splash("alpha"));
+            assert!(is_connect_splash_cleanup_failure(&err));
+            assert!(err.to_string().contains("cleanup failed"));
+            assert!(err.to_string().contains("delete failed"));
             assert_eq!(created.lock().unwrap().len(), 1);
             assert_eq!(submitted.lock().unwrap().len(), 1);
             assert_eq!(deleted.lock().unwrap().len(), 1);
@@ -8067,6 +8140,141 @@ mod tests {
 
         fn submit_turn_is_cancellation_safe(&self) -> bool {
             self.cancellation_safe
+        }
+    }
+
+    #[test]
+    fn workspace_switch_connect_splash_cleanup_failure_is_terminal_error() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let alpha_fake = WorkerSessionFakeClient {
+                listed_sessions: Vec::new(),
+                list_sessions_error: None,
+                loadable_sessions: Vec::new(),
+                load_reject_ids: Vec::new(),
+                created: Arc::new(StdMutex::new(Vec::new())),
+                deleted: Arc::new(StdMutex::new(Vec::new())),
+                submitted: Arc::new(StdMutex::new(Vec::new())),
+                list_calls: Arc::new(StdMutex::new(0)),
+                load_calls: Arc::new(StdMutex::new(Vec::new())),
+                submit_response: String::new(),
+                cancellation_safe: true,
+                sink_set_states: Arc::new(StdMutex::new(Vec::new())),
+                delete_error: None,
+            };
+            let beta_created = Arc::new(StdMutex::new(Vec::new()));
+            let beta_deleted = Arc::new(StdMutex::new(Vec::new()));
+            let beta_submitted = Arc::new(StdMutex::new(Vec::new()));
+            let beta_fake = WorkerSessionFakeClient {
+                listed_sessions: Vec::new(),
+                list_sessions_error: None,
+                loadable_sessions: Vec::new(),
+                load_reject_ids: Vec::new(),
+                created: Arc::clone(&beta_created),
+                deleted: Arc::clone(&beta_deleted),
+                submitted: Arc::clone(&beta_submitted),
+                list_calls: Arc::new(StdMutex::new(0)),
+                load_calls: Arc::new(StdMutex::new(Vec::new())),
+                submit_response: "GENERATED\nSPLASH".to_string(),
+                cancellation_safe: true,
+                sink_set_states: Arc::new(StdMutex::new(Vec::new())),
+                delete_error: Some("delete failed".to_string()),
+            };
+            let app = Arc::new(Mutex::new(App {
+                workspaces: vec![
+                    crate::cli::workspace::Workspace {
+                        id: 0,
+                        config: crate::cli::workspace::WorkspaceConfig {
+                            id: Some("ws-alpha".to_string()),
+                            name: "alpha".to_string(),
+                            backend: crate::cli::workspace::Backend::Openclaw,
+                            url: "ws://alpha.example".to_string(),
+                            token_env: None,
+                            token: None,
+                            label: None,
+                            namespace_aliases: Vec::new(),
+                        },
+                        client: Some(Arc::new(Mutex::new(Box::new(alpha_fake)))),
+                        cron: None,
+                    },
+                    crate::cli::workspace::Workspace {
+                        id: 1,
+                        config: crate::cli::workspace::WorkspaceConfig {
+                            id: Some("ws-beta".to_string()),
+                            name: "beta".to_string(),
+                            backend: crate::cli::workspace::Backend::Openclaw,
+                            url: "ws://beta.example".to_string(),
+                            token_env: None,
+                            token: None,
+                            label: None,
+                            namespace_aliases: Vec::new(),
+                        },
+                        client: Some(Arc::new(Mutex::new(Box::new(beta_fake)))),
+                        cron: None,
+                    },
+                ],
+                active: 0,
+                shared_mnemos: None,
+                config_path: std::path::PathBuf::from("test-config.toml"),
+            }));
+            let active_session = Session {
+                id: "main".to_string(),
+                name: "Main".to_string(),
+                model: "model".to_string(),
+                provider: "provider".to_string(),
+            };
+            let workspace_key = current_workspace_binding_key(&app).await.unwrap();
+            let mut bindings = HashMap::new();
+            remember_worker_session(&mut bindings, workspace_key, &active_session);
+            let handler = CommandHandler::new(Arc::clone(&app));
+            let (sink, mut rx) = StreamSink::channel(32);
+
+            handle_worker_command_request(
+                "/workspace switch beta".to_string(),
+                &app,
+                &mut bindings,
+                &active_session.name,
+                &sink,
+                &handler,
+                true,
+            )
+            .await;
+
+            let mut rendered = String::new();
+            let mut terminal_error = None;
+            let mut typewriter_chunks = 0usize;
+            while let Ok(chunk) = rx.try_recv() {
+                match chunk {
+                    TurnChunk::Token(text) => rendered.push_str(&text),
+                    TurnChunk::Typewriter(_) => typewriter_chunks += 1,
+                    TurnChunk::Finished(Err(message)) => terminal_error = Some(message),
+                    _ => {}
+                }
+            }
+
+            assert!(rendered.contains("switched to workspace: beta"));
+            let terminal_error = terminal_error.expect("cleanup failure should reach the UI");
+            assert!(terminal_error.contains("slash command outcome unknown"));
+            assert!(terminal_error.contains("connect-splash cleanup failed"));
+            assert!(terminal_error.contains("delete failed"));
+            assert_eq!(typewriter_chunks, 0);
+            assert_eq!(beta_submitted.lock().unwrap().len(), 1);
+            assert_eq!(beta_deleted.lock().unwrap().len(), 1);
+            assert!(beta_created
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|session| { session.name.starts_with("zterm connect splash beta ") }));
+        });
+
+        match old_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
         }
     }
 

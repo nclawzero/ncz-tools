@@ -13,9 +13,11 @@
 > v0.3.1 connect splash asks the active backend for period-style text
 > through a bounded scratch session, caches only confirmed generated
 > output for 24h, and falls back to a local modem sequence on timeout
-> or backend error. Setting `[ui].splash_screen = false` disables both
-> the legacy ANSI splash and the TV connect-splash cache/backend path.
-> State writes use a
+> or backend error before scratch-session cleanup. Cleanup failures
+> after backend state is created are surfaced to the UI instead of
+> silently falling back. Setting `[ui].splash_screen = false` disables
+> both the legacy ANSI splash and the TV connect-splash cache/backend
+> path. State writes use a
 > bounded lock wait, and the TV path persists a mutation fence after
 > timed-out mutating slash commands until `/resync --force`.
 
