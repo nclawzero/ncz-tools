@@ -1589,6 +1589,7 @@ impl App {
             label: None,
             namespace_aliases: Vec::new(),
         };
+        validate_workspace_url_safety(&cfg)?;
         let mut app_cfg = AppConfig {
             active: Some("default".to_string()),
             workspaces: vec![cfg],
@@ -2790,6 +2791,44 @@ url = "ws://c"
 
         assert!(err.to_string().contains("resolved token is blank"));
         assert!(err.to_string().contains("not localhost/loopback"));
+    }
+
+    #[test]
+    fn synthesize_single_zeroclaw_rejects_credential_bearing_remote_url() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+
+        let err = match App::synthesize_single_zeroclaw(
+            "https://operator:embedded-password@example.com/ws?token=url-token",
+            Some("bearer-token".to_string()),
+        ) {
+            Ok(_) => panic!("credential-bearing synthetic zeroclaw URL should fail closed"),
+            Err(err) => err,
+        };
+
+        match old_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+
+        let msg = err.to_string();
+        assert!(msg.contains("url must not embed username/password credentials"));
+        for leaked in ["operator", "embedded-password", "url-token"] {
+            assert!(!msg.contains(leaked), "{leaked} leaked in {msg}");
+        }
+
+        let query_err = match App::synthesize_single_zeroclaw(
+            "https://example.com/ws?token=url-token",
+            Some("bearer-token".to_string()),
+        ) {
+            Ok(_) => panic!("token query synthetic zeroclaw URL should fail closed"),
+            Err(err) => err,
+        };
+        let query_msg = query_err.to_string();
+        assert!(query_msg.contains("sensitive query parameter `token`"));
+        assert!(!query_msg.contains("url-token"));
     }
 
     #[test]
