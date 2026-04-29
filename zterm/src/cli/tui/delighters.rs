@@ -1,10 +1,15 @@
 //! Small v0.3 flavor helpers that are testable without a terminal.
 
+use std::fs;
+use std::io::{self, Write};
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 
 pub const CONNECT_SPLASH_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
@@ -46,7 +51,7 @@ pub fn sanitize_workspace_name(workspace: &str) -> String {
 pub fn connect_splash_cache_path(base: &Path, workspace: &str) -> PathBuf {
     base.join("cache")
         .join("connect-splash")
-        .join(format!("{}.txt", sanitize_workspace_name(workspace)))
+        .join(format!("{}.txt", opaque_workspace_cache_key(workspace)))
 }
 
 pub fn default_connect_splash_cache_path(workspace: &str) -> Option<PathBuf> {
@@ -64,12 +69,12 @@ pub fn is_cache_fresh(modified: SystemTime, now: SystemTime, ttl: Duration) -> b
 }
 
 pub fn read_cached_connect_splash(path: &Path, now: SystemTime, ttl: Duration) -> Option<String> {
-    let metadata = std::fs::metadata(path).ok()?;
+    let metadata = fs::metadata(path).ok()?;
     let modified = metadata.modified().ok()?;
     if !is_cache_fresh(modified, now, ttl) {
         return None;
     }
-    let text = std::fs::read_to_string(path).ok()?;
+    let text = fs::read_to_string(path).ok()?;
     let normalized = normalize_connect_splash(&text);
     if normalized.is_empty() {
         None
@@ -78,11 +83,78 @@ pub fn read_cached_connect_splash(path: &Path, now: SystemTime, ttl: Duration) -
     }
 }
 
-pub fn write_connect_splash_cache(path: &Path, text: &str) -> std::io::Result<()> {
+pub fn write_connect_splash_cache(path: &Path, text: &str) -> io::Result<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        create_private_cache_dir_all(parent)?;
     }
-    std::fs::write(path, normalize_connect_splash(text))
+    let normalized = normalize_connect_splash(text);
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let filename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("splash");
+    let tmp_path = parent.join(format!(".{filename}.{}.tmp", uuid::Uuid::new_v4()));
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        opts.mode(0o600);
+    }
+    let mut file = opts.open(&tmp_path)?;
+    file.write_all(normalized.as_bytes())?;
+    drop(file);
+    if let Err(e) = fs::rename(&tmp_path, path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+    harden_private_cache_file(path)
+}
+
+fn opaque_workspace_cache_key(workspace: &str) -> String {
+    let digest = Sha256::digest(workspace.as_bytes());
+    digest[..16]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn create_private_cache_dir_all(dir: &Path) -> io::Result<()> {
+    fs::create_dir_all(dir)?;
+    harden_private_cache_dirs(dir)
+}
+
+#[cfg(unix)]
+fn harden_private_cache_dirs(dir: &Path) -> io::Result<()> {
+    let mut dirs = vec![dir.to_path_buf()];
+    if dir.file_name().and_then(|name| name.to_str()) == Some("connect-splash") {
+        if let Some(cache_dir) = dir.parent() {
+            dirs.push(cache_dir.to_path_buf());
+            if cache_dir.file_name().and_then(|name| name.to_str()) == Some("cache") {
+                if let Some(root_dir) = cache_dir.parent() {
+                    dirs.push(root_dir.to_path_buf());
+                }
+            }
+        }
+    }
+    for dir in dirs {
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn harden_private_cache_dirs(_dir: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn harden_private_cache_file(path: &Path) -> io::Result<()> {
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+}
+
+#[cfg(not(unix))]
+fn harden_private_cache_file(_path: &Path) -> io::Result<()> {
+    Ok(())
 }
 
 pub fn normalize_connect_splash(text: &str) -> String {
@@ -181,6 +253,18 @@ mod tests {
     }
 
     #[test]
+    fn workspace_cache_filename_is_opaque_hash() {
+        let path = connect_splash_cache_path(Path::new("/tmp/.zterm"), "../prod typhon");
+        let filename = path.file_name().unwrap().to_string_lossy();
+        let stem = filename.strip_suffix(".txt").unwrap();
+
+        assert_eq!(stem.len(), 32);
+        assert!(stem.chars().all(|ch| ch.is_ascii_hexdigit()));
+        assert!(!filename.contains("prod"));
+        assert!(!filename.contains("typhon"));
+    }
+
+    #[test]
     fn cache_freshness_uses_mtime_and_ttl() {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100_000);
         let fresh = now - Duration::from_secs(60);
@@ -205,6 +289,35 @@ mod tests {
             local_connect_splash("prod typhon"),
             "ATZ\nOK\nATDT PROD_TYPHON\nCONNECT 14400/ZTERM\nCARRIER LOCKED\nWORKSPACE READY"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn connect_splash_cache_uses_private_unix_modes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let base = dir.path().join(".zterm");
+        let path = connect_splash_cache_path(&base, "prod typhon");
+
+        write_connect_splash_cache(&path, "line 1\nline 2").unwrap();
+
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        for dir in [
+            base.clone(),
+            base.join("cache"),
+            base.join("cache").join("connect-splash"),
+        ] {
+            assert_eq!(
+                fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+                0o700,
+                "{}",
+                dir.display()
+            );
+        }
     }
 
     #[test]
