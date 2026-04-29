@@ -891,9 +891,9 @@ async fn collect_assistant_message(
 
 /// Like `collect_assistant_message` but accumulates tool_calls,
 /// tool_results, and thinking from all intermediate assistant
-/// messages into `turn`, and returns `()` when a terminal
-/// text-bearing assistant reply arrives (or timeout). The caller
-/// owns the TurnResult; this function only mutates it in place.
+/// messages into `turn`, and returns `()` only after the expected
+/// run/message reaches an explicit terminal completion marker. The
+/// caller owns the TurnResult; this function only mutates it in place.
 async fn collect_turn_result(
     event_rx: &mut tokio::sync::mpsc::Receiver<super::wire::EventFrame>,
     session_key: &str,
@@ -903,24 +903,30 @@ async fn collect_turn_result(
 ) -> anyhow::Result<()> {
     let deadline = tokio::time::Instant::now() + timeout;
     let mut saw_terminal_completion = false;
+    let mut expected_message_id: Option<String> = None;
 
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
-            return finish_tool_only_or_timeout(timeout, turn, saw_terminal_completion);
+            return finish_completed_or_timeout(timeout, turn, saw_terminal_completion);
         }
 
         let rx_res = tokio::time::timeout(remaining, event_rx.recv()).await;
         let event = match rx_res {
             Ok(Some(ev)) => ev,
             Ok(None) => anyhow::bail!("openclaw: event channel closed mid-stream"),
-            Err(_) => return finish_tool_only_or_timeout(timeout, turn, saw_terminal_completion),
+            Err(_) => return finish_completed_or_timeout(timeout, turn, saw_terminal_completion),
         };
 
         if event.event != "session.message" {
-            if event_marks_expected_run_completed(&event, session_key, expected_run_id) {
+            if event_marks_expected_turn_completed(
+                &event,
+                session_key,
+                expected_run_id,
+                expected_message_id.as_deref(),
+            ) {
                 saw_terminal_completion = true;
-                if turn_can_finish_without_text(turn) {
+                if turn_can_finish(turn) {
                     return Ok(());
                 }
             }
@@ -961,13 +967,23 @@ async fn collect_turn_result(
                 continue;
             }
         }
+        if expected_message_id.is_none() {
+            expected_message_id = session_message_id(payload, message).map(str::to_string);
+        }
 
         let content = match message.get("content") {
             Some(v) => super::handshake::AssistantContent::parse(v),
             None => super::handshake::AssistantContent { parts: Vec::new() },
         };
 
+        let previous_text = turn.text.clone();
+        let content_text = content.display_text();
+        let append_text_delta = !content_text.is_empty() && message_is_text_delta(payload, message);
         turn.merge(&content);
+        if append_text_delta {
+            turn.text = previous_text;
+            turn.text.push_str(&content_text);
+        }
         turn.usage = crate::cli::agent::TurnUsage::from_json_candidates(message)
             .or_else(|| crate::cli::agent::TurnUsage::from_json_candidates(payload))
             .or(turn.usage);
@@ -975,14 +991,10 @@ async fn collect_turn_result(
         let message_completed =
             message_marks_run_completed(payload, message) || saw_terminal_completion;
 
-        // If this message has text content, it's the terminal
-        // assistant reply for the turn. Tool-only final runs are also
-        // valid when the protocol marks the expected run complete.
-        // Otherwise keep consuming (tool_use only, thinking only, etc.).
-        if !content.display_text().is_empty() {
-            return Ok(());
-        }
-        if message_completed && turn_can_finish_without_text(turn) {
+        // Text-bearing events can be deltas or intermediate snapshots;
+        // success still requires the expected run/message completion
+        // marker so we do not truncate a streaming reply.
+        if message_completed && turn_can_finish(turn) {
             return Ok(());
         }
         tracing::debug!(
@@ -1005,10 +1017,25 @@ fn session_message_run_id<'a>(
         .or_else(|| payload.get("run_id").and_then(|v| v.as_str()))
 }
 
-fn event_marks_expected_run_completed(
+fn session_message_id<'a>(
+    payload: &'a serde_json::Value,
+    message: &'a serde_json::Value,
+) -> Option<&'a str> {
+    message
+        .get("messageId")
+        .and_then(|v| v.as_str())
+        .or_else(|| payload.get("messageId").and_then(|v| v.as_str()))
+        .or_else(|| message.get("message_id").and_then(|v| v.as_str()))
+        .or_else(|| payload.get("message_id").and_then(|v| v.as_str()))
+        .or_else(|| message.get("id").and_then(|v| v.as_str()))
+        .or_else(|| payload.get("id").and_then(|v| v.as_str()))
+}
+
+fn event_marks_expected_turn_completed(
     event: &super::wire::EventFrame,
     session_key: &str,
     expected_run_id: &str,
+    expected_message_id: Option<&str>,
 ) -> bool {
     if !is_terminal_run_event_name(&event.event) {
         return false;
@@ -1016,10 +1043,19 @@ fn event_marks_expected_run_completed(
     let Some(payload) = event.payload.as_ref() else {
         return false;
     };
-    payload_matches_session_key(payload, session_key)
-        && value_run_id(payload)
-            .map(|run_id| run_id == expected_run_id)
-            .unwrap_or(false)
+    if !payload_matches_session_key(payload, session_key) {
+        return false;
+    }
+    if event_payload_run_id(payload)
+        .map(|run_id| run_id == expected_run_id)
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    expected_message_id
+        .zip(event_payload_message_id(payload))
+        .map(|(expected, actual)| expected == actual)
+        .unwrap_or(false)
 }
 
 fn is_terminal_run_event_name(event: &str) -> bool {
@@ -1038,6 +1074,29 @@ fn is_terminal_run_event_name(event: &str) -> bool {
 
 fn message_marks_run_completed(payload: &serde_json::Value, message: &serde_json::Value) -> bool {
     value_marks_completed(message) || value_marks_completed(payload)
+}
+
+fn message_is_text_delta(payload: &serde_json::Value, message: &serde_json::Value) -> bool {
+    value_marks_delta(message) || value_marks_delta(payload)
+}
+
+fn value_marks_delta(value: &serde_json::Value) -> bool {
+    for key in ["state", "kind", "phase"] {
+        if value
+            .get(key)
+            .and_then(|v| v.as_str())
+            .map(|s| s.eq_ignore_ascii_case("delta"))
+            .unwrap_or(false)
+        {
+            return true;
+        }
+    }
+    for key in ["delta", "isDelta"] {
+        if value.get(key).and_then(|v| v.as_bool()).unwrap_or(false) {
+            return true;
+        }
+    }
+    false
 }
 
 fn value_marks_completed(value: &serde_json::Value) -> bool {
@@ -1072,16 +1131,44 @@ fn value_run_id(value: &serde_json::Value) -> Option<&str> {
         .or_else(|| value.get("run_id").and_then(|v| v.as_str()))
 }
 
+fn event_payload_run_id(payload: &serde_json::Value) -> Option<&str> {
+    value_run_id(payload).or_else(|| {
+        payload
+            .get("message")
+            .and_then(|message| value_run_id(message))
+    })
+}
+
+fn value_message_id(value: &serde_json::Value) -> Option<&str> {
+    value
+        .get("messageId")
+        .and_then(|v| v.as_str())
+        .or_else(|| value.get("message_id").and_then(|v| v.as_str()))
+        .or_else(|| value.get("id").and_then(|v| v.as_str()))
+}
+
+fn event_payload_message_id(payload: &serde_json::Value) -> Option<&str> {
+    value_message_id(payload).or_else(|| {
+        payload
+            .get("message")
+            .and_then(|message| value_message_id(message))
+    })
+}
+
 fn turn_can_finish_without_text(turn: &super::handshake::TurnResult) -> bool {
     turn.text.is_empty() && (!turn.tool_calls.is_empty() || !turn.tool_results.is_empty())
 }
 
-fn finish_tool_only_or_timeout(
+fn turn_can_finish(turn: &super::handshake::TurnResult) -> bool {
+    !turn.text.is_empty() || turn_can_finish_without_text(turn)
+}
+
+fn finish_completed_or_timeout(
     timeout: std::time::Duration,
     turn: &super::handshake::TurnResult,
     saw_terminal_completion: bool,
 ) -> anyhow::Result<()> {
-    if saw_terminal_completion && turn_can_finish_without_text(turn) {
+    if saw_terminal_completion && turn_can_finish(turn) {
         return Ok(());
     }
     anyhow::bail!(
@@ -1620,6 +1707,31 @@ mod tests {
         }
     }
 
+    fn assistant_delta_event(
+        session_key: &str,
+        run_id: &str,
+        message_id: &str,
+        text: &str,
+    ) -> super::super::wire::EventFrame {
+        super::super::wire::EventFrame {
+            event: "session.message".to_string(),
+            payload: Some(serde_json::json!({
+                "sessionKey": session_key,
+                "runId": run_id,
+                "messageId": message_id,
+                "state": "delta",
+                "message": {
+                    "id": message_id,
+                    "role": "assistant",
+                    "runId": run_id,
+                    "content": [{ "type": "text", "text": text }]
+                }
+            })),
+            seq: None,
+            state_version: None,
+        }
+    }
+
     fn assistant_tool_event(session_key: &str, run_id: &str) -> super::super::wire::EventFrame {
         super::super::wire::EventFrame {
             event: "session.message".to_string(),
@@ -1659,6 +1771,50 @@ mod tests {
             seq: None,
             state_version: None,
         }
+    }
+
+    #[tokio::test]
+    async fn collect_turn_result_accumulates_text_deltas_until_completion() {
+        let (event_tx, mut event_rx) = mpsc::channel::<super::super::wire::EventFrame>(4);
+        event_tx
+            .send(assistant_delta_event(
+                "session-a",
+                "current-run",
+                "message-1",
+                "hello ",
+            ))
+            .await
+            .unwrap();
+        event_tx
+            .send(assistant_delta_event(
+                "session-a",
+                "current-run",
+                "message-1",
+                "world",
+            ))
+            .await
+            .unwrap();
+        event_tx
+            .send(run_completed_event("session-a", "current-run"))
+            .await
+            .unwrap();
+
+        let mut turn = super::super::handshake::TurnResult {
+            run_id: Some("current-run".to_string()),
+            ..Default::default()
+        };
+        collect_turn_result(
+            &mut event_rx,
+            "session-a",
+            "current-run",
+            Duration::from_millis(50),
+            &mut turn,
+        )
+        .await
+        .expect("text deltas followed by completion should collect");
+
+        assert_eq!(turn.run_id.as_deref(), Some("current-run"));
+        assert_eq!(turn.text, "hello world");
     }
 
     #[tokio::test]
@@ -1788,6 +1944,10 @@ mod tests {
             .send(assistant_event("session-a", "current-run", "current"))
             .await
             .expect("current event should queue");
+        event_tx
+            .send(run_completed_event("session-a", "current-run"))
+            .await
+            .expect("completion event should queue");
 
         let unsubscribe = outbound_rx
             .recv()
