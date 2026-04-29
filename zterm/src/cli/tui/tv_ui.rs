@@ -3903,34 +3903,7 @@ fn is_resync_force_command(input: &str) -> bool {
 }
 
 fn mutation_fence_allows_input(input: &str) -> bool {
-    let Ok(tokens) = tokenize_slash_command(input) else {
-        return false;
-    };
-    (tokens.len() == 1 && matches!(tokens[0].as_str(), "/help" | "/resync" | "/sync"))
-        || (tokens.len() == 2
-            && matches!(tokens[0].as_str(), "/resync" | "/sync")
-            && matches!(tokens[1].as_str(), "--force" | "force"))
-        || mutation_fence_allows_read_only_inspection(&tokens)
-}
-
-fn mutation_fence_allows_read_only_inspection(tokens: &[String]) -> bool {
-    let command = tokens.first().map(String::as_str);
-    let subcommand = tokens.get(1).map(String::as_str);
-    match (command, subcommand) {
-        (Some("/session"), Some("list" | "info")) => true,
-        (Some("/workspace" | "/workspaces"), None | Some("list" | "info")) => true,
-        (Some("/memory"), None | Some("search" | "list" | "recent" | "get" | "stats" | "help")) => {
-            true
-        }
-        (Some("/memory"), Some("post" | "add" | "delete" | "rm")) => false,
-        (Some("/memory"), Some(_)) => true,
-        (Some("/cron"), None | Some("list")) => true,
-        (Some("/models" | "/model"), None | Some("list" | "status")) => true,
-        (Some("/providers"), None | Some("list")) => true,
-        (Some("/mcp"), None | Some("status")) => true,
-        (Some("/config"), _) => true,
-        _ => false,
-    }
+    super::mutation_fence_allows_recovery_input(input)
 }
 
 fn mutation_fence_workspace_key(workspace: &str, workspace_id: Option<&str>) -> String {

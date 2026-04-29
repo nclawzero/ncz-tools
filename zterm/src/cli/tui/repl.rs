@@ -1002,13 +1002,7 @@ fn workspace_switch_target(cmdline: &str) -> Option<String> {
 }
 
 fn legacy_mutation_fence_allows_input(input: &str) -> bool {
-    let Ok(tokens) = tokenize_slash_command(input) else {
-        return false;
-    };
-    (tokens.len() == 1 && matches!(tokens[0].as_str(), "/help" | "/resync" | "/sync"))
-        || (tokens.len() == 2
-            && matches!(tokens[0].as_str(), "/resync" | "/sync")
-            && matches!(tokens[1].as_str(), "--force" | "force"))
+    super::mutation_fence_allows_recovery_input(input)
 }
 
 fn legacy_slash_command_may_mutate_state(cmdline: &str) -> bool {
@@ -1948,6 +1942,38 @@ mod tests {
                 .mutation_fence_block_output("/resync --force")
                 .await
                 .is_none());
+            for input in [
+                "/session list",
+                "/session info",
+                "/workspace info",
+                "/workspaces",
+                "/cron list",
+                "/memory list",
+                "/memory search deploy",
+                "/models status",
+                "/providers list",
+                "/mcp status",
+                "/config",
+            ] {
+                assert!(
+                    repl.mutation_fence_block_output(input).await.is_none(),
+                    "{input} should remain available for mutation-fence recovery"
+                );
+            }
+            for input in [
+                "/memory post remember this",
+                "/memory delete mem-1",
+                "/cron add backup",
+                "/workspace switch beta",
+                "/session create scratch",
+                "/models set primary",
+                "/clear",
+            ] {
+                assert!(
+                    repl.mutation_fence_block_output(input).await.is_some(),
+                    "{input} should stay blocked while mutation outcome is unknown"
+                );
+            }
             assert!(submitted.lock().unwrap().is_empty());
         });
 

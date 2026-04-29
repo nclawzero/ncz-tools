@@ -4,6 +4,7 @@ use std::io::{self, Write};
 use tracing::{info, warn};
 
 use crate::cli::client::Session;
+use crate::cli::commands::tokenize_slash_command;
 use crate::cli::pairing::PairingManager;
 use crate::cli::storage::{self, SessionMetadata};
 use crate::cli::workspace::{App, AppConfig, WorkspaceConfig};
@@ -15,6 +16,37 @@ pub mod rusty_repl;
 pub mod splash;
 pub mod themes;
 pub mod tv_ui;
+
+pub(crate) fn mutation_fence_allows_recovery_input(input: &str) -> bool {
+    let Ok(tokens) = tokenize_slash_command(input) else {
+        return false;
+    };
+    (tokens.len() == 1 && matches!(tokens[0].as_str(), "/help" | "/resync" | "/sync"))
+        || (tokens.len() == 2
+            && matches!(tokens[0].as_str(), "/resync" | "/sync")
+            && matches!(tokens[1].as_str(), "--force" | "force"))
+        || mutation_fence_allows_read_only_inspection(&tokens)
+}
+
+fn mutation_fence_allows_read_only_inspection(tokens: &[String]) -> bool {
+    let command = tokens.first().map(String::as_str);
+    let subcommand = tokens.get(1).map(String::as_str);
+    match (command, subcommand) {
+        (Some("/session"), Some("list" | "info")) => true,
+        (Some("/workspace" | "/workspaces"), None | Some("list" | "info")) => true,
+        (Some("/memory"), None | Some("search" | "list" | "recent" | "get" | "stats" | "help")) => {
+            true
+        }
+        (Some("/memory"), Some("post" | "add" | "delete" | "rm")) => false,
+        (Some("/memory"), Some(_)) => true,
+        (Some("/cron"), None | Some("list")) => true,
+        (Some("/models" | "/model"), None | Some("list" | "status")) => true,
+        (Some("/providers"), None | Some("list")) => true,
+        (Some("/mcp"), None | Some("status")) => true,
+        (Some("/config"), _) => true,
+        _ => false,
+    }
+}
 
 /// Run the ZTerm interactive REPL
 pub async fn run(
