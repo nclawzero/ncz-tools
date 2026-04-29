@@ -6,6 +6,7 @@ use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use tracing::warn;
 
 use crate::cli::agent::AgentClient;
 use crate::cli::client::ZeroclawClient;
@@ -1124,11 +1125,19 @@ impl CommandHandler {
                 "No local session history metadata found to clear\n".to_string(),
             ));
         };
+
+        let removed_history = storage::clear_scoped_session_history(&scope, session_id)?;
+        let mut touched_metadata = false;
         if let Ok(mut metadata) = storage::load_scoped_session_metadata(&scope, session_id) {
+            touched_metadata = true;
             metadata.message_count = 0;
             metadata.last_active = Utc::now().to_rfc3339();
-            storage::clear_scoped_session_history(&scope, session_id)?;
-            storage::save_scoped_session_metadata(&scope, &metadata)?;
+            if let Err(e) = storage::save_scoped_session_metadata(&scope, &metadata) {
+                warn!("cleared session history, but metadata update failed for {session_id}: {e}");
+            }
+        }
+
+        if removed_history || touched_metadata {
             return Ok(Some("✓ Session history cleared\n".to_string()));
         }
         Ok(Some(
@@ -3108,6 +3117,35 @@ provider_settings = { tokens = ["array-token-1", "array-token-2"], name = "kept"
         assert!(!blocked_path.exists());
 
         storage::delete_scoped_session(&scope, "main").unwrap();
+    }
+
+    #[tokio::test]
+    async fn clear_removes_transcript_history_even_when_metadata_is_missing() {
+        let suffix = uuid::Uuid::new_v4();
+        let workspace_name = format!("clear-missing-meta-{suffix}");
+        let scope = storage::workspace_scope("zeroclaw", &workspace_name, None).unwrap();
+        storage::append_scoped_session_history(&scope, "main", "user", "hello").unwrap();
+        storage::mark_scoped_session_history_incomplete(&scope, "main", "assistant append failed")
+            .unwrap();
+        let history = storage::scoped_session_history_file(&scope, "main").unwrap();
+        let marker = storage::scoped_session_history_incomplete_file(&scope, "main").unwrap();
+        assert!(storage::load_scoped_session_metadata(&scope, "main").is_err());
+
+        let handler = super::CommandHandler::new(app_with_two_fake_clients(
+            &workspace_name,
+            FakeAgentClient {
+                sessions: vec![session("main", "Main")],
+                deleted: Arc::new(StdMutex::new(Vec::new())),
+            },
+            "other",
+            FakeAgentClient::default(),
+        ));
+
+        let out = handler.handle("/clear", "main").await.unwrap().unwrap();
+
+        assert!(out.contains("cleared"));
+        assert!(!history.exists());
+        assert!(!marker.exists());
     }
 
     #[test]

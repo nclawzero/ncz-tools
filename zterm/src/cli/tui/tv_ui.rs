@@ -607,7 +607,8 @@ pub async fn run(
                                 continue;
                             }
                             let mut client = client_arc.lock().await;
-                            let (turn_sink, turn_rx) = StreamSink::channel(TURN_STREAM_CAPACITY);
+                            let (turn_sink, turn_rx) =
+                                StreamSink::turn_channel(TURN_STREAM_CAPACITY);
                             let observed_finished = Arc::new(AtomicBool::new(false));
                             let forwarded_token = Arc::new(AtomicBool::new(false));
                             let mut forward_task = tokio::spawn(forward_turn_chunks(
@@ -4188,6 +4189,50 @@ mod tests {
 
         drop(sink);
         assert!(rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn turn_stream_sink_overflow_rejects_later_finished_as_incomplete() {
+        let (turn_sink, turn_rx) = StreamSink::turn_channel(1);
+        let (ui_tx, mut ui_rx) = StreamSink::channel(8);
+        let observed_finished = Arc::new(AtomicBool::new(false));
+        let forwarded_token = Arc::new(AtomicBool::new(false));
+
+        assert!(turn_sink
+            .send(TurnChunk::Token("queued".to_string()))
+            .is_ok());
+        assert!(turn_sink
+            .send(TurnChunk::Token("dropped".to_string()))
+            .is_err());
+        assert!(turn_sink
+            .send(TurnChunk::Finished(Ok("".to_string())))
+            .is_err());
+        drop(turn_sink);
+
+        let saw_finished = forward_turn_chunks(
+            turn_rx,
+            ui_tx,
+            Arc::clone(&observed_finished),
+            Arc::clone(&forwarded_token),
+        )
+        .await;
+        assert!(!saw_finished);
+        assert!(!observed_finished.load(Ordering::Acquire));
+        assert!(forwarded_token.load(Ordering::Acquire));
+
+        match ui_rx.recv().await {
+            Some(TurnChunk::Token(text)) => assert_eq!(text, "queued"),
+            other => panic!("expected queued token, got {other:?}"),
+        }
+
+        let fallback = submit_turn_fallback_chunks(
+            &Ok("complete backend text".to_string()),
+            saw_finished,
+            true,
+        );
+        assert!(
+            matches!(fallback.as_slice(), [TurnChunk::Finished(Err(message))] if message.contains("partial response incomplete"))
+        );
     }
 
     #[tokio::test]

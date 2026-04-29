@@ -208,19 +208,34 @@ pub enum TurnChunk {
 ///
 /// `send` is intentionally synchronous because some legacy emission
 /// helpers are not async. It uses `try_send` under the hood, while async
-/// forwarders can call `send_async` to apply backpressure. A full queue is
-/// reported to the caller but does not poison the long-lived TUI channel.
+/// forwarders can call `send_async` to apply backpressure. Long-lived UI
+/// channels report full queues without poisoning themselves; per-turn
+/// stream channels close on overflow so ignored `Full` errors cannot make
+/// a truncated assistant response look complete.
 #[derive(Debug, Clone)]
 pub struct StreamSink {
     inner: Arc<StdMutex<Option<mpsc::Sender<TurnChunk>>>>,
+    close_on_full: bool,
 }
 
 impl StreamSink {
     pub fn channel(capacity: usize) -> (Self, mpsc::Receiver<TurnChunk>) {
+        Self::channel_with_policy(capacity, false)
+    }
+
+    pub fn turn_channel(capacity: usize) -> (Self, mpsc::Receiver<TurnChunk>) {
+        Self::channel_with_policy(capacity, true)
+    }
+
+    fn channel_with_policy(
+        capacity: usize,
+        close_on_full: bool,
+    ) -> (Self, mpsc::Receiver<TurnChunk>) {
         let (tx, rx) = mpsc::channel(capacity.max(1));
         (
             Self {
                 inner: Arc::new(StdMutex::new(Some(tx))),
+                close_on_full,
             },
             rx,
         )
@@ -237,7 +252,9 @@ impl StreamSink {
             Some(tx) => tx.try_send(chunk),
             None => Err(mpsc::error::TrySendError::Closed(chunk)),
         };
-        if matches!(result, Err(mpsc::error::TrySendError::Closed(_))) {
+        if matches!(result, Err(mpsc::error::TrySendError::Closed(_)))
+            || (self.close_on_full && matches!(result, Err(mpsc::error::TrySendError::Full(_))))
+        {
             *guard = None;
         }
         result
