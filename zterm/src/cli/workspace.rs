@@ -1179,7 +1179,7 @@ impl App {
         token_override: Option<String>,
         workspace_override: Option<&str>,
     ) -> Result<Self> {
-        apply_cli_token_override(&mut cfg, token_override.as_deref(), workspace_override);
+        apply_cli_token_override(&mut cfg, token_override.as_deref(), workspace_override)?;
         Self::from_config(cfg, config_path)
     }
 
@@ -1285,30 +1285,36 @@ fn apply_cli_token_override(
     cfg: &mut AppConfig,
     token_override: Option<&str>,
     workspace_override: Option<&str>,
-) {
+) -> Result<()> {
     let Some(token) = token_override.filter(|token| !token.is_empty()) else {
-        return;
+        return Ok(());
     };
-    let selected = workspace_override
-        .and_then(|name| {
-            cfg.workspaces
-                .iter()
-                .position(|workspace| workspace.name == name)
-        })
-        .or_else(|| {
-            cfg.active.as_deref().and_then(|name| {
+    let selected = if let Some(name) = workspace_override.filter(|name| !name.is_empty()) {
+        cfg.workspaces
+            .iter()
+            .position(|workspace| workspace.name == name)
+            .ok_or_else(|| {
+                anyhow!(
+                    "workspace '{}' not found; refusing to apply CLI token to a different workspace",
+                    name
+                )
+            })?
+    } else {
+        cfg.active
+            .as_deref()
+            .and_then(|name| {
                 cfg.workspaces
                     .iter()
                     .position(|workspace| workspace.name == name)
             })
-        })
-        .unwrap_or(0);
+            .unwrap_or(0)
+    };
     if let Some(workspace) = cfg.workspaces.get_mut(selected) {
         workspace.token_env = None;
         workspace.token = Some(token.to_string());
     }
+    Ok(())
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2176,6 +2182,46 @@ token = "stale-token"
             Some(v) => std::env::set_var("ZTERM_TEST_STALE_TOKEN", v),
             None => std::env::remove_var("ZTERM_TEST_STALE_TOKEN"),
         }
+    }
+
+    #[test]
+    fn cli_token_override_rejects_missing_workspace_without_mutating_tokens() {
+        let mut cfg = AppConfig::parse(
+            r#"
+active = "primary"
+
+[[workspaces]]
+name = "primary"
+backend = "zeroclaw"
+url = "http://primary.example"
+token = "primary-token"
+
+[[workspaces]]
+name = "target"
+backend = "zeroclaw"
+url = "http://target.example"
+token_env = "TARGET_TOKEN"
+token = "target-token"
+"#,
+        )
+        .unwrap();
+
+        let err = apply_cli_token_override(&mut cfg, Some("cli-token"), Some("typo")).unwrap_err();
+
+        assert!(err.to_string().contains("refusing to apply CLI token"));
+        let primary = cfg
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.name == "primary")
+            .unwrap();
+        assert_eq!(primary.token.as_deref(), Some("primary-token"));
+        let target = cfg
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.name == "target")
+            .unwrap();
+        assert_eq!(target.token_env.as_deref(), Some("TARGET_TOKEN"));
+        assert_eq!(target.token.as_deref(), Some("target-token"));
     }
 
     #[test]
