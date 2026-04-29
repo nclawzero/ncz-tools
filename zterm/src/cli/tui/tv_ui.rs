@@ -699,11 +699,15 @@ pub async fn run(
                                 Arc::clone(&forwarded_token),
                             ));
                             client.set_stream_sink(Some(turn_sink));
-                            let submit_result = submit_turn_with_worker_timeout(
-                                client.submit_turn(&worker_session_id, &text),
-                                TURN_SUBMIT_WORKER_TIMEOUT,
-                            )
-                            .await;
+                            let submit_result = if client.submit_turn_is_cancellation_safe() {
+                                submit_turn_with_worker_timeout(
+                                    client.submit_turn(&worker_session_id, &text),
+                                    TURN_SUBMIT_WORKER_TIMEOUT,
+                                )
+                                .await
+                            } else {
+                                client.submit_turn(&worker_session_id, &text).await
+                            };
                             client.set_stream_sink(Some(worker_sink.clone()));
                             drop(client);
                             let submit_error_text =

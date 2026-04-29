@@ -350,6 +350,15 @@ pub trait AgentClient: Send + Sync {
     /// `&mut self` to match, no behavior change.
     async fn submit_turn(&mut self, session_id: &str, message: &str) -> Result<String>;
 
+    /// Whether callers may wrap `submit_turn` in a cancelling timeout.
+    ///
+    /// Implementations that temporarily move internal receivers or must
+    /// perform post-ack cleanup should return false and enforce their own
+    /// bounded timeouts internally.
+    fn submit_turn_is_cancellation_safe(&self) -> bool {
+        true
+    }
+
     // ---------- streaming sink ----------
 
     /// Install or clear the streaming sink used by `submit_turn`.

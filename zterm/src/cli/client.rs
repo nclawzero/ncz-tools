@@ -694,6 +694,18 @@ impl ZeroclawClient {
                 Ok(event) => event,
                 Err(_) => continue,
             };
+            if zeroclaw_ws_frame_requires_ownership(&event) {
+                match zeroclaw_ws_frame_matches_turn(&event, &request_id, session_id) {
+                    Ok(true) => {}
+                    Ok(false) => continue,
+                    Err(e) => {
+                        let wrapped = anyhow!("WebSocket frame ownership check failed: {e}");
+                        let _ = ws_stream.close(None).await;
+                        self.emit_failure(&wrapped);
+                        return Err(wrapped);
+                    }
+                }
+            }
 
             match event.get("type").and_then(|v| v.as_str()) {
                 Some("chunk") => {
@@ -1172,6 +1184,36 @@ async fn ensure_success_response(res: reqwest::Response, context: &str) -> Resul
     } else {
         Err(anyhow!("{context}: {status}: {body}"))
     }
+}
+
+fn zeroclaw_ws_frame_requires_ownership(event: &serde_json::Value) -> bool {
+    matches!(
+        event.get("type").and_then(|v| v.as_str()),
+        Some("chunk" | "stream" | "usage" | "done" | "error")
+    )
+}
+
+fn zeroclaw_ws_frame_matches_turn(
+    event: &serde_json::Value,
+    request_id: &str,
+    session_id: &str,
+) -> Result<bool> {
+    let frame_request_id = zeroclaw_ws_string_field(event, "request_id", "requestId")
+        .ok_or_else(|| anyhow!("missing request_id"))?;
+    let frame_session_id = zeroclaw_ws_string_field(event, "session_id", "sessionId")
+        .ok_or_else(|| anyhow!("missing session_id"))?;
+    Ok(frame_request_id == request_id && frame_session_id == session_id)
+}
+
+fn zeroclaw_ws_string_field<'a>(
+    event: &'a serde_json::Value,
+    snake_case: &str,
+    camel_case: &str,
+) -> Option<&'a str> {
+    event
+        .get(snake_case)
+        .or_else(|| event.get(camel_case))
+        .and_then(|value| value.as_str())
 }
 
 /// Pick a default model key from the parsed config.
@@ -1722,13 +1764,42 @@ fallback = "gemini"
         frames: Vec<serde_json::Value>,
         hold_open: Option<Duration>,
     ) -> WebSocketStream<MaybeTlsStream<TcpStream>> {
+        test_ws_stream_with_ownership(frames, hold_open, true).await
+    }
+
+    async fn test_ws_stream_with_ownership(
+        frames: Vec<serde_json::Value>,
+        hold_open: Option<Duration>,
+        attach_ownership: bool,
+    ) -> WebSocketStream<MaybeTlsStream<TcpStream>> {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut server_ws = tokio_tungstenite::accept_async(stream).await.unwrap();
-            let _ = server_ws.next().await;
-            for frame in frames {
+            let request = server_ws
+                .next()
+                .await
+                .and_then(Result::ok)
+                .and_then(|message| match message {
+                    Message::Text(text) => serde_json::from_str::<serde_json::Value>(&text).ok(),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            let request_id = request
+                .get("request_id")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let session_id = request
+                .get("session_id")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .to_string();
+            for mut frame in frames {
+                if attach_ownership {
+                    attach_test_ws_frame_ownership(&mut frame, &request_id, &session_id);
+                }
                 let _ = server_ws.send(Message::Text(frame.to_string())).await;
             }
             if let Some(duration) = hold_open {
@@ -1739,6 +1810,24 @@ fallback = "gemini"
         });
         let (client_ws, _) = connect_async(format!("ws://{addr}")).await.unwrap();
         client_ws
+    }
+
+    fn attach_test_ws_frame_ownership(
+        frame: &mut serde_json::Value,
+        request_id: &str,
+        session_id: &str,
+    ) {
+        if !zeroclaw_ws_frame_requires_ownership(frame) {
+            return;
+        }
+        if let Some(object) = frame.as_object_mut() {
+            object
+                .entry("request_id")
+                .or_insert_with(|| serde_json::Value::String(request_id.to_string()));
+            object
+                .entry("session_id")
+                .or_insert_with(|| serde_json::Value::String(session_id.to_string()));
+        }
     }
 
     #[tokio::test]
@@ -1812,6 +1901,70 @@ fallback = "gemini"
         assert!(err
             .to_string()
             .contains("WebSocket closed before a response completed"));
+    }
+
+    #[tokio::test]
+    async fn ws_submit_ignores_foreign_owned_frames() {
+        let ws = test_ws_stream(
+            vec![
+                json!({
+                    "type": "chunk",
+                    "request_id": "stale-request",
+                    "session_id": "main",
+                    "content": "stale"
+                }),
+                json!({ "type": "chunk", "content": "owned" }),
+                json!({
+                    "type": "done",
+                    "request_id": "stale-request",
+                    "session_id": "main",
+                    "full_response": "stale"
+                }),
+                json!({ "type": "done", "full_response": "owned" }),
+            ],
+            None,
+        )
+        .await;
+        let client = ZeroclawClient::new("http://localhost:8888".to_string(), String::new());
+
+        let response = client
+            .submit_turn_ws_connected_with_limits(
+                ws,
+                "main",
+                "hello",
+                "primary",
+                Duration::from_secs(5),
+                1024,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response, "owned");
+    }
+
+    #[tokio::test]
+    async fn ws_submit_rejects_missing_frame_ownership() {
+        let ws = test_ws_stream_with_ownership(
+            vec![json!({ "type": "chunk", "content": "ownerless" })],
+            None,
+            false,
+        )
+        .await;
+        let client = ZeroclawClient::new("http://localhost:8888".to_string(), String::new());
+
+        let err = client
+            .submit_turn_ws_connected_with_limits(
+                ws,
+                "main",
+                "hello",
+                "primary",
+                Duration::from_secs(5),
+                1024,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("missing request_id"));
     }
 
     #[test]

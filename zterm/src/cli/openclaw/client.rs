@@ -1883,6 +1883,10 @@ impl AgentClient for OpenClawClient {
         }
     }
 
+    fn submit_turn_is_cancellation_safe(&self) -> bool {
+        false
+    }
+
     fn set_stream_sink(&mut self, sink: Option<StreamSink>) {
         self.stream_sink = sink;
     }
@@ -2301,6 +2305,13 @@ mod tests {
         // ZeroclawClient in cli/client.rs.
         fn assert_agent_client<T: crate::cli::agent::AgentClient>() {}
         assert_agent_client::<OpenClawClient>();
+    }
+
+    #[test]
+    fn openclaw_submit_turn_disables_outer_cancelling_timeout() {
+        let client = tests_support_new_fake(PendingRequests::new(), None, true);
+
+        assert!(!crate::cli::agent::AgentClient::submit_turn_is_cancellation_safe(&client));
     }
 
     #[tokio::test]
