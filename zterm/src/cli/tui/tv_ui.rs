@@ -1058,11 +1058,12 @@ async fn handle_worker_command_request(
                         session_switched = true;
                     }
                     Err(e) => {
+                        let detail = format!(
+                            "could not bind session `{target_session}` to workspace after backend session mutation: {e}"
+                        );
                         send_worker_finished(
                             worker_sink,
-                            Err(format!(
-                                "could not bind session `{target_session}` to workspace: {e}"
-                            )),
+                            Err(mutating_command_unknown_outcome_message(&cmdline, &detail)),
                         )
                         .await;
                         return;
@@ -1070,9 +1071,10 @@ async fn handle_worker_command_request(
                 }
             }
             Err(e) => {
+                let detail = format!("could not {action_label} `{target_session}`: {e}");
                 send_worker_finished(
                     worker_sink,
-                    Err(format!("could not {action_label} `{target_session}`: {e}")),
+                    Err(mutating_command_unknown_outcome_message(&cmdline, &detail)),
                 )
                 .await;
                 return;
@@ -1086,14 +1088,11 @@ async fn handle_worker_command_request(
         Ok(command_output) => match command_output.output {
             Some(text) => {
                 let model_switched = successful_model_switch_command(&cmdline, &text);
-                let command_failed = command_output_indicates_error(&text);
-                let command_terminal_error = command_failed.then(|| {
-                    if command_output.mutation_outcome_unknown {
-                        mutating_command_unknown_outcome_message(&cmdline, &text)
-                    } else {
-                        COMMAND_ERROR_ALREADY_RENDERED.to_string()
-                    }
-                });
+                let command_terminal_error = command_terminal_error_for_output(
+                    &cmdline,
+                    &text,
+                    command_output.mutation_outcome_unknown,
+                );
                 let _ = worker_sink.send(TurnChunk::Token(text));
                 let mut workspace_switched = false;
                 if preflight == CommandSessionPreflight::AfterWorkspaceSwitch {
@@ -1112,9 +1111,11 @@ async fn handle_worker_command_request(
                         .await
                         {
                             let _ = worker_sink.send(TurnChunk::ClearUsage);
+                            let detail =
+                                format!("workspace switched, but session setup failed: {e}");
                             send_worker_finished(
                                 worker_sink,
-                                Err(format!("workspace switched, but session setup failed: {e}")),
+                                Err(mutating_command_unknown_outcome_message(&cmdline, &detail)),
                             )
                             .await;
                             return;
@@ -1431,10 +1432,27 @@ fn command_output_indicates_error(output: &str) -> bool {
             .any(|line| line.trim_start().starts_with("❌"))
 }
 
+fn command_terminal_error_for_output(
+    cmdline: &str,
+    rendered_text: &str,
+    mutation_outcome_unknown: bool,
+) -> Option<String> {
+    if mutation_outcome_unknown {
+        Some(mutating_command_unknown_outcome_message(
+            cmdline,
+            rendered_text,
+        ))
+    } else if command_output_indicates_error(rendered_text) {
+        Some(COMMAND_ERROR_ALREADY_RENDERED.to_string())
+    } else {
+        None
+    }
+}
+
 fn mutating_command_unknown_outcome_message(cmdline: &str, rendered_text: &str) -> String {
     let rendered = sanitize_terminal_text(rendered_text.trim());
     format!(
-        "{} Backend/client returned a transport error after dispatch: {}",
+        "{} Backend/client returned an ambiguous result after dispatch: {}",
         SlashCommandDeadline::mutating(MUTATING_COMMAND_WORKER_TIMEOUT)
             .timeout_message(Some(cmdline)),
         rendered
@@ -5569,6 +5587,30 @@ mod tests {
         assert!(!command_output_indicates_error(
             "✅ Active model key: primary\n"
         ));
+    }
+
+    #[test]
+    fn unknown_mutation_output_sets_terminal_fence_even_without_error_marker() {
+        let message = command_terminal_error_for_output(
+            "/memory post 'remember this'",
+            "📝 Memory saved: (unknown id)\n",
+            true,
+        )
+        .expect("unknown mutation should produce terminal fence error");
+
+        assert!(mutation_timeout_requires_fence(&message));
+        assert!(message.contains("ambiguous result"));
+    }
+
+    #[test]
+    fn session_preflight_failure_message_sets_terminal_fence() {
+        let message = mutating_command_unknown_outcome_message(
+            "/session create scratch",
+            "could not create session `scratch`: request timed out",
+        );
+
+        assert!(mutation_timeout_requires_fence(&message));
+        assert!(message.contains("/session create scratch"));
     }
 
     #[test]
