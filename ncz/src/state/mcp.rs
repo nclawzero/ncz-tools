@@ -156,14 +156,88 @@ pub fn validate_declaration(declaration: &McpDeclaration) -> Result<(), NczError
 }
 
 fn reject_inline_secret_command(command: &str) -> Result<(), NczError> {
-    for token in command.split_whitespace() {
-        if is_secret_command_token(token) {
+    let mut next_arg_is_credential = false;
+    for token in shell_words(command)? {
+        if next_arg_is_credential
+            || is_secret_command_token(&token)
+            || is_user_credential_equals_flag(&token)
+            || is_inline_user_pass_token(&token)
+        {
             return Err(NczError::Usage(
                 "stdio MCP commands cannot include inline credentials; use --auth-env".to_string(),
             ));
         }
+        next_arg_is_credential = is_user_credential_next_arg_flag(&token);
     }
     Ok(())
+}
+
+fn shell_words(command: &str) -> Result<Vec<String>, NczError> {
+    let mut tokens = Vec::new();
+    let mut token = String::new();
+    let mut quote = None;
+    let mut escaped = false;
+    let mut in_token = false;
+    for ch in command.chars() {
+        if escaped {
+            token.push(ch);
+            escaped = false;
+            in_token = true;
+        } else if quote == Some('\'') {
+            if ch == '\'' {
+                quote = None;
+            } else {
+                token.push(ch);
+            }
+        } else if quote == Some('"') {
+            if ch == '"' {
+                quote = None;
+            } else if ch == '\\' {
+                escaped = true;
+            } else {
+                token.push(ch);
+            }
+        } else if ch.is_whitespace() {
+            if in_token {
+                tokens.push(std::mem::take(&mut token));
+                in_token = false;
+            }
+        } else if ch == '\'' || ch == '"' {
+            quote = Some(ch);
+            in_token = true;
+        } else if ch == '\\' {
+            escaped = true;
+            in_token = true;
+        } else {
+            token.push(ch);
+            in_token = true;
+        }
+    }
+    if escaped || quote.is_some() {
+        return Err(NczError::Usage(
+            "stdio MCP command has invalid shell quoting".to_string(),
+        ));
+    }
+    if in_token {
+        tokens.push(token);
+    }
+    Ok(tokens)
+}
+
+fn is_user_credential_next_arg_flag(token: &str) -> bool {
+    matches!(token, "-u" | "--user" | "--proxy-user")
+}
+
+fn is_user_credential_equals_flag(token: &str) -> bool {
+    ["--user=", "--proxy-user="].iter().any(|flag| {
+        token
+            .strip_prefix(flag)
+            .is_some_and(|value| !value.is_empty())
+    })
+}
+
+fn is_inline_user_pass_token(token: &str) -> bool {
+    token.contains(':') && !token.contains("://")
 }
 
 fn is_secret_command_token(raw_token: &str) -> bool {
@@ -502,6 +576,66 @@ mod tests {
 
             assert!(matches!(err, NczError::Usage(_)));
         }
+    }
+
+    #[test]
+    fn test_reject_user_flag_with_next_arg_pair() {
+        let err = validate_declaration(&McpDeclaration {
+            schema_version: 1,
+            name: "search".to_string(),
+            transport: "stdio".to_string(),
+            command: Some("mcp-server --user alice:secret".to_string()),
+            url: None,
+            auth_env: None,
+        })
+        .unwrap_err();
+
+        assert!(matches!(err, NczError::Usage(_)));
+    }
+
+    #[test]
+    fn test_reject_user_flag_with_equals_form() {
+        let err = validate_declaration(&McpDeclaration {
+            schema_version: 1,
+            name: "search".to_string(),
+            transport: "stdio".to_string(),
+            command: Some("mcp-server --user=alice:secret".to_string()),
+            url: None,
+            auth_env: None,
+        })
+        .unwrap_err();
+
+        assert!(matches!(err, NczError::Usage(_)));
+    }
+
+    #[test]
+    fn test_reject_short_u_flag() {
+        let err = validate_declaration(&McpDeclaration {
+            schema_version: 1,
+            name: "search".to_string(),
+            transport: "stdio".to_string(),
+            command: Some("mcp-server -u alice:secret".to_string()),
+            url: None,
+            auth_env: None,
+        })
+        .unwrap_err();
+
+        assert!(matches!(err, NczError::Usage(_)));
+    }
+
+    #[test]
+    fn test_reject_inline_user_pass_token() {
+        let err = validate_declaration(&McpDeclaration {
+            schema_version: 1,
+            name: "search".to_string(),
+            transport: "stdio".to_string(),
+            command: Some("mcp-server alice:secret".to_string()),
+            url: None,
+            auth_env: None,
+        })
+        .unwrap_err();
+
+        assert!(matches!(err, NczError::Usage(_)));
     }
 
     #[test]
