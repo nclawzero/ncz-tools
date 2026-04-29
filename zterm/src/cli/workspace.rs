@@ -138,6 +138,14 @@ impl WorkspaceConfig {
         self.token.clone()
     }
 
+    fn resolved_zeroclaw_token(&self) -> Result<String> {
+        match self.resolved_token() {
+            Some(token) if !token.trim().is_empty() => Ok(token),
+            Some(_) if zeroclaw_url_allows_blank_token(&self.url) => Ok(String::new()),
+            _ => Err(missing_zeroclaw_token_error(self)),
+        }
+    }
+
     /// Display name for tabs — `label` if set, else `name`.
     pub fn display_label(&self) -> &str {
         self.label.as_deref().unwrap_or(&self.name)
@@ -297,9 +305,7 @@ impl Workspace {
     pub fn instantiate(id: usize, config: WorkspaceConfig) -> Result<Self> {
         match config.backend {
             Backend::Zeroclaw => {
-                let token = config
-                    .resolved_token()
-                    .ok_or_else(|| missing_zeroclaw_token_error(&config))?;
+                let token = config.resolved_zeroclaw_token()?;
                 let concrete = ZeroclawClient::new(config.url.clone(), token);
                 let cron = Some(concrete.clone());
                 let boxed: Box<dyn AgentClient + Send + Sync> = Box::new(concrete);
@@ -1645,22 +1651,49 @@ impl App {
 
 fn validate_zeroclaw_workspace_tokens(cfg: &AppConfig) -> Result<()> {
     for workspace in &cfg.workspaces {
-        if workspace.backend == Backend::Zeroclaw && workspace.resolved_token().is_none() {
-            return Err(missing_zeroclaw_token_error(workspace));
+        if workspace.backend == Backend::Zeroclaw {
+            workspace.resolved_zeroclaw_token()?;
         }
     }
     Ok(())
 }
 
 fn missing_zeroclaw_token_error(config: &WorkspaceConfig) -> anyhow::Error {
-    let source = match config.token_env.as_deref().filter(|name| !name.is_empty()) {
-        Some(name) => format!("token_env `{name}` is unset or empty and no inline token is set"),
-        None => "no token_env or inline token is set".to_string(),
+    let source = match config.resolved_token() {
+        Some(token) if token.trim().is_empty() => format!(
+            "resolved token is blank and url `{}` is not localhost/loopback",
+            config.url
+        ),
+        Some(_) => "resolved token is unusable".to_string(),
+        None => match config.token_env.as_deref().filter(|name| !name.is_empty()) {
+            Some(name) => {
+                format!("token_env `{name}` is unset or empty and no inline token is set")
+            }
+            None => "no token_env or inline token is set".to_string(),
+        },
     };
     anyhow!(
         "zeroclaw workspace `{}` has no resolved token ({source}); set token_env, set token, pass --token for the selected workspace, or set token = \"\" only for an explicitly unauthenticated local gateway",
         config.name
     )
+}
+
+fn zeroclaw_url_allows_blank_token(url: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    if !matches!(url.scheme(), "http" | "https") {
+        return false;
+    }
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    host.parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
 }
 
 fn apply_cli_token_override(
@@ -2589,7 +2622,7 @@ url = "ws://c"
         let old_home = std::env::var_os("HOME");
         std::env::set_var("HOME", home.path());
 
-        let app = App::synthesize_single_zeroclaw("http://a", None).unwrap();
+        let app = App::synthesize_single_zeroclaw("http://127.0.0.1:42617", None).unwrap();
         assert_eq!(app.workspaces.len(), 1);
         assert!(app.active_workspace().unwrap().is_activated());
 
@@ -2597,6 +2630,27 @@ url = "ws://c"
             Some(home) => std::env::set_var("HOME", home),
             None => std::env::remove_var("HOME"),
         }
+    }
+
+    #[test]
+    fn synthesize_single_zeroclaw_rejects_missing_token_for_remote_url() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+
+        let err = match App::synthesize_single_zeroclaw("http://example.com:42617", None) {
+            Ok(_) => panic!("remote synthetic zeroclaw without token should fail closed"),
+            Err(err) => err,
+        };
+
+        match old_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+
+        assert!(err.to_string().contains("resolved token is blank"));
+        assert!(err.to_string().contains("not localhost/loopback"));
     }
 
     #[test]
@@ -2659,6 +2713,51 @@ token = ""
         let app = App::from_config(cfg, PathBuf::from("/dev/null")).unwrap();
         assert_eq!(app.workspaces.len(), 1);
         assert!(app.active_workspace().unwrap().is_activated());
+    }
+
+    #[test]
+    fn from_config_rejects_explicit_empty_zeroclaw_token_for_remote_url() {
+        let cfg = AppConfig::parse(
+            r#"
+[[workspaces]]
+name = "remote"
+backend = "zeroclaw"
+url = "http://example.com:42617"
+token = ""
+"#,
+        )
+        .unwrap();
+
+        let err = match App::from_config(cfg, PathBuf::from("/dev/null")) {
+            Ok(_) => panic!("remote blank zeroclaw token should fail closed"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("resolved token is blank"));
+        assert!(err.to_string().contains("not localhost/loopback"));
+    }
+
+    #[test]
+    fn from_config_rejects_unset_token_env_with_blank_inline_remote_fallback() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        std::env::remove_var("ZTERM_TEST_BLANK_FALLBACK_TOKEN_ENV");
+        let cfg = AppConfig::parse(
+            r#"
+[[workspaces]]
+name = "remote"
+backend = "zeroclaw"
+url = "http://example.com:42617"
+token_env = "ZTERM_TEST_BLANK_FALLBACK_TOKEN_ENV"
+token = ""
+"#,
+        )
+        .unwrap();
+
+        let err = match App::from_config(cfg, PathBuf::from("/dev/null")) {
+            Ok(_) => panic!("blank inline fallback should fail closed for remote zeroclaw"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("resolved token is blank"));
+        assert!(err.to_string().contains("not localhost/loopback"));
     }
 
     #[test]
