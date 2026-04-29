@@ -366,6 +366,7 @@ pub fn resume(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn mutate(
     ctx: &Context,
     paths: &Paths,
