@@ -906,40 +906,60 @@ impl ZeroclawClient {
     /// Pause a cron job
     pub async fn pause_cron(&self, job_id: &str) -> Result<()> {
         let url = format!("{}/api/cron/pause/{}", self.base_url, job_id);
-        self.http_client
+        let res = self
+            .http_client
             .post(&url)
             .bearer_auth(&self.token)
             .send()
             .await
             .map_err(|e| anyhow!("Failed to pause job: {}", e))?;
 
-        Ok(())
+        ensure_success_response(res, "Failed to pause job").await
     }
 
     /// Resume a cron job
     pub async fn resume_cron(&self, job_id: &str) -> Result<()> {
         let url = format!("{}/api/cron/resume/{}", self.base_url, job_id);
-        self.http_client
+        let res = self
+            .http_client
             .post(&url)
             .bearer_auth(&self.token)
             .send()
             .await
             .map_err(|e| anyhow!("Failed to resume job: {}", e))?;
 
-        Ok(())
+        ensure_success_response(res, "Failed to resume job").await
     }
 
     /// Delete a cron job
     pub async fn delete_cron(&self, job_id: &str) -> Result<()> {
         let url = format!("{}/api/cron/remove/{}", self.base_url, job_id);
-        self.http_client
+        let res = self
+            .http_client
             .delete(&url)
             .bearer_auth(&self.token)
             .send()
             .await
             .map_err(|e| anyhow!("Failed to delete job: {}", e))?;
 
-        Ok(())
+        ensure_success_response(res, "Failed to delete job").await
+    }
+}
+
+async fn ensure_success_response(res: reqwest::Response, context: &str) -> Result<()> {
+    let status = res.status();
+    if status.is_success() {
+        return Ok(());
+    }
+
+    let body = res
+        .text()
+        .await
+        .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
+    if body.trim().is_empty() {
+        Err(anyhow!("{context}: {status}"))
+    } else {
+        Err(anyhow!("{context}: {status}: {body}"))
     }
 }
 
@@ -1039,6 +1059,60 @@ mod tests {
             "test_token".to_string(),
         );
         assert_eq!(client.base_url, "http://localhost:8888");
+    }
+
+    #[tokio::test]
+    async fn pause_cron_rejects_http_error_status() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/api/cron/pause/job-1")
+            .with_status(401)
+            .with_body("denied")
+            .create_async()
+            .await;
+        let client = ZeroclawClient::new(server.url(), "test_token".to_string());
+
+        let err = client.pause_cron("job-1").await.unwrap_err();
+
+        let msg = err.to_string();
+        assert!(msg.contains("401"));
+        assert!(msg.contains("denied"));
+    }
+
+    #[tokio::test]
+    async fn resume_cron_rejects_http_error_status() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/api/cron/resume/job-1")
+            .with_status(404)
+            .with_body("missing")
+            .create_async()
+            .await;
+        let client = ZeroclawClient::new(server.url(), "test_token".to_string());
+
+        let err = client.resume_cron("job-1").await.unwrap_err();
+
+        let msg = err.to_string();
+        assert!(msg.contains("404"));
+        assert!(msg.contains("missing"));
+    }
+
+    #[tokio::test]
+    async fn delete_cron_rejects_http_error_status() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("DELETE", "/api/cron/remove/job-1")
+            .with_status(500)
+            .with_body("broken")
+            .create_async()
+            .await;
+        let client = ZeroclawClient::new(server.url(), "test_token".to_string());
+
+        let err = client.delete_cron("job-1").await.unwrap_err();
+
+        let msg = err.to_string();
+        assert!(msg.contains("500"));
+        assert!(msg.contains("broken"));
     }
 
     #[test]

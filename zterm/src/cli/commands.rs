@@ -767,11 +767,9 @@ impl CommandHandler {
                     }
                 }
             },
-            Some("pause") => {
-                let id = args.first().copied().unwrap_or("");
-                if id.is_empty() {
-                    out.push_str("Usage: /cron pause <id>\n");
-                } else {
+            Some("pause") => match parse_single_cron_target(args, "/cron pause <id>") {
+                Err(message) => out.push_str(&message),
+                Ok(id) => {
                     let res = match self.current_cron().await {
                         Some(c) => c.pause_cron(id).await,
                         None => Err(anyhow::anyhow!("cron not available on this backend")),
@@ -781,12 +779,10 @@ impl CommandHandler {
                         Err(e) => out.push_str(&format!("❌ Failed to pause job: {e}\n")),
                     }
                 }
-            }
-            Some("resume") => {
-                let id = args.first().copied().unwrap_or("");
-                if id.is_empty() {
-                    out.push_str("Usage: /cron resume <id>\n");
-                } else {
+            },
+            Some("resume") => match parse_single_cron_target(args, "/cron resume <id>") {
+                Err(message) => out.push_str(&message),
+                Ok(id) => {
                     let res = match self.current_cron().await {
                         Some(c) => c.resume_cron(id).await,
                         None => Err(anyhow::anyhow!("cron not available on this backend")),
@@ -796,12 +792,10 @@ impl CommandHandler {
                         Err(e) => out.push_str(&format!("❌ Failed to resume job: {e}\n")),
                     }
                 }
-            }
-            Some("remove") => {
-                let id = args.first().copied().unwrap_or("");
-                if id.is_empty() {
-                    out.push_str("Usage: /cron remove <id>\n");
-                } else {
+            },
+            Some("remove") => match parse_single_cron_target(args, "/cron remove <id>") {
+                Err(message) => out.push_str(&message),
+                Ok(id) => {
                     let res = match self.current_cron().await {
                         Some(c) => c.delete_cron(id).await,
                         None => Err(anyhow::anyhow!("cron not available on this backend")),
@@ -811,7 +805,7 @@ impl CommandHandler {
                         Err(e) => out.push_str(&format!("❌ Failed to delete job: {e}\n")),
                     }
                 }
-            }
+            },
             _ => {
                 out.push_str("Usage: /cron list\n");
                 out.push_str("       /cron add '<expr>' '<prompt>'\n");
@@ -1567,6 +1561,25 @@ fn parse_single_session_target<'a>(
     }
 }
 
+fn parse_single_cron_target<'a>(
+    args: &'a [&str],
+    usage: &str,
+) -> std::result::Result<&'a str, String> {
+    match args {
+        [] => Err(format!("{usage}\n")),
+        [target] => {
+            if target.is_empty() {
+                Err(format!("{usage}\n"))
+            } else {
+                Ok(*target)
+            }
+        }
+        [_target, ..] => Err(format!(
+            "{usage}\n❌ Cron job targets must be a single id token; extra tokens were not ignored.\n"
+        )),
+    }
+}
+
 pub(crate) fn tokenize_slash_command(input: &str) -> std::result::Result<Vec<String>, String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
@@ -2224,6 +2237,27 @@ mod tests {
                 .unwrap_err();
 
         assert!(err.contains("extra tokens were not ignored"));
+    }
+
+    #[test]
+    fn cron_destructive_parser_rejects_empty_and_extra_targets() {
+        assert_eq!(
+            super::parse_single_cron_target(&["job-a"], "/cron remove <id>").unwrap(),
+            "job-a"
+        );
+
+        let pause_err =
+            super::parse_single_cron_target(&["job-a", "job-b"], "/cron pause <id>").unwrap_err();
+        let resume_err =
+            super::parse_single_cron_target(&["job-a", "job-b"], "/cron resume <id>").unwrap_err();
+        let remove_err =
+            super::parse_single_cron_target(&["job-a", "job-b"], "/cron remove <id>").unwrap_err();
+        let empty_err = super::parse_single_cron_target(&[], "/cron remove <id>").unwrap_err();
+
+        assert!(pause_err.contains("extra tokens were not ignored"));
+        assert!(resume_err.contains("extra tokens were not ignored"));
+        assert!(remove_err.contains("extra tokens were not ignored"));
+        assert!(empty_err.contains("/cron remove <id>"));
     }
 
     #[test]
