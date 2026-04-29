@@ -970,6 +970,7 @@ fn apply_workspace_state(config_path: &Path, cfg: &mut AppConfig) -> Result<()> 
             &claimed_zeroclaw_entries,
         ) {
             let entry = &state.zeroclaw_workspaces[entry_idx];
+            let stored_url = redact_url_secrets_lossy_for_display(&entry.url);
             return Err(anyhow!(
                 "zeroclaw workspace '{}' has no explicit id and partially matches persisted workspace-state entry {} \
                  (stored name='{}', url='{}', id='{}') at the same Zeroclaw index ({}). \
@@ -978,7 +979,7 @@ fn apply_workspace_state(config_path: &Path, cfg: &mut AppConfig) -> Result<()> 
                 workspace.name,
                 entry_idx,
                 entry.name,
-                entry.url,
+                stored_url,
                 entry.id,
                 workspace_index,
                 entry.id,
@@ -1105,6 +1106,7 @@ fn apply_workspace_state(config_path: &Path, cfg: &mut AppConfig) -> Result<()> 
             &configured_openclaw_identities,
         ) {
             let entry = &state.openclaw_workspaces[entry_idx];
+            let stored_url = redact_url_secrets_lossy_for_display(&entry.url);
             return Err(anyhow!(
                 "openclaw workspace '{}' has no explicit id and does not match persisted workspace-state entry {} \
                  (stored name='{}', url='{}', id='{}'), but that unclaimed entry has the same OpenClaw index ({}). \
@@ -1113,7 +1115,7 @@ fn apply_workspace_state(config_path: &Path, cfg: &mut AppConfig) -> Result<()> 
                 workspace.name,
                 entry_idx,
                 entry.name,
-                entry.url,
+                stored_url,
                 entry.id,
                 workspace_index,
                 entry.id,
@@ -2282,6 +2284,48 @@ url = "ws://new.example"
     }
 
     #[test]
+    fn openclaw_stale_state_error_redacts_stored_url_secrets() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        let original = r#"
+[[workspaces]]
+name = "alpha"
+backend = "openclaw"
+url = "ws://old.example"
+"#;
+        std::fs::write(&path, original).unwrap();
+
+        let cfg = AppConfig::load(&path).unwrap();
+        let old_id = cfg.workspaces[0].id.clone().unwrap();
+        let state_path = workspace_state_path_for_config(&path);
+        let mut state = load_workspace_state(&state_path).unwrap();
+        state.openclaw_workspaces[0].url =
+            "ws://legacy_user:legacy_pass@old.example/path?access_token=sidecar-secret#frag-secret"
+                .to_string();
+        save_workspace_state(&state_path, &state).unwrap();
+
+        let replacement = r#"
+[[workspaces]]
+name = "beta"
+backend = "openclaw"
+url = "ws://new.example"
+"#;
+        std::fs::write(&path, replacement).unwrap();
+
+        let err = AppConfig::load(&path).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Refusing to mint a fresh id"));
+        assert!(msg.contains("redacted:redacted"));
+        assert!(msg.contains("access_token=REDACTED"));
+        assert!(msg.contains("#REDACTED"));
+        assert!(msg.contains(&format!("id='{old_id}'")));
+        assert!(!msg.contains("legacy_user"));
+        assert!(!msg.contains("legacy_pass"));
+        assert!(!msg.contains("sidecar-secret"));
+        assert!(!msg.contains("frag-secret"));
+    }
+
+    #[test]
     fn openclaw_reorder_and_rename_does_not_inherit_index_state_id() {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("config.toml");
@@ -2370,6 +2414,58 @@ token = ""
         assert!(msg.contains("same Zeroclaw index (0)"));
         assert!(msg.contains(&format!("id='{id}'")));
         assert!(msg.contains("Add `id = "));
+
+        match prior {
+            Some(value) => std::env::set_var("ZTERM_CONFIG_DIR", value),
+            None => std::env::remove_var("ZTERM_CONFIG_DIR"),
+        }
+    }
+
+    #[test]
+    fn zeroclaw_stale_state_error_redacts_stored_url_secrets() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let prior = std::env::var("ZTERM_CONFIG_DIR").ok();
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::env::set_var("ZTERM_CONFIG_DIR", tmp.path());
+        let path = tmp.path().join("config.toml");
+        let original = r#"
+[[workspaces]]
+name = "alpha"
+backend = "zeroclaw"
+url = "http://127.0.0.1:42617"
+token = ""
+"#;
+        std::fs::write(&path, original).unwrap();
+
+        let cfg = AppConfig::load(&path).unwrap();
+        let old_id = cfg.workspaces[0].id.clone().unwrap();
+        let state_path = workspace_state_path_for_config(&path);
+        let mut state = load_workspace_state(&state_path).unwrap();
+        state.zeroclaw_workspaces[0].url =
+            "http://legacy_user:legacy_pass@127.0.0.1:42617?api_token=sidecar-secret#frag-secret"
+                .to_string();
+        save_workspace_state(&state_path, &state).unwrap();
+
+        let edited = r#"
+[[workspaces]]
+name = "alpha"
+backend = "zeroclaw"
+url = "http://127.0.0.1:42618"
+token = ""
+"#;
+        std::fs::write(&path, edited).unwrap();
+
+        let err = AppConfig::load(&path).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("partially matches persisted workspace-state entry"));
+        assert!(msg.contains("redacted:redacted"));
+        assert!(msg.contains("api_token=REDACTED"));
+        assert!(msg.contains("#REDACTED"));
+        assert!(msg.contains(&format!("id='{old_id}'")));
+        assert!(!msg.contains("legacy_user"));
+        assert!(!msg.contains("legacy_pass"));
+        assert!(!msg.contains("sidecar-secret"));
+        assert!(!msg.contains("frag-secret"));
 
         match prior {
             Some(value) => std::env::set_var("ZTERM_CONFIG_DIR", value),
