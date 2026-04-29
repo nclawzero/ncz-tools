@@ -581,23 +581,31 @@ pub async fn run(
                     };
                     match client_opt {
                         Some(client_arc) => {
-                            let transcript_scope =
-                                match local_storage_scope_for_active_workspace(&worker_app).await {
-                                    Ok(scope) => Some(scope),
-                                    Err(e) => {
-                                        warn!(
-                                        "could not resolve transcript scope for session {}: {e}",
+                            let transcript_scope = match local_storage_scope_for_active_workspace(
+                                &worker_app,
+                            )
+                            .await
+                            {
+                                Ok(scope) => scope,
+                                Err(e) => {
+                                    let _ = worker_sink.send(TurnChunk::Finished(Err(format!(
+                                        "could not resolve transcript scope for session {}; turn not submitted: {e}",
                                         worker_session_id
-                                    );
-                                        None
-                                    }
-                                };
-                            append_turn_transcript_entry_best_effort(
-                                transcript_scope.as_ref(),
+                                    ))));
+                                    continue;
+                                }
+                            };
+                            if let Err(e) = append_turn_transcript_entry(
+                                &transcript_scope,
                                 &worker_session_id,
                                 "user",
                                 &text,
-                            );
+                            ) {
+                                let _ = worker_sink.send(TurnChunk::Finished(Err(format!(
+                                    "{e}; turn not submitted"
+                                ))));
+                                continue;
+                            }
                             let mut client = client_arc.lock().await;
                             let (turn_sink, turn_rx) = StreamSink::channel(TURN_STREAM_CAPACITY);
                             let observed_finished = Arc::new(AtomicBool::new(false));
@@ -615,20 +623,37 @@ pub async fn run(
 
                             match &submit_result {
                                 Ok(response) if !response.is_empty() => {
-                                    append_turn_transcript_entry_best_effort(
-                                        transcript_scope.as_ref(),
+                                    if let Err(e) = append_turn_transcript_entry(
+                                        &transcript_scope,
                                         &worker_session_id,
                                         "assistant",
                                         response,
-                                    );
+                                    ) {
+                                        let message =
+                                            mark_turn_transcript_incomplete_after_append_failure(
+                                                &transcript_scope,
+                                                &worker_session_id,
+                                                &e,
+                                            );
+                                        let _ = worker_sink.send(TurnChunk::Finished(Err(message)));
+                                    }
                                 }
                                 Err(e) => {
-                                    append_turn_transcript_entry_best_effort(
-                                        transcript_scope.as_ref(),
+                                    let error_text = e.to_string();
+                                    if let Err(append_error) = append_turn_transcript_entry(
+                                        &transcript_scope,
                                         &worker_session_id,
                                         "error",
-                                        &e.to_string(),
-                                    );
+                                        &error_text,
+                                    ) {
+                                        let message =
+                                            mark_turn_transcript_incomplete_after_append_failure(
+                                                &transcript_scope,
+                                                &worker_session_id,
+                                                &append_error,
+                                            );
+                                        let _ = worker_sink.send(TurnChunk::Finished(Err(message)));
+                                    }
                                 }
                                 _ => {}
                             }
@@ -1450,20 +1475,32 @@ where
     true
 }
 
-fn append_turn_transcript_entry_best_effort(
-    scope: Option<&storage::LocalWorkspaceScope>,
+fn append_turn_transcript_entry(
+    scope: &storage::LocalWorkspaceScope,
     session_id: &str,
     role: &str,
     content: &str,
-) -> bool {
-    let Some(scope) = scope else {
-        return false;
-    };
-    if let Err(e) = storage::append_scoped_session_history(scope, session_id, role, content) {
-        warn!("could not append {role} transcript entry for session {session_id}: {e}");
-        return false;
+) -> Result<()> {
+    storage::append_scoped_session_history(scope, session_id, role, content).map_err(|e| {
+        anyhow::anyhow!("could not append {role} transcript entry for session {session_id}: {e}")
+    })
+}
+
+fn mark_turn_transcript_incomplete_after_append_failure(
+    scope: &storage::LocalWorkspaceScope,
+    session_id: &str,
+    append_error: &anyhow::Error,
+) -> String {
+    warn!("{append_error}");
+    let reason = append_error.to_string();
+    match storage::mark_scoped_session_history_incomplete(scope, session_id, &reason) {
+        Ok(()) => {
+            format!("{reason}; transcript marked incomplete and /save is disabled until /clear")
+        }
+        Err(marker_error) => {
+            format!("{reason}; additionally failed to mark transcript incomplete: {marker_error}")
+        }
     }
-    true
 }
 
 #[derive(Debug)]
@@ -4668,6 +4705,39 @@ mod tests {
         });
 
         assert!(!saved);
+    }
+
+    #[test]
+    fn user_transcript_append_failure_is_returned_to_block_submit() {
+        let scope = storage::workspace_scope("zeroclaw", "default", None).unwrap();
+
+        let err = append_turn_transcript_entry(&scope, "../unsafe", "user", "secret").unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("could not append user transcript entry"));
+        assert!(err.to_string().contains("unsafe session id"));
+    }
+
+    #[test]
+    fn post_submit_transcript_failure_marks_history_incomplete() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let scope = storage::workspace_scope(
+            "zeroclaw",
+            &format!("transcript-{}", uuid::Uuid::new_v4()),
+            None,
+        )
+        .unwrap();
+        storage::append_scoped_session_history(&scope, "main", "user", "hello").unwrap();
+        let append_error = anyhow::anyhow!(
+            "could not append assistant transcript entry for session main: disk full"
+        );
+
+        let message =
+            mark_turn_transcript_incomplete_after_append_failure(&scope, "main", &append_error);
+
+        assert!(message.contains("transcript marked incomplete"));
+        assert!(storage::scoped_session_history_is_incomplete(&scope, "main").unwrap());
     }
 
     #[test]

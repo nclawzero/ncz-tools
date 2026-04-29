@@ -1147,6 +1147,12 @@ impl CommandHandler {
 
         if let Some(scope) = self.current_storage_scope().await {
             if let Ok(history_path) = storage::scoped_session_history_file(&scope, session_id) {
+                if storage::scoped_session_history_is_incomplete(&scope, session_id)? {
+                    return Ok(Some(
+                        "❌ Session transcript is incomplete; refusing to save. Run /clear to discard the incomplete local history.\n"
+                            .to_string(),
+                    ));
+                }
                 if history_path.exists() {
                     let mut src = fs::File::open(&history_path)?;
                     let mut dst = match fs::OpenOptions::new()
@@ -3092,6 +3098,14 @@ provider_settings = { tokens = ["array-token-1", "array-token-2"], name = "kept"
         assert!(saved.contains(r#""content":"hello""#));
         assert!(saved.contains(r#""role":"assistant""#));
         assert!(saved.contains(r#""content":"hi there""#));
+
+        storage::mark_scoped_session_history_incomplete(&scope, "main", "assistant append failed")
+            .unwrap();
+        let blocked_path = tempdir.path().join("blocked-transcript.txt");
+        let blocked_cmd = format!("/save {}", blocked_path.display());
+        let blocked = handler.handle(&blocked_cmd, "main").await.unwrap().unwrap();
+        assert!(blocked.contains("transcript is incomplete"));
+        assert!(!blocked_path.exists());
 
         storage::delete_scoped_session(&scope, "main").unwrap();
     }

@@ -227,12 +227,22 @@ impl OpenClawClient {
             pending.cancel();
             return Err(anyhow!("openclaw: write loop dropped (connection closed)"));
         };
-        if tx.send(req).await.is_err() {
-            pending.cancel();
-            return Err(anyhow!("openclaw: write loop dropped (connection closed)"));
+        let deadline = tokio::time::Instant::now() + timeout;
+        match tokio::time::timeout_at(deadline, tx.send(req)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => {
+                pending.cancel();
+                return Err(anyhow!("openclaw: write loop dropped (connection closed)"));
+            }
+            Err(_) => {
+                pending.cancel();
+                return Err(anyhow!(
+                    "openclaw: request {id} timed out after {timeout:?}"
+                ));
+            }
         }
 
-        match tokio::time::timeout(timeout, pending.receiver_mut()).await {
+        match tokio::time::timeout_at(deadline, pending.receiver_mut()).await {
             Ok(Ok(frame)) => Ok(frame),
             Ok(Err(_)) => {
                 pending.cancel();
@@ -4476,6 +4486,27 @@ mod tests {
         assert!(
             pending.is_empty().await,
             "timed-out requests must not remain in the pending map"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_request_timeout_covers_full_outbound_queue() {
+        let pending = PendingRequests::new();
+        let (outbound_tx, _outbound_rx) = mpsc::channel::<RequestFrame>(1);
+        outbound_tx
+            .try_send(RequestFrame::new("already.full", None))
+            .expect("test queue should start full");
+        let client = tests_support_new_fake(pending.clone(), Some(outbound_tx), true);
+
+        let err = client
+            .send_request_with_timeout("models.list", None, Duration::from_millis(10))
+            .await
+            .expect_err("full outbound queue should time out");
+
+        assert!(err.to_string().contains("timed out"));
+        assert!(
+            pending.is_empty().await,
+            "enqueue timeouts must cancel their pending request entry"
         );
     }
 

@@ -189,6 +189,15 @@ pub fn scoped_session_history_file(
     Ok(scoped_session_dir(scope, session_id)?.join("history.jsonl"))
 }
 
+/// Marker written when a transcript append fails after a backend turn
+/// has already been submitted. `/save` refuses to export marked history.
+pub fn scoped_session_history_incomplete_file(
+    scope: &LocalWorkspaceScope,
+    session_id: &str,
+) -> Result<PathBuf> {
+    Ok(scoped_session_dir(scope, session_id)?.join("history.incomplete"))
+}
+
 /// Ensure config directory exists
 pub fn ensure_config_dir() -> Result<()> {
     let dir = config_dir()?;
@@ -363,6 +372,21 @@ fn open_private_append_file(file: &Path) -> Result<fs::File> {
     Ok(out)
 }
 
+fn open_private_write_file(file: &Path) -> Result<fs::File> {
+    let mut opts = fs::OpenOptions::new();
+    opts.create(true).truncate(true).write(true);
+    #[cfg(unix)]
+    {
+        opts.mode(0o600);
+    }
+
+    let out = opts
+        .open(file)
+        .map_err(|e| anyhow!("Failed to open private storage file: {}", e))?;
+    harden_private_file(file)?;
+    Ok(out)
+}
+
 #[cfg(unix)]
 fn harden_private_file(file: &Path) -> Result<()> {
     if file.exists() {
@@ -377,18 +401,53 @@ fn harden_private_file(_file: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Mark a transcript incomplete after a post-submit persistence failure.
+pub fn mark_scoped_session_history_incomplete(
+    scope: &LocalWorkspaceScope,
+    session_id: &str,
+    reason: &str,
+) -> Result<()> {
+    if !is_safe_session_id(session_id) {
+        return Err(anyhow!("unsafe session id for local history marker"));
+    }
+
+    ensure_scoped_session_dir(scope, session_id)?;
+    let file = scoped_session_history_incomplete_file(scope, session_id)?;
+    let mut out = open_private_write_file(&file)?;
+    writeln!(out, "{reason}")
+        .map_err(|e| anyhow!("Failed to write session history incomplete marker: {}", e))?;
+    Ok(())
+}
+
+/// True when `/save` should refuse to export this scoped transcript.
+pub fn scoped_session_history_is_incomplete(
+    scope: &LocalWorkspaceScope,
+    session_id: &str,
+) -> Result<bool> {
+    if !is_safe_session_id(session_id) {
+        return Err(anyhow!("unsafe session id for local history marker check"));
+    }
+    Ok(scoped_session_history_incomplete_file(scope, session_id)?.exists())
+}
+
 /// Remove workspace-scoped transcript history for a session, leaving metadata intact.
 pub fn clear_scoped_session_history(scope: &LocalWorkspaceScope, session_id: &str) -> Result<bool> {
     if !is_safe_session_id(session_id) {
         return Err(anyhow!("unsafe session id for local history clear"));
     }
 
-    let file = scoped_session_history_file(scope, session_id)?;
-    match fs::remove_file(&file) {
-        Ok(()) => Ok(true),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(e) => Err(anyhow!("Failed to clear session history: {}", e)),
+    let mut removed = false;
+    for file in [
+        scoped_session_history_file(scope, session_id)?,
+        scoped_session_history_incomplete_file(scope, session_id)?,
+    ] {
+        match fs::remove_file(&file) {
+            Ok(()) => removed = true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(anyhow!("Failed to clear session history: {}", e)),
+        }
     }
+    Ok(removed)
 }
 
 /// Load config from file
@@ -715,6 +774,32 @@ mod tests {
                 dir.display()
             );
         }
+
+        mark_scoped_session_history_incomplete(&scope, "main", "append failed").unwrap();
+        let marker = scoped_session_history_incomplete_file(&scope, "main").unwrap();
+        assert_eq!(
+            fs::metadata(&marker).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn clear_scoped_history_removes_incomplete_marker() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let scope = scope(&format!("incomplete-{}", uuid::Uuid::new_v4()));
+
+        append_scoped_session_history(&scope, "main", "user", "hello").unwrap();
+        mark_scoped_session_history_incomplete(&scope, "main", "assistant append failed").unwrap();
+
+        assert!(scoped_session_history_is_incomplete(&scope, "main").unwrap());
+        assert!(clear_scoped_session_history(&scope, "main").unwrap());
+        assert!(!scoped_session_history_file(&scope, "main")
+            .unwrap()
+            .exists());
+        assert!(!scoped_session_history_incomplete_file(&scope, "main")
+            .unwrap()
+            .exists());
+        assert!(!scoped_session_history_is_incomplete(&scope, "main").unwrap());
     }
 
     #[test]

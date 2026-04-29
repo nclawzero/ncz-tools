@@ -286,21 +286,24 @@ impl ReplLoop {
                 }
             };
             let transcript_scope = match self.current_storage_scope().await {
-                Ok(scope) => Some(scope),
+                Ok(scope) => scope,
                 Err(e) => {
-                    warn!(
-                        "could not resolve transcript scope for session {}: {e}",
-                        session_id
+                    ui::print_error(
+                        "could not resolve transcript scope; turn not submitted",
+                        Some(&format!("session {session_id}: {e}")),
                     );
-                    None
+                    continue;
                 }
             };
-            append_repl_transcript_entry_best_effort(
-                transcript_scope.as_ref(),
-                &session_id,
-                "user",
-                &input,
-            );
+            if let Err(e) =
+                append_repl_transcript_entry(&transcript_scope, &session_id, "user", &input)
+            {
+                ui::print_error(
+                    "could not persist user transcript; turn not submitted",
+                    Some(&e.to_string()),
+                );
+                continue;
+            }
             let turn_res = {
                 let mut guard = active_client.lock().await;
                 guard.submit_turn(&session_id, &input).await
@@ -308,12 +311,14 @@ impl ReplLoop {
             match turn_res {
                 Ok(response) => {
                     if !response.is_empty() {
-                        append_repl_transcript_entry_best_effort(
-                            transcript_scope.as_ref(),
+                        if let Err(e) = append_repl_transcript_entry(
+                            &transcript_scope,
                             &session_id,
                             "assistant",
                             &response,
-                        );
+                        ) {
+                            surface_repl_transcript_incomplete(&transcript_scope, &session_id, &e);
+                        }
                     }
                     // Response already printed by streaming handler
                     // Update session metadata
@@ -322,12 +327,19 @@ impl ReplLoop {
                     }
                 }
                 Err(e) => {
-                    append_repl_transcript_entry_best_effort(
-                        transcript_scope.as_ref(),
+                    let error_text = e.to_string();
+                    if let Err(append_error) = append_repl_transcript_entry(
+                        &transcript_scope,
                         &session_id,
                         "error",
-                        &e.to_string(),
-                    );
+                        &error_text,
+                    ) {
+                        surface_repl_transcript_incomplete(
+                            &transcript_scope,
+                            &session_id,
+                            &append_error,
+                        );
+                    }
                     eprintln!("\n❌ Error: {}", e);
                 }
             }
@@ -688,20 +700,34 @@ fn save_legacy_session_metadata(
     Ok(())
 }
 
-fn append_repl_transcript_entry_best_effort(
-    scope: Option<&storage::LocalWorkspaceScope>,
+fn append_repl_transcript_entry(
+    scope: &storage::LocalWorkspaceScope,
     session_id: &str,
     role: &str,
     content: &str,
-) -> bool {
-    let Some(scope) = scope else {
-        return false;
-    };
-    if let Err(e) = storage::append_scoped_session_history(scope, session_id, role, content) {
-        warn!("could not append {role} transcript entry for session {session_id}: {e}");
-        return false;
+) -> Result<()> {
+    storage::append_scoped_session_history(scope, session_id, role, content).map_err(|e| {
+        anyhow::anyhow!("could not append {role} transcript entry for session {session_id}: {e}")
+    })
+}
+
+fn surface_repl_transcript_incomplete(
+    scope: &storage::LocalWorkspaceScope,
+    session_id: &str,
+    append_error: &anyhow::Error,
+) {
+    warn!("{append_error}");
+    let reason = append_error.to_string();
+    match storage::mark_scoped_session_history_incomplete(scope, session_id, &reason) {
+        Ok(()) => ui::print_error(
+            "transcript persistence failed; /save disabled until /clear",
+            Some(&reason),
+        ),
+        Err(marker_error) => ui::print_error(
+            "transcript persistence failed and incomplete marker could not be written",
+            Some(&format!("{reason}; marker error: {marker_error}")),
+        ),
     }
-    true
 }
 
 #[cfg(test)]
@@ -846,6 +872,37 @@ mod tests {
         }
 
         fn set_stream_sink(&mut self, _sink: Option<StreamSink>) {}
+    }
+
+    #[test]
+    fn legacy_repl_user_transcript_append_failure_is_returned() {
+        let scope = storage::workspace_scope("zeroclaw", "default", None).unwrap();
+
+        let err = append_repl_transcript_entry(&scope, "../unsafe", "user", "secret").unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("could not append user transcript entry"));
+        assert!(err.to_string().contains("unsafe session id"));
+    }
+
+    #[test]
+    fn legacy_repl_post_submit_failure_marks_history_incomplete() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let scope = storage::workspace_scope(
+            "zeroclaw",
+            &format!("legacy-transcript-{}", uuid::Uuid::new_v4()),
+            None,
+        )
+        .unwrap();
+        storage::append_scoped_session_history(&scope, "main", "user", "hello").unwrap();
+        let append_error = anyhow::anyhow!(
+            "could not append assistant transcript entry for session main: disk full"
+        );
+
+        surface_repl_transcript_incomplete(&scope, "main", &append_error);
+
+        assert!(storage::scoped_session_history_is_incomplete(&scope, "main").unwrap());
     }
 
     fn workspace(
