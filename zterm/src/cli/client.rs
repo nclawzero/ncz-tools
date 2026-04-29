@@ -18,6 +18,7 @@ const ZEROCLAW_TURN_RESPONSE_MAX_BYTES: usize = 2 * 1024 * 1024;
 const ZEROCLAW_WEBHOOK_ENVELOPE_MAX_BYTES: usize = 64 * 1024;
 const ZEROCLAW_WEBHOOK_ERROR_BODY_MAX_BYTES: usize = 8 * 1024;
 const ZEROCLAW_CRON_ERROR_BODY_MAX_BYTES: usize = 2 * 1024;
+const ZEROCLAW_CRON_LIST_BODY_MAX_BYTES: usize = 512 * 1024;
 const ZEROCLAW_CONFIG_BODY_MAX_BYTES: usize = 512 * 1024;
 
 /// One row from the daemon's `[providers.models.<key>]` config table.
@@ -1060,19 +1061,19 @@ impl ZeroclawClient {
             .map_err(|e| anyhow!("Failed to list cron jobs: {}", e))?;
 
         let status = res.status();
+        let body = if status.is_success() {
+            read_bounded_response_body(res, ZEROCLAW_CRON_LIST_BODY_MAX_BYTES).await
+        } else {
+            read_bounded_response_body(res, ZEROCLAW_CRON_ERROR_BODY_MAX_BYTES).await
+        };
         if !status.is_success() {
-            let body = res
-                .text()
-                .await
-                .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
             if body.trim().is_empty() {
                 return Err(anyhow!("Failed to list cron jobs: {status}"));
             }
             return Err(anyhow!("Failed to list cron jobs: {status}: {body}"));
         }
 
-        res.json::<Vec<serde_json::Value>>()
-            .await
+        serde_json::from_str::<Vec<serde_json::Value>>(&body)
             .map_err(|e| anyhow!("Failed to parse cron list response: {}", e))
     }
 
@@ -1510,6 +1511,52 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("401"));
         assert!(msg.contains("denied"));
+    }
+
+    #[tokio::test]
+    async fn list_cron_jobs_error_body_is_bounded_before_rendering() {
+        let mut server = mockito::Server::new_async().await;
+        let huge = format!(
+            "{}tail-marker",
+            "x".repeat(ZEROCLAW_CRON_ERROR_BODY_MAX_BYTES + 512)
+        );
+        let _mock = server
+            .mock("GET", "/api/cron/list")
+            .with_status(502)
+            .with_body(huge)
+            .create_async()
+            .await;
+        let client = ZeroclawClient::new(server.url(), "test_token".to_string());
+
+        let err = client.list_cron_jobs().await.unwrap_err();
+
+        let msg = err.to_string();
+        assert!(msg.contains("502"));
+        assert!(msg.contains("truncated"));
+        assert!(!msg.contains("tail-marker"));
+        assert!(msg.len() < ZEROCLAW_CRON_ERROR_BODY_MAX_BYTES + 256);
+    }
+
+    #[tokio::test]
+    async fn list_cron_jobs_success_body_is_bounded_before_parsing() {
+        let mut server = mockito::Server::new_async().await;
+        let huge = format!(
+            "[{}{{\"id\":\"tail-marker\"}}]",
+            "{\"id\":\"job\"},".repeat(ZEROCLAW_CRON_LIST_BODY_MAX_BYTES / 13 + 64)
+        );
+        let _mock = server
+            .mock("GET", "/api/cron/list")
+            .with_status(200)
+            .with_body(huge)
+            .create_async()
+            .await;
+        let client = ZeroclawClient::new(server.url(), "test_token".to_string());
+
+        let err = client.list_cron_jobs().await.unwrap_err();
+
+        let msg = err.to_string();
+        assert!(msg.contains("Failed to parse cron list response"));
+        assert!(!msg.contains("tail-marker"));
     }
 
     #[tokio::test]
