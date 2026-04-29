@@ -2802,13 +2802,7 @@ fn run_event_loop(
                 }
                 // Slash-prefixed input routes to CommandHandler;
                 // everything else submits as an agent turn.
-                let is_turn = !submitted.starts_with('/');
-                let request = if is_turn {
-                    WorkerRequest::Turn(submitted.clone())
-                } else {
-                    WorkerRequest::Command(submitted.clone())
-                };
-                let toast = (!is_turn).then(|| format!("Command: {submitted}"));
+                let (is_turn, request, toast) = worker_request_for_submitted_text(&submitted);
                 let status = dispatch_worker_backed_submission(
                     &submitted,
                     request,
@@ -2963,8 +2957,19 @@ fn run_slash_popup(app: &mut Application) -> u16 {
     menu_box.execute(&mut app.terminal)
 }
 
-fn should_open_slash_popup(key_code: u16, input_empty: bool) -> bool {
-    key_code == KB_CTRL_K || (key_code == b'/' as u16 && input_empty)
+fn should_open_slash_popup(key_code: u16, _input_empty: bool) -> bool {
+    key_code == KB_CTRL_K
+}
+
+fn worker_request_for_submitted_text(submitted: &str) -> (bool, WorkerRequest, Option<String>) {
+    let is_turn = !submitted.starts_with('/');
+    let request = if is_turn {
+        WorkerRequest::Turn(submitted.to_string())
+    } else {
+        WorkerRequest::Command(submitted.to_string())
+    };
+    let toast = (!is_turn).then(|| format!("Command: {submitted}"));
+    (is_turn, request, toast)
 }
 
 fn should_block_modal_entry_while_busy(event: &Event, input_empty: bool) -> bool {
@@ -6522,8 +6527,22 @@ mod tests {
     fn slash_popup_opens_for_ctrl_k_not_typed_slash() {
         assert!(should_open_slash_popup(KB_CTRL_K, true));
         assert!(should_open_slash_popup(KB_CTRL_K, false));
-        assert!(should_open_slash_popup(b'/' as u16, true));
+        assert!(!should_open_slash_popup(b'/' as u16, true));
         assert!(!should_open_slash_popup(b'/' as u16, false));
+    }
+
+    #[test]
+    fn typed_argument_slash_commands_route_to_worker_command() {
+        assert!(is_resync_force_command("/resync --force"));
+
+        let (is_turn, request, toast) =
+            worker_request_for_submitted_text("/cron add \"*/5 * * * *\" echo ok");
+        assert!(!is_turn);
+        assert!(matches!(request, WorkerRequest::Command(cmd) if cmd.starts_with("/cron add ")));
+        assert_eq!(
+            toast,
+            Some("Command: /cron add \"*/5 * * * *\" echo ok".to_string())
+        );
     }
 
     #[test]
@@ -6543,6 +6562,10 @@ mod tests {
         assert!(should_block_modal_entry_while_busy(
             &Event::keyboard(KB_CTRL_K),
             false
+        ));
+        assert!(!should_block_modal_entry_while_busy(
+            &Event::keyboard(b'/' as u16),
+            true
         ));
 
         let mut click_menu_bar = Event::nothing();
