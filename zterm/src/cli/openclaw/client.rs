@@ -1795,6 +1795,7 @@ impl AgentClient for OpenClawClient {
         let limit = 200;
         let mut sessions = Vec::new();
         let mut seen = std::collections::HashSet::new();
+        let mut stable_names = std::collections::HashSet::new();
         for namespace in self.session_namespaces() {
             let result = self
                 .rpc_sessions_list(SessionsListOpts {
@@ -1804,10 +1805,40 @@ impl AgentClient for OpenClawClient {
                 })
                 .await?;
             ensure_session_list_not_truncated(&result, limit)?;
-            for row in self.namespaced_session_rows(result.sessions) {
+            for row in result
+                .sessions
+                .into_iter()
+                .filter(|row| self.stable_row_belongs_to_session_namespace(row))
+            {
                 if seen.insert(row.key.clone()) {
+                    stable_names.insert(display_name_for_row(&row));
                     sessions.push(row_into_session(row));
                 }
+            }
+        }
+        for search in self.legacy_session_search_terms() {
+            let result = self
+                .rpc_sessions_list(SessionsListOpts {
+                    limit: Some(limit),
+                    search: Some(search),
+                    ..Default::default()
+                })
+                .await?;
+            ensure_session_list_not_truncated(&result, limit)?;
+            for row in result
+                .sessions
+                .into_iter()
+                .filter(|row| self.legacy_server_key_row_belongs_to_session_namespace(row))
+            {
+                if seen.contains(&row.key) {
+                    continue;
+                }
+                let name = display_name_for_row(&row);
+                if stable_names.contains(&name) {
+                    continue;
+                }
+                seen.insert(row.key.clone());
+                sessions.push(row_into_session(row));
             }
         }
         Ok(sessions)
@@ -1965,7 +1996,6 @@ impl OpenClawClient {
             .collect()
     }
 
-    #[cfg(test)]
     fn row_belongs_to_session_namespace(&self, row: &super::handshake::OpenClawSessionRow) -> bool {
         self.stable_row_belongs_to_session_namespace(row)
             || self.legacy_server_key_row_belongs_to_session_namespace(row)
@@ -1982,10 +2012,9 @@ impl OpenClawClient {
     }
 
     fn row_authorizes_session_operation(&self, row: &super::handshake::OpenClawSessionRow) -> bool {
-        self.stable_row_belongs_to_session_namespace(row)
+        self.row_belongs_to_session_namespace(row)
     }
 
-    #[cfg(test)]
     fn legacy_server_key_row_belongs_to_session_namespace(
         &self,
         row: &super::handshake::OpenClawSessionRow,
@@ -2007,7 +2036,25 @@ impl OpenClawClient {
         namespaces
     }
 
-    #[cfg(test)]
+    fn legacy_session_search_terms(&self) -> Vec<String> {
+        let mut terms = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let include_current =
+            legacy_namespace_workspace_identity(&self.session_namespace).is_some();
+        for namespace in self
+            .session_namespace_aliases
+            .iter()
+            .map(String::as_str)
+            .chain(include_current.then_some(self.session_namespace.as_str()))
+        {
+            let namespace = namespace.trim();
+            if !namespace.is_empty() && seen.insert(namespace.to_string()) {
+                terms.push(namespace.to_string());
+            }
+        }
+        terms
+    }
+
     fn row_metadata_matches_session_namespace(
         &self,
         row: &super::handshake::OpenClawSessionRow,
@@ -2035,7 +2082,6 @@ impl OpenClawClient {
     }
 }
 
-#[cfg(test)]
 #[derive(Debug)]
 struct SessionNamespaceIdentity<'a> {
     namespace: &'a str,
@@ -2044,7 +2090,6 @@ struct SessionNamespaceIdentity<'a> {
     workspace_url: Option<&'a str>,
 }
 
-#[cfg(test)]
 impl<'a> SessionNamespaceIdentity<'a> {
     fn from_namespace(namespace: &'a str) -> Self {
         let legacy_workspace = legacy_namespace_workspace_identity(namespace);
@@ -2088,7 +2133,6 @@ impl<'a> SessionNamespaceIdentity<'a> {
     }
 }
 
-#[cfg(test)]
 #[derive(Debug, Default)]
 struct RowIdentityMetadata {
     session_namespaces: Vec<String>,
@@ -2097,7 +2141,6 @@ struct RowIdentityMetadata {
     workspace_urls: Vec<String>,
 }
 
-#[cfg(test)]
 impl RowIdentityMetadata {
     fn is_empty(&self) -> bool {
         self.session_namespaces.is_empty()
@@ -2107,7 +2150,6 @@ impl RowIdentityMetadata {
     }
 }
 
-#[cfg(test)]
 fn canonical_namespace_workspace_id(namespace: &str) -> Option<&str> {
     let mut parts = namespace.trim().split(';');
     let backend = parts.next()?;
@@ -2120,7 +2162,6 @@ fn canonical_namespace_workspace_id(namespace: &str) -> Option<&str> {
     (key == "workspace_id").then_some(value)
 }
 
-#[cfg(test)]
 fn legacy_namespace_workspace_identity(namespace: &str) -> Option<(&str, &str)> {
     let mut parts = namespace.trim().split(';');
     let backend = parts.next()?;
@@ -2139,19 +2180,16 @@ fn legacy_namespace_workspace_identity(namespace: &str) -> Option<(&str, &str)> 
     }
 }
 
-#[cfg(test)]
 fn namespace_key_value(part: &str) -> Option<(&str, &str)> {
     let (key, value) = part.split_once('=')?;
     let value = value.trim();
     (!value.is_empty()).then_some((key, value))
 }
 
-#[cfg(test)]
 fn urls_equivalent(actual: &str, expected: &str) -> bool {
     actual.trim_end_matches('/') == expected.trim_end_matches('/')
 }
 
-#[cfg(test)]
 fn row_identity_metadata(row: &super::handshake::OpenClawSessionRow) -> RowIdentityMetadata {
     let mut out = RowIdentityMetadata::default();
 
@@ -2170,7 +2208,6 @@ fn row_identity_metadata(row: &super::handshake::OpenClawSessionRow) -> RowIdent
     out
 }
 
-#[cfg(test)]
 fn collect_identity_metadata_for_key(
     key: &str,
     value: &serde_json::Value,
@@ -2183,7 +2220,6 @@ fn collect_identity_metadata_for_key(
     }
 }
 
-#[cfg(test)]
 fn collect_identity_metadata_values(value: &serde_json::Value, target: &mut Vec<String>) {
     match value {
         serde_json::Value::String(s) => {
@@ -2201,7 +2237,6 @@ fn collect_identity_metadata_values(value: &serde_json::Value, target: &mut Vec<
     }
 }
 
-#[cfg(test)]
 fn normalize_metadata_key(key: &str) -> String {
     key.chars()
         .filter(|ch| ch.is_ascii_alphanumeric())
@@ -2209,7 +2244,6 @@ fn normalize_metadata_key(key: &str) -> String {
         .collect()
 }
 
-#[cfg(test)]
 fn identity_metadata_target<'a>(
     key: &str,
     metadata: &'a mut RowIdentityMetadata,
@@ -2624,7 +2658,7 @@ mod tests {
         );
         assert!(client.legacy_server_key_row_belongs_to_session_namespace(&exact_namespace_row));
         assert!(client.row_belongs_to_session_namespace(&exact_namespace_row));
-        assert!(!client.row_authorizes_session_operation(&exact_namespace_row));
+        assert!(client.row_authorizes_session_operation(&exact_namespace_row));
 
         let exact_workspace_id_row = test_session_row_with_extra(
             "oc-server-exact-workspace-id",
@@ -2636,7 +2670,7 @@ mod tests {
         );
         assert!(client.legacy_server_key_row_belongs_to_session_namespace(&exact_workspace_id_row));
         assert!(client.row_belongs_to_session_namespace(&exact_workspace_id_row));
-        assert!(!client.row_authorizes_session_operation(&exact_workspace_id_row));
+        assert!(client.row_authorizes_session_operation(&exact_workspace_id_row));
 
         let spoofed_container_row = test_session_row_with_extra(
             "oc-server-spoofed-container",
@@ -4325,6 +4359,28 @@ mod tests {
                 error: None,
             })
             .await;
+        let legacy_list_req = outbound_rx
+            .recv()
+            .await
+            .expect("legacy metadata scan should be sent for legacy namespace");
+        assert_eq!(
+            legacy_list_req.params.as_ref().unwrap()["search"].as_str(),
+            Some(active_namespace)
+        );
+        pending
+            .resolve(ResponseFrame {
+                id: legacy_list_req.id,
+                ok: true,
+                payload: Some(serde_json::json!({
+                    "ts": 1,
+                    "path": "sessions.jsonl",
+                    "count": 0,
+                    "defaults": {},
+                    "sessions": []
+                })),
+                error: None,
+            })
+            .await;
         let sessions = list_task
             .await
             .expect("list task should join")
@@ -4461,6 +4517,29 @@ mod tests {
                 error: None,
             })
             .await;
+
+        let legacy_req = outbound_rx
+            .recv()
+            .await
+            .expect("legacy alias metadata scan should be sent");
+        assert_eq!(
+            legacy_req.params.as_ref().unwrap()["search"].as_str(),
+            Some(legacy_namespace)
+        );
+        pending
+            .resolve(ResponseFrame {
+                id: legacy_req.id,
+                ok: true,
+                payload: Some(serde_json::json!({
+                    "ts": 1,
+                    "path": "sessions.jsonl",
+                    "count": 0,
+                    "defaults": {},
+                    "sessions": []
+                })),
+                error: None,
+            })
+            .await;
         let sessions = list_task
             .await
             .expect("list task should join")
@@ -4468,6 +4547,167 @@ mod tests {
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].id, legacy_key);
         assert_eq!(sessions[0].name, "Research");
+    }
+
+    #[tokio::test]
+    async fn legacy_alias_server_key_rows_list_load_and_delete_by_metadata() {
+        let pending = PendingRequests::new();
+        let (outbound_tx, mut outbound_rx) = mpsc::channel::<RequestFrame>(OUTBOUND_CAPACITY);
+        let mut client = tests_support_new_fake(pending.clone(), Some(outbound_tx), true);
+        let primary_namespace = "backend=openclaw;workspace_id=ws_immutable";
+        let legacy_namespace = "backend=openclaw;workspace=alpha;url=ws://old";
+        let server_key = "oc-server-generated-legacy";
+        client.set_session_namespace(primary_namespace);
+        client.set_session_namespace_aliases([legacy_namespace]);
+        let client = Arc::new(client);
+
+        let list_client = Arc::clone(&client);
+        let list_task = tokio::spawn(async move { list_client.list_sessions().await });
+        for expected_search in [
+            session_key_prefix(primary_namespace),
+            session_key_prefix(legacy_namespace),
+        ] {
+            let req = outbound_rx
+                .recv()
+                .await
+                .expect("stable scan should be sent");
+            assert_eq!(
+                req.params.as_ref().unwrap()["search"].as_str(),
+                Some(expected_search.as_str())
+            );
+            pending
+                .resolve(ResponseFrame {
+                    id: req.id,
+                    ok: true,
+                    payload: Some(serde_json::json!({
+                        "ts": 1,
+                        "path": "sessions.jsonl",
+                        "count": 0,
+                        "defaults": {},
+                        "sessions": []
+                    })),
+                    error: None,
+                })
+                .await;
+        }
+
+        let legacy_req = outbound_rx
+            .recv()
+            .await
+            .expect("legacy metadata scan should be sent");
+        assert_eq!(
+            legacy_req.params.as_ref().unwrap()["search"].as_str(),
+            Some(legacy_namespace)
+        );
+        pending
+            .resolve(ResponseFrame {
+                id: legacy_req.id,
+                ok: true,
+                payload: Some(serde_json::json!({
+                    "ts": 1,
+                    "path": "sessions.jsonl",
+                    "count": 1,
+                    "defaults": {},
+                    "sessions": [{
+                        "key": server_key,
+                        "kind": "direct",
+                        "label": "Research",
+                        "metadata": {
+                            "zterm": { "sessionNamespace": legacy_namespace }
+                        }
+                    }]
+                })),
+                error: None,
+            })
+            .await;
+        let sessions = list_task
+            .await
+            .expect("list task should join")
+            .expect("legacy metadata list should succeed");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, server_key);
+        assert_eq!(sessions[0].name, "Research");
+
+        let load_client = Arc::clone(&client);
+        let load_task = tokio::spawn(async move { load_client.load_session(server_key).await });
+        let load_req = outbound_rx.recv().await.expect("load should search by key");
+        assert_eq!(
+            load_req.params.as_ref().unwrap()["search"].as_str(),
+            Some(server_key)
+        );
+        pending
+            .resolve(ResponseFrame {
+                id: load_req.id,
+                ok: true,
+                payload: Some(serde_json::json!({
+                    "ts": 1,
+                    "path": "sessions.jsonl",
+                    "count": 1,
+                    "defaults": {},
+                    "sessions": [{
+                        "key": server_key,
+                        "kind": "direct",
+                        "label": "Research",
+                        "metadata": {
+                            "zterm": { "sessionNamespace": legacy_namespace }
+                        }
+                    }]
+                })),
+                error: None,
+            })
+            .await;
+        let loaded = load_task
+            .await
+            .expect("load task should join")
+            .expect("legacy metadata row should load");
+        assert_eq!(loaded.id, server_key);
+
+        let delete_client = Arc::clone(&client);
+        let delete_task =
+            tokio::spawn(async move { delete_client.delete_session(server_key).await });
+        let lookup_req = outbound_rx
+            .recv()
+            .await
+            .expect("delete should validate with load");
+        pending
+            .resolve(ResponseFrame {
+                id: lookup_req.id,
+                ok: true,
+                payload: Some(serde_json::json!({
+                    "ts": 1,
+                    "path": "sessions.jsonl",
+                    "count": 1,
+                    "defaults": {},
+                    "sessions": [{
+                        "key": server_key,
+                        "kind": "direct",
+                        "label": "Research",
+                        "metadata": {
+                            "zterm": { "sessionNamespace": legacy_namespace }
+                        }
+                    }]
+                })),
+                error: None,
+            })
+            .await;
+        let delete_req = outbound_rx
+            .recv()
+            .await
+            .expect("delete should send sessions.delete after authorization");
+        assert_eq!(delete_req.method, "sessions.delete");
+        assert_eq!(delete_req.params.as_ref().unwrap()["key"], server_key);
+        pending
+            .resolve(ResponseFrame {
+                id: delete_req.id,
+                ok: true,
+                payload: Some(serde_json::json!({})),
+                error: None,
+            })
+            .await;
+        delete_task
+            .await
+            .expect("delete task should join")
+            .expect("legacy metadata row should delete");
     }
 
     #[tokio::test]
@@ -4663,11 +4903,12 @@ mod tests {
                 error: None,
             })
             .await;
-        let load_err = load_task
+        let loaded = load_task
             .await
             .expect("load task should join")
-            .expect_err("metadata-only server key must not load");
-        assert!(load_err.to_string().contains("session not found"));
+            .expect("trusted metadata server key should load");
+        assert_eq!(loaded.id, server_key);
+        assert_eq!(loaded.name, "Research");
 
         let delete_client = Arc::clone(&client);
         let delete_task =
@@ -4697,17 +4938,24 @@ mod tests {
                 error: None,
             })
             .await;
-        let err = delete_task
+        let delete_req = outbound_rx
+            .recv()
+            .await
+            .expect("trusted metadata delete should send sessions.delete");
+        assert_eq!(delete_req.method, "sessions.delete");
+        assert_eq!(delete_req.params.as_ref().unwrap()["key"], server_key);
+        pending
+            .resolve(ResponseFrame {
+                id: delete_req.id,
+                ok: true,
+                payload: Some(serde_json::json!({})),
+                error: None,
+            })
+            .await;
+        delete_task
             .await
             .expect("delete task should join")
-            .expect_err("metadata-only server key must not delete");
-        assert!(err.to_string().contains("session not found"));
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(50), outbound_rx.recv())
-                .await
-                .is_err(),
-            "metadata-only legacy delete must not send sessions.delete"
-        );
+            .expect("trusted metadata server key should delete");
     }
 
     #[tokio::test]
