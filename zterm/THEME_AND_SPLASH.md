@@ -8,14 +8,15 @@
 > Vision TUI in `src/cli/tui/tv_ui.rs`. The ANSI splash documented
 > here remains relevant to the legacy/stdout path; the TV path adds
 > runtime palette presets, `~/.zterm/theme.toml`, cached
-> deterministic local connect-splash text at
-> `~/.zterm/cache/connect-splash/`, and `~/.zterm/state.toml` for
-> launch count plus `beep_on_error`. State writes use a bounded
-> lock wait, and the TV path persists a mutation fence after
+> connect-splash text at `~/.zterm/cache/connect-splash/`, and
+> `~/.zterm/state.toml` for launch count plus `beep_on_error`. The
+> default connect splash is a local modem sequence. Operators can
+> opt into backend generation with `[ui] connect_splash_backend =
+> true` in `~/.zterm/config.toml` or `ZTERM_CONNECT_SPLASH_BACKEND=1`;
+> that path uses an isolated temporary backend session and caches
+> generated text only after cleanup succeeds. State writes use a
+> bounded lock wait, and the TV path persists a mutation fence after
 > timed-out mutating slash commands until `/resync --force`.
-> v0.3.1 does not call a backend or LLM to generate connect-splash
-> text; a daemon-backed scratch generation path is deferred until it
-> can run outside user chat sessions.
 
 ---
 

@@ -25,6 +25,14 @@
 active = "zeroclaw-typhon"
 
 # -------------------------------------------------------------------
+# UI preferences. Backend-generated connect splash is opt-in because
+# it creates a temporary backend session and submits a short prompt on
+# cache misses. The default false path uses a local modem sequence.
+# -------------------------------------------------------------------
+[ui]
+connect_splash_backend = false
+
+# -------------------------------------------------------------------
 # Workspaces. Each entry is a named claw-family agent backend.
 # -------------------------------------------------------------------
 
