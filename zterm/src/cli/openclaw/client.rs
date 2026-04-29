@@ -2001,11 +2001,12 @@ struct SessionNamespaceIdentity<'a> {
 
 impl<'a> SessionNamespaceIdentity<'a> {
     fn from_namespace(namespace: &'a str) -> Self {
+        let legacy_workspace = legacy_namespace_workspace_identity(namespace);
         Self {
             namespace,
-            workspace_id: namespace_component(namespace, "workspace_id"),
-            workspace_name: namespace_component(namespace, "workspace"),
-            workspace_url: namespace_component(namespace, "url"),
+            workspace_id: canonical_namespace_workspace_id(namespace),
+            workspace_name: legacy_workspace.map(|(name, _)| name),
+            workspace_url: legacy_workspace.map(|(_, url)| url),
         }
     }
 
@@ -2058,11 +2059,40 @@ impl RowIdentityMetadata {
     }
 }
 
-fn namespace_component<'a>(namespace: &'a str, key: &str) -> Option<&'a str> {
-    namespace.split(';').find_map(|part| {
-        let (part_key, value) = part.split_once('=')?;
-        (part_key == key && !value.trim().is_empty()).then_some(value.trim())
-    })
+fn canonical_namespace_workspace_id(namespace: &str) -> Option<&str> {
+    let mut parts = namespace.trim().split(';');
+    let backend = parts.next()?;
+    let workspace_id = parts.next()?;
+    if parts.next().is_some() || backend != "backend=openclaw" {
+        return None;
+    }
+
+    let (key, value) = namespace_key_value(workspace_id)?;
+    (key == "workspace_id").then_some(value)
+}
+
+fn legacy_namespace_workspace_identity(namespace: &str) -> Option<(&str, &str)> {
+    let mut parts = namespace.trim().split(';');
+    let backend = parts.next()?;
+    let workspace = parts.next()?;
+    let url = parts.next()?;
+    if parts.next().is_some() || backend != "backend=openclaw" {
+        return None;
+    }
+
+    let (workspace_key, workspace_value) = namespace_key_value(workspace)?;
+    let (url_key, url_value) = namespace_key_value(url)?;
+    if workspace_key == "workspace" && url_key == "url" {
+        Some((workspace_value, url_value))
+    } else {
+        None
+    }
+}
+
+fn namespace_key_value(part: &str) -> Option<(&str, &str)> {
+    let (key, value) = part.split_once('=')?;
+    let value = value.trim();
+    (!value.is_empty()).then_some((key, value))
 }
 
 fn urls_equivalent(actual: &str, expected: &str) -> bool {
@@ -2428,10 +2458,8 @@ mod tests {
     #[test]
     fn legacy_metadata_matching_only_trusts_exact_identity_fields() {
         let mut client = tests_support_new_fake(PendingRequests::new(), None, true);
-        let active_namespace =
-            "backend=openclaw;workspace_id=ws_active;workspace=alpha;url=ws://shared";
-        let foreign_namespace =
-            "backend=openclaw;workspace_id=ws_foreign;workspace=beta;url=ws://shared";
+        let active_namespace = "backend=openclaw;workspace_id=ws_active";
+        let foreign_namespace = "backend=openclaw;workspace_id=ws_foreign";
         client.set_session_namespace(active_namespace);
 
         let exact_namespace_row = test_session_row_with_extra(
@@ -2483,6 +2511,41 @@ mod tests {
         assert!(
             !client.legacy_server_key_row_belongs_to_session_namespace(&conflicting_namespace_row)
         );
+    }
+
+    #[test]
+    fn legacy_metadata_matching_rejects_delimiter_injected_namespace_fields() {
+        let mut client = tests_support_new_fake(PendingRequests::new(), None, true);
+        client.set_session_namespace("backend=openclaw;workspace_id=ws_active");
+        client.set_session_namespace_aliases([
+            "backend=openclaw;workspace=alpha;workspace_id=ws_foreign;url=ws://shared",
+            "backend=openclaw;workspace=alpha;url=ws://shared;workspace_id=ws_foreign",
+        ]);
+
+        let injected_workspace_id_row = test_session_row_with_extra(
+            "oc-server-injected-workspace-id",
+            serde_json::json!({
+                "metadata": {
+                    "zterm": { "workspaceId": "ws_foreign" }
+                }
+            }),
+        );
+        assert!(
+            !client.legacy_server_key_row_belongs_to_session_namespace(&injected_workspace_id_row)
+        );
+
+        let injected_name_url_row = test_session_row_with_extra(
+            "oc-server-injected-name-url",
+            serde_json::json!({
+                "metadata": {
+                    "zterm": {
+                        "workspaceName": "alpha",
+                        "workspaceUrl": "ws://shared"
+                    }
+                }
+            }),
+        );
+        assert!(!client.legacy_server_key_row_belongs_to_session_namespace(&injected_name_url_row));
     }
 
     #[test]

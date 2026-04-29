@@ -1446,16 +1446,18 @@ fn should_clear_usage_after_command(
     workspace_switched || session_switched || model_switched
 }
 
-fn model_switch_target(cmdline: &str) -> Option<&str> {
-    let mut parts = cmdline.split_whitespace();
-    let command = parts.next()?;
-    if !matches!(command, "/model" | "/models") {
+fn model_switch_target(cmdline: &str) -> Option<String> {
+    let parts = tokenize_slash_command(cmdline).ok()?;
+    if parts.len() != 3 {
         return None;
     }
-    if parts.next()? != "set" {
+    if !matches!(parts[0].as_str(), "/model" | "/models") {
         return None;
     }
-    parts.next()
+    if parts[1] != "set" {
+        return None;
+    }
+    Some(parts[2].clone())
 }
 
 fn command_output_indicates_error(output: &str) -> bool {
@@ -5895,12 +5897,27 @@ mod tests {
         assert!(should_clear_usage_after_command(false, false, true));
         assert!(!should_clear_usage_after_command(false, false, false));
 
-        assert_eq!(model_switch_target("/models set primary"), Some("primary"));
-        assert_eq!(model_switch_target("/model set fast"), Some("fast"));
+        assert_eq!(
+            model_switch_target("/models set primary").as_deref(),
+            Some("primary")
+        );
+        assert_eq!(
+            model_switch_target("/model set fast").as_deref(),
+            Some("fast")
+        );
+        assert_eq!(
+            model_switch_target("/models set 'primary key'").as_deref(),
+            Some("primary key")
+        );
         assert_eq!(model_switch_target("/models list"), None);
+        assert_eq!(model_switch_target("/models set primary extra"), None);
         assert!(successful_model_switch_command(
             "/models set primary",
             "✅ Active model key: primary\n"
+        ));
+        assert!(successful_model_switch_command(
+            "/models set 'primary key'",
+            "✅ Active model key: primary key\n   Future turns will use this model.\n"
         ));
         assert!(!successful_model_switch_command(
             "/models set primary",
