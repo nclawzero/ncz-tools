@@ -1971,21 +1971,25 @@ async fn resolve_or_create_session_for_worker(
         plan_worker_session_resolution(session_name, locked.list_sessions().await)?
     };
 
-    if let WorkerSessionResolution::Existing(session) = resolution {
-        match client.lock().await.load_session(&session.id).await {
-            Ok(session) => return Ok(session),
-            Err(e) => {
-                warn!(
-                    "listed session '{}' could not be loaded for active workspace; creating scoped session '{}': {}",
-                    session.id, session_name, e
-                );
-            }
+    match resolution {
+        WorkerSessionResolution::Existing(session) => client
+            .lock()
+            .await
+            .load_session(&session.id)
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "listed session '{}' matched '{}', but could not be loaded: {e}; refusing to create a replacement session",
+                    session.id,
+                    session_name
+                )
+            }),
+        WorkerSessionResolution::Create => {
+            let session = client.lock().await.create_session(session_name).await?;
+            save_worker_session_metadata_best_effort(app, &session).await;
+            Ok(session)
         }
     }
-
-    let session = client.lock().await.create_session(session_name).await?;
-    save_worker_session_metadata_best_effort(app, &session).await;
-    Ok(session)
 }
 
 async fn create_new_session_for_worker(
@@ -7521,7 +7525,7 @@ mod tests {
     }
 
     #[test]
-    fn worker_session_switch_does_not_bind_unloadable_list_row() {
+    fn worker_session_switch_fails_closed_on_unloadable_list_row() {
         let _env = crate::cli::test_env_lock().lock().unwrap();
         let home = tempfile::tempdir().unwrap();
         let old_home = std::env::var_os("HOME");
@@ -7543,12 +7547,12 @@ mod tests {
                 listed_sessions: vec![display_only],
                 list_sessions_error: None,
                 loadable_sessions: Vec::new(),
-                load_reject_ids: Vec::new(),
+                load_reject_ids: vec!["legacy-server-key".to_string()],
                 created: Arc::clone(&created),
                 deleted,
                 submitted: Arc::clone(&submitted),
                 list_calls,
-                load_calls,
+                load_calls: Arc::clone(&load_calls),
             };
             let boxed: Box<dyn crate::cli::agent::AgentClient + Send + Sync> = Box::new(fake);
             let app = Arc::new(Mutex::new(App {
@@ -7571,37 +7575,20 @@ mod tests {
                 shared_mnemos: None,
                 config_path: std::path::PathBuf::from("test-config.toml"),
             }));
-            let mut bindings = HashMap::new();
 
-            let session = resolve_or_create_session_for_worker(&app, "legacy-server-key")
+            let err = resolve_or_create_session_for_worker(&app, "legacy-server-key")
                 .await
-                .unwrap();
-            let workspace_key = current_workspace_binding_key(&app).await.unwrap();
-            remember_worker_session(&mut bindings, workspace_key, &session);
-            let turn_session_id =
-                turn_session_id_for_active_workspace(&app, &mut bindings, "fallback")
-                    .await
-                    .unwrap();
-            let client = {
-                let guard = app.lock().await;
-                guard.active_workspace().unwrap().client.clone().unwrap()
-            };
-            client
-                .lock()
-                .await
-                .submit_turn(&turn_session_id, "hello")
-                .await
-                .unwrap();
+                .unwrap_err();
 
-            assert_eq!(session.id, "created-legacy-server-key");
-            assert_eq!(turn_session_id, "created-legacy-server-key");
-            let created_guard = created.lock().unwrap();
-            assert_eq!(created_guard.len(), 1);
-            assert_eq!(created_guard[0].name.as_str(), "legacy-server-key");
-            drop(created_guard);
+            let msg = err.to_string();
+            assert!(msg.contains("listed session 'legacy-server-key'"));
+            assert!(msg.contains("could not be loaded"));
+            assert!(msg.contains("refusing to create a replacement session"));
+            assert!(created.lock().unwrap().is_empty());
+            assert!(submitted.lock().unwrap().is_empty());
             assert_eq!(
-                submitted.lock().unwrap().as_slice(),
-                [("created-legacy-server-key".to_string(), "hello".to_string())]
+                *load_calls.lock().unwrap(),
+                vec!["legacy-server-key".to_string()]
             );
         });
 
