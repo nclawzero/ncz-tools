@@ -1548,9 +1548,15 @@ async fn generate_connect_splash_from_detached_config(
 async fn detached_connect_splash_client(config: &WorkspaceConfig) -> Result<SharedAgentClient> {
     match tokio::time::timeout(CONNECT_SPLASH_GENERATION_TIMEOUT, async {
         match config.backend {
-            Backend::Zeroclaw => Workspace::instantiate(0, config.clone())?
-                .client
-                .ok_or_else(|| anyhow::anyhow!("zeroclaw workspace has no detached client")),
+            Backend::Zeroclaw => {
+                let workspace = Workspace::instantiate(0, config.clone())?;
+                if let Some(cron) = workspace.cron.as_ref() {
+                    cron.refresh_models().await?;
+                }
+                workspace
+                    .client
+                    .ok_or_else(|| anyhow::anyhow!("zeroclaw workspace has no detached client"))
+            }
             Backend::Openclaw => Workspace::activate_detached_client(config).await,
             Backend::Nemoclaw => {
                 anyhow::bail!("nemoclaw backend is not yet implemented (v0.3)")

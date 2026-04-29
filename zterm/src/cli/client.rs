@@ -83,6 +83,9 @@ struct ModelState {
     /// wins when set; static `"primary"` fallback when neither
     /// applies (a neutral config-key string).
     current: Option<String>,
+    /// True only when `/api/config` explicitly advertises that the
+    /// daemon honors zterm's no-tools cosmetic splash contract.
+    side_effect_free_splash: bool,
 }
 
 /// Config response from /api/config
@@ -251,12 +254,14 @@ impl ZeroclawClient {
         // applied at read time, not stored, so users can flip it
         // without restarting the daemon.
         let default_key = default_key_from_list(&list, &cfg);
+        let side_effect_free_splash = config_supports_side_effect_free_splash(&cfg);
 
         let mut state = self.model_state.lock().expect("model_state poisoned");
         state.list = list.clone();
         if state.current.is_none() {
             state.current = default_key;
         }
+        state.side_effect_free_splash = side_effect_free_splash;
         Ok(list)
     }
 
@@ -878,6 +883,9 @@ impl ZeroclawClient {
         session_id: &str,
         message: &str,
     ) -> Result<String> {
+        if !self.supports_side_effect_free_splash_generation_cached() {
+            anyhow::bail!("zeroclaw daemon did not advertise side-effect-free splash generation");
+        }
         let payload = serde_json::json!({
             "message": message,
             "session": session_id,
@@ -890,6 +898,13 @@ impl ZeroclawClient {
         });
         self.submit_webhook_payload_with_limit(payload, ZEROCLAW_SPLASH_RESPONSE_MAX_BYTES)
             .await
+    }
+
+    fn supports_side_effect_free_splash_generation_cached(&self) -> bool {
+        self.model_state
+            .lock()
+            .expect("model_state poisoned")
+            .side_effect_free_splash
     }
 
     async fn submit_webhook_payload_with_limit(
@@ -1361,6 +1376,14 @@ fn default_key_from_list(list: &[ModelInfo], cfg: &toml::Value) -> Option<String
     list.first().map(|m| m.key.clone())
 }
 
+fn config_supports_side_effect_free_splash(cfg: &toml::Value) -> bool {
+    cfg.get("capabilities")
+        .and_then(|capabilities| capabilities.get("zterm"))
+        .and_then(|zterm| zterm.get("side_effect_free_splash"))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+}
+
 // ===================================================================
 // AgentClient trait impl for ZeroclawClient
 //
@@ -1422,7 +1445,7 @@ impl crate::cli::agent::AgentClient for ZeroclawClient {
     }
 
     fn supports_side_effect_free_splash_generation(&self) -> bool {
-        true
+        self.supports_side_effect_free_splash_generation_cached()
     }
 
     async fn submit_side_effect_free_splash(
@@ -1908,6 +1931,18 @@ mod tests {
     #[tokio::test]
     async fn zeroclaw_side_effect_free_splash_uses_no_tools_webhook_payload() {
         let mut server = mockito::Server::new_async().await;
+        let config_mock = server
+            .mock("GET", "/api/config")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "content": "[capabilities.zterm]\nside_effect_free_splash = true\n"
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
         let mock = server
             .mock("POST", "/webhook")
             .match_body(mockito::Matcher::PartialJson(json!({
@@ -1928,6 +1963,11 @@ mod tests {
         let mut client = ZeroclawClient::new(server.url(), "test-token".to_string());
 
         assert!(
+            !crate::cli::agent::AgentClient::supports_side_effect_free_splash_generation(&client)
+        );
+        client.refresh_models().await.unwrap();
+        config_mock.assert_async().await;
+        assert!(
             crate::cli::agent::AgentClient::supports_side_effect_free_splash_generation(&client)
         );
         let response = crate::cli::agent::AgentClient::submit_side_effect_free_splash(
@@ -1940,6 +1980,29 @@ mod tests {
 
         mock.assert_async().await;
         assert_eq!(response, "generated splash");
+    }
+
+    #[tokio::test]
+    async fn zeroclaw_side_effect_free_splash_requires_daemon_capability() {
+        let mut client = ZeroclawClient::new(
+            "http://localhost:8888".to_string(),
+            "test-token".to_string(),
+        );
+
+        assert!(
+            !crate::cli::agent::AgentClient::supports_side_effect_free_splash_generation(&client)
+        );
+        let err = crate::cli::agent::AgentClient::submit_side_effect_free_splash(
+            &mut client,
+            "zterm connect splash test",
+            "splash prompt",
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("did not advertise side-effect-free splash generation"));
     }
 
     #[tokio::test]

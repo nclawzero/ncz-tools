@@ -109,6 +109,13 @@ connect_splash_backend = true
 
 Default is `false`. When enabled, zterm still requires the active
 backend to pass the side-effect-free and cancellable generation guards.
+For Zeroclaw, that means `/api/config` must advertise:
+
+```toml
+[capabilities.zterm]
+side_effect_free_splash = true
+```
+
 Generated text is cached per workspace for 24 hours; unsupported
 backends fall back to the local modem/BBS sequence without writing a
 cache entry.
