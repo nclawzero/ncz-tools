@@ -313,7 +313,7 @@ pub enum BackupAction {
         ///
         /// Faster, but risks capturing a volume mid-write. The default path stops
         /// the systemd unit before `podman volume export` and restarts it after.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "exclude_volumes")]
         unsafe_live_volumes: bool,
     },
     /// Verify manifest hashes in a backup archive.

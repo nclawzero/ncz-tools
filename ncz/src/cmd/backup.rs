@@ -40,6 +40,7 @@ pub struct BackupCreateReport {
     pub redacted_count: usize,
     pub included_secrets: bool,
     pub volumes_included: bool,
+    pub unsafe_live_volumes: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -81,6 +82,15 @@ impl Render for BackupCreateReport {
                 "included"
             } else {
                 "excluded"
+            }
+        )?;
+        writeln!(
+            w,
+            "unsafe live volumes: {}",
+            if self.unsafe_live_volumes {
+                "enabled"
+            } else {
+                "disabled"
             }
         )
     }
@@ -148,7 +158,7 @@ pub fn run_with_paths(
             exclude_volumes,
             unsafe_live_volumes,
         } => Ok(BackupRunResult {
-            report: BackupReport::Create(create(
+            report: BackupReport::Create(create_with_unsafe_live_volumes(
                 ctx,
                 paths,
                 &to,
@@ -178,6 +188,34 @@ pub fn run_with_paths(
 }
 
 pub fn create(
+    ctx: &Context,
+    paths: &Paths,
+    archive: &Path,
+    include_secrets: bool,
+    exclude_volumes: bool,
+) -> Result<BackupCreateReport, NczError> {
+    create_with_options(ctx, paths, archive, include_secrets, exclude_volumes, false)
+}
+
+pub fn create_with_unsafe_live_volumes(
+    ctx: &Context,
+    paths: &Paths,
+    archive: &Path,
+    include_secrets: bool,
+    exclude_volumes: bool,
+    unsafe_live_volumes: bool,
+) -> Result<BackupCreateReport, NczError> {
+    create_with_options(
+        ctx,
+        paths,
+        archive,
+        include_secrets,
+        exclude_volumes,
+        unsafe_live_volumes,
+    )
+}
+
+pub(crate) fn create_with_options(
     ctx: &Context,
     paths: &Paths,
     archive: &Path,
@@ -218,6 +256,7 @@ pub fn create(
         redacted_count,
         included_secrets: include_secrets,
         volumes_included: !exclude_volumes,
+        unsafe_live_volumes: unsafe_live_volumes && !exclude_volumes,
     })
 }
 
@@ -692,7 +731,7 @@ mod tests {
         let runner = FakeRunner::new();
         expect_hostname(&runner);
 
-        let report = create(&ctx(&runner), &paths, &archive, false, true, false).unwrap();
+        let report = create(&ctx(&runner), &paths, &archive, false, true).unwrap();
         let (manifest, entries) = backup_state::read_archive(&archive).unwrap();
         let entry = backup_state::archive_entry(&entries, backup_state::AGENT_ENV_PATH).unwrap();
 
@@ -720,7 +759,7 @@ mod tests {
         let runner = FakeRunner::new();
         expect_hostname(&runner);
 
-        let report = create(&ctx(&runner), &paths, &archive, true, true, false).unwrap();
+        let report = create(&ctx(&runner), &paths, &archive, true, true).unwrap();
         let (manifest, entries) = backup_state::read_archive(&archive).unwrap();
         let entry = backup_state::archive_entry(&entries, backup_state::AGENT_ENV_PATH).unwrap();
 
@@ -747,7 +786,7 @@ mod tests {
         let runner = FakeRunner::new();
         expect_hostname(&runner);
 
-        let report = create(&ctx(&runner), &paths, &archive, false, true, false).unwrap();
+        let report = create(&ctx(&runner), &paths, &archive, false, true).unwrap();
         let (manifest, entries) = backup_state::read_archive(&archive).unwrap();
         let entry = backup_state::archive_entry(&entries, "/etc/nclawzero/providers.d/legacy.json")
             .unwrap();
@@ -771,7 +810,7 @@ mod tests {
         let runner = FakeRunner::new();
         expect_hostname(&runner);
 
-        let report = create(&ctx(&runner), &paths, &archive, true, true, false).unwrap();
+        let report = create(&ctx(&runner), &paths, &archive, true, true).unwrap();
         let (manifest, entries) = backup_state::read_archive(&archive).unwrap();
         let entry = backup_state::archive_entry(&entries, "/etc/nclawzero/providers.d/legacy.json")
             .unwrap();
@@ -837,9 +876,10 @@ mod tests {
         );
         expect_hostname(&runner);
 
-        let report = create(&ctx(&runner), &paths, &archive, false, false, false).unwrap();
+        let report = create(&ctx(&runner), &paths, &archive, false, false).unwrap();
 
         assert_eq!(report.source_count, 1);
+        assert!(!report.unsafe_live_volumes);
         assert!(!export_path.exists());
         runner.assert_done();
     }
@@ -882,9 +922,12 @@ mod tests {
         );
         expect_hostname(&runner);
 
-        let report = create(&ctx(&runner), &paths, &archive, false, false, true).unwrap();
+        let report =
+            create_with_unsafe_live_volumes(&ctx(&runner), &paths, &archive, false, false, true)
+                .unwrap();
 
         assert_eq!(report.source_count, 1);
+        assert!(report.unsafe_live_volumes);
         assert!(!export_path.exists());
         runner.assert_done();
     }
