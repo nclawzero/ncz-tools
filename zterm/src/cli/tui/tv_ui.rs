@@ -17,6 +17,7 @@
 
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
+use std::future::Future;
 use std::rc::Rc;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -143,6 +144,7 @@ const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦
 const SPINNER_INTERVAL: Duration = Duration::from_millis(80);
 const TURN_FORWARD_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
 const SESSION_PICKER_LIST_TIMEOUT: Duration = Duration::from_secs(5);
+const COMMAND_WORKER_TIMEOUT: Duration = Duration::from_secs(30);
 const RESPONSE_BUSY_TOAST: &str = "Busy: response in progress";
 const UI_EVENT_CAPACITY: usize = 512;
 const TURN_STREAM_CAPACITY: usize = 128;
@@ -151,6 +153,9 @@ const TURN_STREAM_MAX_BYTES: usize = 2 * 1024 * 1024;
 const COMMAND_ERROR_ALREADY_RENDERED: &str = "__zterm_command_error_already_rendered__";
 const PARTIAL_STREAM_INCOMPLETE_REASON: &str =
     "partial response incomplete; backend stream ended without a finished frame";
+const SESSION_PICKER_NAME_MAX_CHARS: usize = 48;
+const SESSION_PICKER_DETAIL_MAX_CHARS: usize = 32;
+const SESSION_PICKER_ID_MAX_CHARS: usize = 64;
 
 /// How long a status-line toast (e.g. palette confirmation after
 /// Ctrl-P) remains visible. ~1s is long enough to read but short
@@ -789,218 +794,19 @@ pub async fn run(
                         }));
                 }
                 WorkerRequest::Command(cmdline) => {
-                    // Route slash commands through the shared
-                    // `CommandHandler`. Advertised commands return
-                    // structured strings so side effects are visible
-                    // inside the full-screen TUI.
-                    if let Some(message) = stdout_only_slash_command_block_message(&cmdline) {
-                        let _ = worker_sink.send(TurnChunk::Token(message));
-                        send_worker_finished(&worker_sink, Ok(String::new())).await;
-                        continue;
-                    }
-                    if let Some(target) = active_worker_session_delete_target(
-                        &cmdline,
-                        &worker_app,
-                        &mut worker_sessions,
-                    )
-                    .await
-                    {
-                        send_worker_finished(
-                            &worker_sink,
-                            Err(format!(
-                                "cannot delete active session `{target}`; switch to another session before deleting it"
-                            )),
-                        )
-                        .await;
-                        continue;
-                    }
-                    let preflight = command_session_preflight(&cmdline);
-                    let workspace_before_dispatch =
-                        if preflight == CommandSessionPreflight::AfterWorkspaceSwitch {
-                            current_workspace_name(&worker_app).await.ok()
-                        } else {
-                            None
-                        };
-                    let mut command_session_id = remembered_session_id_for_active_workspace(
-                        &worker_app,
-                        &worker_sessions,
-                        &fallback_session_name,
-                    )
-                    .await;
-                    if preflight == CommandSessionPreflight::BeforeDispatch {
-                        command_session_id = match ensure_session_for_active_workspace(
+                    run_worker_command_with_timeout(
+                        &worker_sink,
+                        COMMAND_WORKER_TIMEOUT,
+                        handle_worker_command_request(
+                            cmdline,
                             &worker_app,
                             &mut worker_sessions,
                             &fallback_session_name,
-                        )
-                        .await
-                        {
-                            Ok(session_id) => session_id,
-                            Err(e) => {
-                                send_worker_finished(
-                                    &worker_sink,
-                                    Err(format!(
-                                        "could not prepare session for active workspace: {e}"
-                                    )),
-                                )
-                                .await;
-                                continue;
-                            }
-                        };
-                    }
-                    let mut session_switched = false;
-                    if let Some(session_action) = session_action(&cmdline) {
-                        let target_session = session_action.target().to_string();
-                        let action_label = match &session_action {
-                            SessionAction::Switch { .. } => "switch session to",
-                            SessionAction::Create { .. } => "create session",
-                        };
-                        let session_result = match session_action {
-                            SessionAction::Switch { target } => {
-                                resolve_or_create_session_for_worker(&worker_app, &target).await
-                            }
-                            SessionAction::Create { target } => {
-                                create_new_session_for_worker(&worker_app, &target).await
-                            }
-                        };
-                        match session_result {
-                            Ok(session) => {
-                                command_session_id = session.id.clone();
-                                match current_workspace_binding_key(&worker_app).await {
-                                    Ok(workspace_key) => {
-                                        remember_worker_session(
-                                            &mut worker_sessions,
-                                            workspace_key,
-                                            &session,
-                                        );
-                                        session_switched = true;
-                                    }
-                                    Err(e) => {
-                                        send_worker_finished(
-                                            &worker_sink,
-                                            Err(format!(
-                                                "could not bind session `{target_session}` to workspace: {e}"
-                                            )),
-                                        )
-                                        .await;
-                                        continue;
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                send_worker_finished(
-                                    &worker_sink,
-                                    Err(format!(
-                                        "could not {action_label} `{target_session}`: {e}"
-                                    )),
-                                )
-                                .await;
-                                continue;
-                            }
-                        }
-                    }
-                    match worker_cmd_handler
-                        .handle(&cmdline, &command_session_id)
-                        .await
-                    {
-                        Ok(Some(text)) => {
-                            let model_switched = successful_model_switch_command(&cmdline, &text);
-                            let command_failed = command_output_indicates_error(&text);
-                            let _ = worker_sink.send(TurnChunk::Token(text));
-                            let mut workspace_switched = false;
-                            if preflight == CommandSessionPreflight::AfterWorkspaceSwitch {
-                                let switched_workspace = {
-                                    let guard = worker_app.lock().await;
-                                    guard.active_workspace().map(|w| w.config.name.clone())
-                                };
-                                if switched_workspace != workspace_before_dispatch {
-                                    workspace_switched = true;
-                                    install_stream_sink_on_active_client(
-                                        &worker_app,
-                                        worker_sink.clone(),
-                                    )
-                                    .await;
-                                    if let Err(e) = ensure_session_for_active_workspace(
-                                        &worker_app,
-                                        &mut worker_sessions,
-                                        &fallback_session_name,
-                                    )
-                                    .await
-                                    {
-                                        let _ = worker_sink.send(TurnChunk::ClearUsage);
-                                        send_worker_finished(
-                                            &worker_sink,
-                                            Err(format!(
-                                                "workspace switched, but session setup failed: {e}"
-                                            )),
-                                        )
-                                        .await;
-                                        continue;
-                                    }
-                                    if let Some(name) = switched_workspace {
-                                        let splash = connect_splash_for_workspace(&name);
-                                        let _ = worker_sink.send(TurnChunk::Typewriter(splash));
-                                    }
-                                }
-                            }
-                            if should_clear_usage_after_command(
-                                workspace_switched,
-                                session_switched,
-                                model_switched,
-                            ) {
-                                let _ = worker_sink.send(TurnChunk::ClearUsage);
-                            }
-                            if workspace_switched || model_switched {
-                                if let Some((workspace, model)) =
-                                    status_snapshot_for_worker(&worker_app).await
-                                {
-                                    let _ = worker_sink.send(TurnChunk::Status {
-                                        workspace: Some(workspace),
-                                        model: Some(model),
-                                    });
-                                }
-                            }
-                            if command_failed {
-                                send_worker_finished(
-                                    &worker_sink,
-                                    Err(COMMAND_ERROR_ALREADY_RENDERED.to_string()),
-                                )
-                                .await;
-                            } else {
-                                send_worker_finished(&worker_sink, Ok(String::new())).await;
-                            }
-                        }
-                        Ok(None) => {
-                            let _ = worker_sink.send(TurnChunk::Token(format!(
-                                "Command `{cmdline}` completed without structured TUI output."
-                            )));
-                            if should_clear_usage_after_command(false, session_switched, false) {
-                                let _ = worker_sink.send(TurnChunk::ClearUsage);
-                            }
-                            send_worker_finished(&worker_sink, Ok(String::new())).await;
-                        }
-                        Err(e) if e.to_string() == "EXIT" => {
-                            // `/exit` bubbled up; mirror the
-                            // rustyline behavior by signalling a
-                            // clean shutdown via Finished(Ok).
-                            // E-6 introduces a dedicated Quit
-                            // TurnChunk; for now the user just
-                            // sees the command acknowledged and
-                            // Alt-X actually closes the UI.
-                            let _ = worker_sink.send(TurnChunk::Token(
-                                "(use Alt-X or F10 → File → Exit to leave \
-                                 the TUI)"
-                                    .to_string(),
-                            ));
-                            send_worker_finished(&worker_sink, Ok(String::new())).await;
-                        }
-                        Err(e) => {
-                            if should_clear_usage_after_command(false, session_switched, false) {
-                                let _ = worker_sink.send(TurnChunk::ClearUsage);
-                            }
-                            send_worker_finished(&worker_sink, Err(e.to_string())).await;
-                        }
-                    }
+                            &worker_sink,
+                            &worker_cmd_handler,
+                        ),
+                    )
+                    .await;
                 }
             }
         }
@@ -1022,6 +828,214 @@ pub async fn run(
     })
     .await
     .map_err(|e| anyhow::anyhow!("tv_ui join error: {e}"))?
+}
+
+async fn run_worker_command_with_timeout<F>(worker_sink: &StreamSink, timeout: Duration, command: F)
+where
+    F: Future<Output = ()>,
+{
+    if tokio::time::timeout(timeout, command).await.is_err() {
+        send_worker_finished(
+            worker_sink,
+            Err(format!("slash command timed out after {timeout:?}")),
+        )
+        .await;
+    }
+}
+
+async fn handle_worker_command_request(
+    cmdline: String,
+    worker_app: &Arc<Mutex<App>>,
+    worker_sessions: &mut HashMap<String, WorkerSessionBinding>,
+    fallback_session_name: &str,
+    worker_sink: &StreamSink,
+    worker_cmd_handler: &CommandHandler,
+) {
+    // Route slash commands through the shared `CommandHandler`.
+    // Advertised commands return structured strings so side effects
+    // are visible inside the full-screen TUI.
+    if let Some(message) = stdout_only_slash_command_block_message(&cmdline) {
+        let _ = worker_sink.send(TurnChunk::Token(message));
+        send_worker_finished(worker_sink, Ok(String::new())).await;
+        return;
+    }
+    if let Some(target) =
+        active_worker_session_delete_target(&cmdline, worker_app, worker_sessions).await
+    {
+        send_worker_finished(
+            worker_sink,
+            Err(format!(
+                "cannot delete active session `{target}`; switch to another session before deleting it"
+            )),
+        )
+        .await;
+        return;
+    }
+    let preflight = command_session_preflight(&cmdline);
+    let workspace_before_dispatch = if preflight == CommandSessionPreflight::AfterWorkspaceSwitch {
+        current_workspace_name(worker_app).await.ok()
+    } else {
+        None
+    };
+    let mut command_session_id = remembered_session_id_for_active_workspace(
+        worker_app,
+        worker_sessions,
+        fallback_session_name,
+    )
+    .await;
+    if preflight == CommandSessionPreflight::BeforeDispatch {
+        command_session_id = match ensure_session_for_active_workspace(
+            worker_app,
+            worker_sessions,
+            fallback_session_name,
+        )
+        .await
+        {
+            Ok(session_id) => session_id,
+            Err(e) => {
+                send_worker_finished(
+                    worker_sink,
+                    Err(format!(
+                        "could not prepare session for active workspace: {e}"
+                    )),
+                )
+                .await;
+                return;
+            }
+        };
+    }
+    let mut session_switched = false;
+    if let Some(session_action) = session_action(&cmdline) {
+        let target_session = session_action.target().to_string();
+        let action_label = match &session_action {
+            SessionAction::Switch { .. } => "switch session to",
+            SessionAction::Create { .. } => "create session",
+        };
+        let session_result = match session_action {
+            SessionAction::Switch { target } => {
+                resolve_or_create_session_for_worker(worker_app, &target).await
+            }
+            SessionAction::Create { target } => {
+                create_new_session_for_worker(worker_app, &target).await
+            }
+        };
+        match session_result {
+            Ok(session) => {
+                command_session_id = session.id.clone();
+                match current_workspace_binding_key(worker_app).await {
+                    Ok(workspace_key) => {
+                        remember_worker_session(worker_sessions, workspace_key, &session);
+                        session_switched = true;
+                    }
+                    Err(e) => {
+                        send_worker_finished(
+                            worker_sink,
+                            Err(format!(
+                                "could not bind session `{target_session}` to workspace: {e}"
+                            )),
+                        )
+                        .await;
+                        return;
+                    }
+                }
+            }
+            Err(e) => {
+                send_worker_finished(
+                    worker_sink,
+                    Err(format!("could not {action_label} `{target_session}`: {e}")),
+                )
+                .await;
+                return;
+            }
+        }
+    }
+    match worker_cmd_handler
+        .handle(&cmdline, &command_session_id)
+        .await
+    {
+        Ok(Some(text)) => {
+            let model_switched = successful_model_switch_command(&cmdline, &text);
+            let command_failed = command_output_indicates_error(&text);
+            let _ = worker_sink.send(TurnChunk::Token(text));
+            let mut workspace_switched = false;
+            if preflight == CommandSessionPreflight::AfterWorkspaceSwitch {
+                let switched_workspace = {
+                    let guard = worker_app.lock().await;
+                    guard.active_workspace().map(|w| w.config.name.clone())
+                };
+                if switched_workspace != workspace_before_dispatch {
+                    workspace_switched = true;
+                    install_stream_sink_on_active_client(worker_app, worker_sink.clone()).await;
+                    if let Err(e) = ensure_session_for_active_workspace(
+                        worker_app,
+                        worker_sessions,
+                        fallback_session_name,
+                    )
+                    .await
+                    {
+                        let _ = worker_sink.send(TurnChunk::ClearUsage);
+                        send_worker_finished(
+                            worker_sink,
+                            Err(format!("workspace switched, but session setup failed: {e}")),
+                        )
+                        .await;
+                        return;
+                    }
+                    if let Some(name) = switched_workspace {
+                        let splash = connect_splash_for_workspace(&name);
+                        let _ = worker_sink.send(TurnChunk::Typewriter(splash));
+                    }
+                }
+            }
+            if should_clear_usage_after_command(
+                workspace_switched,
+                session_switched,
+                model_switched,
+            ) {
+                let _ = worker_sink.send(TurnChunk::ClearUsage);
+            }
+            if workspace_switched || model_switched {
+                if let Some((workspace, model)) = status_snapshot_for_worker(worker_app).await {
+                    let _ = worker_sink.send(TurnChunk::Status {
+                        workspace: Some(workspace),
+                        model: Some(model),
+                    });
+                }
+            }
+            if command_failed {
+                send_worker_finished(worker_sink, Err(COMMAND_ERROR_ALREADY_RENDERED.to_string()))
+                    .await;
+            } else {
+                send_worker_finished(worker_sink, Ok(String::new())).await;
+            }
+        }
+        Ok(None) => {
+            let _ = worker_sink.send(TurnChunk::Token(format!(
+                "Command `{cmdline}` completed without structured TUI output."
+            )));
+            if should_clear_usage_after_command(false, session_switched, false) {
+                let _ = worker_sink.send(TurnChunk::ClearUsage);
+            }
+            send_worker_finished(worker_sink, Ok(String::new())).await;
+        }
+        Err(e) if e.to_string() == "EXIT" => {
+            // `/exit` bubbled up; mirror the rustyline behavior by
+            // signalling a clean shutdown via Finished(Ok). E-6
+            // introduces a dedicated Quit TurnChunk; for now the user
+            // just sees the command acknowledged and Alt-X actually
+            // closes the UI.
+            let _ = worker_sink.send(TurnChunk::Token(
+                "(use Alt-X or F10 -> File -> Exit to leave the TUI)".to_string(),
+            ));
+            send_worker_finished(worker_sink, Ok(String::new())).await;
+        }
+        Err(e) => {
+            if should_clear_usage_after_command(false, session_switched, false) {
+                let _ = worker_sink.send(TurnChunk::ClearUsage);
+            }
+            send_worker_finished(worker_sink, Err(e.to_string())).await;
+        }
+    }
 }
 
 fn connect_splash_for_workspace(workspace_name: &str) -> String {
@@ -3672,13 +3686,7 @@ fn run_session_picker(
         .iter()
         .enumerate()
         .map(|(i, e)| {
-            let label = format!(
-                " {}  [{} / {}]  {}",
-                e.name,
-                empty_label(&e.provider),
-                empty_label(&e.model),
-                e.id
-            );
+            let label = session_picker_menu_label(e);
             MenuItem::with_shortcut(&label, CMD_SESSION_SELECT_BASE + i as u16, 0, "", 0)
         })
         .collect();
@@ -3697,6 +3705,49 @@ fn run_session_picker(
     }
     let idx = selected.checked_sub(CMD_SESSION_SELECT_BASE)? as usize;
     entries.get(idx).cloned()
+}
+
+fn session_picker_menu_label(entry: &SessionPickerEntry) -> String {
+    format!(
+        " {}  [{} / {}]  {}",
+        menu_safe_label_field(&entry.name, SESSION_PICKER_NAME_MAX_CHARS),
+        menu_safe_label_field(
+            empty_label(&entry.provider),
+            SESSION_PICKER_DETAIL_MAX_CHARS
+        ),
+        menu_safe_label_field(empty_label(&entry.model), SESSION_PICKER_DETAIL_MAX_CHARS),
+        menu_safe_label_field(&entry.id, SESSION_PICKER_ID_MAX_CHARS)
+    )
+}
+
+fn menu_safe_label_field(value: &str, max_chars: usize) -> String {
+    let sanitized = sanitize_terminal_text(value);
+    let mut safe = String::with_capacity(sanitized.len().min(max_chars));
+    for ch in sanitized.chars() {
+        if ch == '~' {
+            safe.push('-');
+        } else if !ch.is_control() {
+            safe.push(ch);
+        }
+    }
+    let safe = safe.trim();
+    if safe.is_empty() {
+        return "-".to_string();
+    }
+    truncate_menu_label_field(safe, max_chars)
+}
+
+fn truncate_menu_label_field(value: &str, max_chars: usize) -> String {
+    let count = value.chars().count();
+    if count <= max_chars {
+        return value.to_string();
+    }
+    if max_chars <= 3 {
+        return value.chars().take(max_chars).collect();
+    }
+    let mut out: String = value.chars().take(max_chars - 3).collect();
+    out.push_str("...");
+    out
 }
 
 fn empty_label(value: &str) -> &str {
@@ -4040,6 +4091,25 @@ mod tests {
         };
 
         assert!(session_switch_command_for_picker_entry(&entry).is_err());
+    }
+
+    #[test]
+    fn session_picker_label_sanitizes_and_caps_backend_fields() {
+        let entry = SessionPickerEntry {
+            id: format!("id-{}~", "x".repeat(120)),
+            name: "bad\u{1b}]52;c;owned\u{07}~name".to_string(),
+            model: "model~name".to_string(),
+            provider: "provider\u{1b}[31m".to_string(),
+        };
+
+        let label = session_picker_menu_label(&entry);
+
+        assert!(!label.contains('\u{1b}'));
+        assert!(!label.contains('\u{7}'));
+        assert!(!label.contains('~'));
+        assert!(label.contains("<ESC>"));
+        assert!(label.contains("..."));
+        assert!(label.chars().count() < 180);
     }
 
     #[test]
@@ -4398,6 +4468,25 @@ mod tests {
         let rendered = lines.borrow().join("\n");
         assert!(rendered.contains("Unknown command"));
         assert!(!rendered.contains("[error]"));
+    }
+
+    #[tokio::test]
+    async fn timed_out_worker_command_emits_terminal_error() {
+        let (sink, mut rx) = StreamSink::channel(4);
+
+        run_worker_command_with_timeout(
+            &sink,
+            Duration::from_millis(1),
+            std::future::pending::<()>(),
+        )
+        .await;
+
+        match rx.recv().await {
+            Some(TurnChunk::Finished(Err(message))) => {
+                assert!(message.contains("slash command timed out"));
+            }
+            other => panic!("expected timeout terminal error, got {other:?}"),
+        }
     }
 
     #[test]
