@@ -2101,7 +2101,17 @@ fn urls_equivalent(actual: &str, expected: &str) -> bool {
 
 fn row_identity_metadata(row: &super::handshake::OpenClawSessionRow) -> RowIdentityMetadata {
     let mut out = RowIdentityMetadata::default();
-    for (key, value) in &row.extra {
+
+    let Some(zterm_metadata) = row
+        .extra
+        .get("metadata")
+        .and_then(|metadata| metadata.get("zterm"))
+        .and_then(serde_json::Value::as_object)
+    else {
+        return out;
+    };
+
+    for (key, value) in zterm_metadata {
         collect_identity_metadata_for_key(key, value, &mut out);
     }
     out
@@ -2114,23 +2124,22 @@ fn collect_identity_metadata_for_key(
 ) {
     let normalized_key = normalize_metadata_key(key);
 
+    if let Some(target) = identity_metadata_target(&normalized_key, out) {
+        collect_identity_metadata_values(value, target);
+    }
+}
+
+fn collect_identity_metadata_values(value: &serde_json::Value, target: &mut Vec<String>) {
     match value {
         serde_json::Value::String(s) => {
-            if let Some(target) = identity_metadata_target(&normalized_key, out) {
-                let trimmed = s.trim();
-                if !trimmed.is_empty() {
-                    target.push(trimmed.to_string());
-                }
+            let trimmed = s.trim();
+            if !trimmed.is_empty() {
+                target.push(trimmed.to_string());
             }
         }
         serde_json::Value::Array(items) => {
             for item in items {
-                collect_identity_metadata_for_key(key, item, out);
-            }
-        }
-        serde_json::Value::Object(map) => {
-            for (child_key, value) in map {
-                collect_identity_metadata_for_key(child_key, value, out);
+                collect_identity_metadata_values(item, target);
             }
         }
         _ => {}
@@ -2546,6 +2555,35 @@ mod tests {
             }),
         );
         assert!(!client.legacy_server_key_row_belongs_to_session_namespace(&injected_name_url_row));
+    }
+
+    #[test]
+    fn legacy_metadata_matching_ignores_untrusted_nested_identity_keys() {
+        let mut client = tests_support_new_fake(PendingRequests::new(), None, true);
+        client.set_session_namespace("backend=openclaw;workspace_id=ws_active");
+
+        let unrelated_nested_identity_row = test_session_row_with_extra(
+            "oc-server-untrusted-nested-identity",
+            serde_json::json!({
+                "metadata": {
+                    "foreign": { "workspaceId": "ws_active" },
+                    "zterm": {
+                        "notes": { "sessionNamespace": "backend=openclaw;workspace_id=ws_active" }
+                    }
+                }
+            }),
+        );
+        assert!(!client
+            .legacy_server_key_row_belongs_to_session_namespace(&unrelated_nested_identity_row));
+
+        let top_level_identity_row = test_session_row_with_extra(
+            "oc-server-untrusted-top-level-identity",
+            serde_json::json!({
+                "workspaceId": "ws_active",
+                "sessionNamespace": "backend=openclaw;workspace_id=ws_active"
+            }),
+        );
+        assert!(!client.legacy_server_key_row_belongs_to_session_namespace(&top_level_identity_row));
     }
 
     #[test]

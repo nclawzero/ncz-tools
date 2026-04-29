@@ -521,11 +521,16 @@ impl ReplLoop {
                 (Some(target), Some(active)) if target == active
             );
             if successful_switch || workspace_after_dispatch != workspace_before_dispatch {
-                self.ensure_session_for_active_workspace()
-                    .await
-                    .map_err(|e| {
-                        anyhow::anyhow!("workspace switched, but session setup failed: {e}")
-                    })?;
+                if let Err(e) = self.ensure_session_for_active_workspace().await {
+                    let reason = legacy_workspace_switch_session_setup_failure_message(input, &e);
+                    let reason = self.persist_mutation_fence(&reason).await;
+                    let mut output = result.clone().unwrap_or_default();
+                    if !output.ends_with('\n') {
+                        output.push('\n');
+                    }
+                    output.push_str(&format!("[blocked] {reason}\n"));
+                    return Ok(Some(output));
+                }
             }
         }
 
@@ -808,6 +813,17 @@ fn legacy_mutating_unknown_outcome_message(cmdline: &str, rendered_text: &str) -
     )
 }
 
+fn legacy_workspace_switch_session_setup_failure_message(
+    cmdline: &str,
+    error: &anyhow::Error,
+) -> String {
+    format!(
+        "slash command outcome unknown for `{}`; workspace switch was applied, but session setup failed: {}. Run /resync to inspect state, or /resync --force to clear this fence after manual reconciliation.",
+        sanitize_terminal_text(cmdline).replace('`', "'"),
+        sanitize_terminal_text(&error.to_string())
+    )
+}
+
 fn legacy_mutation_fence_command_from_reason(reason: &str) -> String {
     let Some(start) = reason.find(" for `") else {
         return String::new();
@@ -1055,6 +1071,7 @@ mod tests {
         sessions: Vec<Session>,
         submitted: Arc<StdMutex<Vec<(String, String)>>>,
         deleted: Arc<StdMutex<Vec<String>>>,
+        list_sessions_error: Option<String>,
     }
 
     #[async_trait::async_trait]
@@ -1086,6 +1103,9 @@ mod tests {
         }
 
         async fn list_sessions(&self) -> anyhow::Result<Vec<Session>> {
+            if let Some(error) = &self.list_sessions_error {
+                anyhow::bail!("{error}");
+            }
             Ok(self.sessions.clone())
         }
 
@@ -1194,10 +1214,22 @@ mod tests {
         submitted: Arc<StdMutex<Vec<(String, String)>>>,
         deleted: Arc<StdMutex<Vec<String>>>,
     ) -> Workspace {
+        workspace_with_list_sessions_error(id, name, sessions, submitted, deleted, None)
+    }
+
+    fn workspace_with_list_sessions_error(
+        id: usize,
+        name: &str,
+        sessions: Vec<Session>,
+        submitted: Arc<StdMutex<Vec<(String, String)>>>,
+        deleted: Arc<StdMutex<Vec<String>>>,
+        list_sessions_error: Option<&str>,
+    ) -> Workspace {
         let fake = FakeWorkspaceClient {
             sessions,
             submitted,
             deleted,
+            list_sessions_error: list_sessions_error.map(str::to_string),
         };
         let boxed: Box<dyn AgentClient + Send + Sync> = Box::new(fake);
         Workspace {
@@ -1285,6 +1317,80 @@ mod tests {
             assert!(delighters::mutation_fence_for_workspace("name:alpha")
                 .unwrap()
                 .is_none());
+        });
+
+        match old_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    #[test]
+    fn legacy_repl_workspace_switch_setup_failure_persists_fence() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let alpha_submitted = Arc::new(StdMutex::new(Vec::new()));
+            let beta_submitted = Arc::new(StdMutex::new(Vec::new()));
+            let alpha_deleted = Arc::new(StdMutex::new(Vec::new()));
+            let beta_deleted = Arc::new(StdMutex::new(Vec::new()));
+            let alpha = session("alpha-session", "chat");
+            let app = Arc::new(Mutex::new(App {
+                workspaces: vec![
+                    workspace(
+                        0,
+                        "alpha",
+                        vec![alpha.clone()],
+                        Arc::clone(&alpha_submitted),
+                        Arc::clone(&alpha_deleted),
+                    ),
+                    workspace_with_list_sessions_error(
+                        1,
+                        "beta",
+                        Vec::new(),
+                        Arc::clone(&beta_submitted),
+                        Arc::clone(&beta_deleted),
+                        Some("backend listing failed"),
+                    ),
+                ],
+                active: 0,
+                shared_mnemos: None,
+                config_path: PathBuf::from("test-config.toml"),
+            }));
+            let mut repl = ReplLoop::new(
+                Arc::clone(&app),
+                alpha,
+                "model".to_string(),
+                "provider".to_string(),
+            )
+            .unwrap();
+
+            repl.ensure_session_for_active_workspace().await.unwrap();
+            let out = repl
+                .handle_slash_command("/workspace switch beta")
+                .await
+                .expect("post-switch setup failure should be surfaced")
+                .expect("workspace switch should return blocked output");
+
+            assert_eq!(app.lock().await.active, 1);
+            assert!(out.contains("switched to workspace: beta"));
+            assert!(out.contains("[blocked]"));
+            assert!(out.contains("workspace switch was applied, but session setup failed"));
+            assert!(out.contains("backend listing failed"));
+            assert!(delighters::mutation_fence_for_workspace("name:beta")
+                .unwrap()
+                .is_some());
+
+            let blocked = repl
+                .handle_slash_command("/session list")
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(blocked.contains("mutation outcome is unknown"));
         });
 
         match old_home {
