@@ -1174,13 +1174,23 @@ async fn handle_worker_command_request(
                 }
                 let mut workspace_switched = false;
                 if preflight == CommandSessionPreflight::AfterWorkspaceSwitch {
-                    let switched_workspace = {
-                        let guard = worker_app.lock().await;
-                        guard.active_workspace().map(|w| w.config.name.clone())
-                    };
-                    if switched_workspace != workspace_before_dispatch {
+                    let switched_workspace = active_workspace_identity_for_worker(worker_app).await;
+                    let switched_workspace_name =
+                        switched_workspace.as_ref().map(|(name, _)| name.clone());
+                    if switched_workspace_name != workspace_before_dispatch {
                         workspace_switched = true;
                         install_stream_sink_on_active_client(worker_app, worker_sink.clone()).await;
+                        if let Some((name, workspace_id)) = switched_workspace.as_ref() {
+                            let _ = send_worker_chunk_reliably(
+                                worker_sink,
+                                TurnChunk::Status {
+                                    workspace: Some(name.clone()),
+                                    workspace_id: workspace_id.clone(),
+                                    model: None,
+                                },
+                            )
+                            .await;
+                        }
                         if let Err(e) = ensure_session_for_active_workspace(
                             worker_app,
                             worker_sessions,
@@ -1199,7 +1209,7 @@ async fn handle_worker_command_request(
                             .await;
                             return;
                         }
-                        if let Some(name) = switched_workspace {
+                        if let Some((name, _)) = switched_workspace {
                             let splash = connect_splash_for_workspace(&name);
                             let _ = send_worker_chunk_reliably(
                                 worker_sink,
@@ -1764,6 +1774,14 @@ async fn status_snapshot_for_worker(
 
     let model = client.lock().await.current_model_label();
     Some((workspace, workspace_id, model))
+}
+
+async fn active_workspace_identity_for_worker(
+    app: &Arc<Mutex<App>>,
+) -> Option<(String, Option<String>)> {
+    let guard = app.lock().await;
+    let workspace = guard.active_workspace()?;
+    Some((workspace.config.name.clone(), workspace.config.id.clone()))
 }
 
 async fn remembered_session_id_for_active_workspace(
@@ -5995,6 +6013,85 @@ mod tests {
             None => std::env::remove_var("HOME"),
         }
 
+        assert!(source_after.is_none());
+        assert!(target_after.reason.contains("outcome unknown"));
+        assert!(target_after.reason.contains("/workspace switch beta"));
+        assert_eq!(state.mutation_fence, Some(target_after.reason));
+    }
+
+    #[test]
+    fn unknown_workspace_switch_failure_status_frame_replaces_stale_source_fence() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+
+        let mut state = StatusState::new(
+            "alpha".to_string(),
+            "gpt-test".to_string(),
+            "borland".to_string(),
+            false,
+        );
+        state.workspace_id = Some("ws-alpha".to_string());
+        let lines = Rc::new(RefCell::new(Vec::new()));
+        let (req_tx, mut req_rx) = mpsc::channel(4);
+        let mut response_in_flight = false;
+        assert_eq!(
+            dispatch_worker_backed_submission(
+                "/workspace switch beta",
+                WorkerRequest::Command("/workspace switch beta".to_string()),
+                &lines,
+                &req_tx,
+                &mut state,
+                &mut response_in_flight,
+                false,
+                None,
+                "dispatch",
+            ),
+            SubmissionStatus::Started
+        );
+        let source_key = "id:ws-alpha".to_string();
+        let target_key = "id:ws-beta".to_string();
+        assert!(delighters::mutation_fence_for_workspace(&source_key)
+            .unwrap()
+            .is_some());
+        let _ = req_rx.try_recv();
+
+        let (event_tx, mut event_rx) = mpsc::channel(4);
+        event_tx
+            .try_send(TurnChunk::Status {
+                workspace: Some("beta".to_string()),
+                workspace_id: Some("ws-beta".to_string()),
+                model: None,
+            })
+            .unwrap();
+        event_tx
+            .try_send(TurnChunk::Finished(Err(
+                "workspace switched, but session setup failed".to_string(),
+            )))
+            .unwrap();
+        let mut typewriter_state = None;
+        let mut session_picker_state = SessionPickerState::default();
+        assert!(drain_stream_events(
+            &mut event_rx,
+            &lines,
+            &mut state,
+            &mut typewriter_state,
+            &mut response_in_flight,
+            &mut session_picker_state
+        ));
+        let source_after = delighters::mutation_fence_for_workspace(&source_key).unwrap();
+        let target_after = delighters::mutation_fence_for_workspace(&target_key)
+            .unwrap()
+            .unwrap();
+
+        match old_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+
+        assert_eq!(state.workspace, "beta");
+        assert_eq!(state.workspace_id.as_deref(), Some("ws-beta"));
         assert!(source_after.is_none());
         assert!(target_after.reason.contains("outcome unknown"));
         assert!(target_after.reason.contains("/workspace switch beta"));
