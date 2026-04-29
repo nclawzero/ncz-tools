@@ -202,14 +202,19 @@ pub fn local_connect_splash(workspace: &str) -> String {
 }
 
 pub fn load_state(path: &Path) -> ZtermState {
+    load_state_checked(path).unwrap_or_default()
+}
+
+pub fn load_state_checked(path: &Path) -> io::Result<ZtermState> {
     load_state_unlocked(path)
 }
 
-fn load_state_unlocked(path: &Path) -> ZtermState {
-    let Ok(text) = fs::read_to_string(path) else {
-        return ZtermState::default();
-    };
-    toml::from_str(&text).unwrap_or_default()
+fn load_state_unlocked(path: &Path) -> io::Result<ZtermState> {
+    match fs::read_to_string(path) {
+        Ok(text) => toml::from_str(&text).map_err(io::Error::other),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(ZtermState::default()),
+        Err(e) => Err(e),
+    }
 }
 
 pub fn save_state(path: &Path, state: &ZtermState) -> io::Result<()> {
@@ -336,7 +341,7 @@ pub fn record_launch() -> std::io::Result<(u64, Option<String>)> {
 
 pub fn record_launch_at(path: &Path) -> std::io::Result<(u64, Option<String>)> {
     with_state_lock(path, || {
-        let mut state = load_state_unlocked(path);
+        let mut state = load_state_unlocked(path)?;
         state.launches = state.launches.saturating_add(1);
         let launches = state.launches;
         save_state_unlocked(path, &state)?;
@@ -355,23 +360,32 @@ pub fn set_beep_on_error(enabled: bool) -> std::io::Result<ZtermState> {
 
 pub fn set_beep_on_error_at(path: &Path, enabled: bool) -> std::io::Result<ZtermState> {
     with_state_lock(path, || {
-        let mut state = load_state_unlocked(path);
+        let mut state = load_state_unlocked(path)?;
         state.beep_on_error = enabled;
         save_state_unlocked(path, &state)?;
         Ok(state)
     })
 }
 
-pub fn mutation_fence_for_workspace(workspace_key: &str) -> Option<MutationFenceState> {
-    let path = default_state_path()?;
+pub fn mutation_fence_for_workspace(
+    workspace_key: &str,
+) -> std::io::Result<Option<MutationFenceState>> {
+    let Some(path) = default_state_path() else {
+        return Err(std::io::Error::other(
+            "no home directory; cannot read zterm mutation fence",
+        ));
+    };
     mutation_fence_for_workspace_at(&path, workspace_key)
 }
 
 pub fn mutation_fence_for_workspace_at(
     path: &Path,
     workspace_key: &str,
-) -> Option<MutationFenceState> {
-    load_state(path).mutation_fences.get(workspace_key).cloned()
+) -> std::io::Result<Option<MutationFenceState>> {
+    Ok(load_state_unlocked(path)?
+        .mutation_fences
+        .get(workspace_key)
+        .cloned())
 }
 
 pub fn set_mutation_fence_for_workspace(
@@ -392,7 +406,7 @@ pub fn set_mutation_fence_for_workspace_at(
     fence: MutationFenceState,
 ) -> std::io::Result<ZtermState> {
     with_state_lock(path, || {
-        let mut state = load_state_unlocked(path);
+        let mut state = load_state_unlocked(path)?;
         state
             .mutation_fences
             .insert(workspace_key.to_string(), fence);
@@ -415,11 +429,28 @@ pub fn clear_mutation_fence_for_workspace_at(
     workspace_key: &str,
 ) -> std::io::Result<ZtermState> {
     with_state_lock(path, || {
-        let mut state = load_state_unlocked(path);
+        let mut state = match load_state_unlocked(path) {
+            Ok(state) => state,
+            Err(_) if path.exists() => {
+                quarantine_corrupt_state_file(path)?;
+                ZtermState::default()
+            }
+            Err(e) => return Err(e),
+        };
         state.mutation_fences.remove(workspace_key);
         save_state_unlocked(path, &state)?;
         Ok(state)
     })
+}
+
+fn quarantine_corrupt_state_file(path: &Path) -> io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let filename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("state.toml");
+    let quarantine = parent.join(format!("{filename}.corrupt.{}", uuid::Uuid::new_v4()));
+    fs::rename(path, quarantine)
 }
 
 pub fn is_welcome_milestone(launches: u64) -> bool {
@@ -575,13 +606,56 @@ mod tests {
         set_mutation_fence_for_workspace_at(&path, "id:prod", fence.clone()).unwrap();
 
         assert_eq!(
-            mutation_fence_for_workspace_at(&path, "id:prod"),
+            mutation_fence_for_workspace_at(&path, "id:prod").unwrap(),
             Some(fence)
         );
-        assert_eq!(mutation_fence_for_workspace_at(&path, "id:dev"), None);
+        assert_eq!(
+            mutation_fence_for_workspace_at(&path, "id:dev").unwrap(),
+            None
+        );
 
         clear_mutation_fence_for_workspace_at(&path, "id:prod").unwrap();
-        assert_eq!(mutation_fence_for_workspace_at(&path, "id:prod"), None);
+        assert_eq!(
+            mutation_fence_for_workspace_at(&path, "id:prod").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn malformed_state_fails_checked_load_and_is_not_rewritten_by_boot_writes() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("state.toml");
+        fs::write(&path, "launches = ???\nmutation_fences = {}\n").unwrap();
+
+        assert!(load_state_checked(&path).is_err());
+        assert!(mutation_fence_for_workspace_at(&path, "id:prod").is_err());
+        assert!(record_launch_at(&path).is_err());
+        assert!(set_beep_on_error_at(&path, true).is_err());
+
+        let raw = fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("launches = ???"));
+    }
+
+    #[test]
+    fn force_clear_quarantines_malformed_state() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("state.toml");
+        fs::write(&path, "launches = ???\nmutation_fences = {}\n").unwrap();
+
+        clear_mutation_fence_for_workspace_at(&path, "id:prod").unwrap();
+
+        let state = load_state_checked(&path).unwrap();
+        assert!(state.mutation_fences.is_empty());
+        let quarantined = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("state.toml.corrupt.")
+            });
+        assert!(quarantined);
     }
 
     #[test]

@@ -3508,7 +3508,16 @@ fn load_persisted_mutation_fence_for_status(
     status_state: &StatusState,
 ) -> Option<delighters::MutationFenceState> {
     let key = mutation_fence_key_for_status(status_state);
-    delighters::mutation_fence_for_workspace(&key)
+    match delighters::mutation_fence_for_workspace(&key) {
+        Ok(fence) => fence,
+        Err(e) => Some(delighters::MutationFenceState {
+            command: String::new(),
+            reason: format!(
+                "could not read zterm mutation-fence state: {e}; run /resync --force only after manual reconciliation"
+            ),
+            created_at_unix: 0,
+        }),
+    }
 }
 
 fn set_local_and_persisted_mutation_fence(status_state: &mut StatusState, reason: &str) {
@@ -5002,6 +5011,7 @@ mod tests {
         let key = mutation_fence_key_for_status(&state);
         assert!(delighters::mutation_fence_for_workspace(&key)
             .unwrap()
+            .unwrap()
             .reason
             .contains("/memory post hello"));
         let rendered = lines.borrow().join("\n");
@@ -5101,7 +5111,9 @@ mod tests {
         force_clear_mutation_fence(&mut state, &lines);
 
         assert!(state.mutation_fence.is_none());
-        assert!(delighters::mutation_fence_for_workspace(&key).is_none());
+        assert!(delighters::mutation_fence_for_workspace(&key)
+            .unwrap()
+            .is_none());
         assert!(lines.borrow().join("\n").contains("/resync --force"));
 
         match old_home {
