@@ -29,6 +29,8 @@ pub struct BackupManifest {
     pub hostname: String,
     pub created_at: String,
     pub ncz_version: String,
+    #[serde(default)]
+    pub unsafe_live_volumes: bool,
     pub sources: Vec<BackupSource>,
 }
 
@@ -53,7 +55,11 @@ pub struct ArchiveEntry {
     pub contents: Vec<u8>,
 }
 
-pub fn manifest(hostname: String, sources: &[ArchiveSource]) -> BackupManifest {
+pub fn manifest(
+    hostname: String,
+    sources: &[ArchiveSource],
+    unsafe_live_volumes: bool,
+) -> BackupManifest {
     BackupManifest {
         schema_version: 1,
         hostname,
@@ -61,6 +67,7 @@ pub fn manifest(hostname: String, sources: &[ArchiveSource]) -> BackupManifest {
             .format(&Rfc3339)
             .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string()),
         ncz_version: env!("CARGO_PKG_VERSION").to_string(),
+        unsafe_live_volumes,
         sources: sources.iter().map(|source| source.source.clone()).collect(),
     }
 }
@@ -631,14 +638,33 @@ mod tests {
             false,
             b"openclaw\n".to_vec(),
         )];
-        let manifest = manifest("host".to_string(), &sources);
+        let manifest = manifest("host".to_string(), &sources, false);
 
         write_archive(&archive, &manifest, &sources).unwrap();
         let (read_manifest, entries) = read_archive(&archive).unwrap();
         let validation = validate_archive_sources(&read_manifest, &entries);
 
         assert_eq!(read_manifest.sources, manifest.sources);
+        assert_eq!(
+            read_manifest.unsafe_live_volumes,
+            manifest.unsafe_live_volumes
+        );
         assert_eq!(validation.len(), 1);
         assert!(validation[0].ok);
+    }
+
+    #[test]
+    fn manifest_defaults_missing_unsafe_live_volumes_to_false() {
+        let json = r#"{
+            "schema_version": 1,
+            "hostname": "host",
+            "created_at": "1970-01-01T00:00:00Z",
+            "ncz_version": "0.0.0",
+            "sources": []
+        }"#;
+
+        let manifest: BackupManifest = serde_json::from_str(json).unwrap();
+
+        assert!(!manifest.unsafe_live_volumes);
     }
 }

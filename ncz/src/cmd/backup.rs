@@ -47,6 +47,7 @@ pub struct BackupCreateReport {
 pub struct BackupVerifyReport {
     pub schema_version: u32,
     pub archive: String,
+    pub unsafe_live_volumes: bool,
     pub ok: bool,
     pub ok_count: usize,
     pub fail_count: usize,
@@ -58,6 +59,7 @@ pub struct BackupRestoreReport {
     pub schema_version: u32,
     pub archive: String,
     pub dry_run: bool,
+    pub unsafe_live_volumes: bool,
     pub restored_count: usize,
     pub actions: Vec<RestoreAction>,
     pub skipped_redacted_agent_env_keys: Vec<String>,
@@ -108,6 +110,15 @@ impl Render for BackupVerifyReport {
         }
         writeln!(
             w,
+            "unsafe live volumes: {}",
+            if self.unsafe_live_volumes {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        )?;
+        writeln!(
+            w,
             "summary: {} ok, {} failed",
             self.ok_count, self.fail_count
         )
@@ -125,6 +136,15 @@ impl Render for BackupRestoreReport {
         for path in &self.skipped_redacted_provider_files {
             writeln!(w, "skipped redacted provider/MCP source: {path}")?;
         }
+        writeln!(
+            w,
+            "unsafe live volumes: {}",
+            if self.unsafe_live_volumes {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        )?;
         writeln!(
             w,
             "{}: {} restored",
@@ -224,13 +244,14 @@ pub(crate) fn create_with_options(
     unsafe_live_volumes: bool,
 ) -> Result<BackupCreateReport, NczError> {
     let _lock = state::acquire_lock(&paths.lock_path)?;
+    let captured_live_volumes = unsafe_live_volumes && !exclude_volumes;
     if include_secrets {
         eprintln!(
             "ncz: audit: backup create includes unredacted secrets in {}",
             archive.display()
         );
     }
-    if unsafe_live_volumes && !exclude_volumes {
+    if captured_live_volumes {
         eprintln!(
             "ncz: audit: backup create exporting live Podman volumes without quiesce \
              into {}",
@@ -239,10 +260,10 @@ pub(crate) fn create_with_options(
     }
     let mut sources = backup_state::discover_file_sources(paths, include_secrets)?;
     if !exclude_volumes {
-        sources.extend(volume_sources(ctx, unsafe_live_volumes)?);
+        sources.extend(volume_sources(ctx, captured_live_volumes)?);
     }
     let hostname = hostname(ctx);
-    let manifest = backup_state::manifest(hostname, &sources);
+    let manifest = backup_state::manifest(hostname, &sources, captured_live_volumes);
     backup_state::write_archive(archive, &manifest, &sources)?;
     let redacted_count = manifest
         .sources
@@ -256,7 +277,7 @@ pub(crate) fn create_with_options(
         redacted_count,
         included_secrets: include_secrets,
         volumes_included: !exclude_volumes,
-        unsafe_live_volumes: unsafe_live_volumes && !exclude_volumes,
+        unsafe_live_volumes: captured_live_volumes,
     })
 }
 
@@ -268,6 +289,7 @@ pub fn verify(archive: &Path) -> Result<BackupVerifyReport, NczError> {
     Ok(BackupVerifyReport {
         schema_version: common::SCHEMA_VERSION,
         archive: archive.display().to_string(),
+        unsafe_live_volumes: manifest.unsafe_live_volumes,
         ok: fail_count == 0,
         ok_count,
         fail_count,
@@ -284,6 +306,12 @@ pub fn restore(
 ) -> Result<BackupRestoreReport, NczError> {
     let _lock = state::acquire_lock(&paths.lock_path)?;
     let (manifest, entries) = backup_state::read_archive(archive)?;
+    if manifest.unsafe_live_volumes {
+        eprintln!(
+            "ncz: warning: archive captured Podman volumes WITHOUT quiesce; \
+             volume contents may be inconsistent"
+        );
+    }
     let validations = backup_state::validate_archive_sources(&manifest, &entries);
     let failed: Vec<String> = validations
         .iter()
@@ -390,6 +418,7 @@ pub fn restore(
         schema_version: common::SCHEMA_VERSION,
         archive: archive.display().to_string(),
         dry_run,
+        unsafe_live_volumes: manifest.unsafe_live_volumes,
         restored_count,
         actions,
         skipped_redacted_agent_env_keys,
@@ -705,6 +734,16 @@ mod tests {
         contents: &[u8],
         redacted: bool,
     ) -> backup_state::BackupManifest {
+        write_archive_with_unsafe_live_volumes(archive, path, contents, redacted, false)
+    }
+
+    fn write_archive_with_unsafe_live_volumes(
+        archive: &Path,
+        path: &str,
+        contents: &[u8],
+        redacted: bool,
+        unsafe_live_volumes: bool,
+    ) -> backup_state::BackupManifest {
         let source = backup_state::ArchiveSource {
             source: backup_state::BackupSource {
                 path: path.to_string(),
@@ -716,7 +755,8 @@ mod tests {
             contents: contents.to_vec(),
         };
         let sources = std::slice::from_ref(&source);
-        let manifest = backup_state::manifest("test-host".to_string(), sources);
+        let manifest =
+            backup_state::manifest("test-host".to_string(), sources, unsafe_live_volumes);
         backup_state::write_archive(archive, &manifest, sources).unwrap();
         manifest
     }
@@ -769,6 +809,24 @@ mod tests {
             String::from_utf8(entry.contents.clone()).unwrap(),
             "OPENAI_API_KEY=sk-live\n"
         );
+        runner.assert_done();
+    }
+
+    #[test]
+    fn backup_create_default_manifest_round_trips_unsafe_live_volumes_false() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        let archive = tmp.path().join("backup.tar.gz");
+        let runner = FakeRunner::new();
+        expect_hostname(&runner);
+
+        let report = create(&ctx(&runner), &paths, &archive, false, true).unwrap();
+        let (manifest, _) = backup_state::read_archive(&archive).unwrap();
+        let verify_report = verify(&archive).unwrap();
+
+        assert!(!report.unsafe_live_volumes);
+        assert!(!manifest.unsafe_live_volumes);
+        assert!(!verify_report.unsafe_live_volumes);
         runner.assert_done();
     }
 
@@ -933,6 +991,62 @@ mod tests {
     }
 
     #[test]
+    fn backup_manifest_persists_unsafe_live_volumes_for_verify() {
+        let _guard = VOLUME_EXPORT_TEST_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        let archive = tmp.path().join("backup.tar.gz");
+        let export_path = backup_volume_export_path("zeroclaw-data");
+        let _ = fs::remove_file(&export_path);
+        fs::write(&export_path, b"volume tar").unwrap();
+        let runner = FakeRunner::new();
+        runner.expect(
+            "podman",
+            &["volume", "exists", "zeroclaw-data"],
+            out(0, "", ""),
+        );
+        runner.expect(
+            "podman",
+            &[
+                "volume",
+                "export",
+                "--output",
+                &export_path.display().to_string(),
+                "zeroclaw-data",
+            ],
+            out(0, "", ""),
+        );
+        runner.expect(
+            "podman",
+            &["volume", "exists", "openclaw-data"],
+            out(1, "", ""),
+        );
+        runner.expect(
+            "podman",
+            &["volume", "exists", "hermes-data"],
+            out(1, "", ""),
+        );
+        expect_hostname(&runner);
+
+        let report =
+            create_with_unsafe_live_volumes(&ctx(&runner), &paths, &archive, false, false, true)
+                .unwrap();
+        let (manifest, _) = backup_state::read_archive(&archive).unwrap();
+        let verify_report = verify(&archive).unwrap();
+        let mut verify_text = Vec::new();
+        crate::output::Render::render_text(&verify_report, &mut verify_text).unwrap();
+        let verify_text = String::from_utf8(verify_text).unwrap();
+
+        assert!(report.unsafe_live_volumes);
+        assert!(manifest.unsafe_live_volumes);
+        assert!(verify_report.unsafe_live_volumes);
+        assert!(verify_report.ok);
+        assert!(verify_text.contains("unsafe live volumes: enabled\n"));
+        assert!(!export_path.exists());
+        runner.assert_done();
+    }
+
+    #[test]
     fn restore_refuses_on_non_empty_state() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = test_paths(tmp.path());
@@ -1052,8 +1166,35 @@ mod tests {
         let report = restore(&ctx(&runner), &paths, &archive, true, false).unwrap();
 
         assert!(report.dry_run);
+        assert!(!report.unsafe_live_volumes);
         assert_eq!(report.restored_count, 1);
         assert!(!paths.channel().exists());
+    }
+
+    #[test]
+    fn restore_report_carries_unsafe_live_volumes_from_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        let archive = tmp.path().join("backup.tar.gz");
+        write_archive_with_unsafe_live_volumes(
+            &archive,
+            "podman://volume/zeroclaw-data",
+            b"tar contents",
+            false,
+            true,
+        );
+        let runner = FakeRunner::new();
+
+        let report = restore(&ctx(&runner), &paths, &archive, true, true).unwrap();
+        let mut restore_text = Vec::new();
+        crate::output::Render::render_text(&report, &mut restore_text).unwrap();
+        let restore_text = String::from_utf8(restore_text).unwrap();
+
+        assert!(report.dry_run);
+        assert!(report.unsafe_live_volumes);
+        assert_eq!(report.actions[0].action, "would-restore-volume");
+        assert!(restore_text.contains("unsafe live volumes: enabled\n"));
+        runner.assert_done();
     }
 
     #[test]
