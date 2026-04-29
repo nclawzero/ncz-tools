@@ -2657,9 +2657,7 @@ fn run_event_loop(
                     }
                     continue;
                 }
-                if status_state.mutation_fence.is_some() && !mutation_fence_allows_input(&submitted)
-                {
-                    note_mutation_fence(status_state, &chat_lines);
+                if mutation_fence_blocks_submission(status_state, &submitted, &chat_lines) {
                     continue;
                 }
                 // `/theme …` is a TUI-only concern — it toggles the
@@ -3113,6 +3111,7 @@ fn handle_command(
     response_in_flight: &mut bool,
     session_picker_state: &mut SessionPickerState,
 ) {
+    refresh_mutation_fence_for_dispatch(status_state);
     match command {
         CM_QUIT => {
             if quit_is_blocked_by_inflight_turn(*response_in_flight) {
@@ -3567,6 +3566,64 @@ fn load_persisted_mutation_fence_for_status(
             created_at_unix: 0,
         }),
     }
+}
+
+fn refresh_mutation_fence_for_dispatch(status_state: &mut StatusState) {
+    refresh_mutation_fence_for_dispatch_with(
+        status_state,
+        load_persisted_mutation_fence_for_status,
+    );
+}
+
+fn refresh_mutation_fence_for_dispatch_with<F>(status_state: &mut StatusState, load_fence: F)
+where
+    F: FnOnce(&StatusState) -> Option<delighters::MutationFenceState>,
+{
+    let prior = status_state.mutation_fence.clone();
+    match load_fence(status_state).map(|fence| fence.reason) {
+        Some(reason) => status_state.mutation_fence = Some(reason),
+        None if prior
+            .as_deref()
+            .is_some_and(mutation_fence_reason_is_unpersisted) =>
+        {
+            status_state.mutation_fence = prior;
+        }
+        None => status_state.mutation_fence = None,
+    }
+}
+
+fn mutation_fence_reason_is_unpersisted(reason: &str) -> bool {
+    reason.contains("failed to persist fence")
+}
+
+fn mutation_fence_blocks_submission(
+    status_state: &mut StatusState,
+    input: &str,
+    chat_lines: &Rc<RefCell<Vec<String>>>,
+) -> bool {
+    mutation_fence_blocks_submission_with(
+        status_state,
+        input,
+        chat_lines,
+        load_persisted_mutation_fence_for_status,
+    )
+}
+
+fn mutation_fence_blocks_submission_with<F>(
+    status_state: &mut StatusState,
+    input: &str,
+    chat_lines: &Rc<RefCell<Vec<String>>>,
+    load_fence: F,
+) -> bool
+where
+    F: FnOnce(&StatusState) -> Option<delighters::MutationFenceState>,
+{
+    refresh_mutation_fence_for_dispatch_with(status_state, load_fence);
+    if status_state.mutation_fence.is_some() && !mutation_fence_allows_input(input) {
+        note_mutation_fence(status_state, chat_lines);
+        return true;
+    }
+    false
 }
 
 fn set_local_and_persisted_mutation_fence(status_state: &mut StatusState, reason: &str) {
@@ -5084,6 +5141,58 @@ mod tests {
         assert!(!mutation_fence_allows_input("hello"));
         assert!(!mutation_fence_allows_input("/session list"));
         assert!(!mutation_fence_allows_input("/memory post hello"));
+    }
+
+    #[test]
+    fn stale_persisted_mutation_fence_blocks_before_submission_dispatch() {
+        let mut state = StatusState::new(
+            "default".to_string(),
+            "gpt-test".to_string(),
+            "borland".to_string(),
+            false,
+        );
+        let lines = Rc::new(RefCell::new(Vec::new()));
+        let external_fence = delighters::MutationFenceState {
+            command: "/memory post hello".to_string(),
+            reason: "slash command outcome unknown for `/memory post hello`".to_string(),
+            created_at_unix: 42,
+        };
+
+        assert!(mutation_fence_blocks_submission_with(
+            &mut state,
+            "/memory post again",
+            &lines,
+            |_| Some(external_fence.clone())
+        ));
+
+        assert_eq!(state.mutation_fence, Some(external_fence.reason));
+        let rendered = lines.borrow().join("\n");
+        assert!(rendered.contains("[blocked] mutation outcome is unknown"));
+        assert!(rendered.contains("/resync --force"));
+    }
+
+    #[test]
+    fn stale_persisted_mutation_fence_still_allows_help_before_dispatch() {
+        let mut state = StatusState::new(
+            "default".to_string(),
+            "gpt-test".to_string(),
+            "borland".to_string(),
+            false,
+        );
+        let lines = Rc::new(RefCell::new(Vec::new()));
+
+        assert!(!mutation_fence_blocks_submission_with(
+            &mut state,
+            "/help",
+            &lines,
+            |_| Some(delighters::MutationFenceState {
+                command: "/session create x".to_string(),
+                reason: "slash command outcome unknown for `/session create x`".to_string(),
+                created_at_unix: 42,
+            })
+        ));
+        assert!(state.mutation_fence.is_some());
+        assert!(lines.borrow().is_empty());
     }
 
     #[test]
