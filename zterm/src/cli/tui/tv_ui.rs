@@ -1448,8 +1448,8 @@ async fn generate_connect_splash_with_named_session(
         .await
         {
             Ok(Ok(())) => {}
-            Ok(Err(e)) => warn!("connect-splash scratch session cleanup failed: {e}"),
-            Err(_) => warn!("connect-splash scratch session cleanup timed out"),
+            Ok(Err(e)) => anyhow::bail!("connect-splash scratch session cleanup failed: {e}"),
+            Err(_) => anyhow::bail!("connect-splash scratch session cleanup timed out"),
         }
     }
 
@@ -5276,6 +5276,7 @@ mod tests {
                 submit_response: generated.to_string(),
                 cancellation_safe: true,
                 sink_set_states: Arc::clone(&sink_set_states),
+                delete_error: None,
             };
             let boxed: Box<dyn crate::cli::agent::AgentClient + Send + Sync> = Box::new(fake);
             let app = Arc::new(Mutex::new(App {
@@ -5356,6 +5357,7 @@ mod tests {
                 submit_response: "SHOULD NOT BE USED".to_string(),
                 cancellation_safe: false,
                 sink_set_states: Arc::clone(&sink_set_states),
+                delete_error: None,
             };
             let boxed: Box<dyn crate::cli::agent::AgentClient + Send + Sync> = Box::new(fake);
             let app = Arc::new(Mutex::new(App {
@@ -5397,6 +5399,71 @@ mod tests {
     }
 
     #[test]
+    fn connect_splash_cleanup_failure_falls_back_without_cache() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let created = Arc::new(StdMutex::new(Vec::new()));
+            let deleted = Arc::new(StdMutex::new(Vec::new()));
+            let submitted = Arc::new(StdMutex::new(Vec::new()));
+            let fake = WorkerSessionFakeClient {
+                listed_sessions: Vec::new(),
+                list_sessions_error: None,
+                loadable_sessions: Vec::new(),
+                load_reject_ids: Vec::new(),
+                created: Arc::clone(&created),
+                deleted: Arc::clone(&deleted),
+                submitted: Arc::clone(&submitted),
+                list_calls: Arc::new(StdMutex::new(0)),
+                load_calls: Arc::new(StdMutex::new(Vec::new())),
+                submit_response: "GENERATED\nSPLASH".to_string(),
+                cancellation_safe: true,
+                sink_set_states: Arc::new(StdMutex::new(Vec::new())),
+                delete_error: Some("delete failed".to_string()),
+            };
+            let boxed: Box<dyn crate::cli::agent::AgentClient + Send + Sync> = Box::new(fake);
+            let app = Arc::new(Mutex::new(App {
+                workspaces: vec![crate::cli::workspace::Workspace {
+                    id: 0,
+                    config: crate::cli::workspace::WorkspaceConfig {
+                        id: Some("ws-alpha".to_string()),
+                        name: "alpha".to_string(),
+                        backend: crate::cli::workspace::Backend::Openclaw,
+                        url: "ws://gateway.example".to_string(),
+                        token_env: None,
+                        token: None,
+                        label: None,
+                        namespace_aliases: Vec::new(),
+                    },
+                    client: Some(Arc::new(Mutex::new(boxed))),
+                    cron: None,
+                }],
+                active: 0,
+                shared_mnemos: None,
+                config_path: std::path::PathBuf::from("test-config.toml"),
+            }));
+
+            let splash = connect_splash_for_workspace(&app, "alpha", None).await;
+
+            assert_eq!(splash, delighters::local_connect_splash("alpha"));
+            assert_eq!(created.lock().unwrap().len(), 1);
+            assert_eq!(submitted.lock().unwrap().len(), 1);
+            assert_eq!(deleted.lock().unwrap().len(), 1);
+            let path = delighters::default_connect_splash_cache_path("alpha").unwrap();
+            assert!(!path.exists());
+        });
+
+        match old_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    #[test]
     fn connect_splash_does_not_delete_preexisting_scratch_name() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
@@ -5423,6 +5490,7 @@ mod tests {
                 submit_response: "SHOULD NOT BE USED".to_string(),
                 cancellation_safe: true,
                 sink_set_states: Arc::new(StdMutex::new(Vec::new())),
+                delete_error: None,
             };
 
             let err =
@@ -7804,6 +7872,7 @@ mod tests {
         submit_response: String,
         cancellation_safe: bool,
         sink_set_states: Arc<StdMutex<Vec<bool>>>,
+        delete_error: Option<String>,
     }
 
     #[async_trait::async_trait]
@@ -7880,6 +7949,9 @@ mod tests {
 
         async fn delete_session(&self, session_id: &str) -> anyhow::Result<()> {
             self.deleted.lock().unwrap().push(session_id.to_string());
+            if let Some(error) = &self.delete_error {
+                anyhow::bail!("{error}");
+            }
             Ok(())
         }
 
@@ -7932,6 +8004,7 @@ mod tests {
                 submit_response: String::new(),
                 cancellation_safe: true,
                 sink_set_states: Arc::new(StdMutex::new(Vec::new())),
+                delete_error: None,
             };
             let boxed: Box<dyn crate::cli::agent::AgentClient + Send + Sync> = Box::new(fake);
             let app = Arc::new(Mutex::new(App {
@@ -8005,6 +8078,7 @@ mod tests {
                 submit_response: String::new(),
                 cancellation_safe: true,
                 sink_set_states: Arc::new(StdMutex::new(Vec::new())),
+                delete_error: None,
             };
             let boxed: Box<dyn crate::cli::agent::AgentClient + Send + Sync> = Box::new(fake);
             let app = Arc::new(Mutex::new(App {
@@ -8091,6 +8165,7 @@ mod tests {
                 submit_response: String::new(),
                 cancellation_safe: true,
                 sink_set_states: Arc::new(StdMutex::new(Vec::new())),
+                delete_error: None,
             };
             let boxed: Box<dyn crate::cli::agent::AgentClient + Send + Sync> = Box::new(fake);
             let app = Arc::new(Mutex::new(App {
@@ -8166,6 +8241,7 @@ mod tests {
                 submit_response: String::new(),
                 cancellation_safe: true,
                 sink_set_states: Arc::new(StdMutex::new(Vec::new())),
+                delete_error: None,
             };
             let boxed: Box<dyn crate::cli::agent::AgentClient + Send + Sync> = Box::new(fake);
             let app = Arc::new(Mutex::new(App {
@@ -8253,6 +8329,7 @@ mod tests {
             submit_response: String::new(),
             cancellation_safe: true,
             sink_set_states: Arc::new(StdMutex::new(Vec::new())),
+            delete_error: None,
         };
         let boxed: Box<dyn crate::cli::agent::AgentClient + Send + Sync> = Box::new(fake);
         let app = Arc::new(Mutex::new(App {
