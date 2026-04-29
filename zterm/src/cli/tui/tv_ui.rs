@@ -2361,10 +2361,9 @@ fn run_event_loop(
             status_line.handle_event(&mut event);
         }
 
-        // Slash-command popup: reserve Ctrl-K/menu paths for the
-        // picker so plain `/` remains ordinary text input. That keeps
-        // arbitrary slash commands typeable even when the popup is
-        // dismissed.
+        // Slash-command popup: Ctrl-K opens it anywhere; `/` opens it
+        // only from an empty prompt so typed slash commands still work
+        // after the first character.
         if event.what == EventType::Keyboard
             && should_open_slash_popup(event.key_code, input_data.borrow().is_empty())
         {
@@ -2587,7 +2586,7 @@ fn run_slash_popup(app: &mut Application) -> u16 {
 }
 
 fn should_open_slash_popup(key_code: u16, input_empty: bool) -> bool {
-    input_empty && key_code == KB_CTRL_K
+    key_code == KB_CTRL_K || (input_empty && key_code == KB_SLASH)
 }
 
 fn should_block_modal_entry_while_busy(event: &Event, input_empty: bool) -> bool {
@@ -3437,13 +3436,31 @@ fn request_session_picker_load_if_workspace_changed(
 }
 
 fn session_switch_command_for_picker_entry(entry: &SessionPickerEntry) -> Result<String> {
-    let id = entry.id.trim();
-    if id.is_empty() || id.split_whitespace().count() != 1 {
-        return Err(anyhow::anyhow!(
-            "backend session id is not a single command token"
-        ));
-    }
+    let id = slash_quote_command_arg(entry.id.trim())?;
     Ok(format!("/session switch {id}"))
+}
+
+fn slash_quote_command_arg(arg: &str) -> Result<String> {
+    if arg.is_empty() {
+        return Err(anyhow::anyhow!("backend session id is empty"));
+    }
+    if !arg
+        .chars()
+        .any(|ch| ch.is_whitespace() || matches!(ch, '"' | '\'' | '\\'))
+    {
+        return Ok(arg.to_string());
+    }
+
+    let mut quoted = String::with_capacity(arg.len() + 2);
+    quoted.push('"');
+    for ch in arg.chars() {
+        if matches!(ch, '"' | '\\') {
+            quoted.push('\\');
+        }
+        quoted.push(ch);
+    }
+    quoted.push('"');
+    Ok(quoted)
 }
 
 /// Theme color editor modal (E-8b MVP).
@@ -3999,9 +4016,24 @@ mod tests {
     }
 
     #[test]
-    fn session_picker_entry_rejects_non_token_backend_id() {
+    fn session_picker_entry_quotes_backend_id_with_spaces() {
         let entry = SessionPickerEntry {
-            id: "bad id".to_string(),
+            id: "Research Notes".to_string(),
+            name: "scratch".to_string(),
+            model: String::new(),
+            provider: String::new(),
+        };
+
+        let command = session_switch_command_for_picker_entry(&entry).unwrap();
+        assert_eq!(command, "/session switch \"Research Notes\"");
+        let tokens = tokenize_slash_command(&command).unwrap();
+        assert_eq!(tokens, ["/session", "switch", "Research Notes"]);
+    }
+
+    #[test]
+    fn session_picker_entry_rejects_empty_backend_id() {
+        let entry = SessionPickerEntry {
+            id: "   ".to_string(),
             name: "scratch".to_string(),
             model: String::new(),
             provider: String::new(),
@@ -4757,10 +4789,11 @@ mod tests {
     }
 
     #[test]
-    fn slash_popup_ignores_plain_slash() {
+    fn slash_popup_opens_for_empty_prompt_slash_or_ctrl_k() {
         assert!(should_open_slash_popup(KB_CTRL_K, true));
-        assert!(!should_open_slash_popup(KB_SLASH, true));
-        assert!(!should_open_slash_popup(KB_CTRL_K, false));
+        assert!(should_open_slash_popup(KB_CTRL_K, false));
+        assert!(should_open_slash_popup(KB_SLASH, true));
+        assert!(!should_open_slash_popup(KB_SLASH, false));
     }
 
     #[test]
@@ -4777,7 +4810,7 @@ mod tests {
             &Event::keyboard(KB_CTRL_K),
             true
         ));
-        assert!(!should_block_modal_entry_while_busy(
+        assert!(should_block_modal_entry_while_busy(
             &Event::keyboard(KB_CTRL_K),
             false
         ));
