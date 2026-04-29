@@ -42,8 +42,6 @@ use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Write};
-#[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -745,59 +743,6 @@ fn save_workspace_state(path: &Path, state: &WorkspaceState) -> Result<()> {
     Ok(())
 }
 
-fn save_app_config(path: &Path, cfg: &AppConfig) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating zterm config dir {}", parent.display()))?;
-    }
-    #[cfg(unix)]
-    let existing_mode = std::fs::metadata(path)
-        .ok()
-        .map(|metadata| metadata.permissions().mode() & 0o7777);
-    let body = toml::to_string_pretty(cfg).with_context(|| "serializing zterm config TOML")?;
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("config.toml");
-    let tmp_path = path.with_file_name(format!(
-        ".{file_name}.{}.tmp",
-        uuid::Uuid::new_v4().simple()
-    ));
-    {
-        let mut open_options = OpenOptions::new();
-        open_options.write(true).create_new(true);
-        #[cfg(unix)]
-        if let Some(mode) = existing_mode {
-            open_options.mode(mode);
-        }
-        let mut tmp_file = open_options
-            .open(&tmp_path)
-            .with_context(|| format!("creating zterm config {}", tmp_path.display()))?;
-        tmp_file
-            .write_all(body.as_bytes())
-            .with_context(|| format!("writing zterm config {}", tmp_path.display()))?;
-        #[cfg(unix)]
-        if let Some(mode) = existing_mode {
-            tmp_file
-                .set_permissions(std::fs::Permissions::from_mode(mode))
-                .with_context(|| format!("preserving zterm config mode {}", tmp_path.display()))?;
-        }
-        tmp_file
-            .sync_all()
-            .with_context(|| format!("syncing zterm config {}", tmp_path.display()))?;
-    }
-    std::fs::rename(&tmp_path, path)
-        .with_context(|| format!("atomically replacing zterm config {}", path.display()))?;
-    if let Some(parent) = path.parent() {
-        if let Ok(parent_dir) = File::open(parent) {
-            parent_dir
-                .sync_all()
-                .with_context(|| format!("syncing zterm config dir {}", parent.display()))?;
-        }
-    }
-    Ok(())
-}
-
 fn apply_openclaw_workspace_state(config_path: &Path, cfg: &mut AppConfig) -> Result<()> {
     if !cfg
         .workspaces
@@ -811,7 +756,6 @@ fn apply_openclaw_workspace_state(config_path: &Path, cfg: &mut AppConfig) -> Re
     let _state_lock = lock_workspace_state(&state_path)?;
     let mut state = load_workspace_state(&state_path)?;
     let mut state_changed = false;
-    let mut config_changed = false;
     let mut claimed_state_entries = std::collections::HashSet::new();
     let configured_openclaw_identities = configured_openclaw_workspace_identities(cfg);
     let mut openclaw_index = 0usize;
@@ -860,7 +804,6 @@ fn apply_openclaw_workspace_state(config_path: &Path, cfg: &mut AppConfig) -> Re
             }
             let entry = &mut state.openclaw_workspaces[entry_idx];
             workspace.id = Some(entry.id.clone());
-            config_changed = true;
             for alias in &entry.namespace_aliases {
                 push_unique_namespace(&mut workspace.namespace_aliases, alias.trim());
             }
@@ -938,7 +881,7 @@ fn apply_openclaw_workspace_state(config_path: &Path, cfg: &mut AppConfig) -> Re
                     state = verified_state;
                     tracing::warn!(
                         "generated openclaw workspace id for '{}' was not present after persisting {}; \
-                         falling back to primary config durability",
+                         using an in-memory id for this process",
                         workspace.name,
                         state_path.display()
                     );
@@ -947,7 +890,7 @@ fn apply_openclaw_workspace_state(config_path: &Path, cfg: &mut AppConfig) -> Re
             Err(e) => {
                 tracing::warn!(
                     "could not persist generated openclaw workspace id for '{}': {e}; \
-                     falling back to primary config durability",
+                     using an in-memory id for this process",
                     workspace.name
                 );
             }
@@ -958,16 +901,12 @@ fn apply_openclaw_workspace_state(config_path: &Path, cfg: &mut AppConfig) -> Re
         for alias in &entry.namespace_aliases {
             push_unique_namespace(&mut workspace.namespace_aliases, alias.trim());
         }
-        config_changed = true;
     }
+    cfg.validate()?;
     if state_changed {
         if let Err(e) = save_workspace_state(&state_path, &state) {
             tracing::warn!("could not persist updated openclaw workspace state aliases: {e}");
         }
-    }
-    if config_changed {
-        cfg.validate()?;
-        save_app_config(config_path, cfg)?;
     }
     Ok(())
 }
@@ -1300,6 +1239,8 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
     fn sample_zeroclaw_config() -> &'static str {
         r#"
@@ -1374,16 +1315,56 @@ url = "http://a"
     }
 
     #[test]
-    fn load_persists_openclaw_workspace_id_in_primary_config() {
+    fn load_preserves_primary_openclaw_config_bytes_and_recovers_id_from_sidecar() {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("config.toml");
-        let original = r#"
+        let original = br#"# user comment before unknown top-level state
+unknown_top_level = "keep me byte-for-byte"
+
+[[workspaces]]
+name = "alpha"
+backend = "openclaw"
+url = "ws://old.example"
+unknown_workspace_field = { nested = "also ignored" }
+"#;
+        std::fs::write(&path, original).unwrap();
+
+        let cfg = AppConfig::load(&path).unwrap();
+        let workspace = &cfg.workspaces[0];
+        let id = workspace
+            .id
+            .as_deref()
+            .expect("state sidecar should assign id");
+        assert!(id.starts_with("ws_"));
+        assert!(workspace
+            .namespace_aliases
+            .iter()
+            .any(|alias| { alias == "backend=openclaw;workspace=alpha;url=ws://old.example" }));
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+
+        let state = load_workspace_state(&workspace_state_path_for_config(&path)).unwrap();
+        assert_eq!(state.openclaw_workspaces.len(), 1);
+        assert_eq!(state.openclaw_workspaces[0].id, id);
+
+        let reloaded = AppConfig::load(&path).unwrap();
+        assert_eq!(reloaded.workspaces[0].id.as_deref(), Some(id));
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn readonly_primary_openclaw_config_loads_with_generated_sidecar_id() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        let original = br#"
 [[workspaces]]
 name = "alpha"
 backend = "openclaw"
 url = "ws://old.example"
 "#;
         std::fs::write(&path, original).unwrap();
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&path, permissions).unwrap();
 
         let cfg = AppConfig::load(&path).unwrap();
         let workspace = &cfg.workspaces[0];
@@ -1396,30 +1377,26 @@ url = "ws://old.example"
             .namespace_aliases
             .iter()
             .any(|alias| { alias == "backend=openclaw;workspace=alpha;url=ws://old.example" }));
-        assert!(workspace_state_path_for_config(&path).exists());
-        let saved_config = std::fs::read_to_string(&path).unwrap();
-        assert!(saved_config.contains(&format!("id = \"{id}\"")));
+        assert_eq!(std::fs::read(&path).unwrap(), original);
 
         let reloaded = AppConfig::load(&path).unwrap();
         assert_eq!(reloaded.workspaces[0].id.as_deref(), Some(id));
+        assert_eq!(std::fs::read(&path).unwrap(), original);
     }
 
     #[cfg(unix)]
     #[test]
-    fn load_preserves_private_config_permissions_when_persisting_openclaw_id() {
+    fn load_preserves_private_config_permissions_when_generating_openclaw_sidecar_id() {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("config.toml");
-        std::fs::write(
-            &path,
-            r#"
+        let original = br#"
 [[workspaces]]
 name = "alpha"
 backend = "openclaw"
 url = "ws://old.example"
 token = "inline-secret-token"
-"#,
-        )
-        .unwrap();
+"#;
+        std::fs::write(&path, original).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
 
         let cfg = AppConfig::load(&path).unwrap();
@@ -1427,19 +1404,18 @@ token = "inline-secret-token"
         assert!(cfg.workspaces[0].id.as_deref().unwrap().starts_with("ws_"));
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
-        let saved_config = std::fs::read_to_string(&path).unwrap();
-        assert!(saved_config.contains("token = \"inline-secret-token\""));
-        assert!(saved_config.contains("id = \""));
+        assert_eq!(std::fs::read(&path).unwrap(), original);
     }
 
     #[test]
-    fn generated_openclaw_workspace_id_survives_lost_state_sidecar() {
+    fn explicit_openclaw_workspace_id_survives_lost_state_sidecar() {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("config.toml");
         std::fs::write(
             &path,
             r#"
 [[workspaces]]
+id = "ws_explicit"
 name = "alpha"
 backend = "openclaw"
 url = "ws://old.example"
@@ -1452,7 +1428,7 @@ url = "ws://old.example"
         let namespace = openclaw_session_namespace(&cfg.workspaces[0]);
         assert_eq!(namespace, format!("backend=openclaw;workspace_id={id}"));
 
-        std::fs::remove_file(workspace_state_path_for_config(&path)).unwrap();
+        let _ = std::fs::remove_file(workspace_state_path_for_config(&path));
 
         let reloaded = AppConfig::load(&path).unwrap();
         assert_eq!(reloaded.workspaces[0].id.as_deref(), Some(id.as_str()));
