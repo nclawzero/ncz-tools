@@ -237,7 +237,13 @@ fn is_user_credential_equals_flag(token: &str) -> bool {
 }
 
 fn is_inline_user_pass_token(token: &str) -> bool {
-    token.contains(':') && !token.contains("://")
+    if let Some((_, rest)) = token.split_once("://") {
+        let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+        return authority
+            .split_once('@')
+            .is_some_and(|(userinfo, _)| !userinfo.is_empty());
+    }
+    token.contains(':')
 }
 
 fn is_secret_command_token(raw_token: &str) -> bool {
@@ -636,6 +642,49 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(err, NczError::Usage(_)));
+    }
+
+    #[test]
+    fn test_reject_url_with_user_pass_userinfo() {
+        let err = validate_declaration(&McpDeclaration {
+            schema_version: 1,
+            name: "search".to_string(),
+            transport: "stdio".to_string(),
+            command: Some("mcp-server https://alice:secret@host".to_string()),
+            url: None,
+            auth_env: None,
+        })
+        .unwrap_err();
+
+        assert!(matches!(err, NczError::Usage(_)));
+    }
+
+    #[test]
+    fn test_reject_url_with_token_userinfo() {
+        let err = validate_declaration(&McpDeclaration {
+            schema_version: 1,
+            name: "search".to_string(),
+            transport: "stdio".to_string(),
+            command: Some("mcp-server https://token@host".to_string()),
+            url: None,
+            auth_env: None,
+        })
+        .unwrap_err();
+
+        assert!(matches!(err, NczError::Usage(_)));
+    }
+
+    #[test]
+    fn test_accept_clean_url() {
+        validate_declaration(&McpDeclaration {
+            schema_version: 1,
+            name: "search".to_string(),
+            transport: "stdio".to_string(),
+            command: Some("mcp-server https://host/path".to_string()),
+            url: None,
+            auth_env: None,
+        })
+        .unwrap();
     }
 
     #[test]
