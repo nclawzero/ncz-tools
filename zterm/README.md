@@ -17,7 +17,7 @@ unsafe code:    zero in zterm
 
 ## Status
 
-**v0.3.1 — Turbo Vision UX release.** Ships the Paradox 4.5/dBASE V-inspired `turbo-vision-4-rust` TUI, real slash-command routing through `CommandHandler`, live workspace/model/context-token status, spinner/menu feedback, cached connect splash, milestone welcome-back lines, and opt-in beep-on-error.
+**v0.3.1 — Turbo Vision UX release.** Ships the Paradox 4.5/dBASE V-inspired `turbo-vision-4-rust` TUI, real slash-command routing through `CommandHandler`, live workspace/model/context-token status, spinner/menu feedback, cached deterministic local connect splash, milestone welcome-back lines, and opt-in beep-on-error.
 
 Previous: v0.2.0 — multi-backend public release with zeroclaw and openclaw behind a shared `trait AgentClient`, runtime multi-workspace switching, and a `--workspace` CLI override.
 

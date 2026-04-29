@@ -1,6 +1,8 @@
 use anyhow::{anyhow, Result};
 use chrono::Utc;
 use std::fs;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -9,6 +11,11 @@ use crate::cli::client::ZeroclawClient;
 use crate::cli::client::{Model, Provider, Session};
 use crate::cli::input::InputHistory;
 use crate::cli::storage;
+use crate::cli::workspace::{Workspace, WorkspaceConfig};
+
+type AgentClientHandle = Arc<Mutex<Box<dyn AgentClient + Send + Sync>>>;
+type WorkspaceActivationFuture = Pin<Box<dyn Future<Output = Result<AgentClientHandle>> + Send>>;
+type WorkspaceActivator = Arc<dyn Fn(WorkspaceConfig) -> WorkspaceActivationFuture + Send + Sync>;
 
 /// Command handler.
 ///
@@ -17,6 +24,7 @@ use crate::cli::storage;
 /// cron handle, or MNEMOS client. Chunk D-3b.
 pub struct CommandHandler {
     app: std::sync::Arc<tokio::sync::Mutex<crate::cli::workspace::App>>,
+    workspace_activator: WorkspaceActivator,
 }
 
 impl CommandHandler {
@@ -25,7 +33,23 @@ impl CommandHandler {
     /// Takes the shared `Arc<Mutex<App>>` that ReplLoop also holds,
     /// so `/workspace switch` mutations are visible to both.
     pub fn new(app: std::sync::Arc<tokio::sync::Mutex<crate::cli::workspace::App>>) -> Self {
-        Self { app }
+        Self {
+            app,
+            workspace_activator: Arc::new(|config| {
+                Box::pin(async move { Workspace::activate_detached_client(&config).await })
+            }),
+        }
+    }
+
+    #[cfg(test)]
+    fn new_with_workspace_activator(
+        app: std::sync::Arc<tokio::sync::Mutex<crate::cli::workspace::App>>,
+        workspace_activator: WorkspaceActivator,
+    ) -> Self {
+        Self {
+            app,
+            workspace_activator,
+        }
     }
 
     async fn current_mnemos(&self) -> Option<crate::cli::mnemos::MnemosClient> {
@@ -44,7 +68,7 @@ impl CommandHandler {
         self.app.lock().await.inventory()
     }
 
-    async fn current_agent_client(&self) -> Option<Arc<Mutex<Box<dyn AgentClient + Send + Sync>>>> {
+    async fn current_agent_client(&self) -> Option<AgentClientHandle> {
         self.app
             .lock()
             .await
@@ -1208,16 +1232,30 @@ impl CommandHandler {
             )));
         };
 
-        // Activate the target workspace if it hasn't been yet. Note:
-        // this holds the App mutex across a potentially-slow openclaw
-        // WS handshake. Fine for single-threaded REPL usage; future
-        // slices revisit if concurrency enters the picture.
-        {
+        let activation = {
             let mut app = self.app.lock().await;
             if !app.workspaces[target_idx].is_activated() {
-                if let Err(e) = app.workspaces[target_idx].activate().await {
-                    return Ok(Some(format!("❌ failed to activate \"{name}\": {e}\n")));
-                }
+                Some(app.workspaces[target_idx].config.clone())
+            } else {
+                app.active = target_idx;
+                None
+            }
+        };
+
+        if let Some(config) = activation {
+            let activated_client = match (self.workspace_activator)(config).await {
+                Ok(client) => client,
+                Err(e) => return Ok(Some(format!("❌ failed to activate \"{name}\": {e}\n"))),
+            };
+
+            let mut app = self.app.lock().await;
+            let Some(target_idx) = app.workspaces.iter().position(|w| w.config.name == name) else {
+                return Ok(Some(format!(
+                    "❌ workspace \"{name}\" disappeared during activation\n"
+                )));
+            };
+            if !app.workspaces[target_idx].is_activated() {
+                app.workspaces[target_idx].client = Some(activated_client);
             }
             app.active = target_idx;
         }
@@ -2495,6 +2533,51 @@ mod tests {
         }))
     }
 
+    fn fake_client_handle(fake: FakeAgentClient) -> Arc<Mutex<Box<dyn AgentClient + Send + Sync>>> {
+        Arc::new(Mutex::new(Box::new(fake)))
+    }
+
+    fn app_with_pending_openclaw_workspace() -> Arc<Mutex<App>> {
+        let alpha_boxed: Box<dyn AgentClient + Send + Sync> = Box::new(FakeAgentClient::default());
+        Arc::new(Mutex::new(App {
+            workspaces: vec![
+                Workspace {
+                    id: 0,
+                    config: WorkspaceConfig {
+                        id: None,
+                        name: "alpha".to_string(),
+                        backend: Backend::Zeroclaw,
+                        url: "http://alpha.example".to_string(),
+                        token_env: None,
+                        token: None,
+                        label: None,
+                        namespace_aliases: Vec::new(),
+                    },
+                    client: Some(Arc::new(Mutex::new(alpha_boxed))),
+                    cron: None,
+                },
+                Workspace {
+                    id: 1,
+                    config: WorkspaceConfig {
+                        id: Some("ws_beta".to_string()),
+                        name: "beta".to_string(),
+                        backend: Backend::Openclaw,
+                        url: "ws://beta.example".to_string(),
+                        token_env: None,
+                        token: None,
+                        label: None,
+                        namespace_aliases: Vec::new(),
+                    },
+                    client: None,
+                    cron: None,
+                },
+            ],
+            active: 0,
+            shared_mnemos: None,
+            config_path: PathBuf::from("test-config.toml"),
+        }))
+    }
+
     #[tokio::test]
     async fn advertised_local_commands_return_structured_tui_output() {
         let handler = super::CommandHandler::new(app_with_fake_client(FakeAgentClient::default()));
@@ -2523,6 +2606,54 @@ mod tests {
                 "{cmdline} should not complete silently"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn workspace_switch_releases_app_lock_while_activation_is_in_flight() {
+        let app = app_with_pending_openclaw_workspace();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let entered_tx = Arc::new(StdMutex::new(Some(entered_tx)));
+        let release_rx = Arc::new(StdMutex::new(Some(release_rx)));
+        let activator: super::WorkspaceActivator = Arc::new(move |config| {
+            let entered_tx = Arc::clone(&entered_tx);
+            let release_rx = Arc::clone(&release_rx);
+            Box::pin(async move {
+                assert_eq!(config.name, "beta");
+                if let Some(tx) = entered_tx.lock().unwrap().take() {
+                    let _ = tx.send(());
+                }
+                let release_rx = {
+                    let mut guard = release_rx.lock().unwrap();
+                    guard.take().expect("activation should run once")
+                };
+                let _ = release_rx.await;
+                Ok(fake_client_handle(FakeAgentClient::default()))
+            })
+        });
+        let handler =
+            super::CommandHandler::new_with_workspace_activator(Arc::clone(&app), activator);
+
+        let switch_task =
+            tokio::spawn(async move { handler.handle("/workspace switch beta", "s").await });
+        entered_rx.await.expect("activation should start");
+        let guard = tokio::time::timeout(std::time::Duration::from_millis(100), app.lock())
+            .await
+            .expect("App mutex must not be held while activation is waiting");
+        assert_eq!(guard.active, 0);
+        drop(guard);
+
+        release_tx.send(()).unwrap();
+        let out = switch_task
+            .await
+            .expect("switch task should not panic")
+            .expect("switch command should complete")
+            .expect("switch command should return output");
+
+        assert!(out.contains("switched to workspace: beta"));
+        let app = app.lock().await;
+        assert_eq!(app.active_workspace().unwrap().config.name, "beta");
+        assert!(app.active_workspace().unwrap().is_activated());
     }
 
     #[test]

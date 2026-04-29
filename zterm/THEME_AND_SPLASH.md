@@ -8,8 +8,12 @@
 > Vision TUI in `src/cli/tui/tv_ui.rs`. The ANSI splash documented
 > here remains relevant to the legacy/stdout path; the TV path adds
 > runtime palette presets, `~/.zterm/theme.toml`, cached
-> connect-splash text at `~/.zterm/cache/connect-splash/`, and
-> `~/.zterm/state.toml` for launch count plus `beep_on_error`.
+> deterministic local connect-splash text at
+> `~/.zterm/cache/connect-splash/`, and `~/.zterm/state.toml` for
+> launch count plus `beep_on_error`. v0.3.1 does not call a backend
+> or LLM to generate connect-splash text; a daemon-backed scratch
+> generation path is deferred until it can run outside user chat
+> sessions.
 
 ---
 

@@ -356,47 +356,74 @@ impl Workspace {
     }
 
     async fn activate_openclaw(&mut self) -> Result<()> {
-        use crate::cli::openclaw::client::OpenClawClient;
-        use crate::cli::openclaw::device::DeviceIdentity;
-        use crate::cli::openclaw::handshake::{ClientIdentity, HandshakeParams};
-
-        let device_key_path = default_openclaw_device_key_path()?;
-        let device = DeviceIdentity::load_or_create(&device_key_path).with_context(|| {
-            format!(
-                "loading openclaw device key at {}",
-                device_key_path.display()
-            )
-        })?;
-
-        let params = HandshakeParams {
-            client: ClientIdentity {
-                id: "cli".to_string(),
-                display_name: Some("zterm".to_string()),
-                version: env!("CARGO_PKG_VERSION").to_string(),
-                mode: "cli".to_string(),
-                platform: std::env::consts::OS.to_string(),
-                device_family: None,
-            },
-            role: "operator".to_string(),
-            scopes: vec!["operator.read".to_string(), "operator.write".to_string()],
-            token: self.config.resolved_token(),
-        };
-
-        let mut client = OpenClawClient::connect_and_handshake(&self.config.url, &device, &params)
-            .await
-            .with_context(|| {
-                format!(
-                    "openclaw workspace '{}' connect+handshake to {}",
-                    self.config.name, self.config.url
-                )
-            })?;
-        client.set_session_namespace(openclaw_session_namespace(&self.config));
-        client.set_session_namespace_aliases(openclaw_session_namespace_aliases(&self.config));
-
+        let client = openclaw_client_for_config(&self.config).await?;
         let boxed: Box<dyn AgentClient + Send + Sync> = Box::new(client);
         self.client = Some(Arc::new(Mutex::new(boxed)));
         Ok(())
     }
+
+    /// Build the live OpenClaw client for a workspace config without
+    /// mutating a `Workspace`. Runtime switch paths use this to avoid
+    /// holding the shared `App` mutex across network activation.
+    pub(crate) async fn activate_detached_client(
+        config: &WorkspaceConfig,
+    ) -> Result<Arc<Mutex<Box<dyn AgentClient + Send + Sync>>>> {
+        match config.backend {
+            Backend::Openclaw => {
+                let client = openclaw_client_for_config(config).await?;
+                let boxed: Box<dyn AgentClient + Send + Sync> = Box::new(client);
+                Ok(Arc::new(Mutex::new(boxed)))
+            }
+            Backend::Zeroclaw => Err(anyhow!(
+                "workspace '{}' (zeroclaw) should already be activated after instantiate; bug",
+                config.name
+            )),
+            Backend::Nemoclaw => Err(anyhow!("nemoclaw backend is not yet implemented (v0.3)")),
+        }
+    }
+}
+
+async fn openclaw_client_for_config(
+    config: &WorkspaceConfig,
+) -> Result<crate::cli::openclaw::client::OpenClawClient> {
+    use crate::cli::openclaw::client::OpenClawClient;
+    use crate::cli::openclaw::device::DeviceIdentity;
+    use crate::cli::openclaw::handshake::{ClientIdentity, HandshakeParams};
+
+    let device_key_path = default_openclaw_device_key_path()?;
+    let device = DeviceIdentity::load_or_create(&device_key_path).with_context(|| {
+        format!(
+            "loading openclaw device key at {}",
+            device_key_path.display()
+        )
+    })?;
+
+    let params = HandshakeParams {
+        client: ClientIdentity {
+            id: "cli".to_string(),
+            display_name: Some("zterm".to_string()),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            mode: "cli".to_string(),
+            platform: std::env::consts::OS.to_string(),
+            device_family: None,
+        },
+        role: "operator".to_string(),
+        scopes: vec!["operator.read".to_string(), "operator.write".to_string()],
+        token: config.resolved_token(),
+    };
+
+    let mut client = OpenClawClient::connect_and_handshake(&config.url, &device, &params)
+        .await
+        .with_context(|| {
+            format!(
+                "openclaw workspace '{}' connect+handshake to {}",
+                config.name, config.url
+            )
+        })?;
+    client.set_session_namespace(openclaw_session_namespace(config));
+    client.set_session_namespace_aliases(openclaw_session_namespace_aliases(config));
+
+    Ok(client)
 }
 
 fn openclaw_session_namespace(config: &WorkspaceConfig) -> String {
@@ -851,54 +878,48 @@ fn apply_openclaw_workspace_state(config_path: &Path, cfg: &mut AppConfig) -> Re
         };
         let mut next_state = state.clone();
         next_state.openclaw_workspaces.push(entry.clone());
-        match save_workspace_state(&state_path, &next_state) {
-            Ok(()) => {
-                let verified_state = load_workspace_state(&state_path)?;
-                if let Some(entry_idx) =
-                    verified_state
-                        .openclaw_workspaces
-                        .iter()
-                        .position(|persisted| {
-                            persisted.id == entry.id
-                                && openclaw_workspace_identity_values_match(
-                                    &persisted.name,
-                                    &persisted.url,
-                                    &entry.name,
-                                    &entry.url,
-                                )
-                        })
-                {
-                    let persisted = &verified_state.openclaw_workspaces[entry_idx];
-                    let persisted_id = persisted.id.clone();
-                    let persisted_aliases = persisted.namespace_aliases.clone();
-                    state = verified_state;
-                    claimed_state_entries.insert(entry_idx);
-                    workspace.id = Some(persisted_id);
-                    for alias in &persisted_aliases {
-                        push_unique_namespace(&mut workspace.namespace_aliases, alias.trim());
-                    }
-                } else {
-                    state = verified_state;
-                    tracing::warn!(
-                        "generated openclaw workspace id for '{}' was not present after persisting {}; \
-                         using an in-memory id for this process",
-                        workspace.name,
-                        state_path.display()
-                    );
-                }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "could not persist generated openclaw workspace id for '{}': {e}; \
-                     using an in-memory id for this process",
-                    workspace.name
-                );
-            }
-        }
-        if workspace.id.is_none() {
-            workspace.id = Some(generated_id);
-        }
-        for alias in &entry.namespace_aliases {
+        save_workspace_state(&state_path, &next_state).with_context(|| {
+            format!(
+                "could not persist generated openclaw workspace id for '{}' to {}; refusing to use an in-memory-only id",
+                workspace.name,
+                state_path.display()
+            )
+        })?;
+
+        let verified_state = load_workspace_state(&state_path).with_context(|| {
+            format!(
+                "could not verify generated openclaw workspace id for '{}' in {}; refusing to use an in-memory-only id",
+                workspace.name,
+                state_path.display()
+            )
+        })?;
+        let entry_idx = verified_state
+            .openclaw_workspaces
+            .iter()
+            .position(|persisted| {
+                persisted.id == entry.id
+                    && openclaw_workspace_identity_values_match(
+                        &persisted.name,
+                        &persisted.url,
+                        &entry.name,
+                        &entry.url,
+                    )
+            })
+            .ok_or_else(|| {
+                anyhow!(
+                    "generated openclaw workspace id for '{}' was not present after persisting {}; refusing to use an in-memory-only id",
+                    workspace.name,
+                    state_path.display()
+                )
+            })?;
+
+        let persisted = &verified_state.openclaw_workspaces[entry_idx];
+        let persisted_id = persisted.id.clone();
+        let persisted_aliases = persisted.namespace_aliases.clone();
+        state = verified_state;
+        claimed_state_entries.insert(entry_idx);
+        workspace.id = Some(persisted_id);
+        for alias in &persisted_aliases {
             push_unique_namespace(&mut workspace.namespace_aliases, alias.trim());
         }
     }
@@ -1382,6 +1403,37 @@ url = "ws://old.example"
         let reloaded = AppConfig::load(&path).unwrap();
         assert_eq!(reloaded.workspaces[0].id.as_deref(), Some(id));
         assert_eq!(std::fs::read(&path).unwrap(), original);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generated_openclaw_id_errors_when_workspace_state_cannot_be_persisted() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[[workspaces]]
+name = "alpha"
+backend = "openclaw"
+url = "ws://old.example"
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let err = AppConfig::load(&path).unwrap_err();
+
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("workspace state lock") || msg.contains("workspace-state.toml"),
+            "{msg}"
+        );
+        assert!(
+            !workspace_state_path_for_config(&path).exists(),
+            "load must not continue with an in-memory-only generated id"
+        );
     }
 
     #[cfg(unix)]

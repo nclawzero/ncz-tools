@@ -62,6 +62,7 @@ use super::wire::{Frame, PendingRequests, RequestFrame, ResponseFrame};
 /// Default timeout for a single RPC round-trip. Applies to any caller
 /// that uses the convenience `send_request` without its own timeout.
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Channel capacity for the outbound request queue. Small on purpose —
 /// backpressure the caller rather than buffer arbitrary requests.
@@ -274,7 +275,35 @@ impl OpenClawClient {
         device: &super::device::DeviceIdentity,
         params: &super::handshake::HandshakeParams,
     ) -> anyhow::Result<Self> {
-        let mut client = Self::connect(url).await?;
+        Self::connect_and_handshake_with_timeout(url, device, params, DEFAULT_HANDSHAKE_TIMEOUT)
+            .await
+    }
+
+    pub(crate) async fn connect_and_handshake_with_timeout(
+        url: &str,
+        device: &super::device::DeviceIdentity,
+        params: &super::handshake::HandshakeParams,
+        handshake_timeout: Duration,
+    ) -> anyhow::Result<Self> {
+        match tokio::time::timeout(handshake_timeout, async {
+            let client = Self::connect(url).await?;
+            Self::finish_handshake(client, device, params).await
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(anyhow!(
+                "openclaw: connect+handshake timed out after {:?}",
+                handshake_timeout
+            )),
+        }
+    }
+
+    async fn finish_handshake(
+        mut client: Self,
+        device: &super::device::DeviceIdentity,
+        params: &super::handshake::HandshakeParams,
+    ) -> anyhow::Result<Self> {
         let mut event_rx = client
             .event_rx
             .take()
@@ -284,6 +313,27 @@ impl OpenClawClient {
         client.event_rx = Some(event_rx);
         client.hello_ok = Some(hello_ok);
         Ok(client)
+    }
+
+    #[cfg(test)]
+    async fn finish_handshake_with_timeout(
+        client: Self,
+        device: &super::device::DeviceIdentity,
+        params: &super::handshake::HandshakeParams,
+        handshake_timeout: Duration,
+    ) -> anyhow::Result<Self> {
+        match tokio::time::timeout(
+            handshake_timeout,
+            Self::finish_handshake(client, device, params),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(anyhow!(
+                "openclaw: handshake timed out after {:?}",
+                handshake_timeout
+            )),
+        }
     }
 
     /// Result of the last successful handshake. None if the client
@@ -1962,7 +2012,25 @@ fn is_already_exists_error(err: &anyhow::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::super::device::DeviceIdentity;
+    use super::super::handshake::{ClientIdentity, HandshakeParams};
     use super::*;
+
+    fn sample_handshake_params() -> HandshakeParams {
+        HandshakeParams {
+            client: ClientIdentity {
+                id: "cli".to_string(),
+                display_name: Some("zterm".to_string()),
+                version: "0.1.0".to_string(),
+                mode: "cli".to_string(),
+                platform: "linux".to_string(),
+                device_family: None,
+            },
+            role: "operator".to_string(),
+            scopes: vec!["operator.read".to_string(), "operator.write".to_string()],
+            token: None,
+        }
+    }
 
     #[test]
     fn openclaw_client_implements_agent_client() {
@@ -1972,6 +2040,37 @@ mod tests {
         // ZeroclawClient in cli/client.rs.
         fn assert_agent_client<T: crate::cli::agent::AgentClient>() {}
         assert_agent_client::<OpenClawClient>();
+    }
+
+    #[tokio::test]
+    async fn connect_and_handshake_times_out_when_gateway_never_sends_challenge() {
+        let (_event_tx, event_rx) = mpsc::channel::<super::super::wire::EventFrame>(1);
+        let client = OpenClawClient {
+            pending: PendingRequests::new(),
+            outbound_tx: None,
+            event_rx: Some(event_rx),
+            connected: Arc::new(AtomicBool::new(true)),
+            hello_ok: None,
+            stream_sink: None,
+            session_namespace: DEFAULT_SESSION_NAMESPACE.to_string(),
+            session_namespace_aliases: Vec::new(),
+            read_task: None,
+            write_task: None,
+        };
+        let tmp = tempfile::TempDir::new().unwrap();
+        let device = DeviceIdentity::create(&tmp.path().join("device.pem")).unwrap();
+        let params = sample_handshake_params();
+
+        let err = OpenClawClient::finish_handshake_with_timeout(
+            client,
+            &device,
+            &params,
+            Duration::from_millis(50),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.to_string().contains("handshake timed out"));
     }
 
     #[test]
