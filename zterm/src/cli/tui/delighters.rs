@@ -429,28 +429,11 @@ pub fn clear_mutation_fence_for_workspace_at(
     workspace_key: &str,
 ) -> std::io::Result<ZtermState> {
     with_state_lock(path, || {
-        let mut state = match load_state_unlocked(path) {
-            Ok(state) => state,
-            Err(_) if path.exists() => {
-                quarantine_corrupt_state_file(path)?;
-                ZtermState::default()
-            }
-            Err(e) => return Err(e),
-        };
+        let mut state = load_state_unlocked(path)?;
         state.mutation_fences.remove(workspace_key);
         save_state_unlocked(path, &state)?;
         Ok(state)
     })
-}
-
-fn quarantine_corrupt_state_file(path: &Path) -> io::Result<()> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let filename = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("state.toml");
-    let quarantine = parent.join(format!("{filename}.corrupt.{}", uuid::Uuid::new_v4()));
-    fs::rename(path, quarantine)
 }
 
 pub fn is_welcome_milestone(launches: u64) -> bool {
@@ -602,8 +585,14 @@ mod tests {
             reason: "slash command outcome unknown".to_string(),
             created_at_unix: 42,
         };
+        let other_fence = MutationFenceState {
+            command: "/session create scratch".to_string(),
+            reason: "session outcome unknown".to_string(),
+            created_at_unix: 43,
+        };
 
         set_mutation_fence_for_workspace_at(&path, "id:prod", fence.clone()).unwrap();
+        set_mutation_fence_for_workspace_at(&path, "id:dev", other_fence.clone()).unwrap();
 
         assert_eq!(
             mutation_fence_for_workspace_at(&path, "id:prod").unwrap(),
@@ -611,13 +600,17 @@ mod tests {
         );
         assert_eq!(
             mutation_fence_for_workspace_at(&path, "id:dev").unwrap(),
-            None
+            Some(other_fence.clone())
         );
 
         clear_mutation_fence_for_workspace_at(&path, "id:prod").unwrap();
         assert_eq!(
             mutation_fence_for_workspace_at(&path, "id:prod").unwrap(),
             None
+        );
+        assert_eq!(
+            mutation_fence_for_workspace_at(&path, "id:dev").unwrap(),
+            Some(other_fence)
         );
     }
 
@@ -637,15 +630,13 @@ mod tests {
     }
 
     #[test]
-    fn force_clear_quarantines_malformed_state() {
+    fn force_clear_malformed_state_fails_closed_without_rewrite() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("state.toml");
         fs::write(&path, "launches = ???\nmutation_fences = {}\n").unwrap();
 
-        clear_mutation_fence_for_workspace_at(&path, "id:prod").unwrap();
+        assert!(clear_mutation_fence_for_workspace_at(&path, "id:prod").is_err());
 
-        let state = load_state_checked(&path).unwrap();
-        assert!(state.mutation_fences.is_empty());
         let quarantined = fs::read_dir(dir.path())
             .unwrap()
             .filter_map(Result::ok)
@@ -655,7 +646,9 @@ mod tests {
                     .to_string_lossy()
                     .starts_with("state.toml.corrupt.")
             });
-        assert!(quarantined);
+        assert!(!quarantined);
+        let raw = fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("launches = ???"));
     }
 
     #[test]
