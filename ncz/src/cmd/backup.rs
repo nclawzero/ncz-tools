@@ -146,6 +146,7 @@ pub fn run_with_paths(
             to,
             include_secrets,
             exclude_volumes,
+            unsafe_live_volumes,
         } => Ok(BackupRunResult {
             report: BackupReport::Create(create(
                 ctx,
@@ -153,6 +154,7 @@ pub fn run_with_paths(
                 &to,
                 include_secrets,
                 exclude_volumes,
+                unsafe_live_volumes,
             )?),
             code: 0,
         }),
@@ -181,22 +183,19 @@ pub fn create(
     archive: &Path,
     include_secrets: bool,
     exclude_volumes: bool,
-) -> Result<BackupCreateReport, NczError> {
-    create_with_options(ctx, paths, archive, include_secrets, exclude_volumes, false)
-}
-
-fn create_with_options(
-    ctx: &Context,
-    paths: &Paths,
-    archive: &Path,
-    include_secrets: bool,
-    exclude_volumes: bool,
     unsafe_live_volumes: bool,
 ) -> Result<BackupCreateReport, NczError> {
     let _lock = state::acquire_lock(&paths.lock_path)?;
     if include_secrets {
         eprintln!(
             "ncz: audit: backup create includes unredacted secrets in {}",
+            archive.display()
+        );
+    }
+    if unsafe_live_volumes && !exclude_volumes {
+        eprintln!(
+            "ncz: audit: backup create exporting live Podman volumes without quiesce \
+             into {}",
             archive.display()
         );
     }
@@ -693,7 +692,7 @@ mod tests {
         let runner = FakeRunner::new();
         expect_hostname(&runner);
 
-        let report = create(&ctx(&runner), &paths, &archive, false, true).unwrap();
+        let report = create(&ctx(&runner), &paths, &archive, false, true, false).unwrap();
         let (manifest, entries) = backup_state::read_archive(&archive).unwrap();
         let entry = backup_state::archive_entry(&entries, backup_state::AGENT_ENV_PATH).unwrap();
 
@@ -721,7 +720,7 @@ mod tests {
         let runner = FakeRunner::new();
         expect_hostname(&runner);
 
-        let report = create(&ctx(&runner), &paths, &archive, true, true).unwrap();
+        let report = create(&ctx(&runner), &paths, &archive, true, true, false).unwrap();
         let (manifest, entries) = backup_state::read_archive(&archive).unwrap();
         let entry = backup_state::archive_entry(&entries, backup_state::AGENT_ENV_PATH).unwrap();
 
@@ -748,7 +747,7 @@ mod tests {
         let runner = FakeRunner::new();
         expect_hostname(&runner);
 
-        let report = create(&ctx(&runner), &paths, &archive, false, true).unwrap();
+        let report = create(&ctx(&runner), &paths, &archive, false, true, false).unwrap();
         let (manifest, entries) = backup_state::read_archive(&archive).unwrap();
         let entry = backup_state::archive_entry(&entries, "/etc/nclawzero/providers.d/legacy.json")
             .unwrap();
@@ -772,7 +771,7 @@ mod tests {
         let runner = FakeRunner::new();
         expect_hostname(&runner);
 
-        let report = create(&ctx(&runner), &paths, &archive, true, true).unwrap();
+        let report = create(&ctx(&runner), &paths, &archive, true, true, false).unwrap();
         let (manifest, entries) = backup_state::read_archive(&archive).unwrap();
         let entry = backup_state::archive_entry(&entries, "/etc/nclawzero/providers.d/legacy.json")
             .unwrap();
@@ -838,7 +837,7 @@ mod tests {
         );
         expect_hostname(&runner);
 
-        let report = create(&ctx(&runner), &paths, &archive, false, false).unwrap();
+        let report = create(&ctx(&runner), &paths, &archive, false, false, false).unwrap();
 
         assert_eq!(report.source_count, 1);
         assert!(!export_path.exists());
@@ -883,8 +882,7 @@ mod tests {
         );
         expect_hostname(&runner);
 
-        let report =
-            create_with_options(&ctx(&runner), &paths, &archive, false, false, true).unwrap();
+        let report = create(&ctx(&runner), &paths, &archive, false, false, true).unwrap();
 
         assert_eq!(report.source_count, 1);
         assert!(!export_path.exists());
