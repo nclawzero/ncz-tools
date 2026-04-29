@@ -480,7 +480,7 @@ impl CommandHandler {
     async fn handle_agent(
         &self,
         subcommand: Option<&str>,
-        args: &[&str],
+        _args: &[&str],
     ) -> Result<Option<String>> {
         let out = match subcommand {
             Some("-m") | Some("--message") => {
@@ -489,8 +489,9 @@ impl CommandHandler {
                 );
             }
             Some("-p") | Some("--provider") => {
-                let provider = args.first().copied().unwrap_or("default");
-                format!("🔄 Using provider: {provider}\n")
+                anyhow::bail!(
+                    "/agent -p/--provider is not supported in zterm; use /models set <provider>/<model> or /models list"
+                );
             }
             _ => "✓ Agent mode active (already running)\n".to_string(),
         };
@@ -3454,6 +3455,22 @@ token = "legacy-secret"
         let err = handler.handle("/agent -m hello", "s").await.unwrap_err();
 
         assert!(err.to_string().contains("/agent -m is not supported"));
+    }
+
+    #[tokio::test]
+    async fn agent_provider_switch_fails_closed_until_model_switch_is_wired() {
+        let handler = super::CommandHandler::new(app_with_fake_client(FakeAgentClient::default()));
+
+        for cmdline in ["/agent -p local", "/agent --provider local"] {
+            let err = handler.handle(cmdline, "s").await.unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains("/agent -p/--provider"));
+            assert!(msg.contains("not supported"));
+            assert!(
+                msg.contains("/models set") || msg.contains("/models list"),
+                "{cmdline} should point at the supported model commands"
+            );
+        }
     }
 
     #[tokio::test]
