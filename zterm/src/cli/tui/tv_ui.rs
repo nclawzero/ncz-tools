@@ -2989,7 +2989,16 @@ fn handle_command(
                 return;
             }
             if let Some(selected_name) = run_workspace_picker(app, &workspaces) {
-                let cmdline = format!("/workspace switch {selected_name}");
+                let cmdline = match workspace_switch_command_for_picker_name(&selected_name) {
+                    Ok(cmdline) => cmdline,
+                    Err(e) => {
+                        chat_lines
+                            .borrow_mut()
+                            .push(format!("[workspace] could not switch: {e}"));
+                        chat_lines.borrow_mut().push(String::new());
+                        return;
+                    }
+                };
                 dispatch_command(
                     &cmdline,
                     chat_lines,
@@ -3529,9 +3538,14 @@ fn session_switch_command_for_picker_entry(entry: &SessionPickerEntry) -> Result
     Ok(format!("/session switch {id}"))
 }
 
+fn workspace_switch_command_for_picker_name(name: &str) -> Result<String> {
+    let name = slash_quote_command_arg(name)?;
+    Ok(format!("/workspace switch {name}"))
+}
+
 fn slash_quote_command_arg(arg: &str) -> Result<String> {
     if arg.is_empty() {
-        return Err(anyhow::anyhow!("backend session id is empty"));
+        return Err(anyhow::anyhow!("slash command argument is empty"));
     }
     if !arg
         .chars()
@@ -4234,6 +4248,31 @@ mod tests {
         assert!(label.contains("<ESC>"));
         assert!(label.contains("..."));
         assert!(label.chars().count() < 140);
+    }
+
+    #[test]
+    fn workspace_picker_switch_command_quotes_metacharacter_names() {
+        let name = "Research Notes \"Dev\" \\ Archive";
+
+        let command = workspace_switch_command_for_picker_name(name).unwrap();
+
+        assert_eq!(
+            command,
+            "/workspace switch \"Research Notes \\\"Dev\\\" \\\\ Archive\""
+        );
+        let tokens = tokenize_slash_command(&command).unwrap();
+        assert_eq!(tokens, ["/workspace", "switch", name]);
+    }
+
+    #[test]
+    fn workspace_picker_switch_command_quotes_single_quotes() {
+        let name = "Research's Notes";
+
+        let command = workspace_switch_command_for_picker_name(name).unwrap();
+
+        assert_eq!(command, "/workspace switch \"Research's Notes\"");
+        let tokens = tokenize_slash_command(&command).unwrap();
+        assert_eq!(tokens, ["/workspace", "switch", name]);
     }
 
     #[test]
