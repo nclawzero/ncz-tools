@@ -358,6 +358,10 @@ struct StatusState {
     /// `response_in_flight`. Used to fail closed if the worker dies
     /// before it can type the final result.
     in_flight_request: Option<InFlightRequest>,
+    /// Workspace-switch connect splashes can arrive from a spawned
+    /// task before the command terminal frame. Buffer one until the
+    /// switch has left busy state so the event loop does not drop it.
+    pending_typewriter: Option<String>,
 }
 
 impl StatusState {
@@ -377,6 +381,7 @@ impl StatusState {
             mutation_fence: None,
             resync_in_flight: false,
             in_flight_request: None,
+            pending_typewriter: None,
         }
     }
 
@@ -3739,6 +3744,7 @@ fn drain_stream_events(
                         );
                     }
                     TurnChunk::Finished(result) => {
+                        let terminal_ok = result.is_ok();
                         let was_resync = status_state.resync_in_flight;
                         let in_flight_request = status_state.in_flight_request.take();
                         let mut terminal_requires_fence = false;
@@ -3781,6 +3787,11 @@ fn drain_stream_events(
                         status_state.resync_in_flight = false;
                         status_state.end_turn();
                         *response_in_flight = false;
+                        if terminal_ok {
+                            start_pending_typewriter(status_state, typewriter_state, chat_lines);
+                        } else {
+                            status_state.pending_typewriter = None;
+                        }
                     }
                     TurnChunk::Typewriter(text) => {
                         if !*response_in_flight {
@@ -3790,6 +3801,8 @@ fn drain_stream_events(
                                 text.clone(),
                                 Vec::new(),
                             );
+                        } else if in_flight_request_allows_deferred_typewriter(status_state) {
+                            queue_pending_typewriter(status_state, text);
                         }
                     }
                     TurnChunk::Token(_) => {}
@@ -3803,6 +3816,7 @@ fn drain_stream_events(
             Err(mpsc::error::TryRecvError::Disconnected) => {
                 if *response_in_flight {
                     saw_error = true;
+                    status_state.pending_typewriter = None;
                     let in_flight_request = status_state.in_flight_request.take();
                     let disconnect_message =
                         "worker channel disconnected before the request completed";
@@ -3855,6 +3869,46 @@ fn mutation_fence_reason_for_terminal_failure(
         &request.label,
         message,
     ))
+}
+
+fn in_flight_request_allows_deferred_typewriter(status_state: &StatusState) -> bool {
+    status_state
+        .in_flight_request
+        .as_ref()
+        .is_some_and(|request| {
+            let Ok(tokens) = tokenize_slash_command(&request.label) else {
+                return false;
+            };
+            matches!(
+                (
+                    tokens.first().map(String::as_str),
+                    tokens.get(1).map(String::as_str)
+                ),
+                (Some("/workspace" | "/workspaces"), Some("switch"))
+            )
+        })
+}
+
+fn queue_pending_typewriter(status_state: &mut StatusState, text: &str) {
+    match status_state.pending_typewriter.as_mut() {
+        Some(pending) => {
+            if !pending.is_empty() {
+                pending.push('\n');
+            }
+            pending.push_str(text);
+        }
+        None => status_state.pending_typewriter = Some(text.to_string()),
+    }
+}
+
+fn start_pending_typewriter(
+    status_state: &mut StatusState,
+    typewriter_state: &mut Option<TypewriterState>,
+    chat_lines: &Rc<RefCell<Vec<String>>>,
+) {
+    if let Some(text) = status_state.pending_typewriter.take() {
+        start_typewriter(typewriter_state, chat_lines, text, Vec::new());
+    }
 }
 
 fn note_response_busy(status_state: &mut StatusState) {
@@ -7250,6 +7304,43 @@ mod tests {
             lines.borrow().as_slice(),
             ["> prompt".to_string(), "answer".to_string(), String::new()]
         );
+    }
+
+    #[test]
+    fn workspace_switch_typewriter_before_finished_starts_after_completion() {
+        let mut state = StatusState::new(
+            "default".to_string(),
+            "gpt-test".to_string(),
+            "borland".to_string(),
+            false,
+        );
+        state.begin_busy(false);
+        state.in_flight_request = Some(InFlightRequest {
+            label: "/workspace switch beta".to_string(),
+            mutating_slash: true,
+            mutation_fence_owner: None,
+        });
+        let lines = Rc::new(RefCell::new(vec!["> /workspace switch beta".to_string()]));
+        let mut typewriter_state = None;
+        let mut response_in_flight = true;
+        let mut session_picker_state = SessionPickerState::default();
+        let (tx, mut rx) = mpsc::channel(8);
+        tx.try_send(TurnChunk::Typewriter("CACHED SPLASH".to_string()))
+            .unwrap();
+        tx.try_send(TurnChunk::Finished(Ok(String::new()))).unwrap();
+
+        assert!(!drain_stream_events(
+            &mut rx,
+            &lines,
+            &mut state,
+            &mut typewriter_state,
+            &mut response_in_flight,
+            &mut session_picker_state
+        ));
+
+        assert!(!response_in_flight);
+        assert!(state.pending_typewriter.is_none());
+        assert!(typewriter_state.is_some());
     }
 
     #[test]
