@@ -9,7 +9,7 @@ use crate::cli::{Context, CronAction};
 use crate::cmd::common;
 use crate::error::NczError;
 use crate::output::{self, Render};
-use crate::state::Paths;
+use crate::state::{self, Paths};
 use crate::sys::ProcessOutput;
 
 #[derive(Debug, Serialize)]
@@ -127,15 +127,39 @@ pub fn run_with_paths(
             &schedule,
             &command,
         )?)),
-        CronAction::AddAt { id, at, command } => Ok(CronReport::Mutation(add_at(
-            ctx, paths, &id, &at, &command,
+        CronAction::AddAt {
+            id,
+            at,
+            command,
+            agent,
+        } => Ok(CronReport::Mutation(add_at(
+            ctx,
+            paths,
+            agent.as_deref(),
+            &id,
+            &at,
+            &command,
         )?)),
-        CronAction::AddEvery { id, every, command } => Ok(CronReport::Mutation(add_every(
-            ctx, paths, &id, &every, &command,
+        CronAction::AddEvery {
+            id,
+            every,
+            command,
+            agent,
+        } => Ok(CronReport::Mutation(add_every(
+            ctx,
+            paths,
+            agent.as_deref(),
+            &id,
+            &every,
+            &command,
         )?)),
-        CronAction::Once { id, command } => {
-            Ok(CronReport::Mutation(once(ctx, paths, &id, &command)?))
-        }
+        CronAction::Once { id, command, agent } => Ok(CronReport::Mutation(once(
+            ctx,
+            paths,
+            agent.as_deref(),
+            &id,
+            &command,
+        )?)),
         CronAction::Remove { id, agent } => Ok(CronReport::Mutation(remove(
             ctx,
             paths,
@@ -146,9 +170,11 @@ pub fn run_with_paths(
             id,
             schedule,
             command,
+            agent,
         } => Ok(CronReport::Mutation(update(
             ctx,
             paths,
+            agent.as_deref(),
             &id,
             schedule.as_deref(),
             command.as_deref(),
@@ -176,12 +202,13 @@ pub fn list(
     let agent = require_zeroclaw(paths, requested_agent)?;
     common::require_tool(ctx.runner, "podman", &["--version"])?;
     let out = podman_exec(ctx, &agent, &["cron", "list"])?;
-    let entries = parse_entries(&out.stdout)?;
-    let raw_stdout = if entries.is_empty() && !looks_like_json(&out.stdout) {
+    let parsed_entries = parse_entries(&out.stdout, ctx.json)?;
+    let raw_stdout = if parsed_entries.is_none() {
         Some(out.stdout)
     } else {
         None
     };
+    let entries = parsed_entries.unwrap_or_default();
 
     Ok(CronListReport {
         schema_version: common::SCHEMA_VERSION,
@@ -222,6 +249,7 @@ pub fn add(
 pub fn add_at(
     ctx: &Context,
     paths: &Paths,
+    requested_agent: Option<&str>,
     id: &str,
     at: &str,
     command: &str,
@@ -229,7 +257,7 @@ pub fn add_at(
     mutate(
         ctx,
         paths,
-        None,
+        requested_agent,
         id,
         "add-at",
         &["cron", "add-at", id, "--at", at, "--command", command],
@@ -241,6 +269,7 @@ pub fn add_at(
 pub fn add_every(
     ctx: &Context,
     paths: &Paths,
+    requested_agent: Option<&str>,
     id: &str,
     every: &str,
     command: &str,
@@ -248,7 +277,7 @@ pub fn add_every(
     mutate(
         ctx,
         paths,
-        None,
+        requested_agent,
         id,
         "add-every",
         &[
@@ -268,13 +297,14 @@ pub fn add_every(
 pub fn once(
     ctx: &Context,
     paths: &Paths,
+    requested_agent: Option<&str>,
     id: &str,
     command: &str,
 ) -> Result<CronMutationReport, NczError> {
     mutate(
         ctx,
         paths,
-        None,
+        requested_agent,
         id,
         "once",
         &["cron", "once", id, "--command", command],
@@ -304,6 +334,7 @@ pub fn remove(
 pub fn update(
     ctx: &Context,
     paths: &Paths,
+    requested_agent: Option<&str>,
     id: &str,
     schedule: Option<&str>,
     command: Option<&str>,
@@ -314,7 +345,8 @@ pub fn update(
         ));
     }
 
-    let agent = require_zeroclaw(paths, None)?;
+    let _lock = state::acquire_lock(&paths.lock_path)?;
+    let agent = require_zeroclaw(paths, requested_agent)?;
     common::require_tool(ctx.runner, "podman", &["--version"])?;
 
     let mut args = vec!["cron", "update", id];
@@ -377,6 +409,7 @@ fn mutate(
     schedule: Option<&str>,
     command: Option<&str>,
 ) -> Result<CronMutationReport, NczError> {
+    let _lock = state::acquire_lock(&paths.lock_path)?;
     let agent = require_zeroclaw(paths, requested_agent)?;
     common::require_tool(ctx.runner, "podman", &["--version"])?;
     let out = podman_exec(ctx, &agent, args)?;
@@ -435,26 +468,61 @@ fn podman_exec(ctx: &Context, agent: &str, agent_args: &[&str]) -> Result<Proces
     Ok(out)
 }
 
-fn parse_entries(stdout: &str) -> Result<Vec<CronEntryReport>, NczError> {
+fn parse_entries(stdout: &str, json_mode: bool) -> Result<Option<Vec<CronEntryReport>>, NczError> {
     let trimmed = stdout.trim();
-    if trimmed.is_empty() || !looks_like_json(trimmed) {
-        return Ok(vec![]);
+    if trimmed.is_empty() {
+        return Ok(Some(vec![]));
+    }
+    if !looks_like_json(trimmed) {
+        return if json_mode {
+            Err(NczError::Precondition(
+                "zeroclaw cron list returned non-JSON stdout".to_string(),
+            ))
+        } else {
+            Ok(None)
+        };
     }
 
-    let value: Value = serde_json::from_str(trimmed)?;
+    let value: Value = match serde_json::from_str(trimmed) {
+        Ok(value) => value,
+        Err(err) if json_mode => {
+            return Err(NczError::Precondition(format!(
+                "zeroclaw cron list returned non-parseable JSON: {err}"
+            )));
+        }
+        Err(_) => return Ok(None),
+    };
     let entries = match &value {
         Value::Array(items) => items,
-        Value::Object(obj) => obj
+        Value::Object(obj) if obj.is_empty() => return Ok(Some(vec![])),
+        Value::Object(obj) => match obj
             .get("entries")
             .or_else(|| obj.get("jobs"))
             .or_else(|| obj.get("tasks"))
             .and_then(Value::as_array)
             .map(Vec::as_slice)
-            .unwrap_or(&[]),
-        _ => &[],
+        {
+            Some(entries) => entries,
+            None if json_mode => {
+                return Err(NczError::Precondition(
+                    "zeroclaw cron list JSON did not include an entries array".to_string(),
+                ));
+            }
+            None => return Ok(None),
+        },
+        _ if json_mode => {
+            return Err(NczError::Precondition(
+                "zeroclaw cron list JSON had an unsupported shape".to_string(),
+            ));
+        }
+        _ => return Ok(None),
     };
 
-    entries.iter().map(entry_from_value).collect()
+    entries
+        .iter()
+        .map(entry_from_value)
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
 }
 
 fn entry_from_value(value: &Value) -> Result<CronEntryReport, NczError> {
@@ -518,17 +586,31 @@ fn looks_like_json(stdout: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc,
+    };
+    use std::thread;
+    use std::time::Duration;
 
     use crate::cli::{Context, CronAction};
     use crate::cmd::common::{out, test_paths};
     use crate::error::NczError;
-    use crate::sys::fake::FakeRunner;
+    use crate::sys::{fake::FakeRunner, CommandRunner};
 
     use super::*;
 
-    fn ctx<'a>(runner: &'a FakeRunner) -> Context<'a> {
+    fn ctx<'a>(runner: &'a dyn CommandRunner) -> Context<'a> {
         Context {
             json: false,
+            show_secrets: false,
+            runner,
+        }
+    }
+
+    fn json_ctx<'a>(runner: &'a dyn CommandRunner) -> Context<'a> {
+        Context {
+            json: true,
             show_secrets: false,
             runner,
         }
@@ -543,6 +625,27 @@ mod tests {
 
     fn expect_podman(runner: &FakeRunner) {
         runner.expect("podman", &["--version"], out(0, "podman 5\n", ""));
+    }
+
+    struct LockProbeRunner<'a> {
+        inner: &'a FakeRunner,
+        paths: Paths,
+        observed_blocked: Arc<AtomicBool>,
+    }
+
+    impl CommandRunner for LockProbeRunner<'_> {
+        fn run(&self, cmd: &str, args: &[&str]) -> Result<ProcessOutput, NczError> {
+            let (tx, rx) = mpsc::channel();
+            let lock_path = self.paths.lock_path.clone();
+            thread::spawn(move || {
+                let _guard = state::acquire_lock(&lock_path).unwrap();
+                let _ = tx.send(());
+            });
+            if rx.recv_timeout(Duration::from_millis(50)).is_err() {
+                self.observed_blocked.store(true, Ordering::SeqCst);
+            }
+            self.inner.run(cmd, args)
+        }
     }
 
     #[test]
@@ -569,6 +672,63 @@ mod tests {
         assert_eq!(
             report.entries[0].next_run.as_deref(),
             Some("2026-04-30T09:00:00Z")
+        );
+        runner.assert_done();
+    }
+
+    #[test]
+    fn cron_list_json_fails_on_nonparsable_stdout_with_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_with_agent(tmp.path(), "zeroclaw");
+        let runner = FakeRunner::new();
+        expect_podman(&runner);
+        runner.expect(
+            "podman",
+            &["exec", "zeroclaw", "zeroclaw", "cron", "list"],
+            out(0, "{not json\n", ""),
+        );
+
+        let err = list(&json_ctx(&runner), &paths, None).unwrap_err();
+        assert!(matches!(err, NczError::Precondition(_)));
+        assert!(err.to_string().contains("non-parseable JSON"));
+        runner.assert_done();
+    }
+
+    #[test]
+    fn cron_list_json_accepts_explicit_empty_array() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_with_agent(tmp.path(), "zeroclaw");
+        let runner = FakeRunner::new();
+        expect_podman(&runner);
+        runner.expect(
+            "podman",
+            &["exec", "zeroclaw", "zeroclaw", "cron", "list"],
+            out(0, "[]\n", ""),
+        );
+
+        let report = list(&json_ctx(&runner), &paths, None).unwrap();
+        assert!(report.entries.is_empty());
+        assert!(report.raw_stdout.is_none());
+        runner.assert_done();
+    }
+
+    #[test]
+    fn cron_list_text_mode_passes_raw_when_unparsable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_with_agent(tmp.path(), "zeroclaw");
+        let runner = FakeRunner::new();
+        expect_podman(&runner);
+        runner.expect(
+            "podman",
+            &["exec", "zeroclaw", "zeroclaw", "cron", "list"],
+            out(0, "ID        SCHEDULE\nweekly    @weekly\n", ""),
+        );
+
+        let report = list(&ctx(&runner), &paths, None).unwrap();
+        assert!(report.entries.is_empty());
+        assert_eq!(
+            report.raw_stdout.as_deref(),
+            Some("ID        SCHEDULE\nweekly    @weekly\n")
         );
         runner.assert_done();
     }
@@ -612,6 +772,49 @@ mod tests {
     }
 
     #[test]
+    fn cron_add_acquires_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_with_agent(tmp.path(), "zeroclaw");
+        let inner = FakeRunner::new();
+        expect_podman(&inner);
+        inner.expect(
+            "podman",
+            &[
+                "exec",
+                "zeroclaw",
+                "zeroclaw",
+                "cron",
+                "add",
+                "daily",
+                "--schedule",
+                "0 9 * * *",
+                "--command",
+                "echo ok",
+            ],
+            out(0, "added\n", ""),
+        );
+        let observed_blocked = Arc::new(AtomicBool::new(false));
+        let runner = LockProbeRunner {
+            inner: &inner,
+            paths: paths.clone(),
+            observed_blocked: observed_blocked.clone(),
+        };
+
+        add(
+            &ctx(&runner),
+            &paths,
+            Some("zeroclaw"),
+            "daily",
+            "0 9 * * *",
+            "echo ok",
+        )
+        .unwrap();
+
+        assert!(observed_blocked.load(Ordering::SeqCst));
+        inner.assert_done();
+    }
+
+    #[test]
     fn cron_add_at_dispatches_to_active_zeroclaw() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = paths_with_agent(tmp.path(), "zeroclaw");
@@ -637,11 +840,55 @@ mod tests {
         let report = add_at(
             &ctx(&runner),
             &paths,
+            None,
             "once",
             "2026-04-30T12:00:00Z",
             "echo once",
         )
         .unwrap();
+        assert_eq!(report.action, "add-at");
+        runner.assert_done();
+    }
+
+    #[test]
+    fn cron_add_at_with_agent_flag_routes_to_zeroclaw_when_active_is_other() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_with_agent(tmp.path(), "openclaw");
+        let runner = FakeRunner::new();
+        expect_podman(&runner);
+        runner.expect(
+            "podman",
+            &[
+                "exec",
+                "zeroclaw",
+                "zeroclaw",
+                "cron",
+                "add-at",
+                "once",
+                "--at",
+                "2026-04-30T12:00:00Z",
+                "--command",
+                "echo once",
+            ],
+            out(0, "", ""),
+        );
+
+        let report = run_with_paths(
+            &ctx(&runner),
+            &paths,
+            CronAction::AddAt {
+                id: "once".to_string(),
+                at: "2026-04-30T12:00:00Z".to_string(),
+                command: "echo once".to_string(),
+                agent: Some("zeroclaw".to_string()),
+            },
+        )
+        .unwrap();
+
+        let CronReport::Mutation(report) = report else {
+            panic!("expected mutation report");
+        };
+        assert_eq!(report.agent, "zeroclaw");
         assert_eq!(report.action, "add-at");
         runner.assert_done();
     }
@@ -669,7 +916,8 @@ mod tests {
             out(0, "", ""),
         );
 
-        let report = add_every(&ctx(&runner), &paths, "heartbeat", "5m", "echo beat").unwrap();
+        let report =
+            add_every(&ctx(&runner), &paths, None, "heartbeat", "5m", "echo beat").unwrap();
         assert_eq!(report.action, "add-every");
         runner.assert_done();
     }
@@ -695,7 +943,7 @@ mod tests {
             out(0, "", ""),
         );
 
-        let report = once(&ctx(&runner), &paths, "startup", "echo boot").unwrap();
+        let report = once(&ctx(&runner), &paths, None, "startup", "echo boot").unwrap();
         assert_eq!(report.action, "once");
         runner.assert_done();
     }
@@ -715,6 +963,30 @@ mod tests {
         let report = remove(&ctx(&runner), &paths, None, "daily").unwrap();
         assert_eq!(report.action, "remove");
         runner.assert_done();
+    }
+
+    #[test]
+    fn cron_remove_acquires_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_with_agent(tmp.path(), "zeroclaw");
+        let inner = FakeRunner::new();
+        expect_podman(&inner);
+        inner.expect(
+            "podman",
+            &["exec", "zeroclaw", "zeroclaw", "cron", "remove", "daily"],
+            out(0, "", ""),
+        );
+        let observed_blocked = Arc::new(AtomicBool::new(false));
+        let runner = LockProbeRunner {
+            inner: &inner,
+            paths: paths.clone(),
+            observed_blocked: observed_blocked.clone(),
+        };
+
+        remove(&ctx(&runner), &paths, None, "daily").unwrap();
+
+        assert!(observed_blocked.load(Ordering::SeqCst));
+        inner.assert_done();
     }
 
     #[test]
@@ -743,6 +1015,7 @@ mod tests {
         let report = update(
             &ctx(&runner),
             &paths,
+            None,
             "daily",
             Some("0 10 * * *"),
             Some("echo later"),
@@ -758,7 +1031,7 @@ mod tests {
         let paths = paths_with_agent(tmp.path(), "zeroclaw");
         let runner = FakeRunner::new();
 
-        let err = update(&ctx(&runner), &paths, "daily", None, None).unwrap_err();
+        let err = update(&ctx(&runner), &paths, None, "daily", None, None).unwrap_err();
         assert!(matches!(err, NczError::Usage(_)));
     }
 

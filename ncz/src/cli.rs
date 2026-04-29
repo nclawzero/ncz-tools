@@ -277,6 +277,9 @@ pub enum CronAction {
         /// Command to run.
         #[arg(long)]
         command: String,
+        /// Optional agent name (defaults to the active agent).
+        #[arg(long)]
+        agent: Option<String>,
     },
     /// Add a fixed-interval schedule.
     AddEvery {
@@ -288,6 +291,9 @@ pub enum CronAction {
         /// Command to run.
         #[arg(long)]
         command: String,
+        /// Optional agent name (defaults to the active agent).
+        #[arg(long)]
+        agent: Option<String>,
     },
     /// Add a one-shot immediate task.
     Once {
@@ -296,6 +302,9 @@ pub enum CronAction {
         /// Command to run.
         #[arg(long)]
         command: String,
+        /// Optional agent name (defaults to the active agent).
+        #[arg(long)]
+        agent: Option<String>,
     },
     /// Remove a cron entry.
     Remove {
@@ -315,6 +324,9 @@ pub enum CronAction {
         /// New command.
         #[arg(long)]
         command: Option<String>,
+        /// Optional agent name (defaults to the active agent).
+        #[arg(long)]
+        agent: Option<String>,
     },
     /// Pause a cron entry.
     Pause {
