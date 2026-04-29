@@ -294,7 +294,7 @@ pub async fn run(
         let mut repl = repl::ReplLoop::new(shared_app, session, model, provider)?;
         repl.run().await?;
     } else {
-        tv_ui::run(shared_app, session, model, provider).await?;
+        tv_ui::run(shared_app, session, model, provider, show_splash).await?;
     }
 
     Ok(())

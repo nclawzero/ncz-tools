@@ -559,6 +559,7 @@ pub async fn run(
     session: Session,
     model: String,
     provider: String,
+    connect_splash_enabled: bool,
 ) -> Result<()> {
     info!("Starting tv_ui (E-2 async bridge)");
 
@@ -580,7 +581,13 @@ pub async fn run(
     let (req_tx, mut req_rx) = mpsc::channel::<WorkerRequest>(32);
     let (event_tx, event_rx) = StreamSink::channel(UI_EVENT_CAPACITY);
 
-    let connect_splash = Some(connect_splash_for_workspace(&app, &workspace_name, None).await);
+    let connect_splash = connect_splash_for_workspace_if_enabled(
+        &app,
+        &workspace_name,
+        None,
+        connect_splash_enabled,
+    )
+    .await;
 
     // Install the streaming sink on the boot workspace. The worker
     // also reinstalls before every submitted turn and after every
@@ -610,6 +617,7 @@ pub async fn run(
     let fallback_session_name = session.name.clone();
     let worker_sink = event_tx.clone();
     let worker_cmd_handler = CommandHandler::new(Arc::clone(&app));
+    let worker_connect_splash_enabled = connect_splash_enabled;
     tokio::spawn(async move {
         while let Some(req) = req_rx.recv().await {
             match req {
@@ -900,6 +908,7 @@ pub async fn run(
                         &fallback_session_name,
                         &worker_sink,
                         &worker_cmd_handler,
+                        worker_connect_splash_enabled,
                     );
                     run_worker_command_with_deadline(
                         &worker_sink,
@@ -1057,6 +1066,7 @@ async fn handle_worker_command_request(
     fallback_session_name: &str,
     worker_sink: &StreamSink,
     worker_cmd_handler: &CommandHandler,
+    connect_splash_enabled: bool,
 ) {
     // Route slash commands through the shared `CommandHandler`.
     // Advertised commands return structured strings so side effects
@@ -1211,17 +1221,20 @@ async fn handle_worker_command_request(
                             return;
                         }
                         if let Some((name, _)) = switched_workspace {
-                            let splash = connect_splash_for_workspace(
+                            if let Some(splash) = connect_splash_for_workspace_if_enabled(
                                 worker_app,
                                 &name,
                                 Some(worker_sink.clone()),
+                                connect_splash_enabled,
                             )
-                            .await;
-                            let _ = send_worker_chunk_reliably(
-                                worker_sink,
-                                TurnChunk::Typewriter(splash),
-                            )
-                            .await;
+                            .await
+                            {
+                                let _ = send_worker_chunk_reliably(
+                                    worker_sink,
+                                    TurnChunk::Typewriter(splash),
+                                )
+                                .await;
+                            }
                         }
                     }
                 }
@@ -1370,6 +1383,18 @@ async fn connect_splash_for_workspace(
             delighters::local_connect_splash(workspace_name)
         }
     }
+}
+
+async fn connect_splash_for_workspace_if_enabled(
+    app: &Arc<Mutex<App>>,
+    workspace_name: &str,
+    restore_sink: Option<StreamSink>,
+    enabled: bool,
+) -> Option<String> {
+    if !enabled {
+        return None;
+    }
+    Some(connect_splash_for_workspace(app, workspace_name, restore_sink).await)
 }
 
 async fn generate_connect_splash_from_active_backend(
@@ -5332,6 +5357,78 @@ mod tests {
     }
 
     #[test]
+    fn splash_screen_false_skips_connect_splash_cache_and_backend() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let path = delighters::default_connect_splash_cache_path("alpha").unwrap();
+            delighters::write_connect_splash_cache(&path, "CACHED SPLASH").unwrap();
+
+            let created = Arc::new(StdMutex::new(Vec::new()));
+            let deleted = Arc::new(StdMutex::new(Vec::new()));
+            let submitted = Arc::new(StdMutex::new(Vec::new()));
+            let sink_set_states = Arc::new(StdMutex::new(Vec::new()));
+            let fake = WorkerSessionFakeClient {
+                listed_sessions: Vec::new(),
+                list_sessions_error: None,
+                loadable_sessions: Vec::new(),
+                load_reject_ids: Vec::new(),
+                created: Arc::clone(&created),
+                deleted: Arc::clone(&deleted),
+                submitted: Arc::clone(&submitted),
+                list_calls: Arc::new(StdMutex::new(0)),
+                load_calls: Arc::new(StdMutex::new(Vec::new())),
+                submit_response: "SHOULD NOT BE USED".to_string(),
+                cancellation_safe: true,
+                sink_set_states: Arc::clone(&sink_set_states),
+                delete_error: None,
+            };
+            let boxed: Box<dyn crate::cli::agent::AgentClient + Send + Sync> = Box::new(fake);
+            let app = Arc::new(Mutex::new(App {
+                workspaces: vec![crate::cli::workspace::Workspace {
+                    id: 0,
+                    config: crate::cli::workspace::WorkspaceConfig {
+                        id: Some("ws-alpha".to_string()),
+                        name: "alpha".to_string(),
+                        backend: crate::cli::workspace::Backend::Openclaw,
+                        url: "ws://gateway.example".to_string(),
+                        token_env: None,
+                        token: None,
+                        label: None,
+                        namespace_aliases: Vec::new(),
+                    },
+                    client: Some(Arc::new(Mutex::new(boxed))),
+                    cron: None,
+                }],
+                active: 0,
+                shared_mnemos: None,
+                config_path: std::path::PathBuf::from("test-config.toml"),
+            }));
+
+            let splash = connect_splash_for_workspace_if_enabled(&app, "alpha", None, false).await;
+
+            assert!(splash.is_none());
+            assert!(
+                path.exists(),
+                "disabled connect splash should not touch cache"
+            );
+            assert!(created.lock().unwrap().is_empty());
+            assert!(submitted.lock().unwrap().is_empty());
+            assert!(deleted.lock().unwrap().is_empty());
+            assert!(sink_set_states.lock().unwrap().is_empty());
+        });
+
+        match old_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    #[test]
     fn connect_splash_skips_non_cancellable_backend_generation() {
         let _env = crate::cli::test_env_lock().lock().unwrap();
         let home = tempfile::tempdir().unwrap();
@@ -7797,6 +7894,7 @@ mod tests {
                 &session.name,
                 &sink,
                 &handler,
+                true,
             )
             .await;
 
@@ -8277,6 +8375,7 @@ mod tests {
                 "fallback",
                 &sink,
                 &handler,
+                true,
             )
             .await;
 
@@ -8402,6 +8501,7 @@ mod tests {
                 &active.name,
                 &event_tx,
                 &handler,
+                true,
             )
             .await;
         });
