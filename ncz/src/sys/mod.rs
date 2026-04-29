@@ -63,6 +63,52 @@ pub trait CommandRunner: Send + Sync {
             }),
         }
     }
+
+    /// Blocking GET returning both status and response body from a local agent
+    /// API endpoint.
+    fn http_get_local_body(
+        &self,
+        port: u16,
+        path: &str,
+        timeout_secs: u64,
+        max_body_bytes: usize,
+    ) -> Result<(u16, String), NczError> {
+        let url = format!("http://127.0.0.1:{port}{path}");
+        match ureq::get(&url)
+            .timeout(std::time::Duration::from_secs(timeout_secs))
+            .call()
+        {
+            Ok(resp) => {
+                let status = resp.status();
+                let body = read_http_body(resp, max_body_bytes)?;
+                Ok((status, body))
+            }
+            Err(ureq::Error::Status(code, resp)) => {
+                let body = read_http_body(resp, max_body_bytes)?;
+                Ok((code, body))
+            }
+            Err(e) => Err(NczError::Exec {
+                cmd: "http_get_local_body".into(),
+                msg: e.to_string(),
+            }),
+        }
+    }
+
+    /// Blocking DELETE against a local agent API endpoint.
+    fn http_delete_local(&self, port: u16, path: &str, timeout_secs: u64) -> Result<u16, NczError> {
+        let url = format!("http://127.0.0.1:{port}{path}");
+        match ureq::delete(&url)
+            .timeout(std::time::Duration::from_secs(timeout_secs))
+            .call()
+        {
+            Ok(resp) => Ok(resp.status()),
+            Err(ureq::Error::Status(code, _)) => Ok(code),
+            Err(e) => Err(NczError::Exec {
+                cmd: "http_delete_local".into(),
+                msg: e.to_string(),
+            }),
+        }
+    }
 }
 
 /// Production implementation: `std::process::Command` with a forced C
@@ -182,6 +228,17 @@ fn read_capped<R: Read>(mut reader: R, limit: usize) -> io::Result<(Vec<u8>, boo
     Ok((out, truncated))
 }
 
+fn read_http_body(resp: ureq::Response, max_body_bytes: usize) -> Result<String, NczError> {
+    let (body, truncated) = read_capped(resp.into_reader(), max_body_bytes)?;
+    if truncated {
+        return Err(NczError::Exec {
+            cmd: "http_get_local_body".into(),
+            msg: format!("response body exceeded {max_body_bytes} bytes"),
+        });
+    }
+    Ok(String::from_utf8_lossy(&body).into_owned())
+}
+
 fn join_reader(
     handle: thread::JoinHandle<io::Result<(Vec<u8>, bool)>>,
 ) -> Result<(Vec<u8>, bool), NczError> {
@@ -203,8 +260,12 @@ pub(crate) mod fake {
         pub responses: Mutex<HashMap<String, VecDeque<ProcessOutput>>>,
         pub prefix_responses: Mutex<Vec<(String, VecDeque<ProcessOutput>)>>,
         pub http_responses: Mutex<HashMap<String, VecDeque<u16>>>,
+        pub http_body_responses: Mutex<HashMap<String, VecDeque<(u16, String)>>>,
+        pub http_delete_responses: Mutex<HashMap<String, VecDeque<u16>>>,
         repeatable: Mutex<HashSet<String>>,
         http_repeatable: Mutex<HashSet<String>>,
+        http_body_repeatable: Mutex<HashSet<String>>,
+        http_delete_repeatable: Mutex<HashSet<String>>,
         pub calls: Mutex<Vec<String>>,
         unexpected: Mutex<Vec<String>>,
     }
@@ -215,8 +276,12 @@ pub(crate) mod fake {
                 responses: Mutex::new(HashMap::new()),
                 prefix_responses: Mutex::new(Vec::new()),
                 http_responses: Mutex::new(HashMap::new()),
+                http_body_responses: Mutex::new(HashMap::new()),
+                http_delete_responses: Mutex::new(HashMap::new()),
                 repeatable: Mutex::new(HashSet::new()),
                 http_repeatable: Mutex::new(HashSet::new()),
+                http_body_repeatable: Mutex::new(HashSet::new()),
+                http_delete_repeatable: Mutex::new(HashSet::new()),
                 calls: Mutex::new(vec![]),
                 unexpected: Mutex::new(vec![]),
             }
@@ -273,6 +338,48 @@ pub(crate) mod fake {
         }
 
         #[allow(dead_code)]
+        pub fn expect_http_body(&self, port: u16, path: &str, status: u16, body: &str) {
+            let key = format!("http-get {port} {path}");
+            self.http_body_responses
+                .lock()
+                .unwrap()
+                .entry(key)
+                .or_default()
+                .push_back((status, body.to_string()));
+        }
+
+        #[allow(dead_code)]
+        pub fn expect_http_body_repeating(&self, port: u16, path: &str, status: u16, body: &str) {
+            let key = format!("http-get {port} {path}");
+            self.http_body_responses
+                .lock()
+                .unwrap()
+                .insert(key.clone(), VecDeque::from([(status, body.to_string())]));
+            self.http_body_repeatable.lock().unwrap().insert(key);
+        }
+
+        #[allow(dead_code)]
+        pub fn expect_http_delete(&self, port: u16, path: &str, status: u16) {
+            let key = format!("http-delete {port} {path}");
+            self.http_delete_responses
+                .lock()
+                .unwrap()
+                .entry(key)
+                .or_default()
+                .push_back(status);
+        }
+
+        #[allow(dead_code)]
+        pub fn expect_http_delete_repeating(&self, port: u16, path: &str, status: u16) {
+            let key = format!("http-delete {port} {path}");
+            self.http_delete_responses
+                .lock()
+                .unwrap()
+                .insert(key.clone(), VecDeque::from([status]));
+            self.http_delete_repeatable.lock().unwrap().insert(key);
+        }
+
+        #[allow(dead_code)]
         pub fn assert_done(&self) {
             let repeatable = self.repeatable.lock().unwrap();
             let mut pending: Vec<String> = self
@@ -292,6 +399,32 @@ pub(crate) mod fake {
                     .unwrap()
                     .iter()
                     .filter(|(key, replies)| !http_repeatable.contains(*key) && !replies.is_empty())
+                    .map(|(key, _)| key.clone()),
+            );
+            drop(http_repeatable);
+
+            let http_body_repeatable = self.http_body_repeatable.lock().unwrap();
+            pending.extend(
+                self.http_body_responses
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(key, replies)| {
+                        !http_body_repeatable.contains(*key) && !replies.is_empty()
+                    })
+                    .map(|(key, _)| key.clone()),
+            );
+            drop(http_body_repeatable);
+
+            let http_delete_repeatable = self.http_delete_repeatable.lock().unwrap();
+            pending.extend(
+                self.http_delete_responses
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(key, replies)| {
+                        !http_delete_repeatable.contains(*key) && !replies.is_empty()
+                    })
                     .map(|(key, _)| key.clone()),
             );
             pending.sort();
@@ -374,6 +507,55 @@ pub(crate) mod fake {
                 replies
                     .pop_front()
                     .ok_or_else(|| self.unexpected_call("http_get_local", key))
+            }
+        }
+
+        fn http_get_local_body(
+            &self,
+            port: u16,
+            path: &str,
+            _timeout_secs: u64,
+            _max_body_bytes: usize,
+        ) -> Result<(u16, String), NczError> {
+            let key = format!("http-get {port} {path}");
+            self.calls.lock().unwrap().push(key.clone());
+            let mut responses = self.http_body_responses.lock().unwrap();
+            let Some(replies) = responses.get_mut(&key) else {
+                return Err(self.unexpected_call("http_get_local_body", key));
+            };
+            if self.http_body_repeatable.lock().unwrap().contains(&key) {
+                replies
+                    .front()
+                    .cloned()
+                    .ok_or_else(|| self.unexpected_call("http_get_local_body", key))
+            } else {
+                replies
+                    .pop_front()
+                    .ok_or_else(|| self.unexpected_call("http_get_local_body", key))
+            }
+        }
+
+        fn http_delete_local(
+            &self,
+            port: u16,
+            path: &str,
+            _timeout_secs: u64,
+        ) -> Result<u16, NczError> {
+            let key = format!("http-delete {port} {path}");
+            self.calls.lock().unwrap().push(key.clone());
+            let mut responses = self.http_delete_responses.lock().unwrap();
+            let Some(replies) = responses.get_mut(&key) else {
+                return Err(self.unexpected_call("http_delete_local", key));
+            };
+            if self.http_delete_repeatable.lock().unwrap().contains(&key) {
+                replies
+                    .front()
+                    .copied()
+                    .ok_or_else(|| self.unexpected_call("http_delete_local", key))
+            } else {
+                replies
+                    .pop_front()
+                    .ok_or_else(|| self.unexpected_call("http_delete_local", key))
             }
         }
     }
