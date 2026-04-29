@@ -267,24 +267,13 @@ impl ReplLoop {
                     let locked = active_client.lock().await;
                     locked.load_session(&session.id).await
                 };
-                match load_result {
-                    Ok(session) => Ok(session),
-                    Err(e) => {
-                        warn!(
-                            "listed session '{}' could not be loaded for active workspace; creating scoped session '{}': {}",
-                            session.id, target, e
-                        );
-                        let session = active_client.lock().await.create_session(target).await?;
-                        let scope = self.current_storage_scope().await?;
-                        if let Err(e) = save_legacy_session_metadata(&scope, &session) {
-                            warn!(
-                                "could not save local metadata for newly created session {}: {}",
-                                session.id, e
-                            );
-                        }
-                        Ok(session)
-                    }
-                }
+                load_result.map_err(|e| {
+                    anyhow::anyhow!(
+                        "listed session '{}' matched '{}', but could not be loaded: {e}; refusing to create a replacement session",
+                        session.id,
+                        target
+                    )
+                })
             }
             LegacySessionResolution::Create => {
                 let session = active_client.lock().await.create_session(target).await?;
@@ -386,24 +375,13 @@ impl ReplLoop {
                     let locked = active_client.lock().await;
                     locked.load_session(&session.id).await
                 };
-                match load_result {
-                    Ok(session) => session,
-                    Err(e) => {
-                        warn!(
-                            "listed session '{}' could not be loaded for active workspace; creating scoped session '{}': {}",
-                            session.id, target, e
-                        );
-                        let session = active_client.lock().await.create_session(&target).await?;
-                        let scope = self.current_storage_scope().await?;
-                        if let Err(e) = save_legacy_session_metadata(&scope, &session) {
-                            warn!(
-                                "could not save local metadata for newly created session {}: {}",
-                                session.id, e
-                            );
-                        }
-                        session
-                    }
-                }
+                load_result.map_err(|e| {
+                    anyhow::anyhow!(
+                        "listed session '{}' matched '{}', but could not be loaded: {e}; refusing to create a replacement session",
+                        session.id,
+                        target
+                    )
+                })?
             }
             LegacySessionResolution::Create => {
                 let session = active_client.lock().await.create_session(&target).await?;
@@ -1430,7 +1408,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_repl_session_switch_does_not_bind_unloadable_list_row() {
+    fn legacy_repl_session_switch_fails_closed_on_unloadable_list_row() {
         let _env = crate::cli::test_env_lock().lock().unwrap();
         let home = tempfile::tempdir().unwrap();
         let old_home = std::env::var_os("HOME");
@@ -1466,13 +1444,75 @@ mod tests {
             )
             .unwrap();
 
-            let resolved = repl
+            let err = repl
                 .resolve_or_create_active_workspace_session("legacy-server-key")
                 .await
-                .unwrap();
+                .unwrap_err();
 
-            assert_eq!(resolved.id, "created-legacy-server-key");
-            assert_eq!(created.lock().unwrap().len(), 1);
+            let msg = err.to_string();
+            assert!(msg.contains("listed session 'legacy-server-key'"));
+            assert!(msg.contains("could not be loaded"));
+            assert!(msg.contains("refusing to create a replacement session"));
+            assert!(created.lock().unwrap().is_empty());
+            assert!(submitted.lock().unwrap().is_empty());
+        });
+
+        match old_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    #[test]
+    fn legacy_session_action_switch_fails_closed_on_unloadable_list_row() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+
+        runtime.block_on(async {
+            let submitted = Arc::new(StdMutex::new(Vec::new()));
+            let deleted = Arc::new(StdMutex::new(Vec::new()));
+            let created = Arc::new(StdMutex::new(Vec::new()));
+            let display_only = session("legacy-server-key", "Research");
+            let app = Arc::new(Mutex::new(App {
+                workspaces: vec![workspace_with_session_client_options(
+                    0,
+                    "alpha",
+                    vec![display_only],
+                    Arc::clone(&submitted),
+                    Arc::clone(&deleted),
+                    None,
+                    vec!["legacy-server-key".to_string()],
+                    Arc::clone(&created),
+                )],
+                active: 0,
+                shared_mnemos: None,
+                config_path: PathBuf::from("test-config.toml"),
+            }));
+            let main = session("main", "Main");
+            let mut repl = ReplLoop::new(
+                Arc::clone(&app),
+                main.clone(),
+                "model".to_string(),
+                "provider".to_string(),
+            )
+            .unwrap();
+
+            let err = repl
+                .apply_legacy_session_action(LegacySessionAction::Switch {
+                    target: "legacy-server-key".to_string(),
+                })
+                .await
+                .unwrap_err();
+
+            let msg = err.to_string();
+            assert!(msg.contains("listed session 'legacy-server-key'"));
+            assert!(msg.contains("could not be loaded"));
+            assert!(msg.contains("refusing to create a replacement session"));
+            assert_eq!(repl.session.id, main.id);
+            assert!(created.lock().unwrap().is_empty());
             assert!(submitted.lock().unwrap().is_empty());
         });
 

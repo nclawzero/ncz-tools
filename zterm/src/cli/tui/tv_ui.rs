@@ -2169,7 +2169,7 @@ fn zeroclaw_post_send_failure_requires_incomplete_transcript(message: &str) -> b
 }
 
 fn webhook_post_dispatch_failure_requires_incomplete_transcript(message: &str) -> bool {
-    message.starts_with("Webhook request failed: HTTP ")
+    message.starts_with("Webhook request failed:")
         || message.contains("Failed to parse response")
         || message.contains("Failed to read response body")
         || message.contains("Webhook response missing string 'response' field")
@@ -8199,6 +8199,7 @@ mod tests {
         let _env = crate::cli::test_env_lock().lock().unwrap();
         for reason in [
             "Webhook request failed: HTTP 502: backend processed but returned bad gateway",
+            "Webhook request failed: connection reset after request body was sent",
             "Failed to parse response: expected value at line 1 column 1",
             "Webhook response missing string 'response' field",
         ] {
@@ -8219,11 +8220,6 @@ mod tests {
             assert!(message.contains("transcript marked incomplete"));
             assert!(storage::scoped_session_history_is_incomplete(&scope, "main").unwrap());
         }
-
-        assert!(!submit_error_requires_incomplete_transcript(
-            "Webhook request failed: connection refused",
-            false
-        ));
     }
 
     #[test]
