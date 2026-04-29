@@ -325,17 +325,19 @@ async fn load_or_create_session_with_metadata(
     session_name: &str,
     local_metadata: Option<SessionMetadata>,
 ) -> Result<Session> {
-    match client.lock().await.list_sessions().await {
+    let list_error = match client.lock().await.list_sessions().await {
         Ok(sessions) => {
             if let Some(session) = choose_boot_session_by_id_or_name(&sessions, session_name)? {
                 info!("Found existing backend session: {}", session.id);
                 return Ok(session.clone());
             }
+            None
         }
         Err(e) => {
             warn!("could not list backend sessions while booting '{session_name}': {e}");
+            Some(e)
         }
-    }
+    };
 
     if let Some(metadata) = local_metadata {
         match client.lock().await.load_session(&metadata.id).await {
@@ -359,6 +361,12 @@ async fn load_or_create_session_with_metadata(
                 );
             }
         }
+    }
+
+    if let Some(e) = list_error {
+        return Err(anyhow!(
+            "could not list backend sessions while booting '{session_name}'; refusing to create session without authoritative absence: {e}"
+        ));
     }
 
     // Create new session
@@ -438,7 +446,7 @@ mod tests {
 
     #[derive(Clone)]
     struct BootFakeClient {
-        list_sessions: Vec<Session>,
+        list_sessions: Result<Vec<Session>, String>,
         load_sessions: Vec<Session>,
         create_session: Session,
         loaded: Arc<StdMutex<Vec<String>>>,
@@ -474,7 +482,9 @@ mod tests {
         }
 
         async fn list_sessions(&self) -> Result<Vec<Session>> {
-            Ok(self.list_sessions.clone())
+            self.list_sessions
+                .clone()
+                .map_err(|message| anyhow!(message))
         }
 
         async fn create_session(&self, name: &str) -> Result<Session> {
@@ -639,7 +649,7 @@ url = "ws://example.invalid"
         let loaded = Arc::new(StdMutex::new(Vec::new()));
         let created = Arc::new(StdMutex::new(Vec::new()));
         let fake = BootFakeClient {
-            list_sessions: vec![session("active-main", "main")],
+            list_sessions: Ok(vec![session("active-main", "main")]),
             load_sessions: Vec::new(),
             create_session: session("created/main", "main"),
             loaded: Arc::clone(&loaded),
@@ -665,7 +675,7 @@ url = "ws://example.invalid"
         let loaded = Arc::new(StdMutex::new(Vec::new()));
         let created = Arc::new(StdMutex::new(Vec::new()));
         let fake = BootFakeClient {
-            list_sessions: Vec::new(),
+            list_sessions: Ok(Vec::new()),
             load_sessions: Vec::new(),
             create_session: session("created/main", "main"),
             loaded: Arc::clone(&loaded),
@@ -684,5 +694,58 @@ url = "ws://example.invalid"
         assert_eq!(selected.id, "created/main");
         assert_eq!(loaded.lock().unwrap().as_slice(), ["foreign-main"]);
         assert_eq!(created.lock().unwrap().as_slice(), ["main"]);
+    }
+
+    #[tokio::test]
+    async fn boot_list_failure_without_valid_cached_metadata_does_not_create_session() {
+        let loaded = Arc::new(StdMutex::new(Vec::new()));
+        let created = Arc::new(StdMutex::new(Vec::new()));
+        let fake = BootFakeClient {
+            list_sessions: Err("backend list unavailable".to_string()),
+            load_sessions: Vec::new(),
+            create_session: session("created/main", "main"),
+            loaded: Arc::clone(&loaded),
+            created: Arc::clone(&created),
+        };
+
+        let err = load_or_create_session_with_metadata(
+            &boxed_client(fake),
+            &scope(),
+            "main",
+            Some(metadata("stale-main", "main")),
+        )
+        .await
+        .unwrap_err();
+        let msg = format!("{err:#}");
+
+        assert!(msg.contains("refusing to create session"));
+        assert_eq!(loaded.lock().unwrap().as_slice(), ["stale-main"]);
+        assert!(created.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn boot_list_failure_allows_valid_cached_metadata() {
+        let loaded = Arc::new(StdMutex::new(Vec::new()));
+        let created = Arc::new(StdMutex::new(Vec::new()));
+        let fake = BootFakeClient {
+            list_sessions: Err("backend list unavailable".to_string()),
+            load_sessions: vec![session("cached-main", "main")],
+            create_session: session("created/main", "main"),
+            loaded: Arc::clone(&loaded),
+            created: Arc::clone(&created),
+        };
+
+        let selected = load_or_create_session_with_metadata(
+            &boxed_client(fake),
+            &scope(),
+            "main",
+            Some(metadata("cached-main", "main")),
+        )
+        .await
+        .expect("valid cached metadata should be enough during list outage");
+
+        assert_eq!(selected.id, "cached-main");
+        assert_eq!(loaded.lock().unwrap().as_slice(), ["cached-main"]);
+        assert!(created.lock().unwrap().is_empty());
     }
 }
