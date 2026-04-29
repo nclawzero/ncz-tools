@@ -750,11 +750,6 @@ impl ZeroclawClient {
             }
         }
 
-        if !response.is_empty() {
-            self.emit_finished_ok(response.clone(), streamed);
-            return Ok(response);
-        }
-
         let wrapped = anyhow!("WebSocket closed before a response completed");
         self.emit_failure(&wrapped);
         Err(wrapped)
@@ -1401,6 +1396,8 @@ fallback = "gemini"
             }
             if let Some(duration) = hold_open {
                 tokio::time::sleep(duration).await;
+            } else {
+                let _ = server_ws.close(None).await;
             }
         });
         let (client_ws, _) = connect_async(format!("ws://{addr}")).await.unwrap();
@@ -1456,6 +1453,28 @@ fallback = "gemini"
             .unwrap_err();
 
         assert!(err.to_string().contains("WebSocket turn timed out"));
+    }
+
+    #[tokio::test]
+    async fn ws_submit_rejects_chunk_then_close_without_done() {
+        let ws = test_ws_stream(vec![json!({ "type": "chunk", "content": "partial" })], None).await;
+        let client = ZeroclawClient::new("http://localhost:8888".to_string(), String::new());
+
+        let err = client
+            .submit_turn_ws_connected_with_limits(
+                ws,
+                "main",
+                "hello",
+                "primary",
+                Duration::from_secs(5),
+                1024,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("WebSocket closed before a response completed"));
     }
 
     #[test]
