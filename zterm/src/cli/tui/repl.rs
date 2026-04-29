@@ -245,7 +245,30 @@ impl ReplLoop {
         };
 
         match resolution {
-            LegacySessionResolution::Existing(session) => Ok(session),
+            LegacySessionResolution::Existing(session) => {
+                let load_result = {
+                    let locked = active_client.lock().await;
+                    locked.load_session(&session.id).await
+                };
+                match load_result {
+                    Ok(session) => Ok(session),
+                    Err(e) => {
+                        warn!(
+                            "listed session '{}' could not be loaded for active workspace; creating scoped session '{}': {}",
+                            session.id, target, e
+                        );
+                        let session = active_client.lock().await.create_session(target).await?;
+                        let scope = self.current_storage_scope().await?;
+                        if let Err(e) = save_legacy_session_metadata(&scope, &session) {
+                            warn!(
+                                "could not save local metadata for newly created session {}: {}",
+                                session.id, e
+                            );
+                        }
+                        Ok(session)
+                    }
+                }
+            }
             LegacySessionResolution::Create => {
                 let session = active_client.lock().await.create_session(target).await?;
                 let scope = self.current_storage_scope().await?;
@@ -297,7 +320,30 @@ impl ReplLoop {
         };
 
         let session = match resolution {
-            LegacySessionResolution::Existing(session) => session,
+            LegacySessionResolution::Existing(session) => {
+                let load_result = {
+                    let locked = active_client.lock().await;
+                    locked.load_session(&session.id).await
+                };
+                match load_result {
+                    Ok(session) => session,
+                    Err(e) => {
+                        warn!(
+                            "listed session '{}' could not be loaded for active workspace; creating scoped session '{}': {}",
+                            session.id, target, e
+                        );
+                        let session = active_client.lock().await.create_session(&target).await?;
+                        let scope = self.current_storage_scope().await?;
+                        if let Err(e) = save_legacy_session_metadata(&scope, &session) {
+                            warn!(
+                                "could not save local metadata for newly created session {}: {}",
+                                session.id, e
+                            );
+                        }
+                        session
+                    }
+                }
+            }
             LegacySessionResolution::Create => {
                 let session = active_client.lock().await.create_session(&target).await?;
                 let scope = self.current_storage_scope().await?;
@@ -1294,12 +1340,67 @@ mod tests {
         }
     }
 
+    #[test]
+    fn legacy_repl_session_switch_does_not_bind_unloadable_list_row() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+
+        runtime.block_on(async {
+            let submitted = Arc::new(StdMutex::new(Vec::new()));
+            let deleted = Arc::new(StdMutex::new(Vec::new()));
+            let created = Arc::new(StdMutex::new(Vec::new()));
+            let display_only = session("legacy-server-key", "Research");
+            let app = Arc::new(Mutex::new(App {
+                workspaces: vec![workspace_with_session_client_options(
+                    0,
+                    "alpha",
+                    vec![display_only],
+                    Arc::clone(&submitted),
+                    Arc::clone(&deleted),
+                    None,
+                    vec!["legacy-server-key".to_string()],
+                    Arc::clone(&created),
+                )],
+                active: 0,
+                shared_mnemos: None,
+                config_path: PathBuf::from("test-config.toml"),
+            }));
+            let main = session("main", "Main");
+            let repl = ReplLoop::new(
+                Arc::clone(&app),
+                main,
+                "model".to_string(),
+                "provider".to_string(),
+            )
+            .unwrap();
+
+            let resolved = repl
+                .resolve_or_create_active_workspace_session("legacy-server-key")
+                .await
+                .unwrap();
+
+            assert_eq!(resolved.id, "created-legacy-server-key");
+            assert_eq!(created.lock().unwrap().len(), 1);
+            assert!(submitted.lock().unwrap().is_empty());
+        });
+
+        match old_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
     #[derive(Clone)]
     struct FakeWorkspaceClient {
         sessions: Vec<Session>,
+        created_sessions: Arc<StdMutex<Vec<Session>>>,
         submitted: Arc<StdMutex<Vec<(String, String)>>>,
         deleted: Arc<StdMutex<Vec<String>>>,
         list_sessions_error: Option<String>,
+        load_reject_ids: Vec<String>,
     }
 
     #[async_trait::async_trait]
@@ -1338,11 +1439,26 @@ mod tests {
         }
 
         async fn create_session(&self, name: &str) -> anyhow::Result<Session> {
-            Ok(session(&format!("created-{name}"), name))
+            let session = session(&format!("created-{name}"), name);
+            self.created_sessions.lock().unwrap().push(session.clone());
+            Ok(session)
         }
 
         async fn load_session(&self, session_id: &str) -> anyhow::Result<Session> {
-            self.sessions
+            if self.load_reject_ids.iter().any(|id| id == session_id) {
+                anyhow::bail!("display-only session is not loadable");
+            }
+            if let Some(session) = self
+                .sessions
+                .iter()
+                .find(|session| session.id == session_id)
+                .cloned()
+            {
+                return Ok(session);
+            }
+            self.created_sessions
+                .lock()
+                .unwrap()
                 .iter()
                 .find(|session| session.id == session_id)
                 .cloned()
@@ -1453,11 +1569,36 @@ mod tests {
         deleted: Arc<StdMutex<Vec<String>>>,
         list_sessions_error: Option<&str>,
     ) -> Workspace {
-        let fake = FakeWorkspaceClient {
+        workspace_with_session_client_options(
+            id,
+            name,
             sessions,
             submitted,
             deleted,
+            list_sessions_error,
+            Vec::new(),
+            Arc::new(StdMutex::new(Vec::new())),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn workspace_with_session_client_options(
+        id: usize,
+        name: &str,
+        sessions: Vec<Session>,
+        submitted: Arc<StdMutex<Vec<(String, String)>>>,
+        deleted: Arc<StdMutex<Vec<String>>>,
+        list_sessions_error: Option<&str>,
+        load_reject_ids: Vec<String>,
+        created_sessions: Arc<StdMutex<Vec<Session>>>,
+    ) -> Workspace {
+        let fake = FakeWorkspaceClient {
+            sessions,
+            created_sessions,
+            submitted,
+            deleted,
             list_sessions_error: list_sessions_error.map(str::to_string),
+            load_reject_ids,
         };
         let boxed: Box<dyn AgentClient + Send + Sync> = Box::new(fake);
         Workspace {

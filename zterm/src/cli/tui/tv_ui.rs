@@ -1921,7 +1921,15 @@ async fn resolve_or_create_session_for_worker(
     };
 
     if let WorkerSessionResolution::Existing(session) = resolution {
-        return Ok(session);
+        match client.lock().await.load_session(&session.id).await {
+            Ok(session) => return Ok(session),
+            Err(e) => {
+                warn!(
+                    "listed session '{}' could not be loaded for active workspace; creating scoped session '{}': {}",
+                    session.id, session_name, e
+                );
+            }
+        }
     }
 
     let session = client.lock().await.create_session(session_name).await?;
@@ -4796,6 +4804,7 @@ impl View for ChatPane {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex as StdMutex;
 
     #[test]
     fn token_budget_bar_clamps_and_sizes() {
@@ -7263,6 +7272,174 @@ mod tests {
                 stdout_only_slash_command_block_message(cmdline).is_none(),
                 "{cmdline} should route through CommandHandler instead of the stdout-only blocker"
             );
+        }
+    }
+
+    #[derive(Clone)]
+    struct WorkerSessionFakeClient {
+        listed_sessions: Vec<Session>,
+        loadable_sessions: Vec<Session>,
+        created: Arc<StdMutex<Vec<Session>>>,
+        submitted: Arc<StdMutex<Vec<(String, String)>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::cli::agent::AgentClient for WorkerSessionFakeClient {
+        async fn health(&self) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+
+        async fn get_config(&self) -> anyhow::Result<crate::cli::client::Config> {
+            Ok(crate::cli::client::Config {
+                agent: Default::default(),
+            })
+        }
+
+        async fn put_config(&self, _config: &crate::cli::client::Config) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn list_providers(&self) -> anyhow::Result<Vec<crate::cli::client::Provider>> {
+            Ok(Vec::new())
+        }
+
+        async fn get_models(
+            &self,
+            _provider: &str,
+        ) -> anyhow::Result<Vec<crate::cli::client::Model>> {
+            Ok(Vec::new())
+        }
+
+        async fn list_provider_models(&self, _provider: &str) -> anyhow::Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+
+        async fn list_sessions(&self) -> anyhow::Result<Vec<Session>> {
+            Ok(self.listed_sessions.clone())
+        }
+
+        async fn create_session(&self, name: &str) -> anyhow::Result<Session> {
+            let session = Session {
+                id: format!("created-{name}"),
+                name: name.to_string(),
+                model: "model".to_string(),
+                provider: "provider".to_string(),
+            };
+            self.created.lock().unwrap().push(session.clone());
+            Ok(session)
+        }
+
+        async fn load_session(&self, session_id: &str) -> anyhow::Result<Session> {
+            if let Some(session) = self
+                .loadable_sessions
+                .iter()
+                .find(|session| session.id == session_id)
+                .cloned()
+            {
+                return Ok(session);
+            }
+            self.created
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|session| session.id == session_id)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("display-only session is not loadable"))
+        }
+
+        async fn delete_session(&self, _session_id: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn submit_turn(&mut self, session_id: &str, message: &str) -> anyhow::Result<String> {
+            self.submitted
+                .lock()
+                .unwrap()
+                .push((session_id.to_string(), message.to_string()));
+            Ok(String::new())
+        }
+    }
+
+    #[test]
+    fn worker_session_switch_does_not_bind_unloadable_list_row() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let display_only = Session {
+                id: "legacy-server-key".to_string(),
+                name: "Research".to_string(),
+                model: "model".to_string(),
+                provider: "provider".to_string(),
+            };
+            let created = Arc::new(StdMutex::new(Vec::new()));
+            let submitted = Arc::new(StdMutex::new(Vec::new()));
+            let fake = WorkerSessionFakeClient {
+                listed_sessions: vec![display_only],
+                loadable_sessions: Vec::new(),
+                created: Arc::clone(&created),
+                submitted: Arc::clone(&submitted),
+            };
+            let boxed: Box<dyn crate::cli::agent::AgentClient + Send + Sync> = Box::new(fake);
+            let app = Arc::new(Mutex::new(App {
+                workspaces: vec![crate::cli::workspace::Workspace {
+                    id: 0,
+                    config: crate::cli::workspace::WorkspaceConfig {
+                        id: Some("ws-openclaw".to_string()),
+                        name: "openclaw".to_string(),
+                        backend: crate::cli::workspace::Backend::Openclaw,
+                        url: "ws://gateway.example".to_string(),
+                        token_env: None,
+                        token: None,
+                        label: None,
+                        namespace_aliases: Vec::new(),
+                    },
+                    client: Some(Arc::new(Mutex::new(boxed))),
+                    cron: None,
+                }],
+                active: 0,
+                shared_mnemos: None,
+                config_path: std::path::PathBuf::from("test-config.toml"),
+            }));
+            let mut bindings = HashMap::new();
+
+            let session = resolve_or_create_session_for_worker(&app, "legacy-server-key")
+                .await
+                .unwrap();
+            let workspace_key = current_workspace_binding_key(&app).await.unwrap();
+            remember_worker_session(&mut bindings, workspace_key, &session);
+            let turn_session_id =
+                ensure_session_for_active_workspace(&app, &mut bindings, "fallback")
+                    .await
+                    .unwrap();
+            let client = {
+                let guard = app.lock().await;
+                guard.active_workspace().unwrap().client.clone().unwrap()
+            };
+            client
+                .lock()
+                .await
+                .submit_turn(&turn_session_id, "hello")
+                .await
+                .unwrap();
+
+            assert_eq!(session.id, "created-legacy-server-key");
+            assert_eq!(turn_session_id, "created-legacy-server-key");
+            let created_guard = created.lock().unwrap();
+            assert_eq!(created_guard.len(), 1);
+            assert_eq!(created_guard[0].name.as_str(), "legacy-server-key");
+            drop(created_guard);
+            assert_eq!(
+                submitted.lock().unwrap().as_slice(),
+                [("created-legacy-server-key".to_string(), "hello".to_string())]
+            );
+        });
+
+        match old_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
         }
     }
 
