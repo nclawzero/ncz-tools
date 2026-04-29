@@ -141,9 +141,6 @@ const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦
 const SPINNER_INTERVAL: Duration = Duration::from_millis(80);
 const TURN_FORWARD_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
 const SESSION_PICKER_LIST_TIMEOUT: Duration = Duration::from_secs(5);
-const CONNECT_SPLASH_CLIENT_LOCK_TIMEOUT: Duration = Duration::from_secs(1);
-const CONNECT_SPLASH_SESSION_TIMEOUT: Duration = Duration::from_secs(2);
-const CONNECT_SPLASH_TURN_TIMEOUT: Duration = Duration::from_secs(5);
 const COMMAND_WORKER_TIMEOUT: Duration = Duration::from_secs(30);
 const MUTATING_COMMAND_WORKER_TIMEOUT: Duration = Duration::from_secs(30);
 const RESPONSE_BUSY_TOAST: &str = "Busy: response in progress";
@@ -553,7 +550,7 @@ pub async fn run(
     let (req_tx, mut req_rx) = mpsc::channel::<WorkerRequest>(32);
     let (event_tx, event_rx) = StreamSink::channel(UI_EVENT_CAPACITY);
 
-    let connect_splash = Some(connect_splash_for_workspace(&app, &workspace_name, None).await);
+    let connect_splash = Some(connect_splash_for_workspace(&workspace_name));
 
     // Install the streaming sink on the boot workspace. The worker
     // also reinstalls before every submitted turn and after every
@@ -1124,12 +1121,7 @@ async fn handle_worker_command_request(
                             return;
                         }
                         if let Some(name) = switched_workspace {
-                            let splash = connect_splash_for_workspace(
-                                worker_app,
-                                &name,
-                                Some(worker_sink.clone()),
-                            )
-                            .await;
+                            let splash = connect_splash_for_workspace(&name);
                             let _ = worker_sink.send(TurnChunk::Typewriter(splash));
                         }
                     }
@@ -1229,11 +1221,7 @@ async fn resync_worker_state(
     })
 }
 
-async fn connect_splash_for_workspace(
-    app: &Arc<Mutex<App>>,
-    workspace_name: &str,
-    restore_sink: Option<StreamSink>,
-) -> String {
+fn connect_splash_for_workspace(workspace_name: &str) -> String {
     let cache_path = delighters::default_connect_splash_cache_path(workspace_name);
     if let Some(path) = &cache_path {
         if let Some(cached) = delighters::read_cached_connect_splash(
@@ -1245,180 +1233,16 @@ async fn connect_splash_for_workspace(
         }
     }
 
-    if !backend_connect_splash_enabled(app).await {
-        return delighters::local_connect_splash(workspace_name);
-    }
-
-    match backend_connect_splash_for_workspace(app, workspace_name, restore_sink).await {
-        Ok(generated) => {
-            if let Some(path) = cache_path {
-                let generated_for_cache = generated.clone();
-                let _ = std::thread::spawn(move || {
-                    if let Err(e) =
-                        delighters::write_connect_splash_cache(&path, &generated_for_cache)
-                    {
-                        warn!("connect-splash cache write failed: {e}");
-                    }
-                });
+    let fallback = delighters::local_connect_splash(workspace_name);
+    if let Some(path) = cache_path {
+        let fallback_for_cache = fallback.clone();
+        let _ = std::thread::spawn(move || {
+            if let Err(e) = delighters::write_connect_splash_cache(&path, &fallback_for_cache) {
+                warn!("connect-splash cache write failed: {e}");
             }
-            return generated;
-        }
-        Err(e) => {
-            warn!("connect-splash backend generation failed: {e}");
-        }
+        });
     }
-
-    delighters::local_connect_splash(workspace_name)
-}
-
-async fn backend_connect_splash_for_workspace(
-    app: &Arc<Mutex<App>>,
-    workspace_name: &str,
-    restore_sink: Option<StreamSink>,
-) -> Result<String> {
-    let client_arc = {
-        let guard = app.lock().await;
-        guard.active_workspace().and_then(|w| w.client.clone())
-    }
-    .ok_or_else(|| anyhow::anyhow!("no active workspace client"))?;
-
-    let mut client = tokio::time::timeout(CONNECT_SPLASH_CLIENT_LOCK_TIMEOUT, client_arc.lock())
-        .await
-        .map_err(|_| {
-            anyhow::anyhow!(
-                "timed out waiting for active client after {:?}",
-                CONNECT_SPLASH_CLIENT_LOCK_TIMEOUT
-            )
-        })?;
-
-    let (capture_sink, _capture_rx) = StreamSink::channel(TURN_STREAM_CAPACITY);
-    client.set_stream_sink(Some(capture_sink));
-
-    let result: Result<String> = async {
-        let scratch_name = backend_connect_splash_session_name(workspace_name);
-        let session = tokio::time::timeout(
-            CONNECT_SPLASH_SESSION_TIMEOUT,
-            client.create_session(&scratch_name),
-        )
-        .await
-        .map_err(|_| {
-            anyhow::anyhow!(
-                "timed out creating connect-splash session after {:?}",
-                CONNECT_SPLASH_SESSION_TIMEOUT
-            )
-        })??;
-        if session.id.trim().is_empty() {
-            return Err(anyhow::anyhow!(
-                "backend returned an empty connect-splash session id"
-            ));
-        }
-
-        let prompt = backend_connect_splash_prompt(workspace_name);
-        let response_result = tokio::time::timeout(
-            CONNECT_SPLASH_TURN_TIMEOUT,
-            client.submit_turn(&session.id, &prompt),
-        )
-        .await
-        .map_err(|_| {
-            anyhow::anyhow!(
-                "timed out generating connect splash after {:?}",
-                CONNECT_SPLASH_TURN_TIMEOUT
-            )
-        })
-        .and_then(|result| result);
-
-        let cleanup_result = tokio::time::timeout(
-            CONNECT_SPLASH_SESSION_TIMEOUT,
-            client.delete_session(&session.id),
-        )
-        .await
-        .map_err(|_| {
-            anyhow::anyhow!(
-                "timed out deleting connect-splash session after {:?}",
-                CONNECT_SPLASH_SESSION_TIMEOUT
-            )
-        })
-        .and_then(|result| result);
-        if let Err(e) = cleanup_result {
-            return Err(anyhow::anyhow!(
-                "connect-splash scratch session cleanup failed: {e}"
-            ));
-        }
-
-        let normalized = delighters::normalize_connect_splash(&response_result?);
-        if normalized.is_empty() {
-            Err(anyhow::anyhow!("backend returned an empty connect splash"))
-        } else {
-            Ok(normalized)
-        }
-    }
-    .await;
-
-    match restore_sink {
-        Some(sink) => client.set_stream_sink(Some(sink)),
-        None => client.set_stream_sink(None),
-    }
-
-    result
-}
-
-async fn backend_connect_splash_enabled(app: &Arc<Mutex<App>>) -> bool {
-    if explicit_bool_env("ZTERM_CONNECT_SPLASH_BACKEND") {
-        return true;
-    }
-
-    let config_path = {
-        let guard = app.lock().await;
-        guard.config_path.clone()
-    };
-    config_enables_backend_connect_splash(&config_path)
-}
-
-fn config_enables_backend_connect_splash(config_path: &std::path::Path) -> bool {
-    let Ok(text) = std::fs::read_to_string(config_path) else {
-        return false;
-    };
-    let Ok(value) = toml::from_str::<toml::Value>(&text) else {
-        return false;
-    };
-    value
-        .get("ui")
-        .and_then(|ui| ui.get("connect_splash_backend"))
-        .and_then(toml::Value::as_bool)
-        .or_else(|| {
-            value
-                .get("connect_splash_backend")
-                .and_then(toml::Value::as_bool)
-        })
-        .unwrap_or(false)
-}
-
-fn explicit_bool_env(name: &str) -> bool {
-    std::env::var(name)
-        .map(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false)
-}
-
-fn backend_connect_splash_session_name(workspace_name: &str) -> String {
-    format!(
-        "zterm-connect-splash-{}-{}",
-        delighters::sanitize_workspace_name(workspace_name),
-        uuid::Uuid::new_v4()
-    )
-}
-
-fn backend_connect_splash_prompt(workspace_name: &str) -> String {
-    let workspace = delighters::sanitize_workspace_name(workspace_name);
-    format!(
-        "Generate a period-accurate 1991 BBS modem connect splash for zterm workspace \
-         `{workspace}`. Return only 3 to 6 short lines of terminal text. No markdown, \
-         no prose, no code fences, no ANSI escapes, no private data, and no instructions."
-    )
+    fallback
 }
 
 async fn forward_turn_chunks(
@@ -4490,136 +4314,6 @@ impl View for ChatPane {
 mod tests {
     use super::*;
 
-    #[derive(Clone)]
-    struct SplashFakeClient {
-        state: Arc<std::sync::Mutex<SplashFakeState>>,
-    }
-
-    #[derive(Debug)]
-    struct SplashFakeState {
-        response: String,
-        delete_error: Option<String>,
-        created: Vec<String>,
-        submitted: Vec<(String, String)>,
-        deleted: Vec<String>,
-        sink_states: Vec<bool>,
-    }
-
-    impl SplashFakeClient {
-        fn new(response: &str) -> (Self, Arc<std::sync::Mutex<SplashFakeState>>) {
-            let state = Arc::new(std::sync::Mutex::new(SplashFakeState {
-                response: response.to_string(),
-                delete_error: None,
-                created: Vec::new(),
-                submitted: Vec::new(),
-                deleted: Vec::new(),
-                sink_states: Vec::new(),
-            }));
-            (
-                Self {
-                    state: Arc::clone(&state),
-                },
-                state,
-            )
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl crate::cli::agent::AgentClient for SplashFakeClient {
-        async fn health(&self) -> anyhow::Result<bool> {
-            Ok(true)
-        }
-
-        async fn get_config(&self) -> anyhow::Result<crate::cli::agent::Config> {
-            Ok(crate::cli::agent::Config {
-                agent: Default::default(),
-            })
-        }
-
-        async fn put_config(&self, _config: &crate::cli::agent::Config) -> anyhow::Result<()> {
-            Ok(())
-        }
-
-        async fn list_providers(&self) -> anyhow::Result<Vec<crate::cli::agent::Provider>> {
-            Ok(Vec::new())
-        }
-
-        async fn get_models(
-            &self,
-            _provider: &str,
-        ) -> anyhow::Result<Vec<crate::cli::agent::Model>> {
-            Ok(Vec::new())
-        }
-
-        async fn list_provider_models(&self, _provider: &str) -> anyhow::Result<Vec<String>> {
-            Ok(Vec::new())
-        }
-
-        async fn list_sessions(&self) -> anyhow::Result<Vec<Session>> {
-            Ok(Vec::new())
-        }
-
-        async fn create_session(&self, name: &str) -> anyhow::Result<Session> {
-            let mut state = self.state.lock().unwrap();
-            state.created.push(name.to_string());
-            Ok(Session {
-                id: "scratch-1".to_string(),
-                name: name.to_string(),
-                model: "m".to_string(),
-                provider: "p".to_string(),
-            })
-        }
-
-        async fn load_session(&self, _session_id: &str) -> anyhow::Result<Session> {
-            anyhow::bail!("not needed")
-        }
-
-        async fn delete_session(&self, session_id: &str) -> anyhow::Result<()> {
-            let mut state = self.state.lock().unwrap();
-            state.deleted.push(session_id.to_string());
-            if let Some(message) = state.delete_error.clone() {
-                anyhow::bail!(message);
-            }
-            Ok(())
-        }
-
-        async fn submit_turn(&mut self, session_id: &str, message: &str) -> anyhow::Result<String> {
-            let mut state = self.state.lock().unwrap();
-            state
-                .submitted
-                .push((session_id.to_string(), message.to_string()));
-            Ok(state.response.clone())
-        }
-
-        fn set_stream_sink(&mut self, sink: Option<StreamSink>) {
-            self.state.lock().unwrap().sink_states.push(sink.is_some());
-        }
-    }
-
-    fn app_with_splash_fake_client(fake: SplashFakeClient) -> Arc<Mutex<App>> {
-        let boxed: Box<dyn crate::cli::agent::AgentClient + Send + Sync> = Box::new(fake);
-        Arc::new(Mutex::new(App {
-            workspaces: vec![crate::cli::workspace::Workspace {
-                id: 0,
-                config: crate::cli::workspace::WorkspaceConfig {
-                    id: None,
-                    name: "test".to_string(),
-                    backend: crate::cli::workspace::Backend::Zeroclaw,
-                    url: "http://127.0.0.1:8888".to_string(),
-                    token_env: None,
-                    token: None,
-                    label: None,
-                    namespace_aliases: Vec::new(),
-                },
-                client: Some(Arc::new(Mutex::new(boxed))),
-                cron: None,
-            }],
-            active: 0,
-            shared_mnemos: None,
-            config_path: std::path::PathBuf::from("test-config.toml"),
-        }))
-    }
-
     #[test]
     fn token_budget_bar_clamps_and_sizes() {
         assert_eq!(token_budget_bar(0, 10), "[----------]");
@@ -4838,65 +4532,6 @@ mod tests {
         let text: String = writer.chars.iter().collect();
         assert_eq!(text, "boot<ESC>[31m\nready");
         assert_eq!(writer.after_lines, ["after^G"]);
-    }
-
-    #[tokio::test]
-    async fn backend_connect_splash_uses_scratch_session_and_restores_sink() {
-        let (fake, state) = SplashFakeClient::new(
-            "ATZ\nOK\nCONNECT 14400/ZTERM\nBBS DOORWAY OPEN\nWORKSPACE READY\nEXTRA",
-        );
-        let app = app_with_splash_fake_client(fake);
-        let (restore_sink, _rx) = StreamSink::channel(1);
-
-        let splash = backend_connect_splash_for_workspace(&app, "prod typhon", Some(restore_sink))
-            .await
-            .unwrap();
-
-        assert_eq!(
-            splash,
-            "ATZ\nOK\nCONNECT 14400/ZTERM\nBBS DOORWAY OPEN\nWORKSPACE READY\nEXTRA"
-        );
-        let state = state.lock().unwrap();
-        assert_eq!(state.created.len(), 1);
-        assert!(state.created[0].starts_with("zterm-connect-splash-prod_typhon-"));
-        assert_eq!(state.submitted.len(), 1);
-        assert_eq!(state.submitted[0].0, "scratch-1");
-        assert!(state.submitted[0].1.contains("prod_typhon"));
-        assert_eq!(state.deleted, vec!["scratch-1".to_string()]);
-        assert_eq!(state.sink_states, [true, true]);
-    }
-
-    #[tokio::test]
-    async fn backend_connect_splash_fails_when_cleanup_fails() {
-        let (fake, state) = SplashFakeClient::new("ATZ\nOK\nCONNECT 14400/ZTERM");
-        state.lock().unwrap().delete_error = Some("delete refused".to_string());
-        let app = app_with_splash_fake_client(fake);
-
-        let err = backend_connect_splash_for_workspace(&app, "prod typhon", None)
-            .await
-            .unwrap_err()
-            .to_string();
-
-        assert!(err.contains("cleanup failed"));
-        let state = state.lock().unwrap();
-        assert_eq!(state.submitted.len(), 1);
-        assert_eq!(state.deleted, vec!["scratch-1".to_string()]);
-        assert_eq!(state.sink_states, [true, false]);
-    }
-
-    #[test]
-    fn config_enables_backend_connect_splash_from_ui_or_top_level() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("config.toml");
-
-        std::fs::write(&path, "[ui]\nconnect_splash_backend = true\n").unwrap();
-        assert!(config_enables_backend_connect_splash(&path));
-
-        std::fs::write(&path, "connect_splash_backend = true\n").unwrap();
-        assert!(config_enables_backend_connect_splash(&path));
-
-        std::fs::write(&path, "[ui]\nconnect_splash_backend = false\n").unwrap();
-        assert!(!config_enables_backend_connect_splash(&path));
     }
 
     #[test]
