@@ -1,8 +1,9 @@
 use anyhow::{anyhow, Result};
 use chrono::Utc;
+use std::ffi::OsString;
 use std::fs;
 use std::future::Future;
-use std::io;
+use std::io::{self, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -1300,16 +1301,18 @@ impl CommandHandler {
                 }
                 if history_path.exists() {
                     let mut src = fs::File::open(&history_path)?;
-                    let mut dst = match create_private_export_file(Path::new(&filename)) {
-                        Ok(file) => file,
+                    match write_private_export_atomically(Path::new(&filename), |dst| {
+                        io::copy(&mut src, dst)?;
+                        Ok(())
+                    }) {
+                        Ok(()) => {}
                         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
                             return Ok(Some(format!(
                                 "❌ Refusing to overwrite existing file: {filename}\n"
                             )));
                         }
                         Err(e) => return Err(e.into()),
-                    };
-                    io::copy(&mut src, &mut dst)?;
+                    }
                     return Ok(Some(format!("✓ Session saved to {filename}\n")));
                 } else {
                     return Ok(Some("No history to save\n".to_string()));
@@ -1470,6 +1473,58 @@ fn create_private_export_file(path: &Path) -> io::Result<fs::File> {
     let file = opts.open(path)?;
     harden_private_export_file(path)?;
     Ok(file)
+}
+
+fn write_private_export_atomically<F>(path: &Path, write_content: F) -> io::Result<()>
+where
+    F: FnOnce(&mut fs::File) -> io::Result<()>,
+{
+    if path.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "export path already exists",
+        ));
+    }
+
+    let (temp_path, mut temp_file) = create_private_export_temp_file(path)?;
+    let result = (|| {
+        write_content(&mut temp_file)?;
+        temp_file.flush()?;
+        temp_file.sync_all()?;
+        drop(temp_file);
+        fs::hard_link(&temp_path, path)?;
+        Ok(())
+    })();
+
+    let _ = fs::remove_file(&temp_path);
+    result
+}
+
+fn create_private_export_temp_file(path: &Path) -> io::Result<(PathBuf, fs::File)> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let final_name = path.file_name().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "export path must name a file")
+    })?;
+
+    for _ in 0..16 {
+        let mut temp_name = OsString::from(".");
+        temp_name.push(final_name);
+        temp_name.push(format!(".{}.tmp", uuid::Uuid::new_v4()));
+        let temp_path = parent.join(temp_name);
+        match create_private_export_file(&temp_path) {
+            Ok(file) => return Ok((temp_path, file)),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
+        }
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not allocate a unique export temp file",
+    ))
 }
 
 #[cfg(unix)]
@@ -3593,6 +3648,32 @@ provider_settings = { tokens = ["array-token-1", "array-token-2"], name = "kept"
         assert!(!blocked_path.exists());
 
         storage::delete_scoped_session(&scope, "main").unwrap();
+    }
+
+    #[test]
+    fn private_export_atomic_write_removes_temp_and_final_on_write_failure() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let save_path = tempdir.path().join("partial-export.txt");
+
+        let err = super::write_private_export_atomically(&save_path, |dst| {
+            use std::io::Write;
+
+            dst.write_all(b"partial transcript")?;
+            Err(std::io::Error::other("injected write failure"))
+        })
+        .unwrap_err();
+
+        assert_eq!(err.kind(), std::io::ErrorKind::Other);
+        assert!(!save_path.exists());
+        let leftovers = std::fs::read_dir(tempdir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .collect::<Vec<_>>();
+        assert!(
+            leftovers.is_empty(),
+            "atomic export left temporary files behind: {leftovers:?}"
+        );
     }
 
     #[tokio::test]

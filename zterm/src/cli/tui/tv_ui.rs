@@ -1396,7 +1396,11 @@ fn partial_stream_without_terminal_frame<T>(
 }
 
 fn successful_model_switch_command(cmdline: &str, output: &str) -> bool {
-    model_switch_target(cmdline).is_some() && command_output_indicates_success(output)
+    let Some(target) = model_switch_target(cmdline) else {
+        return false;
+    };
+    let expected = format!("✅ Active model key: {target}");
+    output.lines().any(|line| line.trim() == expected)
 }
 
 fn should_clear_usage_after_command(
@@ -1419,17 +1423,13 @@ fn model_switch_target(cmdline: &str) -> Option<&str> {
     parts.next()
 }
 
-fn command_output_indicates_success(output: &str) -> bool {
-    let trimmed = output.trim_start();
-    !trimmed.is_empty() && !trimmed.starts_with("Usage:") && !trimmed.starts_with("❌")
-}
-
 fn command_output_indicates_error(output: &str) -> bool {
     let trimmed = output.trim_start();
     trimmed.starts_with("Usage:")
-        || output
-            .lines()
-            .any(|line| line.trim_start().starts_with("❌"))
+        || output.lines().any(|line| {
+            let line = line.trim_start();
+            line.starts_with("❌") || line.contains(" is only supported")
+        })
 }
 
 fn command_terminal_error_for_output(
@@ -5572,6 +5572,10 @@ mod tests {
             "✅ Active model key: primary\n"
         ));
         assert!(!successful_model_switch_command(
+            "/models set primary",
+            "✅ Active model key: other\n"
+        ));
+        assert!(!successful_model_switch_command(
             "/models set missing",
             "❌ Failed to set model key: missing\n"
         ));
@@ -5579,11 +5583,18 @@ mod tests {
             "/models set",
             "Usage: /models set <key>\n"
         ));
+        assert!(!successful_model_switch_command(
+            "/models set primary",
+            "/models set is only supported for zeroclaw workspaces; the active backend does not expose zterm-side model switching\n"
+        ));
         assert!(command_output_indicates_error(
             "❌ Failed to set model key: missing\n"
         ));
         assert!(command_output_indicates_error(
             "Usage: /models set <key>\n   Run /models list to see available keys\n"
+        ));
+        assert!(command_output_indicates_error(
+            "/models set is only supported for zeroclaw workspaces; the active backend does not expose zterm-side model switching\n"
         ));
         assert!(!command_output_indicates_error(
             "✅ Active model key: primary\n"
