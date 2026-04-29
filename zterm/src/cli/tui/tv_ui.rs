@@ -1490,39 +1490,52 @@ async fn generate_connect_splash_with_named_session(
     workspace_name: &str,
     session_name: &str,
 ) -> Result<String> {
-    let before = tokio::time::timeout(CONNECT_SPLASH_GENERATION_TIMEOUT, client.list_sessions())
+    generate_connect_splash_with_named_session_timeout(
+        client,
+        workspace_name,
+        session_name,
+        CONNECT_SPLASH_GENERATION_TIMEOUT,
+    )
+    .await
+}
+
+async fn generate_connect_splash_with_named_session_timeout(
+    client: &mut (dyn AgentClient + Send + Sync),
+    workspace_name: &str,
+    session_name: &str,
+    timeout: Duration,
+) -> Result<String> {
+    let before = tokio::time::timeout(timeout, client.list_sessions())
         .await
         .map_err(|_| anyhow::anyhow!("connect-splash session inventory timed out"))??;
     if before.iter().any(|session| session.name == session_name) {
         anyhow::bail!("connect-splash scratch session already exists");
     }
 
-    let session = tokio::time::timeout(
-        CONNECT_SPLASH_GENERATION_TIMEOUT,
-        client.create_session(session_name),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("connect-splash session create timed out"))??;
+    let session = tokio::time::timeout(timeout, client.create_session(session_name))
+        .await
+        .map_err(|_| anyhow::anyhow!("connect-splash session create timed out"))??;
     let owned_session = !before.iter().any(|existing| existing.id == session.id);
     if !owned_session {
         anyhow::bail!("connect-splash session id existed before activation");
     }
 
     let prompt = connect_splash_prompt(workspace_name);
-    let generated = tokio::time::timeout(
-        CONNECT_SPLASH_GENERATION_TIMEOUT,
-        client.submit_turn(&session.id, &prompt),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("connect-splash generation timed out"));
+    let generated = match tokio::time::timeout(timeout, client.submit_turn(&session.id, &prompt))
+        .await
+    {
+        Ok(result) => result,
+        Err(_) => {
+            return Err(ConnectSplashCleanupFailure::new(format!(
+                "connect-splash scratch session `{}` turn timed out after submit; backend outcome unknown",
+                session.id
+            ))
+            .into());
+        }
+    };
 
     if owned_session {
-        match tokio::time::timeout(
-            CONNECT_SPLASH_GENERATION_TIMEOUT,
-            client.delete_session(&session.id),
-        )
-        .await
-        {
+        match tokio::time::timeout(timeout, client.delete_session(&session.id)).await {
             Ok(Ok(())) => {}
             Ok(Err(e))
                 if connect_splash_generation_failed(&generated) && session_not_found_error(&e) =>
@@ -1549,7 +1562,7 @@ async fn generate_connect_splash_with_named_session(
         }
     }
 
-    let generated = generated??;
+    let generated = generated?;
     let normalized = delighters::normalize_connect_splash(&generated);
     if normalized.is_empty() {
         anyhow::bail!("connect-splash generation returned empty output");
@@ -1557,13 +1570,8 @@ async fn generate_connect_splash_with_named_session(
     Ok(normalized)
 }
 
-fn connect_splash_generation_failed(
-    generated: &Result<anyhow::Result<String>, anyhow::Error>,
-) -> bool {
-    match generated {
-        Ok(Ok(_)) => false,
-        Ok(Err(_)) | Err(_) => true,
-    }
+fn connect_splash_generation_failed(generated: &anyhow::Result<String>) -> bool {
+    generated.is_err()
 }
 
 fn session_not_found_error(error: &anyhow::Error) -> bool {
@@ -5385,6 +5393,7 @@ mod tests {
                 load_calls: Arc::new(StdMutex::new(Vec::new())),
                 submit_response: generated.to_string(),
                 submit_error: None,
+                submit_never: false,
                 cancellation_safe: true,
                 sink_set_states: Arc::clone(&sink_set_states),
                 delete_error: None,
@@ -5472,6 +5481,7 @@ mod tests {
                 load_calls: Arc::new(StdMutex::new(Vec::new())),
                 submit_response: "SHOULD NOT BE USED".to_string(),
                 submit_error: None,
+                submit_never: false,
                 cancellation_safe: true,
                 sink_set_states: Arc::clone(&sink_set_states),
                 delete_error: None,
@@ -5544,6 +5554,7 @@ mod tests {
                 load_calls: Arc::new(StdMutex::new(Vec::new())),
                 submit_response: "SHOULD NOT BE USED".to_string(),
                 submit_error: None,
+                submit_never: false,
                 cancellation_safe: false,
                 sink_set_states: Arc::clone(&sink_set_states),
                 delete_error: None,
@@ -5613,6 +5624,7 @@ mod tests {
                 load_calls: Arc::new(StdMutex::new(Vec::new())),
                 submit_response: "GENERATED\nSPLASH".to_string(),
                 submit_error: None,
+                submit_never: false,
                 cancellation_safe: true,
                 sink_set_states: Arc::new(StdMutex::new(Vec::new())),
                 delete_error: Some("delete failed".to_string()),
@@ -5683,6 +5695,7 @@ mod tests {
                 load_calls: Arc::new(StdMutex::new(Vec::new())),
                 submit_response: "SHOULD NOT BE USED".to_string(),
                 submit_error: Some("websocket auth failed before dispatch".to_string()),
+                submit_never: false,
                 cancellation_safe: true,
                 sink_set_states: Arc::new(StdMutex::new(Vec::new())),
                 delete_error: Some("Session not found".to_string()),
@@ -5728,6 +5741,51 @@ mod tests {
     }
 
     #[test]
+    fn connect_splash_submit_timeout_does_not_delete_unknown_backend_turn() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let created = Arc::new(StdMutex::new(Vec::new()));
+            let deleted = Arc::new(StdMutex::new(Vec::new()));
+            let submitted = Arc::new(StdMutex::new(Vec::new()));
+            let mut fake = WorkerSessionFakeClient {
+                listed_sessions: Vec::new(),
+                list_sessions_error: None,
+                loadable_sessions: Vec::new(),
+                load_reject_ids: Vec::new(),
+                created: Arc::clone(&created),
+                deleted: Arc::clone(&deleted),
+                submitted: Arc::clone(&submitted),
+                list_calls: Arc::new(StdMutex::new(0)),
+                load_calls: Arc::new(StdMutex::new(Vec::new())),
+                submit_response: "SHOULD NOT BE USED".to_string(),
+                submit_error: None,
+                submit_never: true,
+                cancellation_safe: true,
+                sink_set_states: Arc::new(StdMutex::new(Vec::new())),
+                delete_error: None,
+            };
+
+            let err = generate_connect_splash_with_named_session_timeout(
+                &mut fake,
+                "alpha",
+                "zterm connect splash alpha timeout",
+                Duration::from_millis(1),
+            )
+            .await
+            .unwrap_err();
+
+            assert!(is_connect_splash_cleanup_failure(&err));
+            assert!(err.to_string().contains("backend outcome unknown"));
+            assert_eq!(created.lock().unwrap().len(), 1);
+            assert_eq!(submitted.lock().unwrap().len(), 1);
+            assert!(
+                deleted.lock().unwrap().is_empty(),
+                "timed-out submitted splash turns must not be treated as safe to delete"
+            );
+        });
+    }
+
+    #[test]
     fn connect_splash_does_not_delete_preexisting_scratch_name() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
@@ -5753,6 +5811,7 @@ mod tests {
                 load_calls: Arc::new(StdMutex::new(Vec::new())),
                 submit_response: "SHOULD NOT BE USED".to_string(),
                 submit_error: None,
+                submit_never: false,
                 cancellation_safe: true,
                 sink_set_states: Arc::new(StdMutex::new(Vec::new())),
                 delete_error: None,
@@ -8137,6 +8196,7 @@ mod tests {
         load_calls: Arc<StdMutex<Vec<String>>>,
         submit_response: String,
         submit_error: Option<String>,
+        submit_never: bool,
         cancellation_safe: bool,
         sink_set_states: Arc<StdMutex<Vec<bool>>>,
         delete_error: Option<String>,
@@ -8230,6 +8290,9 @@ mod tests {
             if let Some(error) = &self.submit_error {
                 anyhow::bail!("{error}");
             }
+            if self.submit_never {
+                std::future::pending::<()>().await;
+            }
             Ok(self.submit_response.clone())
         }
 
@@ -8263,6 +8326,7 @@ mod tests {
                 load_calls: Arc::new(StdMutex::new(Vec::new())),
                 submit_response: String::new(),
                 submit_error: None,
+                submit_never: false,
                 cancellation_safe: true,
                 sink_set_states: Arc::new(StdMutex::new(Vec::new())),
                 delete_error: None,
@@ -8282,6 +8346,7 @@ mod tests {
                 load_calls: Arc::new(StdMutex::new(Vec::new())),
                 submit_response: "GENERATED\nSPLASH".to_string(),
                 submit_error: None,
+                submit_never: false,
                 cancellation_safe: true,
                 sink_set_states: Arc::new(StdMutex::new(Vec::new())),
                 delete_error: Some("delete failed".to_string()),
@@ -8410,6 +8475,7 @@ mod tests {
                 load_calls: Arc::clone(&load_calls),
                 submit_response: String::new(),
                 submit_error: None,
+                submit_never: false,
                 cancellation_safe: true,
                 sink_set_states: Arc::new(StdMutex::new(Vec::new())),
                 delete_error: None,
@@ -8485,6 +8551,7 @@ mod tests {
                 load_calls: Arc::clone(&load_calls),
                 submit_response: String::new(),
                 submit_error: None,
+                submit_never: false,
                 cancellation_safe: true,
                 sink_set_states: Arc::new(StdMutex::new(Vec::new())),
                 delete_error: None,
@@ -8573,6 +8640,7 @@ mod tests {
                 load_calls: Arc::clone(&load_calls),
                 submit_response: String::new(),
                 submit_error: None,
+                submit_never: false,
                 cancellation_safe: true,
                 sink_set_states: Arc::new(StdMutex::new(Vec::new())),
                 delete_error: None,
@@ -8650,6 +8718,7 @@ mod tests {
                 load_calls: Arc::clone(&load_calls),
                 submit_response: String::new(),
                 submit_error: None,
+                submit_never: false,
                 cancellation_safe: true,
                 sink_set_states: Arc::new(StdMutex::new(Vec::new())),
                 delete_error: None,
@@ -8740,6 +8809,7 @@ mod tests {
             load_calls: Arc::new(StdMutex::new(Vec::new())),
             submit_response: String::new(),
             submit_error: None,
+            submit_never: false,
             cancellation_safe: true,
             sink_set_states: Arc::new(StdMutex::new(Vec::new())),
             delete_error: None,
