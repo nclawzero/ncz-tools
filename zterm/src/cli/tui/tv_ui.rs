@@ -1157,7 +1157,16 @@ async fn handle_worker_command_request(
                     &text,
                     command_output.mutation_outcome_unknown,
                 );
-                let _ = worker_sink.send(TurnChunk::Token(cap_worker_command_output(text)));
+                if !send_worker_command_output_reliably(worker_sink, text).await {
+                    let detail = "could not deliver slash command output to UI";
+                    let message = if slash_command_may_mutate_state(&cmdline) {
+                        mutating_command_unknown_outcome_message(&cmdline, detail)
+                    } else {
+                        detail.to_string()
+                    };
+                    send_worker_finished(worker_sink, Err(message)).await;
+                    return;
+                }
                 let mut workspace_switched = false;
                 if preflight == CommandSessionPreflight::AfterWorkspaceSwitch {
                     let switched_workspace = {
@@ -1215,9 +1224,21 @@ async fn handle_worker_command_request(
                 }
             }
             None => {
-                let _ = worker_sink.send(TurnChunk::Token(format!(
-                    "Command `{cmdline}` completed without structured TUI output."
-                )));
+                if !send_worker_command_output_reliably(
+                    worker_sink,
+                    format!("Command `{cmdline}` completed without structured TUI output."),
+                )
+                .await
+                {
+                    let detail = "could not deliver slash command output to UI";
+                    let message = if slash_command_may_mutate_state(&cmdline) {
+                        mutating_command_unknown_outcome_message(&cmdline, detail)
+                    } else {
+                        detail.to_string()
+                    };
+                    send_worker_finished(worker_sink, Err(message)).await;
+                    return;
+                }
                 if should_clear_usage_after_command(false, session_switched, false) {
                     let _ = worker_sink.send(TurnChunk::ClearUsage);
                 }
@@ -1424,6 +1445,10 @@ async fn send_worker_chunks_reliably(ui_sink: &StreamSink, chunks: Vec<TurnChunk
         }
     }
     true
+}
+
+async fn send_worker_command_output_reliably(ui_sink: &StreamSink, text: String) -> bool {
+    send_worker_chunk_reliably(ui_sink, TurnChunk::Token(cap_worker_command_output(text))).await
 }
 
 async fn send_worker_chunk_reliably(ui_sink: &StreamSink, chunk: TurnChunk) -> bool {
@@ -6392,6 +6417,29 @@ mod tests {
             &mut session_picker_state
         ));
         assert!(!response_in_flight);
+    }
+
+    #[tokio::test]
+    async fn reliable_command_output_delivery_waits_for_saturated_ui_queue() {
+        let (sink, mut rx) = StreamSink::channel(1);
+        sink.send(TurnChunk::Token("queued".to_string())).unwrap();
+
+        let send_sink = sink.clone();
+        let send_task = tokio::spawn(async move {
+            send_worker_command_output_reliably(&send_sink, "/cron add ok".to_string()).await
+        });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(!send_task.is_finished());
+
+        match rx.recv().await {
+            Some(TurnChunk::Token(text)) => assert_eq!(text, "queued"),
+            other => panic!("expected saturated queue token, got {other:?}"),
+        }
+        assert!(send_task.await.unwrap());
+        match rx.recv().await {
+            Some(TurnChunk::Token(text)) => assert_eq!(text, "/cron add ok"),
+            other => panic!("expected reliably delivered command output, got {other:?}"),
+        }
     }
 
     #[tokio::test]
