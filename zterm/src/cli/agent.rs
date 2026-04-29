@@ -207,10 +207,9 @@ pub enum TurnChunk {
 /// Bounded sender half the TUI hands to the client before each turn.
 ///
 /// `send` is intentionally synchronous because some legacy emission
-/// helpers are not async. It uses `try_send` under the hood: if the UI
-/// cannot keep up, the shared sender is dropped so the receiver observes a
-/// disconnect and closes the active turn instead of growing memory without
-/// bound.
+/// helpers are not async. It uses `try_send` under the hood, while async
+/// forwarders can call `send_async` to apply backpressure. A full queue is
+/// reported to the caller but does not poison the long-lived TUI channel.
 #[derive(Debug, Clone)]
 pub struct StreamSink {
     inner: Arc<StdMutex<Option<mpsc::Sender<TurnChunk>>>>,
@@ -238,13 +237,32 @@ impl StreamSink {
             Some(tx) => tx.try_send(chunk),
             None => Err(mpsc::error::TrySendError::Closed(chunk)),
         };
-        if matches!(
-            result,
-            Err(mpsc::error::TrySendError::Full(_)) | Err(mpsc::error::TrySendError::Closed(_))
-        ) {
+        if matches!(result, Err(mpsc::error::TrySendError::Closed(_))) {
             *guard = None;
         }
         result
+    }
+
+    pub async fn send_async(
+        &self,
+        chunk: TurnChunk,
+    ) -> std::result::Result<(), mpsc::error::SendError<TurnChunk>> {
+        let tx = match self.inner.lock() {
+            Ok(guard) => guard.as_ref().cloned(),
+            Err(_) => None,
+        };
+        let Some(tx) = tx else {
+            return Err(mpsc::error::SendError(chunk));
+        };
+        match tx.send(chunk).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                if let Ok(mut guard) = self.inner.lock() {
+                    *guard = None;
+                }
+                Err(e)
+            }
+        }
     }
 
     pub fn is_closed(&self) -> bool {

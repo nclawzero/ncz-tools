@@ -2,6 +2,8 @@ use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 
 /// Configuration directory: ~/.zeroclaw
@@ -190,36 +192,54 @@ pub fn scoped_session_history_file(
 /// Ensure config directory exists
 pub fn ensure_config_dir() -> Result<()> {
     let dir = config_dir()?;
-    if !dir.exists() {
-        fs::create_dir_all(&dir)?;
-    }
-    Ok(())
+    create_private_dir_all(&dir)
 }
 
 /// Ensure sessions directory exists
 pub fn ensure_sessions_dir() -> Result<()> {
     let dir = sessions_dir()?;
-    if !dir.exists() {
-        fs::create_dir_all(&dir)?;
-    }
-    Ok(())
+    create_private_dir_all(&dir)
 }
 
 /// Ensure session directory exists
 pub fn ensure_session_dir(session_id: &str) -> Result<()> {
     let dir = session_dir(session_id)?;
-    if !dir.exists() {
-        fs::create_dir_all(&dir)?;
-    }
-    Ok(())
+    create_private_dir_all(&dir)
 }
 
 /// Ensure workspace-scoped session directory exists.
 pub fn ensure_scoped_session_dir(scope: &LocalWorkspaceScope, session_id: &str) -> Result<()> {
     let dir = scoped_session_dir(scope, session_id)?;
-    if !dir.exists() {
-        fs::create_dir_all(&dir)?;
+    create_private_dir_all(&dir)
+}
+
+fn create_private_dir_all(dir: &Path) -> Result<()> {
+    fs::create_dir_all(dir).map_err(|e| anyhow!("Failed to create directory: {}", e))?;
+    harden_private_dirs(dir)
+}
+
+#[cfg(unix)]
+fn harden_private_dirs(dir: &Path) -> Result<()> {
+    let root = config_dir()?;
+    let mut dirs: Vec<PathBuf> = dir
+        .ancestors()
+        .filter(|path| path.starts_with(&root))
+        .map(Path::to_path_buf)
+        .collect();
+    dirs.reverse();
+
+    for path in dirs {
+        if path.is_dir() {
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+                .map_err(|e| anyhow!("Failed to set private directory permissions: {}", e))?;
+        }
     }
+
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn harden_private_dirs(_dir: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -319,16 +339,41 @@ pub fn append_scoped_session_history(
 
     ensure_scoped_session_dir(scope, session_id)?;
     let file = scoped_session_history_file(scope, session_id)?;
-    let mut out = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&file)
-        .map_err(|e| anyhow!("Failed to open session history: {}", e))?;
+    let mut out = open_private_append_file(&file)?;
     let entry = serde_json::json!({
         "role": role,
         "content": content,
     });
     writeln!(out, "{entry}").map_err(|e| anyhow!("Failed to append session history: {}", e))?;
+    Ok(())
+}
+
+fn open_private_append_file(file: &Path) -> Result<fs::File> {
+    let mut opts = fs::OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
+    {
+        opts.mode(0o600);
+    }
+
+    let out = opts
+        .open(file)
+        .map_err(|e| anyhow!("Failed to open session history: {}", e))?;
+    harden_private_file(file)?;
+    Ok(out)
+}
+
+#[cfg(unix)]
+fn harden_private_file(file: &Path) -> Result<()> {
+    if file.exists() {
+        fs::set_permissions(file, fs::Permissions::from_mode(0o600))
+            .map_err(|e| anyhow!("Failed to set private file permissions: {}", e))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn harden_private_file(_file: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -636,6 +681,40 @@ mod tests {
             .unwrap()
             .exists());
         assert!(!clear_scoped_session_history(&scope, "main").unwrap());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn scoped_history_uses_private_unix_modes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let scope = scope(&format!("private-{}", uuid::Uuid::new_v4()));
+
+        append_scoped_session_history(&scope, "main", "user", "secret").unwrap();
+
+        let history = scoped_session_history_file(&scope, "main").unwrap();
+        assert_eq!(
+            fs::metadata(&history).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        for dir in [
+            config_dir().unwrap(),
+            sessions_dir().unwrap(),
+            workspace_sessions_dir().unwrap(),
+            workspace_sessions_dir()
+                .unwrap()
+                .join(scope.path_component()),
+            scoped_session_dir(&scope, "main").unwrap(),
+        ] {
+            assert_eq!(
+                fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+                0o700,
+                "{}",
+                dir.display()
+            );
+        }
     }
 
     #[test]

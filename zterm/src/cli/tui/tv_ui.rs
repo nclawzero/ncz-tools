@@ -939,32 +939,24 @@ async fn forward_turn_chunks(
     let mut pending_token = String::new();
     let mut forwarded_bytes = 0usize;
 
-    let flush_token = |pending_token: &mut String| -> bool {
-        if pending_token.is_empty() {
-            return true;
-        }
-        let chunk = TurnChunk::Token(std::mem::take(pending_token));
-        if ui_sink.send(chunk).is_ok() {
-            forwarded_token.store(true, Ordering::Release);
-            true
-        } else {
-            false
-        }
-    };
-
     while let Some(chunk) = turn_rx.recv().await {
         match chunk {
             TurnChunk::Token(text) => {
                 forwarded_bytes = forwarded_bytes.saturating_add(text.len());
                 if forwarded_bytes > TURN_STREAM_MAX_BYTES {
-                    if !flush_token(&mut pending_token) {
+                    if !flush_forwarded_token(&ui_sink, &forwarded_token, &mut pending_token).await
+                    {
                         return saw_finished;
                     }
                     let message = format!(
                         "response exceeded {} byte TUI stream limit; turn closed",
                         TURN_STREAM_MAX_BYTES
                     );
-                    if ui_sink.send(TurnChunk::Finished(Err(message))).is_ok() {
+                    if ui_sink
+                        .send_async(TurnChunk::Finished(Err(message)))
+                        .await
+                        .is_ok()
+                    {
                         saw_finished = true;
                         observed_finished.store(true, Ordering::Release);
                     }
@@ -972,7 +964,7 @@ async fn forward_turn_chunks(
                 }
                 pending_token.push_str(&text);
                 if pending_token.len() >= TURN_TOKEN_COALESCE_BYTES
-                    && !flush_token(&mut pending_token)
+                    && !flush_forwarded_token(&ui_sink, &forwarded_token, &mut pending_token).await
                 {
                     return saw_finished;
                 }
@@ -981,10 +973,14 @@ async fn forward_turn_chunks(
                 if saw_finished {
                     continue;
                 }
-                if !flush_token(&mut pending_token) {
+                if !flush_forwarded_token(&ui_sink, &forwarded_token, &mut pending_token).await {
                     return saw_finished;
                 }
-                if ui_sink.send(TurnChunk::Finished(result)).is_ok() {
+                if ui_sink
+                    .send_async(TurnChunk::Finished(result))
+                    .await
+                    .is_ok()
+                {
                     saw_finished = true;
                     observed_finished.store(true, Ordering::Release);
                 } else {
@@ -992,17 +988,34 @@ async fn forward_turn_chunks(
                 }
             }
             other => {
-                if !flush_token(&mut pending_token) {
+                if !flush_forwarded_token(&ui_sink, &forwarded_token, &mut pending_token).await {
                     return saw_finished;
                 }
-                if ui_sink.send(other).is_err() {
+                if ui_sink.send_async(other).await.is_err() {
                     return saw_finished;
                 }
             }
         }
     }
-    let _ = flush_token(&mut pending_token);
+    let _ = flush_forwarded_token(&ui_sink, &forwarded_token, &mut pending_token).await;
     saw_finished
+}
+
+async fn flush_forwarded_token(
+    ui_sink: &StreamSink,
+    forwarded_token: &Arc<AtomicBool>,
+    pending_token: &mut String,
+) -> bool {
+    if pending_token.is_empty() {
+        return true;
+    }
+    let chunk = TurnChunk::Token(std::mem::take(pending_token));
+    if ui_sink.send_async(chunk).await.is_ok() {
+        forwarded_token.store(true, Ordering::Release);
+        true
+    } else {
+        false
+    }
 }
 
 fn submit_turn_fallback_chunks(
@@ -4116,17 +4129,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_sink_closes_on_bounded_overflow() {
+    async fn stream_sink_full_queue_does_not_poison_shared_sender() {
         let (sink, mut rx) = StreamSink::channel(1);
 
         assert!(sink.send(TurnChunk::Token("queued".to_string())).is_ok());
         assert!(sink.send(TurnChunk::Token("overflow".to_string())).is_err());
-        assert!(sink.is_closed());
+        assert!(!sink.is_closed());
 
         match rx.recv().await {
             Some(TurnChunk::Token(text)) => assert_eq!(text, "queued"),
             other => panic!("expected queued token, got {other:?}"),
         }
+
+        assert!(sink
+            .send(TurnChunk::Token("after-drain".to_string()))
+            .is_ok());
+        match rx.recv().await {
+            Some(TurnChunk::Token(text)) => assert_eq!(text, "after-drain"),
+            other => panic!("expected token after drain, got {other:?}"),
+        }
+
+        drop(sink);
         assert!(rx.recv().await.is_none());
     }
 
