@@ -57,7 +57,7 @@ impl TurnUsage {
     pub fn used_tokens(&self) -> Option<u64> {
         self.total_tokens
             .or_else(|| match (self.input_tokens, self.output_tokens) {
-                (Some(input), Some(output)) => Some(input + output),
+                (Some(input), Some(output)) => Some(input.saturating_add(output)),
                 (Some(input), None) => Some(input),
                 (None, Some(output)) => Some(output),
                 (None, None) => None,
@@ -286,5 +286,17 @@ mod tests {
 
         assert_eq!(usage.used_tokens(), Some(1250));
         assert_eq!(usage.budget_pct(), Some(15));
+    }
+
+    #[test]
+    fn test_used_tokens_saturates_on_overflow() {
+        let usage = TurnUsage {
+            input_tokens: Some(u64::MAX),
+            output_tokens: Some(u64::MAX),
+            total_tokens: None,
+            context_window: None,
+        };
+
+        assert_eq!(usage.used_tokens(), Some(u64::MAX));
     }
 }
