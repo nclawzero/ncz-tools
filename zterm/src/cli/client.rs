@@ -269,6 +269,15 @@ impl ZeroclawClient {
             .unwrap_or_else(|| "primary".to_string())
     }
 
+    #[cfg(test)]
+    pub(crate) fn cached_model_key_for_tests(&self) -> Option<String> {
+        self.model_state
+            .lock()
+            .expect("model_state poisoned")
+            .current
+            .clone()
+    }
+
     /// Set the current model key. Returns `Err` if the key isn't in
     /// the cached list (caller decides whether to surface that as
     /// `/models set` error text).

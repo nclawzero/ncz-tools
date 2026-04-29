@@ -1071,7 +1071,19 @@ impl CommandHandler {
                 match self.current_cron().await {
                     Some(c) => {
                         if c.model_list().is_empty() {
-                            let _ = c.refresh_models().await;
+                            match c.refresh_models().await {
+                                Ok(list) if list.is_empty() => {
+                                    return Ok(Some(
+                                        "❌ Failed to set model key: /api/config advertised no model keys\n".to_string(),
+                                    ));
+                                }
+                                Ok(_) => {}
+                                Err(e) => {
+                                    return Ok(Some(format!(
+                                        "❌ Failed to set model key: could not refresh /api/config: {e}\n"
+                                    )));
+                                }
+                            }
                         }
                         match c.set_current_model(&key) {
                             Ok(()) => Ok(Some(format!(
@@ -2873,6 +2885,54 @@ mod tests {
 
         assert!(out.contains("active: openclaw default"));
         assert!(out.contains("backend-managed"));
+    }
+
+    #[tokio::test]
+    async fn model_set_fails_closed_when_catalog_refresh_fails() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("GET", "/api/config")
+            .with_status(503)
+            .with_body("unavailable")
+            .create_async()
+            .await;
+        let cron = ZeroclawClient::new(server.url(), "test_token".to_string());
+        let handler = super::CommandHandler::new(app_with_fake_client_and_cron(cron.clone()).await);
+
+        let out_result = handler
+            .handle("/models set typo-model", "main")
+            .await
+            .map(|output| output.unwrap());
+
+        let out = out_result.unwrap();
+
+        assert!(out.contains("❌ Failed to set model key"));
+        assert!(out.contains("could not refresh /api/config"));
+        assert!(cron.cached_model_key_for_tests().is_none());
+    }
+
+    #[tokio::test]
+    async fn model_set_fails_closed_when_catalog_is_empty() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("GET", "/api/config")
+            .with_status(200)
+            .with_body(r#"{"content":"[providers]\nfallback = \"missing\"\n"}"#)
+            .create_async()
+            .await;
+        let cron = ZeroclawClient::new(server.url(), "test_token".to_string());
+        let handler = super::CommandHandler::new(app_with_fake_client_and_cron(cron.clone()).await);
+
+        let out_result = handler
+            .handle("/models set typo-model", "main")
+            .await
+            .map(|output| output.unwrap());
+
+        let out = out_result.unwrap();
+
+        assert!(out.contains("❌ Failed to set model key"));
+        assert!(out.contains("advertised no model keys"));
+        assert!(cron.cached_model_key_for_tests().is_none());
     }
 
     fn session(id: &str, name: &str) -> Session {
