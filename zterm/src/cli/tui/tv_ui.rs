@@ -1291,7 +1291,8 @@ async fn backend_connect_splash_for_workspace(
             )
         })?;
 
-    client.set_stream_sink(None);
+    let (capture_sink, _capture_rx) = StreamSink::channel(TURN_STREAM_CAPACITY);
+    client.set_stream_sink(Some(capture_sink));
 
     let result: Result<String> = async {
         let scratch_name = backend_connect_splash_session_name(workspace_name);
@@ -4862,7 +4863,7 @@ mod tests {
         assert_eq!(state.submitted[0].0, "scratch-1");
         assert!(state.submitted[0].1.contains("prod_typhon"));
         assert_eq!(state.deleted, vec!["scratch-1".to_string()]);
-        assert_eq!(state.sink_states, [false, true]);
+        assert_eq!(state.sink_states, [true, true]);
     }
 
     #[tokio::test]
@@ -4880,6 +4881,7 @@ mod tests {
         let state = state.lock().unwrap();
         assert_eq!(state.submitted.len(), 1);
         assert_eq!(state.deleted, vec!["scratch-1".to_string()]);
+        assert_eq!(state.sink_states, [true, false]);
     }
 
     #[test]

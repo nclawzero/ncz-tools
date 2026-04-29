@@ -1049,11 +1049,9 @@ impl ZeroclawClient {
                     .json()
                     .await
                     .map_err(|e| anyhow!("Failed to parse response: {}", e))?;
-                Ok(json
-                    .get("id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown")
-                    .to_string())
+                cron_response_id(&json).ok_or_else(|| {
+                    anyhow!("cron create response missing a non-empty job id; outcome unknown")
+                })
             }
             _ => Err(anyhow!("Failed to create cron job")),
         }
@@ -1077,7 +1075,15 @@ impl ZeroclawClient {
             .map_err(|e| anyhow!("Failed to create task: {}", e))?;
 
         match res.status().as_u16() {
-            200 | 201 => Ok("Task scheduled".to_string()),
+            200 | 201 => {
+                let json: serde_json::Value = res
+                    .json()
+                    .await
+                    .map_err(|e| anyhow!("Failed to parse response: {}", e))?;
+                cron_response_id(&json).ok_or_else(|| {
+                    anyhow!("cron add-at response missing a non-empty job id; outcome unknown")
+                })
+            }
             _ => Err(anyhow!("Failed to create task")),
         }
     }
@@ -1227,6 +1233,32 @@ impl crate::cli::agent::AgentClient for ZeroclawClient {
     }
 }
 
+fn cron_response_id(value: &serde_json::Value) -> Option<String> {
+    const ID_KEYS: &[&str] = &["id", "job_id", "jobId", "task_id", "taskId"];
+    cron_response_id_in(value, ID_KEYS)
+        .or_else(|| {
+            value
+                .get("job")
+                .and_then(|job| cron_response_id_in(job, ID_KEYS))
+        })
+        .or_else(|| {
+            value
+                .get("task")
+                .and_then(|task| cron_response_id_in(task, ID_KEYS))
+        })
+}
+
+fn cron_response_id_in(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| {
+        value
+            .get(*key)
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToString::to_string)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1328,6 +1360,61 @@ mod tests {
         assert!(err
             .to_string()
             .contains("Failed to parse cron list response"));
+    }
+
+    #[tokio::test]
+    async fn create_cron_job_requires_non_empty_id() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/api/cron/add")
+            .with_status(201)
+            .with_body(r#"{"ok":true}"#)
+            .create_async()
+            .await;
+        let client = ZeroclawClient::new(server.url(), "test_token".to_string());
+
+        let err = client
+            .create_cron_job("0 9 * * *", "standup")
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("missing a non-empty job id"));
+    }
+
+    #[tokio::test]
+    async fn create_cron_at_requires_non_empty_id() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/api/cron/add-at")
+            .with_status(201)
+            .with_body(r#"{"task":{"id":""}}"#)
+            .create_async()
+            .await;
+        let client = ZeroclawClient::new(server.url(), "test_token".to_string());
+
+        let err = client
+            .create_cron_at("2026-04-29T12:00:00Z", "check")
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("missing a non-empty job id"));
+    }
+
+    #[test]
+    fn cron_response_id_accepts_common_shapes() {
+        assert_eq!(
+            cron_response_id(&json!({"id":"job-1"})).as_deref(),
+            Some("job-1")
+        );
+        assert_eq!(
+            cron_response_id(&json!({"job":{"jobId":"job-2"}})).as_deref(),
+            Some("job-2")
+        );
+        assert_eq!(
+            cron_response_id(&json!({"task":{"task_id":"job-3"}})).as_deref(),
+            Some("job-3")
+        );
+        assert_eq!(cron_response_id(&json!({"id":"   "})), None);
     }
 
     #[tokio::test]

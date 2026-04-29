@@ -887,8 +887,10 @@ impl CommandHandler {
                         None => Err(anyhow::anyhow!("cron not available on this backend")),
                     };
                     match res {
-                        Ok(_) => {
-                            out.push_str(&format!("✅ Scheduled task for {datetime}\n"));
+                        Ok(id) => {
+                            let short_id: String = id.chars().take(16).collect();
+                            out.push_str(&format!("✅ Scheduled task: {short_id}\n"));
+                            out.push_str(&format!("   Time: {datetime}\n"));
                             out.push_str(&format!("   Prompt: {prompt}\n"));
                         }
                         Err(e) => out.push_str(&format!("❌ Failed to schedule task: {e}\n")),
@@ -2443,6 +2445,54 @@ mod tests {
             .output
             .unwrap()
             .contains("Failed to create cron job: Failed to parse response"));
+    }
+
+    #[tokio::test]
+    async fn cron_add_success_status_without_id_marks_unknown_outcome() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/api/cron/add")
+            .with_status(201)
+            .with_body(r#"{"ok":true}"#)
+            .create_async()
+            .await;
+        let cron = ZeroclawClient::new(server.url(), "test_token".to_string());
+        let handler = super::CommandHandler::new(app_with_fake_client_and_cron(cron).await);
+
+        let result = handler
+            .handle_with_outcome("/cron add '0 9 * * *' 'standup'", "main")
+            .await
+            .unwrap();
+
+        assert!(result.mutation_outcome_unknown);
+        assert!(result
+            .output
+            .unwrap()
+            .contains("missing a non-empty job id"));
+    }
+
+    #[tokio::test]
+    async fn cron_add_at_success_status_without_id_marks_unknown_outcome() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/api/cron/add-at")
+            .with_status(201)
+            .with_body(r#"{"task":{"id":""}}"#)
+            .create_async()
+            .await;
+        let cron = ZeroclawClient::new(server.url(), "test_token".to_string());
+        let handler = super::CommandHandler::new(app_with_fake_client_and_cron(cron).await);
+
+        let result = handler
+            .handle_with_outcome("/cron add-at '2026-04-29T12:00:00Z' 'check'", "main")
+            .await
+            .unwrap();
+
+        assert!(result.mutation_outcome_unknown);
+        assert!(result
+            .output
+            .unwrap()
+            .contains("missing a non-empty job id"));
     }
 
     #[tokio::test]
