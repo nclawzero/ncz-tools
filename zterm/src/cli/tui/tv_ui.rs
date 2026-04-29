@@ -149,6 +149,8 @@ const TURN_STREAM_CAPACITY: usize = 128;
 const TURN_TOKEN_COALESCE_BYTES: usize = 4096;
 const TURN_STREAM_MAX_BYTES: usize = 2 * 1024 * 1024;
 const COMMAND_ERROR_ALREADY_RENDERED: &str = "__zterm_command_error_already_rendered__";
+const PARTIAL_STREAM_INCOMPLETE_REASON: &str =
+    "partial response incomplete; backend stream ended without a finished frame";
 
 /// How long a status-line toast (e.g. palette confirmation after
 /// Ctrl-P) remains visible. ~1s is long enough to read but short
@@ -672,6 +674,17 @@ pub async fn run(
                             let forwarded_any = forwarded_token.load(Ordering::Acquire);
                             let forwarded_terminal_error =
                                 observed_finished_error.load(Ordering::Acquire);
+                            if partial_stream_without_terminal_frame(
+                                &submit_result,
+                                saw_finished,
+                                forwarded_any,
+                            ) {
+                                let _ = mark_turn_transcript_incomplete_reason(
+                                    &transcript_scope,
+                                    &worker_session_id,
+                                    PARTIAL_STREAM_INCOMPLETE_REASON,
+                                );
+                            }
                             if forwarded_terminal_error && submit_result.is_ok() {
                                 let _ = mark_turn_transcript_incomplete_reason(
                                     &transcript_scope,
@@ -1163,8 +1176,7 @@ fn submit_turn_fallback_chunks(
 
     match submit_result {
         Ok(_) if forwarded_token => vec![TurnChunk::Finished(Err(
-            "partial response incomplete; backend stream ended without a finished frame"
-                .to_string(),
+            PARTIAL_STREAM_INCOMPLETE_REASON.to_string(),
         ))],
         Ok(text) => {
             let mut chunks = Vec::new();
@@ -1176,6 +1188,14 @@ fn submit_turn_fallback_chunks(
         }
         Err(e) => vec![TurnChunk::Finished(Err(e.to_string()))],
     }
+}
+
+fn partial_stream_without_terminal_frame<T>(
+    submit_result: &Result<T>,
+    saw_finished: bool,
+    forwarded_token: bool,
+) -> bool {
+    submit_result.is_ok() && forwarded_token && !saw_finished
 }
 
 fn successful_model_switch_command(cmdline: &str, output: &str) -> bool {
@@ -5206,6 +5226,33 @@ mod tests {
 
         assert!(submit_error_requires_incomplete_transcript(&reason, true));
         let message = mark_turn_transcript_incomplete_reason(&scope, "main", &reason);
+
+        assert!(message.contains("transcript marked incomplete"));
+        assert!(storage::scoped_session_history_is_incomplete(&scope, "main").unwrap());
+    }
+
+    #[test]
+    fn missing_finished_after_streamed_tokens_marks_history_incomplete() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let scope = storage::workspace_scope(
+            "zeroclaw",
+            &format!("partial-ok-transcript-{}", uuid::Uuid::new_v4()),
+            None,
+        )
+        .unwrap();
+        storage::append_scoped_session_history(&scope, "main", "user", "hello").unwrap();
+        let submit_result: Result<String> = Ok("assistant text".to_string());
+
+        assert!(partial_stream_without_terminal_frame(
+            &submit_result,
+            false,
+            true
+        ));
+        let message = mark_turn_transcript_incomplete_reason(
+            &scope,
+            "main",
+            PARTIAL_STREAM_INCOMPLETE_REASON,
+        );
 
         assert!(message.contains("transcript marked incomplete"));
         assert!(storage::scoped_session_history_is_incomplete(&scope, "main").unwrap());

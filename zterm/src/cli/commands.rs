@@ -185,8 +185,8 @@ impl CommandHandler {
             \n\
             Agent & Daemon:\n  \
               /agent             Interactive agent (current mode)\n  \
-              /daemon            Start gateway + channels + scheduler\n  \
-              /service           Manage system service\n\
+              /daemon            Daemon control (unsupported in v0.3.1)\n  \
+              /service           Service control (unsupported in v0.3.1)\n\
             \n\
             Configuration:\n  \
               /onboard           Run setup wizard\n  \
@@ -459,25 +459,25 @@ impl CommandHandler {
         subcommand: Option<&str>,
         args: &[&str],
     ) -> Result<Option<String>> {
-        let mut out = "\n🔌 Daemon & Gateway:\n".to_string();
-        match subcommand {
+        let requested = match subcommand {
             Some("-p") | Some("--port") => {
                 let port = args.first().copied().unwrap_or("42617");
-                out.push_str(&format!("  Starting on port: {port}\n"));
+                format!("daemon start on port {port}")
             }
-            _ => out.push_str("  Listening on: http://127.0.0.1:42617\n"),
-        }
-        out.push_str("  Channels: Connected\n");
-        out.push_str("  Scheduler: Active\n");
-        out.push_str("  (Full daemon features in Phase 7+)\n\n");
+            Some(other) => format!("daemon {other}"),
+            None => "daemon status".to_string(),
+        };
+        let out = format!(
+            "❌ /daemon is not wired to daemon control in zterm v0.3.1; no action taken for {requested}.\n"
+        );
         Ok(Some(out))
     }
 
     async fn handle_service(&self, subcommand: Option<&str>) -> Result<Option<String>> {
         let out = match subcommand {
-            Some("install") => "📦 Install system service (Phase 7+)\n",
-            Some("status") => "  Service: Not installed\n",
-            Some("start") | Some("stop") | Some("restart") => "  (Phase 7+)\n",
+            Some("install" | "status" | "start" | "stop" | "restart") => {
+                "❌ /service is not wired to service control in zterm v0.3.1; no action taken.\n"
+            }
             _ => "Usage: /service install|status|start|stop|restart\n",
         };
         Ok(Some(out.to_string()))
@@ -2773,6 +2773,25 @@ mod tests {
         let err = handler.handle("/agent -m hello", "s").await.unwrap_err();
 
         assert!(err.to_string().contains("/agent -m is not supported"));
+    }
+
+    #[tokio::test]
+    async fn daemon_and_service_commands_fail_closed_until_control_is_wired() {
+        let handler = super::CommandHandler::new(app_with_fake_client(FakeAgentClient::default()));
+
+        for cmdline in [
+            "/daemon",
+            "/daemon -p 42617",
+            "/service status",
+            "/service start",
+        ] {
+            let out = handler.handle(cmdline, "s").await.unwrap().unwrap();
+            assert!(out.contains("❌"), "{cmdline} should render as an error");
+            assert!(
+                out.contains("no action taken"),
+                "{cmdline} should not imply control happened"
+            );
+        }
     }
 
     #[tokio::test]
