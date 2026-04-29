@@ -2057,7 +2057,7 @@ mod tests {
                 .is_some());
 
             let blocked = repl
-                .handle_slash_command("/session list")
+                .handle_slash_command("/session create scratch")
                 .await
                 .unwrap()
                 .unwrap();

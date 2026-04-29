@@ -67,7 +67,7 @@ use crate::cli::commands::{tokenize_slash_command, CommandHandler};
 use crate::cli::storage;
 use crate::cli::tui::delighters;
 use crate::cli::tui::themes;
-use crate::cli::workspace::App;
+use crate::cli::workspace::{App, Backend, Workspace, WorkspaceConfig};
 
 type SharedAgentClient = Arc<Mutex<Box<dyn AgentClient + Send + Sync>>>;
 
@@ -1041,7 +1041,7 @@ async fn run_worker_command_with_deadline<F>(
 
 fn spawn_connect_splash_typewriter(
     app: Arc<Mutex<App>>,
-    client: Option<SharedAgentClient>,
+    config: Option<WorkspaceConfig>,
     worker_sink: StreamSink,
     workspace_name: String,
     workspace_id: Option<String>,
@@ -1053,7 +1053,7 @@ fn spawn_connect_splash_typewriter(
 
     tokio::spawn(async move {
         let result = connect_splash_for_captured_workspace(
-            client,
+            config.as_ref(),
             &workspace_name,
             Some(worker_sink.clone()),
             policy,
@@ -1270,10 +1270,10 @@ async fn handle_worker_command_request(
                             return;
                         }
                         if let Some((name, workspace_id)) = switched_workspace {
-                            let client = active_workspace_client_for_worker(worker_app).await;
+                            let config = active_workspace_config_for_worker(worker_app).await;
                             spawn_connect_splash_typewriter(
                                 Arc::clone(worker_app),
-                                client,
+                                config,
                                 worker_sink.clone(),
                                 name,
                                 workspace_id,
@@ -1424,29 +1424,39 @@ fn is_connect_splash_cleanup_failure(error: &anyhow::Error) -> bool {
         .is_some()
 }
 
+fn read_connect_splash_cache(workspace_name: &str) -> (Option<std::path::PathBuf>, Option<String>) {
+    let cache_path = delighters::default_connect_splash_cache_path(workspace_name);
+    let cached = cache_path.as_ref().and_then(|path| {
+        delighters::read_cached_connect_splash(
+            path,
+            std::time::SystemTime::now(),
+            delighters::CONNECT_SPLASH_TTL,
+        )
+    });
+    (cache_path, cached)
+}
+
+fn write_connect_splash_cache(cache_path: Option<std::path::PathBuf>, generated: &str) {
+    if let Some(path) = cache_path {
+        if let Err(e) = delighters::write_connect_splash_cache(&path, generated) {
+            warn!("connect-splash cache write failed: {e}");
+        }
+    }
+}
+
 async fn connect_splash_for_workspace(
     app: &Arc<Mutex<App>>,
     workspace_name: &str,
     restore_sink: Option<StreamSink>,
 ) -> Result<String> {
-    let cache_path = delighters::default_connect_splash_cache_path(workspace_name);
-    if let Some(path) = &cache_path {
-        if let Some(cached) = delighters::read_cached_connect_splash(
-            path,
-            std::time::SystemTime::now(),
-            delighters::CONNECT_SPLASH_TTL,
-        ) {
-            return Ok(cached);
-        }
+    let (cache_path, cached) = read_connect_splash_cache(workspace_name);
+    if let Some(cached) = cached {
+        return Ok(cached);
     }
 
     match generate_connect_splash_from_active_backend(app, workspace_name, restore_sink).await {
         Ok(generated) => {
-            if let Some(path) = cache_path {
-                if let Err(e) = delighters::write_connect_splash_cache(&path, &generated) {
-                    warn!("connect-splash cache write failed: {e}");
-                }
-            }
+            write_connect_splash_cache(cache_path, &generated);
             Ok(generated)
         }
         Err(e) if is_connect_splash_cleanup_failure(&e) => {
@@ -1478,7 +1488,7 @@ async fn connect_splash_for_workspace_if_enabled(
 }
 
 async fn connect_splash_for_captured_workspace(
-    client: Option<SharedAgentClient>,
+    config: Option<&WorkspaceConfig>,
     workspace_name: &str,
     restore_sink: Option<StreamSink>,
     policy: ConnectSplashPolicy,
@@ -1489,12 +1499,27 @@ async fn connect_splash_for_captured_workspace(
     if !policy.backend {
         return Ok(Some(delighters::local_connect_splash(workspace_name)));
     }
-    let Some(client) = client else {
+    let (cache_path, cached) = read_connect_splash_cache(workspace_name);
+    if let Some(cached) = cached {
+        return Ok(Some(cached));
+    }
+    let Some(config) = config else {
         return Ok(Some(delighters::local_connect_splash(workspace_name)));
     };
-    connect_splash_for_workspace_with_client(client, workspace_name, restore_sink)
-        .await
-        .map(Some)
+    match generate_connect_splash_from_detached_config(config, workspace_name, restore_sink).await {
+        Ok(generated) => {
+            write_connect_splash_cache(cache_path, &generated);
+            Ok(Some(generated))
+        }
+        Err(e) if is_connect_splash_cleanup_failure(&e) => {
+            warn!("connect-splash cleanup failed after creating backend state: {e}");
+            Err(e)
+        }
+        Err(e) => {
+            warn!("connect-splash backend generation failed: {e}; using local fallback");
+            Ok(Some(delighters::local_connect_splash(workspace_name)))
+        }
+    }
 }
 
 async fn generate_connect_splash_from_active_backend(
@@ -1509,6 +1534,36 @@ async fn generate_connect_splash_from_active_backend(
     .ok_or_else(|| anyhow::anyhow!("no active workspace client"))?;
 
     generate_connect_splash_from_client(client, workspace_name, restore_sink).await
+}
+
+async fn generate_connect_splash_from_detached_config(
+    config: &WorkspaceConfig,
+    workspace_name: &str,
+    restore_sink: Option<StreamSink>,
+) -> Result<String> {
+    let client = detached_connect_splash_client(config).await?;
+    generate_connect_splash_from_client(client, workspace_name, restore_sink).await
+}
+
+async fn detached_connect_splash_client(config: &WorkspaceConfig) -> Result<SharedAgentClient> {
+    match tokio::time::timeout(CONNECT_SPLASH_GENERATION_TIMEOUT, async {
+        match config.backend {
+            Backend::Zeroclaw => Workspace::instantiate(0, config.clone())?
+                .client
+                .ok_or_else(|| anyhow::anyhow!("zeroclaw workspace has no detached client")),
+            Backend::Openclaw => Workspace::activate_detached_client(config).await,
+            Backend::Nemoclaw => {
+                anyhow::bail!("nemoclaw backend is not yet implemented (v0.3)")
+            }
+        }
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(anyhow::anyhow!(
+            "connect-splash detached client activation timed out"
+        )),
+    }
 }
 
 async fn generate_connect_splash_from_client(
@@ -1528,24 +1583,6 @@ async fn generate_connect_splash_from_client(
         None => locked.set_stream_sink(None),
     }
     result
-}
-
-async fn connect_splash_for_workspace_with_client(
-    client: SharedAgentClient,
-    workspace_name: &str,
-    restore_sink: Option<StreamSink>,
-) -> Result<String> {
-    match generate_connect_splash_from_client(client, workspace_name, restore_sink).await {
-        Ok(generated) => Ok(generated),
-        Err(e) if is_connect_splash_cleanup_failure(&e) => {
-            warn!("connect-splash cleanup failed after creating backend state: {e}");
-            Err(e)
-        }
-        Err(e) => {
-            warn!("connect-splash backend generation failed: {e}; using local fallback");
-            Ok(delighters::local_connect_splash(workspace_name))
-        }
-    }
 }
 
 async fn generate_connect_splash_with_client(
@@ -2091,9 +2128,9 @@ async fn status_snapshot_for_worker(
     Some((workspace, workspace_id, model))
 }
 
-async fn active_workspace_client_for_worker(app: &Arc<Mutex<App>>) -> Option<SharedAgentClient> {
+async fn active_workspace_config_for_worker(app: &Arc<Mutex<App>>) -> Option<WorkspaceConfig> {
     let guard = app.lock().await;
-    guard.active_workspace()?.client.clone()
+    Some(guard.active_workspace()?.config.clone())
 }
 
 async fn active_workspace_identity_for_worker(
@@ -8534,7 +8571,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_switch_connect_splash_cleanup_failure_is_async_warning() {
+    fn workspace_switch_connect_splash_uses_cache_without_active_client() {
         let _env = crate::cli::test_env_lock().lock().unwrap();
         let home = tempfile::tempdir().unwrap();
         let old_home = std::env::var_os("HOME");
@@ -8562,6 +8599,8 @@ mod tests {
             let beta_created = Arc::new(StdMutex::new(Vec::new()));
             let beta_deleted = Arc::new(StdMutex::new(Vec::new()));
             let beta_submitted = Arc::new(StdMutex::new(Vec::new()));
+            let beta_cache = delighters::default_connect_splash_cache_path("beta").unwrap();
+            delighters::write_connect_splash_cache(&beta_cache, "CACHED\nBETA").unwrap();
             let beta_fake = WorkerSessionFakeClient {
                 listed_sessions: Vec::new(),
                 list_sessions_error: None,
@@ -8572,9 +8611,9 @@ mod tests {
                 submitted: Arc::clone(&beta_submitted),
                 list_calls: Arc::new(StdMutex::new(0)),
                 load_calls: Arc::new(StdMutex::new(Vec::new())),
-                submit_response: "GENERATED\nSPLASH".to_string(),
+                submit_response: "SHOULD NOT BE USED".to_string(),
                 submit_error: None,
-                submit_never: false,
+                submit_never: true,
                 cancellation_safe: true,
                 sink_set_states: Arc::new(StdMutex::new(Vec::new())),
                 delete_error: Some("delete failed".to_string()),
@@ -8645,7 +8684,7 @@ mod tests {
             let mut rendered = String::new();
             let mut terminal_ok = false;
             let mut terminal_error = None;
-            let mut typewriter_chunks = 0usize;
+            let mut typewriter_text = None;
             for _ in 0..20 {
                 let chunk = match tokio::time::timeout(Duration::from_millis(25), rx.recv()).await {
                     Ok(Some(chunk)) => chunk,
@@ -8653,12 +8692,12 @@ mod tests {
                 };
                 match chunk {
                     TurnChunk::Token(text) => rendered.push_str(&text),
-                    TurnChunk::Typewriter(_) => typewriter_chunks += 1,
+                    TurnChunk::Typewriter(text) => typewriter_text = Some(text),
                     TurnChunk::Finished(Ok(_)) => terminal_ok = true,
                     TurnChunk::Finished(Err(message)) => terminal_error = Some(message),
                     _ => {}
                 }
-                if rendered.contains("connect-splash skipped after workspace switch") {
+                if typewriter_text.is_some() {
                     break;
                 }
             }
@@ -8672,16 +8711,14 @@ mod tests {
                 terminal_error.is_none(),
                 "delighter cleanup failure should not become the switch terminal error"
             );
-            assert!(rendered.contains("connect-splash skipped after workspace switch"));
-            assert!(rendered.contains("delete failed"));
-            assert_eq!(typewriter_chunks, 0);
-            assert_eq!(beta_submitted.lock().unwrap().len(), 1);
-            assert_eq!(beta_deleted.lock().unwrap().len(), 1);
-            assert!(beta_created
+            assert_eq!(typewriter_text.as_deref(), Some("CACHED\nBETA"));
+            assert!(beta_submitted.lock().unwrap().is_empty());
+            assert!(beta_deleted.lock().unwrap().is_empty());
+            assert!(!beta_created
                 .lock()
                 .unwrap()
                 .iter()
-                .any(|session| { session.name.starts_with("zterm connect splash beta ") }));
+                .any(|session| { session.name.starts_with("zterm connect splash ") }));
         });
 
         match old_home {
