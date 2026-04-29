@@ -442,6 +442,38 @@ pub fn set_mutation_fence_for_workspace_at(
     })
 }
 
+pub fn replace_mutation_fence_for_workspace(
+    old_workspace_key: Option<&str>,
+    workspace_key: &str,
+    fence: MutationFenceState,
+) -> std::io::Result<ZtermState> {
+    let Some(path) = default_state_path() else {
+        return Err(std::io::Error::other(
+            "no home directory; cannot persist zterm mutation fence",
+        ));
+    };
+    replace_mutation_fence_for_workspace_at(&path, old_workspace_key, workspace_key, fence)
+}
+
+pub fn replace_mutation_fence_for_workspace_at(
+    path: &Path,
+    old_workspace_key: Option<&str>,
+    workspace_key: &str,
+    fence: MutationFenceState,
+) -> std::io::Result<ZtermState> {
+    with_state_lock(path, || {
+        let mut state = load_state_unlocked(path)?;
+        if let Some(old_key) = old_workspace_key.filter(|old_key| *old_key != workspace_key) {
+            state.mutation_fences.remove(old_key);
+        }
+        state
+            .mutation_fences
+            .insert(workspace_key.to_string(), fence);
+        save_state_unlocked(path, &state)?;
+        Ok(state)
+    })
+}
+
 pub fn clear_mutation_fence_for_workspace(workspace_key: &str) -> std::io::Result<ZtermState> {
     let Some(path) = default_state_path() else {
         return Err(std::io::Error::other(

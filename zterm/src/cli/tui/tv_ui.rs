@@ -92,6 +92,7 @@ enum WorkerRequest {
 struct InFlightRequest {
     label: String,
     mutating_slash: bool,
+    mutation_fence_key: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -3041,7 +3042,13 @@ fn drain_stream_events(
                                     in_flight_request.as_ref(),
                                 ) {
                                     terminal_requires_fence = true;
-                                    set_local_and_persisted_mutation_fence(status_state, &reason);
+                                    set_local_and_persisted_mutation_fence_replacing(
+                                        status_state,
+                                        &reason,
+                                        in_flight_request.as_ref().and_then(|request| {
+                                            request.mutation_fence_key.as_deref()
+                                        }),
+                                    );
                                     status_state.set_toast(MUTATION_FENCE_TOAST);
                                 } else if was_resync {
                                     status_state
@@ -3089,7 +3096,13 @@ fn drain_stream_events(
                         disconnect_message,
                         in_flight_request.as_ref(),
                     ) {
-                        set_local_and_persisted_mutation_fence(status_state, &reason);
+                        set_local_and_persisted_mutation_fence_replacing(
+                            status_state,
+                            &reason,
+                            in_flight_request
+                                .as_ref()
+                                .and_then(|request| request.mutation_fence_key.as_deref()),
+                        );
                         status_state.set_toast(MUTATION_FENCE_TOAST);
                         rendered_message = reason;
                     }
@@ -3169,15 +3182,18 @@ fn dispatch_worker_backed_submission(
         note_response_busy(status_state);
         return SubmissionStatus::Busy;
     }
-    let in_flight_request = in_flight_request_for_worker_request(label, &request);
+    let mut in_flight_request = in_flight_request_for_worker_request(label, &request);
     if in_flight_request.mutating_slash {
-        if let Err(e) = write_ahead_mutation_fence_for_dispatch(status_state, label) {
-            status_state.set_toast("Mutation not dispatched");
-            chat_lines.borrow_mut().push(format!(
-                "[error] could not {error_context}: could not persist mutation fence before dispatch; command not submitted: {e}"
-            ));
-            chat_lines.borrow_mut().push(String::new());
-            return SubmissionStatus::DispatchFailed;
+        match write_ahead_mutation_fence_for_dispatch(status_state, label) {
+            Ok(key) => in_flight_request.mutation_fence_key = Some(key),
+            Err(e) => {
+                status_state.set_toast("Mutation not dispatched");
+                chat_lines.borrow_mut().push(format!(
+                    "[error] could not {error_context}: could not persist mutation fence before dispatch; command not submitted: {e}"
+                ));
+                chat_lines.borrow_mut().push(String::new());
+                return SubmissionStatus::DispatchFailed;
+            }
         }
     }
 
@@ -3224,6 +3240,7 @@ fn in_flight_request_for_worker_request(label: &str, request: &WorkerRequest) ->
     InFlightRequest {
         label: label.to_string(),
         mutating_slash,
+        mutation_fence_key: None,
     }
 }
 
@@ -3771,13 +3788,13 @@ fn write_ahead_mutation_fence_reason(cmdline: &str) -> String {
 fn write_ahead_mutation_fence_for_dispatch(
     status_state: &mut StatusState,
     cmdline: &str,
-) -> Result<()> {
+) -> Result<String> {
     let key = mutation_fence_key_for_status(status_state);
     let reason = write_ahead_mutation_fence_reason(cmdline);
     let fence = mutation_fence_state_for_command(cmdline, &reason);
     delighters::set_mutation_fence_for_workspace(&key, fence.clone())?;
     status_state.mutation_fence = Some(fence.reason);
-    Ok(())
+    Ok(key)
 }
 
 fn load_persisted_mutation_fence_for_status(
@@ -3855,10 +3872,20 @@ where
 }
 
 fn set_local_and_persisted_mutation_fence(status_state: &mut StatusState, reason: &str) {
+    set_local_and_persisted_mutation_fence_replacing(status_state, reason, None);
+}
+
+fn set_local_and_persisted_mutation_fence_replacing(
+    status_state: &mut StatusState,
+    reason: &str,
+    old_workspace_key: Option<&str>,
+) {
     let key = mutation_fence_key_for_status(status_state);
     let command = mutation_fence_command_from_reason(reason);
     let fence = mutation_fence_state_for_command(&command, reason);
-    if let Err(e) = delighters::set_mutation_fence_for_workspace(&key, fence.clone()) {
+    if let Err(e) =
+        delighters::replace_mutation_fence_for_workspace(old_workspace_key, &key, fence.clone())
+    {
         status_state.mutation_fence = Some(cap_sanitized_text(
             &format!("{reason}; failed to persist fence: {e}"),
             MUTATION_FENCE_REASON_MAX_CHARS,
@@ -3883,10 +3910,13 @@ fn clear_write_ahead_mutation_fence_after_safe_terminal(
     status_state: &mut StatusState,
     in_flight_request: Option<&InFlightRequest>,
 ) {
-    if !in_flight_request.is_some_and(|request| request.mutating_slash) {
+    let Some(request) = in_flight_request.filter(|request| request.mutating_slash) else {
         return;
-    }
-    let key = mutation_fence_key_for_status(status_state);
+    };
+    let key = request
+        .mutation_fence_key
+        .clone()
+        .unwrap_or_else(|| mutation_fence_key_for_status(status_state));
     match delighters::clear_mutation_fence_for_workspace(&key) {
         Ok(_) => status_state.mutation_fence = None,
         Err(e) => {
@@ -5626,6 +5656,143 @@ mod tests {
     }
 
     #[test]
+    fn safe_workspace_switch_clears_dispatch_workspace_fence_after_status_refresh() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+
+        let mut state = StatusState::new(
+            "alpha".to_string(),
+            "gpt-test".to_string(),
+            "borland".to_string(),
+            false,
+        );
+        state.workspace_id = Some("ws-alpha".to_string());
+        let lines = Rc::new(RefCell::new(Vec::new()));
+        let (req_tx, mut req_rx) = mpsc::channel(4);
+        let mut response_in_flight = false;
+        assert_eq!(
+            dispatch_worker_backed_submission(
+                "/workspace switch beta",
+                WorkerRequest::Command("/workspace switch beta".to_string()),
+                &lines,
+                &req_tx,
+                &mut state,
+                &mut response_in_flight,
+                false,
+                None,
+                "dispatch",
+            ),
+            SubmissionStatus::Started
+        );
+        let source_key = "id:ws-alpha".to_string();
+        let target_key = "id:ws-beta".to_string();
+        assert!(delighters::mutation_fence_for_workspace(&source_key)
+            .unwrap()
+            .is_some());
+        let _ = req_rx.try_recv();
+
+        state.workspace = "beta".to_string();
+        state.workspace_id = Some("ws-beta".to_string());
+        let (event_tx, mut event_rx) = mpsc::channel(4);
+        event_tx
+            .try_send(TurnChunk::Finished(Ok(String::new())))
+            .unwrap();
+        let mut typewriter_state = None;
+        let mut session_picker_state = SessionPickerState::default();
+        assert!(!drain_stream_events(
+            &mut event_rx,
+            &lines,
+            &mut state,
+            &mut typewriter_state,
+            &mut response_in_flight,
+            &mut session_picker_state
+        ));
+        let source_after = delighters::mutation_fence_for_workspace(&source_key).unwrap();
+        let target_after = delighters::mutation_fence_for_workspace(&target_key).unwrap();
+
+        match old_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+
+        assert!(!response_in_flight);
+        assert!(state.mutation_fence.is_none());
+        assert!(source_after.is_none());
+        assert!(target_after.is_none());
+    }
+
+    #[test]
+    fn unknown_workspace_switch_failure_replaces_dispatch_workspace_fence() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+
+        let mut state = StatusState::new(
+            "alpha".to_string(),
+            "gpt-test".to_string(),
+            "borland".to_string(),
+            false,
+        );
+        state.workspace_id = Some("ws-alpha".to_string());
+        let lines = Rc::new(RefCell::new(Vec::new()));
+        let (req_tx, mut req_rx) = mpsc::channel(4);
+        let mut response_in_flight = false;
+        assert_eq!(
+            dispatch_worker_backed_submission(
+                "/workspace switch beta",
+                WorkerRequest::Command("/workspace switch beta".to_string()),
+                &lines,
+                &req_tx,
+                &mut state,
+                &mut response_in_flight,
+                false,
+                None,
+                "dispatch",
+            ),
+            SubmissionStatus::Started
+        );
+        let source_key = "id:ws-alpha".to_string();
+        let target_key = "id:ws-beta".to_string();
+        let _ = req_rx.try_recv();
+
+        state.workspace = "beta".to_string();
+        state.workspace_id = Some("ws-beta".to_string());
+        let (event_tx, mut event_rx) = mpsc::channel(4);
+        event_tx
+            .try_send(TurnChunk::Finished(Err(
+                "workspace switched, but session setup failed".to_string(),
+            )))
+            .unwrap();
+        let mut typewriter_state = None;
+        let mut session_picker_state = SessionPickerState::default();
+        assert!(drain_stream_events(
+            &mut event_rx,
+            &lines,
+            &mut state,
+            &mut typewriter_state,
+            &mut response_in_flight,
+            &mut session_picker_state
+        ));
+        let source_after = delighters::mutation_fence_for_workspace(&source_key).unwrap();
+        let target_after = delighters::mutation_fence_for_workspace(&target_key)
+            .unwrap()
+            .unwrap();
+
+        match old_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+
+        assert!(source_after.is_none());
+        assert!(target_after.reason.contains("outcome unknown"));
+        assert!(target_after.reason.contains("/workspace switch beta"));
+        assert_eq!(state.mutation_fence, Some(target_after.reason));
+    }
+
+    #[test]
     fn resync_finished_keeps_mutation_fence_until_force() {
         let mut state = StatusState::new(
             "default".to_string(),
@@ -5863,6 +6030,7 @@ mod tests {
         state.in_flight_request = Some(InFlightRequest {
             label: "/memory post hello".to_string(),
             mutating_slash: true,
+            mutation_fence_key: None,
         });
         let lines = Rc::new(RefCell::new(vec![
             "> /memory post hello".to_string(),
@@ -5917,6 +6085,7 @@ mod tests {
         let readonly = InFlightRequest {
             label: "/models list".to_string(),
             mutating_slash: false,
+            mutation_fence_key: None,
         };
         assert!(mutation_fence_reason_for_terminal_failure(
             "worker channel disconnected before the request completed",
@@ -5927,6 +6096,7 @@ mod tests {
         let mutating = InFlightRequest {
             label: "/workspace switch prod".to_string(),
             mutating_slash: true,
+            mutation_fence_key: None,
         };
         assert!(mutation_fence_reason_for_terminal_failure(
             COMMAND_ERROR_ALREADY_RENDERED,
