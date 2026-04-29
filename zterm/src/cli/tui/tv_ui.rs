@@ -1183,7 +1183,8 @@ async fn handle_worker_command_request(
                         )
                         .await
                         {
-                            let _ = worker_sink.send(TurnChunk::ClearUsage);
+                            let _ = send_worker_chunk_reliably(worker_sink, TurnChunk::ClearUsage)
+                                .await;
                             let detail =
                                 format!("workspace switched, but session setup failed: {e}");
                             send_worker_finished(
@@ -1195,7 +1196,11 @@ async fn handle_worker_command_request(
                         }
                         if let Some(name) = switched_workspace {
                             let splash = connect_splash_for_workspace(&name);
-                            let _ = worker_sink.send(TurnChunk::Typewriter(splash));
+                            let _ = send_worker_chunk_reliably(
+                                worker_sink,
+                                TurnChunk::Typewriter(splash),
+                            )
+                            .await;
                         }
                     }
                 }
@@ -1204,17 +1209,21 @@ async fn handle_worker_command_request(
                     session_switched,
                     model_switched,
                 ) {
-                    let _ = worker_sink.send(TurnChunk::ClearUsage);
+                    let _ = send_worker_chunk_reliably(worker_sink, TurnChunk::ClearUsage).await;
                 }
                 if workspace_switched || model_switched {
                     if let Some((workspace, workspace_id, model)) =
                         status_snapshot_for_worker(worker_app).await
                     {
-                        let _ = worker_sink.send(TurnChunk::Status {
-                            workspace: Some(workspace),
-                            workspace_id,
-                            model: Some(model),
-                        });
+                        let _ = send_worker_chunk_reliably(
+                            worker_sink,
+                            TurnChunk::Status {
+                                workspace: Some(workspace),
+                                workspace_id,
+                                model: Some(model),
+                            },
+                        )
+                        .await;
                     }
                 }
                 if let Some(command_terminal_error) = command_terminal_error {
@@ -6439,6 +6448,47 @@ mod tests {
         match rx.recv().await {
             Some(TurnChunk::Token(text)) => assert_eq!(text, "/cron add ok"),
             other => panic!("expected reliably delivered command output, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn reliable_context_status_delivery_waits_for_saturated_ui_queue() {
+        let (sink, mut rx) = StreamSink::channel(1);
+        sink.send(TurnChunk::Token("queued".to_string())).unwrap();
+
+        let send_sink = sink.clone();
+        let send_task = tokio::spawn(async move {
+            send_worker_chunk_reliably(&send_sink, TurnChunk::ClearUsage).await
+                && send_worker_chunk_reliably(
+                    &send_sink,
+                    TurnChunk::Status {
+                        workspace: Some("beta".to_string()),
+                        workspace_id: Some("ws-beta".to_string()),
+                        model: Some("model-b".to_string()),
+                    },
+                )
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(!send_task.is_finished());
+
+        match rx.recv().await {
+            Some(TurnChunk::Token(text)) => assert_eq!(text, "queued"),
+            other => panic!("expected saturated queue token, got {other:?}"),
+        }
+        assert!(matches!(rx.recv().await, Some(TurnChunk::ClearUsage)));
+        assert!(send_task.await.unwrap());
+        match rx.recv().await {
+            Some(TurnChunk::Status {
+                workspace,
+                workspace_id,
+                model,
+            }) => {
+                assert_eq!(workspace.as_deref(), Some("beta"));
+                assert_eq!(workspace_id.as_deref(), Some("ws-beta"));
+                assert_eq!(model.as_deref(), Some("model-b"));
+            }
+            other => panic!("expected reliably delivered status update, got {other:?}"),
         }
     }
 

@@ -6,7 +6,7 @@ use tracing::{info, warn};
 use crate::cli::client::Session;
 use crate::cli::pairing::PairingManager;
 use crate::cli::storage::{self, SessionMetadata};
-use crate::cli::workspace::{AppConfig, WorkspaceConfig};
+use crate::cli::workspace::{App, AppConfig, WorkspaceConfig};
 
 pub mod delighters;
 pub mod onboarding;
@@ -138,8 +138,6 @@ pub async fn run(
         }
     };
 
-    info!("Gateway URL: {}", gateway_url);
-
     // Build a multi-workspace App. If ~/.zterm/config.toml has
     // [[workspaces]], use them. Otherwise synthesize a single
     // zeroclaw workspace from the legacy gateway_url + api_token.
@@ -154,27 +152,10 @@ pub async fn run(
     // the named workspace exists. Silently no-ops when running
     // in single-workspace / synthesized mode (only "default"
     // exists there; mismatches are informative, not fatal).
-    if let Some(target) = workspace {
-        let idx = app.workspaces.iter().position(|w| w.config.name == target);
-        match idx {
-            Some(i) => {
-                info!("--workspace override: activating '{}'", target);
-                app.active = i;
-            }
-            None => {
-                let avail: Vec<_> = app
-                    .workspaces
-                    .iter()
-                    .map(|w| w.config.name.clone())
-                    .collect();
-                eprintln!(
-                    "⚠️  --workspace {target:?} not found in config (known: {avail:?}); \
-                     staying on '{}'",
-                    app.active_workspace()
-                        .map(|w| w.config.name.as_str())
-                        .unwrap_or("<none>")
-                );
-            }
+    if let Some(target) = workspace.as_deref() {
+        match activate_workspace_override(&mut app, target) {
+            Some(message) => eprintln!("{message}"),
+            None => info!("--workspace override: activating '{}'", target),
         }
     }
 
@@ -194,6 +175,8 @@ pub async fn run(
     let active_ws = app
         .active_workspace()
         .expect("active workspace just activated");
+    let active_gateway_url = active_gateway_url_for_app(&app)?;
+    info!("Gateway URL: {}", active_gateway_url);
     let active_backend = active_ws.config.backend.as_str().to_string();
     let active_client = active_ws
         .client
@@ -206,7 +189,7 @@ pub async fn run(
     {
         let healthy = active_client.lock().await.health().await?;
         if !healthy {
-            eprintln!("❌ Could not connect to gateway at {}", gateway_url);
+            eprintln!("❌ Could not connect to gateway at {}", active_gateway_url);
             eprintln!("   Make sure the agent backend is running.");
             return Err(anyhow!("Gateway connection failed"));
         }
@@ -269,7 +252,7 @@ pub async fn run(
         .unwrap_or(true); // Default: show splash
 
     if show_splash {
-        splash::display_splash(&session_name, &gateway_url, &model, &provider);
+        splash::display_splash(&session_name, &active_gateway_url, &model, &provider);
     }
 
     let shared_app = std::sync::Arc::new(tokio::sync::Mutex::new(app));
@@ -296,6 +279,36 @@ fn active_workspace_config(config: &AppConfig) -> Option<&WorkspaceConfig> {
                 .find(|workspace| workspace.name == active)
         })
         .or_else(|| config.workspaces.first())
+}
+
+fn activate_workspace_override(app: &mut App, target: &str) -> Option<String> {
+    let idx = app.workspaces.iter().position(|w| w.config.name == target);
+    match idx {
+        Some(i) => {
+            app.active = i;
+            None
+        }
+        None => {
+            let avail: Vec<_> = app
+                .workspaces
+                .iter()
+                .map(|w| w.config.name.clone())
+                .collect();
+            Some(format!(
+                "⚠️  --workspace {target:?} not found in config (known: {avail:?}); \
+                 staying on '{}'",
+                app.active_workspace()
+                    .map(|w| w.config.name.as_str())
+                    .unwrap_or("<none>")
+            ))
+        }
+    }
+}
+
+fn active_gateway_url_for_app(app: &App) -> Result<String> {
+    app.active_workspace()
+        .map(|workspace| workspace.config.url.clone())
+        .ok_or_else(|| anyhow!("no active workspace after boot"))
 }
 
 fn read_toml_value_or_empty(path: &std::path::Path) -> Result<toml::Value> {
@@ -444,6 +457,7 @@ mod tests {
     use super::*;
     use crate::cli::agent::{AgentClient, StreamSink};
     use crate::cli::client::{Config, Model, Provider};
+    use crate::cli::workspace::{Backend, Workspace};
     use std::sync::{Arc, Mutex as StdMutex};
     use tokio::sync::Mutex;
 
@@ -540,6 +554,24 @@ mod tests {
         storage::workspace_scope("zeroclaw", "test", None).unwrap()
     }
 
+    fn display_workspace(id: usize, name: &str, url: &str) -> Workspace {
+        Workspace {
+            id,
+            config: WorkspaceConfig {
+                id: Some(format!("ws-{name}")),
+                name: name.to_string(),
+                backend: Backend::Zeroclaw,
+                url: url.to_string(),
+                token_env: None,
+                token: Some(String::new()),
+                label: None,
+                namespace_aliases: Vec::new(),
+            },
+            client: None,
+            cron: None,
+        }
+    }
+
     fn boxed_client(fake: BootFakeClient) -> Arc<Mutex<Box<dyn AgentClient + Send + Sync>>> {
         Arc::new(Mutex::new(Box::new(fake)))
     }
@@ -564,6 +596,31 @@ mod tests {
                 None => std::env::remove_var(self.key),
             }
         }
+    }
+
+    #[test]
+    fn workspace_override_updates_display_gateway_url() {
+        let mut app = App {
+            workspaces: vec![
+                display_workspace(0, "alpha", "http://alpha.example"),
+                display_workspace(1, "beta", "http://beta.example"),
+            ],
+            active: 0,
+            shared_mnemos: None,
+            config_path: std::path::PathBuf::from("test-config.toml"),
+        };
+
+        assert_eq!(
+            active_gateway_url_for_app(&app).unwrap(),
+            "http://alpha.example"
+        );
+        assert!(activate_workspace_override(&mut app, "beta").is_none());
+
+        assert_eq!(app.active, 1);
+        assert_eq!(
+            active_gateway_url_for_app(&app).unwrap(),
+            "http://beta.example"
+        );
     }
 
     #[tokio::test]
