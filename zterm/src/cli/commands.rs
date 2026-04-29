@@ -3,6 +3,9 @@ use chrono::Utc;
 use std::fs;
 use std::future::Future;
 use std::io;
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -212,7 +215,7 @@ impl CommandHandler {
             \n\
             Local Session:\n  \
               /config            Show configuration\n  \
-              /clear             Clear history\n  \
+              /clear             Clear local transcript; backend context retained\n  \
               /save [file]       Export session\n  \
               /history           Show commands\n  \
               /session list      List sessions\n"
@@ -1122,7 +1125,8 @@ impl CommandHandler {
     async fn handle_clear(&self, session_id: &str) -> Result<Option<String>> {
         let Some(scope) = self.current_storage_scope().await else {
             return Ok(Some(
-                "No local session history metadata found to clear\n".to_string(),
+                "No local session transcript found to clear; backend session context retained\n"
+                    .to_string(),
             ));
         };
 
@@ -1138,10 +1142,14 @@ impl CommandHandler {
         }
 
         if removed_history || touched_metadata {
-            return Ok(Some("✓ Session history cleared\n".to_string()));
+            return Ok(Some(
+                "✓ Local session transcript cleared; backend session context retained\n"
+                    .to_string(),
+            ));
         }
         Ok(Some(
-            "No local session history metadata found to clear\n".to_string(),
+            "No local session transcript found to clear; backend session context retained\n"
+                .to_string(),
         ))
     }
 
@@ -1164,11 +1172,7 @@ impl CommandHandler {
                 }
                 if history_path.exists() {
                     let mut src = fs::File::open(&history_path)?;
-                    let mut dst = match fs::OpenOptions::new()
-                        .write(true)
-                        .create_new(true)
-                        .open(&filename)
-                    {
+                    let mut dst = match create_private_export_file(Path::new(&filename)) {
                         Ok(file) => file,
                         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
                             return Ok(Some(format!(
@@ -1325,6 +1329,29 @@ impl CommandHandler {
 
         Ok(Some(format!("✅ 🗂  switched to workspace: {name}\n")))
     }
+}
+
+fn create_private_export_file(path: &Path) -> io::Result<fs::File> {
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        opts.mode(0o600);
+    }
+
+    let file = opts.open(path)?;
+    harden_private_export_file(path)?;
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn harden_private_export_file(path: &Path) -> io::Result<()> {
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+}
+
+#[cfg(not(unix))]
+fn harden_private_export_file(_path: &Path) -> io::Result<()> {
+    Ok(())
 }
 
 const CONFIG_SECRET_MASK: &str = "***REDACTED***";
@@ -3107,6 +3134,15 @@ provider_settings = { tokens = ["array-token-1", "array-token-2"], name = "kept"
         assert!(saved.contains(r#""content":"hello""#));
         assert!(saved.contains(r#""role":"assistant""#));
         assert!(saved.contains(r#""content":"hi there""#));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            assert_eq!(
+                std::fs::metadata(&save_path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
 
         storage::mark_scoped_session_history_incomplete(&scope, "main", "assistant append failed")
             .unwrap();
@@ -3144,6 +3180,7 @@ provider_settings = { tokens = ["array-token-1", "array-token-2"], name = "kept"
         let out = handler.handle("/clear", "main").await.unwrap().unwrap();
 
         assert!(out.contains("cleared"));
+        assert!(out.contains("backend session context retained"));
         assert!(!history.exists());
         assert!(!marker.exists());
     }

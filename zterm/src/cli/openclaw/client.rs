@@ -1079,6 +1079,7 @@ async fn collect_turn_result(
     let mut saw_terminal_completion = false;
     let mut expected_message_id: Option<String> = expected_ack_message_id.map(str::to_string);
     let mut pending_runless_messages: Vec<BufferedAssistantMessage> = Vec::new();
+    let mut pending_runless_bytes = 0usize;
 
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -1107,6 +1108,7 @@ async fn collect_turn_result(
                 merge_buffered_runless_messages(
                     turn,
                     &mut pending_runless_messages,
+                    &mut pending_runless_bytes,
                     expected_message_id.as_deref(),
                 );
                 if turn_can_finish(turn) {
@@ -1144,6 +1146,7 @@ async fn collect_turn_result(
                 merge_buffered_runless_messages(
                     turn,
                     &mut pending_runless_messages,
+                    &mut pending_runless_bytes,
                     expected_message_id.as_deref(),
                 );
             }
@@ -1167,8 +1170,18 @@ async fn collect_turn_result(
                     tracing::debug!(
                         "openclaw: buffering runId-less assistant message for session {session_key}; waiting for expected run correlation"
                     );
+                    let byte_len = payload.to_string().len();
+                    if pending_runless_messages.len() >= RUNLESS_BUFFER_MAX_MESSAGES
+                        || pending_runless_bytes.saturating_add(byte_len) > RUNLESS_BUFFER_MAX_BYTES
+                    {
+                        anyhow::bail!(
+                            "openclaw: buffered runId-less assistant messages exceeded cap while waiting for run correlation"
+                        );
+                    }
+                    pending_runless_bytes = pending_runless_bytes.saturating_add(byte_len);
                     pending_runless_messages.push(BufferedAssistantMessage {
                         message_id,
+                        byte_len,
                         payload: payload.clone(),
                         message: message.clone(),
                     });
@@ -1203,6 +1216,7 @@ async fn collect_turn_result(
 
 struct BufferedAssistantMessage {
     message_id: String,
+    byte_len: usize,
     payload: serde_json::Value,
     message: serde_json::Value,
 }
@@ -1210,6 +1224,7 @@ struct BufferedAssistantMessage {
 fn merge_buffered_runless_messages(
     turn: &mut super::handshake::TurnResult,
     pending: &mut Vec<BufferedAssistantMessage>,
+    pending_bytes: &mut usize,
     expected_message_id: Option<&str>,
 ) {
     let Some(expected_message_id) = expected_message_id else {
@@ -1219,6 +1234,7 @@ fn merge_buffered_runless_messages(
     while idx < pending.len() {
         if pending[idx].message_id == expected_message_id {
             let buffered = pending.remove(idx);
+            *pending_bytes = pending_bytes.saturating_sub(buffered.byte_len);
             merge_assistant_message_into_turn(turn, &buffered.payload, &buffered.message);
         } else {
             idx += 1;
@@ -1560,6 +1576,8 @@ use crate::cli::agent::{AgentClient, StreamSink, TurnChunk};
 use crate::cli::client::{Config, Model, Provider, Session};
 
 const SUBMIT_TURN_DEFAULT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+const RUNLESS_BUFFER_MAX_MESSAGES: usize = 64;
+const RUNLESS_BUFFER_MAX_BYTES: usize = 256 * 1024;
 
 fn duration_millis_u64(duration: Duration) -> u64 {
     duration.as_millis().min(u128::from(u64::MAX)) as u64
@@ -2673,6 +2691,42 @@ mod tests {
 
         assert_eq!(turn.run_id.as_deref(), Some("current-run"));
         assert_eq!(turn.text, "compat text");
+    }
+
+    #[tokio::test]
+    async fn collect_turn_result_caps_unmatched_runless_message_buffer() {
+        let (event_tx, mut event_rx) =
+            mpsc::channel::<super::super::wire::EventFrame>(RUNLESS_BUFFER_MAX_MESSAGES + 1);
+        for idx in 0..=RUNLESS_BUFFER_MAX_MESSAGES {
+            event_tx
+                .send(assistant_event_without_run_id_with_message_id(
+                    "session-a",
+                    &format!("stale-message-{idx}"),
+                    "stale text",
+                ))
+                .await
+                .unwrap();
+        }
+
+        let mut turn = super::super::handshake::TurnResult {
+            run_id: Some("current-run".to_string()),
+            ..Default::default()
+        };
+        let err = collect_turn_result(
+            &mut event_rx,
+            "session-a",
+            "current-run",
+            None,
+            None,
+            Duration::from_secs(60),
+            &mut turn,
+        )
+        .await
+        .expect_err("unmatched runId-less messages should be capped before timeout");
+
+        assert!(err
+            .to_string()
+            .contains("buffered runId-less assistant messages exceeded cap"));
     }
 
     #[tokio::test]

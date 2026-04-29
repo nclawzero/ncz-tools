@@ -64,7 +64,7 @@ Available commands:
   /memory      - Search memory entries
   /skill       - Enable/disable skills
   /config      - Re-run setup wizard
-  /clear       - Clear session history
+  /clear       - Clear local transcript; backend context is retained
   /save [file] - Save session transcript
   /info        - Show current session info
   /exit        - Exit ZTerm
@@ -138,7 +138,7 @@ Available skills:
 Re-run the configuration wizard to update settings.
 
 ### `/clear`
-Clear the current session's message history (server-side only).
+Clear zterm's local transcript for the current session. This does not reset or delete the backend session, so backend context is retained.
 
 ### `/save [filename]`
 Save the current session transcript to a file.
