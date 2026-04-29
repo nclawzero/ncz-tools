@@ -972,7 +972,7 @@ fn slash_command_may_mutate_state(cmdline: &str) -> bool {
     let command = tokens.first().map(String::as_str);
     let subcommand = tokens.get(1).map(String::as_str);
     match (command, subcommand) {
-        (Some("/clear" | "/save"), _) => true,
+        (Some("/clear"), _) => true,
         (Some("/models" | "/model"), Some("set")) => true,
         (Some("/workspace" | "/workspaces"), Some("switch")) => true,
         (Some("/memory"), Some("post" | "add" | "delete" | "rm")) => true,
@@ -1892,6 +1892,7 @@ fn submit_error_requires_incomplete_transcript(message: &str, forwarded_token: b
         || turn_collection_failure_requires_incomplete_transcript(message)
         || openclaw_submit_failure_requires_incomplete_transcript(message)
         || zeroclaw_post_send_failure_requires_incomplete_transcript(message)
+        || webhook_post_dispatch_failure_requires_incomplete_transcript(message)
         || response_size_failure_requires_incomplete_transcript(message)
 }
 
@@ -1911,6 +1912,12 @@ fn zeroclaw_post_send_failure_requires_incomplete_transcript(message: &str) -> b
     message.contains("WebSocket turn timed out")
         || message.contains("WebSocket read failed")
         || message.contains("WebSocket closed before a response completed")
+}
+
+fn webhook_post_dispatch_failure_requires_incomplete_transcript(message: &str) -> bool {
+    message.starts_with("Webhook request failed: HTTP ")
+        || message.contains("Failed to parse response")
+        || message.contains("Webhook response missing string 'response' field")
 }
 
 #[derive(Debug)]
@@ -5427,7 +5434,7 @@ mod tests {
             );
         }
 
-        for cmdline in ["/memory list", "/session list"] {
+        for cmdline in ["/memory list", "/session list", "/save backup.txt"] {
             assert_eq!(
                 slash_command_deadline(cmdline),
                 SlashCommandDeadline::read_only(COMMAND_WORKER_TIMEOUT),
@@ -5566,6 +5573,17 @@ mod tests {
         .expect("mutating terminal failure should produce a fence reason");
         assert!(reason.contains("/workspace switch prod"));
         assert!(reason.contains("worker channel disconnected"));
+
+        let save = in_flight_request_for_worker_request(
+            "/save missing/parent.txt",
+            &WorkerRequest::Command("/save missing/parent.txt".to_string()),
+        );
+        assert!(!save.mutating_slash);
+        assert!(mutation_fence_reason_for_terminal_failure(
+            "failed to create export file",
+            Some(&save)
+        )
+        .is_none());
     }
 
     #[tokio::test]
@@ -6494,6 +6512,38 @@ mod tests {
         }
         assert!(!submit_error_requires_incomplete_transcript(
             "WebSocket send failed: connection refused",
+            false
+        ));
+    }
+
+    #[test]
+    fn webhook_post_dispatch_failures_mark_history_incomplete_without_tokens() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        for reason in [
+            "Webhook request failed: HTTP 502: backend processed but returned bad gateway",
+            "Failed to parse response: expected value at line 1 column 1",
+            "Webhook response missing string 'response' field",
+        ] {
+            let scope = storage::workspace_scope(
+                "zeroclaw",
+                &format!("webhook-failed-transcript-{}", uuid::Uuid::new_v4()),
+                None,
+            )
+            .unwrap();
+            storage::append_scoped_session_history(&scope, "main", "user", "hello").unwrap();
+
+            assert!(
+                submit_error_requires_incomplete_transcript(reason, false),
+                "{reason}"
+            );
+            let message = mark_turn_transcript_incomplete_reason(&scope, "main", reason);
+
+            assert!(message.contains("transcript marked incomplete"));
+            assert!(storage::scoped_session_history_is_incomplete(&scope, "main").unwrap());
+        }
+
+        assert!(!submit_error_requires_incomplete_transcript(
+            "Webhook request failed: connection refused",
             false
         ));
     }
