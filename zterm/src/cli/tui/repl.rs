@@ -10,6 +10,7 @@ use crate::cli::commands::{tokenize_slash_command, CommandHandler};
 use crate::cli::input::InputHistory;
 use crate::cli::storage;
 use crate::cli::theme::Theme;
+use crate::cli::tui::tv_ui::sanitize_terminal_text;
 use crate::cli::ui::{self, StatusBar};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -238,8 +239,9 @@ impl ReplLoop {
                         // Vision UI can render them) — print it
                         // here so the rustyline REPL UX is
                         // unchanged.
-                        print!("{}", text);
-                        if !text.ends_with('\n') {
+                        let safe_text = sanitize_legacy_slash_output(&text);
+                        print!("{}", safe_text);
+                        if !safe_text.ends_with('\n') {
                             println!();
                         }
                     }
@@ -753,6 +755,10 @@ fn repl_submit_error_requires_incomplete_transcript(message: &str) -> bool {
     repl_turn_collection_failure_requires_incomplete_transcript(message) || !message.is_empty()
 }
 
+fn sanitize_legacy_slash_output(output: &str) -> String {
+    sanitize_terminal_text(output)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -812,6 +818,18 @@ mod tests {
             command_session_preflight("/session delete 'Research"),
             CommandSessionPreflight::None
         );
+    }
+
+    #[test]
+    fn legacy_slash_output_sanitizes_terminal_controls() {
+        let raw = "session \u{1b}]52;c;owned\u{7}\nmodel \u{1b}[31mred";
+
+        let safe = sanitize_legacy_slash_output(raw);
+
+        assert!(!safe.contains('\u{1b}'));
+        assert!(!safe.contains('\u{7}'));
+        assert!(safe.contains("<ESC>]52;c;owned^G"));
+        assert!(safe.contains("<ESC>[31mred"));
     }
 
     #[test]

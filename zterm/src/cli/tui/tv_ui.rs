@@ -254,7 +254,7 @@ fn typewriter_chars_due(elapsed: Duration, interval: Duration) -> usize {
     (elapsed.as_millis() / interval.as_millis()) as usize
 }
 
-fn sanitize_terminal_text(input: &str) -> String {
+pub(crate) fn sanitize_terminal_text(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     for ch in input.chars() {
         match ch {
