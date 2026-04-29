@@ -146,6 +146,7 @@ const INPUT_UNDO_DEPTH: usize = 64;
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const SPINNER_INTERVAL: Duration = Duration::from_millis(80);
 const TURN_FORWARD_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
+const TURN_SUBMIT_WORKER_TIMEOUT: Duration = Duration::from_secs(180);
 const SESSION_PICKER_LIST_TIMEOUT: Duration = Duration::from_secs(5);
 const COMMAND_WORKER_TIMEOUT: Duration = Duration::from_secs(30);
 const MUTATING_COMMAND_WORKER_TIMEOUT: Duration = Duration::from_secs(30);
@@ -676,40 +677,40 @@ pub async fn run(
                                 Arc::clone(&forwarded_token),
                             ));
                             client.set_stream_sink(Some(turn_sink));
-                            let submit_result = client.submit_turn(&worker_session_id, &text).await;
+                            let submit_result = submit_turn_with_worker_timeout(
+                                client.submit_turn(&worker_session_id, &text),
+                                TURN_SUBMIT_WORKER_TIMEOUT,
+                            )
+                            .await;
                             client.set_stream_sink(Some(worker_sink.clone()));
                             drop(client);
                             let submit_error_text =
                                 submit_result.as_ref().err().map(|e| e.to_string());
 
-                            let saw_finished = match tokio::time::timeout(
+                            let forwarded_terminal = match tokio::time::timeout(
                                 TURN_FORWARD_DRAIN_TIMEOUT,
                                 &mut forward_task,
                             )
                             .await
                             {
-                                Ok(Ok(saw_finished)) => saw_finished,
+                                Ok(Ok(terminal)) => terminal,
                                 Ok(Err(e)) => {
                                     warn!("tv_ui: turn stream forwarder failed: {e}");
-                                    observed_finished.load(Ordering::Acquire)
+                                    None
                                 }
                                 Err(_) => {
                                     warn!(
                                         "tv_ui: turn stream forwarder did not drain after \
-                                         submit_turn returned; waiting for terminal frame"
+                                        submit_turn returned; using terminal fallback"
                                     );
-                                    match forward_task.await {
-                                        Ok(saw_finished) => saw_finished,
-                                        Err(e) => {
-                                            warn!("tv_ui: turn stream forwarder failed: {e}");
-                                            observed_finished.load(Ordering::Acquire)
-                                        }
-                                    }
+                                    forward_task.abort();
+                                    None
                                 }
                             };
+                            let saw_finished = forwarded_terminal.is_some();
                             let forwarded_any = forwarded_token.load(Ordering::Acquire);
                             let forwarded_terminal_error =
-                                observed_finished_error.load(Ordering::Acquire);
+                                forwarded_terminal.as_ref().is_some_and(Result::is_err);
                             if partial_stream_without_terminal_frame(
                                 &submit_result,
                                 saw_finished,
@@ -721,6 +722,7 @@ pub async fn run(
                                     PARTIAL_STREAM_INCOMPLETE_REASON,
                                 );
                             }
+                            let mut terminal_override: Option<Result<String, String>> = None;
                             if forwarded_terminal_error && submit_result.is_ok() {
                                 let _ = mark_turn_transcript_incomplete_reason(
                                     &transcript_scope,
@@ -742,7 +744,7 @@ pub async fn run(
                                                     &worker_session_id,
                                                     &e,
                                                 );
-                                            send_worker_finished(&worker_sink, Err(message)).await;
+                                            terminal_override = Some(Err(message));
                                         }
                                     }
                                     Err(e) => {
@@ -759,7 +761,7 @@ pub async fn run(
                                                     &worker_session_id,
                                                     &append_error,
                                                 );
-                                            send_worker_finished(&worker_sink, Err(message)).await;
+                                            terminal_override = Some(Err(message));
                                         }
                                     }
                                     _ => {}
@@ -779,9 +781,10 @@ pub async fn run(
                             }
                             send_worker_chunks_reliably(
                                 &worker_sink,
-                                submit_turn_fallback_chunks(
+                                final_turn_terminal_chunks(
+                                    terminal_override,
+                                    forwarded_terminal,
                                     &submit_result,
-                                    saw_finished,
                                     forwarded_any,
                                 ),
                             )
@@ -1256,14 +1259,32 @@ fn connect_splash_for_workspace(workspace_name: &str) -> String {
     fallback
 }
 
+async fn submit_turn_with_worker_timeout<F>(submit: F, timeout: Duration) -> Result<String>
+where
+    F: Future<Output = Result<String>>,
+{
+    match tokio::time::timeout(timeout, submit).await {
+        Ok(result) => result,
+        Err(_) => Err(anyhow::anyhow!(turn_submit_timeout_message(timeout))),
+    }
+}
+
+fn turn_submit_timeout_message(timeout: Duration) -> String {
+    format!(
+        "turn submission timed out after {}s before the worker returned; backend outcome unknown",
+        timeout.as_secs()
+    )
+}
+
 async fn forward_turn_chunks(
     mut turn_rx: mpsc::Receiver<TurnChunk>,
     ui_sink: StreamSink,
     observed_finished: Arc<AtomicBool>,
     observed_finished_error: Arc<AtomicBool>,
     forwarded_token: Arc<AtomicBool>,
-) -> bool {
+) -> Option<Result<String, String>> {
     let mut saw_finished = false;
+    let mut terminal = None;
     let mut pending_token = String::new();
     let mut forwarded_bytes = 0usize;
 
@@ -1274,28 +1295,22 @@ async fn forward_turn_chunks(
                 if forwarded_bytes > TURN_STREAM_MAX_BYTES {
                     if !flush_forwarded_token(&ui_sink, &forwarded_token, &mut pending_token).await
                     {
-                        return saw_finished;
+                        return terminal;
                     }
                     let message = format!(
                         "response exceeded {} byte TUI stream limit; turn closed",
                         TURN_STREAM_MAX_BYTES
                     );
-                    if ui_sink
-                        .send_async(TurnChunk::Finished(Err(message)))
-                        .await
-                        .is_ok()
-                    {
-                        saw_finished = true;
-                        observed_finished.store(true, Ordering::Release);
-                        observed_finished_error.store(true, Ordering::Release);
-                    }
-                    return saw_finished;
+                    observed_finished.store(true, Ordering::Release);
+                    observed_finished_error.store(true, Ordering::Release);
+                    terminal = Some(Err(message));
+                    return terminal;
                 }
                 pending_token.push_str(&text);
                 if pending_token.len() >= TURN_TOKEN_COALESCE_BYTES
                     && !flush_forwarded_token(&ui_sink, &forwarded_token, &mut pending_token).await
                 {
-                    return saw_finished;
+                    return terminal;
                 }
             }
             TurnChunk::Finished(result) => {
@@ -1304,34 +1319,27 @@ async fn forward_turn_chunks(
                 }
                 let is_error = result.is_err();
                 if !flush_forwarded_token(&ui_sink, &forwarded_token, &mut pending_token).await {
-                    return saw_finished;
+                    return terminal;
                 }
-                if ui_sink
-                    .send_async(TurnChunk::Finished(result))
-                    .await
-                    .is_ok()
-                {
-                    saw_finished = true;
-                    observed_finished.store(true, Ordering::Release);
-                    if is_error {
-                        observed_finished_error.store(true, Ordering::Release);
-                    }
-                } else {
-                    return saw_finished;
+                saw_finished = true;
+                observed_finished.store(true, Ordering::Release);
+                if is_error {
+                    observed_finished_error.store(true, Ordering::Release);
                 }
+                terminal = Some(result);
             }
             other => {
                 if !flush_forwarded_token(&ui_sink, &forwarded_token, &mut pending_token).await {
-                    return saw_finished;
+                    return terminal;
                 }
                 if ui_sink.send_async(other).await.is_err() {
-                    return saw_finished;
+                    return terminal;
                 }
             }
         }
     }
     let _ = flush_forwarded_token(&ui_sink, &forwarded_token, &mut pending_token).await;
-    saw_finished
+    terminal
 }
 
 async fn flush_forwarded_token(
@@ -1396,6 +1404,22 @@ fn submit_turn_fallback_chunks(
         }
         Err(e) => vec![TurnChunk::Finished(Err(e.to_string()))],
     }
+}
+
+fn final_turn_terminal_chunks(
+    terminal_override: Option<Result<String, String>>,
+    forwarded_terminal: Option<Result<String, String>>,
+    submit_result: &Result<String>,
+    forwarded_token: bool,
+) -> Vec<TurnChunk> {
+    let saw_finished = forwarded_terminal.is_some();
+    if let Some(result) = terminal_override {
+        return vec![TurnChunk::Finished(result)];
+    }
+    if let Some(result) = forwarded_terminal {
+        return vec![TurnChunk::Finished(result)];
+    }
+    submit_turn_fallback_chunks(submit_result, saw_finished, forwarded_token)
 }
 
 fn partial_stream_without_terminal_frame<T>(
@@ -1893,6 +1917,7 @@ fn submit_error_requires_incomplete_transcript(message: &str, forwarded_token: b
         || openclaw_submit_failure_requires_incomplete_transcript(message)
         || zeroclaw_post_send_failure_requires_incomplete_transcript(message)
         || webhook_post_dispatch_failure_requires_incomplete_transcript(message)
+        || worker_submit_timeout_requires_incomplete_transcript(message)
         || response_size_failure_requires_incomplete_transcript(message)
 }
 
@@ -1912,12 +1937,17 @@ fn zeroclaw_post_send_failure_requires_incomplete_transcript(message: &str) -> b
     message.contains("WebSocket turn timed out")
         || message.contains("WebSocket read failed")
         || message.contains("WebSocket closed before a response completed")
+        || message.contains("WebSocket send timed out")
 }
 
 fn webhook_post_dispatch_failure_requires_incomplete_transcript(message: &str) -> bool {
     message.starts_with("Webhook request failed: HTTP ")
         || message.contains("Failed to parse response")
         || message.contains("Webhook response missing string 'response' field")
+}
+
+fn worker_submit_timeout_requires_incomplete_transcript(message: &str) -> bool {
+    message.contains("turn submission timed out")
 }
 
 #[derive(Debug)]
@@ -4627,6 +4657,37 @@ mod tests {
     }
 
     #[test]
+    fn final_turn_terminal_prefers_persistence_error_over_captured_finished() {
+        let ok: Result<String> = Ok("complete response".to_string());
+        let chunks = final_turn_terminal_chunks(
+            Some(Err("transcript marked incomplete".to_string())),
+            Some(Ok("backend finished".to_string())),
+            &ok,
+            true,
+        );
+
+        match chunks.as_slice() {
+            [TurnChunk::Finished(Err(message))] => {
+                assert_eq!(message, "transcript marked incomplete");
+            }
+            other => panic!("expected only persistence error terminal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_submit_timeout_returns_incomplete_transcript_error() {
+        let result = submit_turn_with_worker_timeout(
+            std::future::pending::<Result<String>>(),
+            Duration::from_millis(1),
+        )
+        .await;
+        let message = result.unwrap_err().to_string();
+
+        assert!(message.contains("turn submission timed out"));
+        assert!(submit_error_requires_incomplete_transcript(&message, false));
+    }
+
+    #[test]
     fn token_chunks_render_terminal_controls_visibly() {
         let lines = Rc::new(RefCell::new(vec![String::new()]));
 
@@ -5587,7 +5648,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn forward_turn_chunks_forwards_only_one_finished() {
+    async fn forward_turn_chunks_captures_only_one_finished() {
         let (turn_tx, turn_rx) = mpsc::channel(8);
         let (ui_tx, mut ui_rx) = StreamSink::channel(8);
         let observed_finished = Arc::new(AtomicBool::new(false));
@@ -5602,24 +5663,19 @@ mod tests {
             .unwrap();
         drop(turn_tx);
 
-        assert!(
-            forward_turn_chunks(
-                turn_rx,
-                ui_tx,
-                Arc::clone(&observed_finished),
-                Arc::clone(&observed_finished_error),
-                Arc::clone(&forwarded_token),
-            )
-            .await
-        );
+        let terminal = forward_turn_chunks(
+            turn_rx,
+            ui_tx,
+            Arc::clone(&observed_finished),
+            Arc::clone(&observed_finished_error),
+            Arc::clone(&forwarded_token),
+        )
+        .await;
         assert!(observed_finished.load(Ordering::Acquire));
         assert!(!observed_finished_error.load(Ordering::Acquire));
         assert!(!forwarded_token.load(Ordering::Acquire));
 
-        match ui_rx.recv().await {
-            Some(TurnChunk::Finished(Ok(text))) => assert_eq!(text, "first"),
-            other => panic!("expected first Finished, got {other:?}"),
-        }
+        assert_eq!(terminal, Some(Ok("first".to_string())));
         assert!(ui_rx.recv().await.is_none());
     }
 
@@ -5636,16 +5692,15 @@ mod tests {
             .unwrap();
         drop(turn_tx);
 
-        assert!(
-            !forward_turn_chunks(
-                turn_rx,
-                ui_tx,
-                Arc::clone(&observed_finished),
-                Arc::clone(&observed_finished_error),
-                Arc::clone(&forwarded_token),
-            )
-            .await
-        );
+        assert!(forward_turn_chunks(
+            turn_rx,
+            ui_tx,
+            Arc::clone(&observed_finished),
+            Arc::clone(&observed_finished_error),
+            Arc::clone(&forwarded_token),
+        )
+        .await
+        .is_none());
         assert!(!observed_finished.load(Ordering::Acquire));
         assert!(!observed_finished_error.load(Ordering::Acquire));
         assert!(forwarded_token.load(Ordering::Acquire));
@@ -5740,7 +5795,7 @@ mod tests {
             .is_err());
         drop(turn_sink);
 
-        let saw_finished = forward_turn_chunks(
+        let terminal = forward_turn_chunks(
             turn_rx,
             ui_tx,
             Arc::clone(&observed_finished),
@@ -5748,7 +5803,7 @@ mod tests {
             Arc::clone(&forwarded_token),
         )
         .await;
-        assert!(!saw_finished);
+        assert!(terminal.is_none());
         assert!(!observed_finished.load(Ordering::Acquire));
         assert!(!observed_finished_error.load(Ordering::Acquire));
         assert!(forwarded_token.load(Ordering::Acquire));
@@ -5760,7 +5815,7 @@ mod tests {
 
         let fallback = submit_turn_fallback_chunks(
             &Ok("complete backend text".to_string()),
-            saw_finished,
+            terminal.is_some(),
             true,
         );
         assert!(
@@ -5784,16 +5839,15 @@ mod tests {
             .unwrap();
         drop(turn_tx);
 
-        assert!(
-            !forward_turn_chunks(
-                turn_rx,
-                ui_tx,
-                Arc::clone(&observed_finished),
-                Arc::clone(&observed_finished_error),
-                Arc::clone(&forwarded_token),
-            )
-            .await
-        );
+        assert!(forward_turn_chunks(
+            turn_rx,
+            ui_tx,
+            Arc::clone(&observed_finished),
+            Arc::clone(&observed_finished_error),
+            Arc::clone(&forwarded_token),
+        )
+        .await
+        .is_none());
         assert!(!observed_finished_error.load(Ordering::Acquire));
         assert!(forwarded_token.load(Ordering::Acquire));
         match ui_rx.recv().await {
@@ -5816,24 +5870,20 @@ mod tests {
             .unwrap();
         drop(turn_tx);
 
-        assert!(
-            forward_turn_chunks(
-                turn_rx,
-                ui_tx,
-                Arc::clone(&observed_finished),
-                Arc::clone(&observed_finished_error),
-                Arc::clone(&forwarded_token),
-            )
-            .await
-        );
+        let terminal = forward_turn_chunks(
+            turn_rx,
+            ui_tx,
+            Arc::clone(&observed_finished),
+            Arc::clone(&observed_finished_error),
+            Arc::clone(&forwarded_token),
+        )
+        .await;
         assert!(observed_finished.load(Ordering::Acquire));
         assert!(observed_finished_error.load(Ordering::Acquire));
         assert!(!forwarded_token.load(Ordering::Acquire));
-        match ui_rx.recv().await {
-            Some(TurnChunk::Finished(Err(message))) => {
-                assert!(message.contains("TUI stream limit"));
-            }
-            other => panic!("expected stream-limit error, got {other:?}"),
+        match terminal {
+            Some(Err(message)) => assert!(message.contains("TUI stream limit")),
+            other => panic!("expected captured stream-limit error, got {other:?}"),
         }
         assert!(ui_rx.recv().await.is_none());
     }
@@ -6504,6 +6554,7 @@ mod tests {
             "WebSocket turn timed out after 30s before a response completed",
             "WebSocket read failed: connection reset",
             "WebSocket closed before a response completed",
+            "WebSocket send timed out after 30s before a response completed",
         ] {
             assert!(
                 submit_error_requires_incomplete_transcript(reason, false),

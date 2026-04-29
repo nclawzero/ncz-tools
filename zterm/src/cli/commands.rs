@@ -1061,13 +1061,13 @@ impl CommandHandler {
                 Ok(Some(format_model_list(&rows, &active)))
             }
             Some("set") => {
-                let key = args.first().copied().unwrap_or("").trim().to_string();
-                if key.is_empty() {
+                if args.len() != 1 || args[0].trim().is_empty() {
                     return Ok(Some(
                         "Usage: /models set <key>\n   Run /models list to see available keys\n"
                             .to_string(),
                     ));
                 }
+                let key = args[0].trim().to_string();
                 match self.current_cron().await {
                     Some(c) => {
                         if c.model_list().is_empty() {
@@ -2933,6 +2933,57 @@ mod tests {
         assert!(out.contains("❌ Failed to set model key"));
         assert!(out.contains("advertised no model keys"));
         assert!(cron.cached_model_key_for_tests().is_none());
+    }
+
+    #[tokio::test]
+    async fn model_set_rejects_extra_tokens_without_switching() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("GET", "/api/config")
+            .with_status(200)
+            .with_body(
+                r#"{"content":"[providers.models.primary]\nname = \"gemini\"\nmodel = \"gemini-flash-latest\"\n"}"#,
+            )
+            .create_async()
+            .await;
+        let cron = ZeroclawClient::new(server.url(), "test_token".to_string());
+        let handler = super::CommandHandler::new(app_with_fake_client_and_cron(cron.clone()).await);
+
+        let out = handler
+            .handle("/models set primary extra", "main")
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(out.contains("Usage: /models set <key>"));
+        assert!(cron.cached_model_key_for_tests().is_none());
+    }
+
+    #[tokio::test]
+    async fn model_set_accepts_quoted_single_key() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("GET", "/api/config")
+            .with_status(200)
+            .with_body(
+                r#"{"content":"[providers.models.\"primary key\"]\nname = \"gemini\"\nmodel = \"gemini-flash-latest\"\n"}"#,
+            )
+            .create_async()
+            .await;
+        let cron = ZeroclawClient::new(server.url(), "test_token".to_string());
+        let handler = super::CommandHandler::new(app_with_fake_client_and_cron(cron.clone()).await);
+
+        let out = handler
+            .handle("/models set 'primary key'", "main")
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(out.contains("✅ Active model key: primary key"));
+        assert_eq!(
+            cron.cached_model_key_for_tests().as_deref(),
+            Some("primary key")
+        );
     }
 
     fn session(id: &str, name: &str) -> Session {

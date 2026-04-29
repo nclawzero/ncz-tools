@@ -12,6 +12,8 @@ use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, Web
 use crate::cli::agent::{StreamSink, TurnChunk, TurnUsage};
 
 const ZEROCLAW_WS_TURN_TIMEOUT: Duration = Duration::from_secs(120);
+const ZEROCLAW_WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const ZEROCLAW_WS_SEND_TIMEOUT: Duration = Duration::from_secs(30);
 const ZEROCLAW_TURN_RESPONSE_MAX_BYTES: usize = 2 * 1024 * 1024;
 const ZEROCLAW_WEBHOOK_ENVELOPE_MAX_BYTES: usize = 64 * 1024;
 const ZEROCLAW_WEBHOOK_ERROR_BODY_MAX_BYTES: usize = 8 * 1024;
@@ -537,7 +539,9 @@ impl ZeroclawClient {
         let model = self.current_model_key();
 
         if let Ok(url) = self.ws_chat_url(session_id) {
-            if let Ok((ws_stream, _)) = connect_async(url.as_str()).await {
+            if let Ok(Ok((ws_stream, _))) =
+                tokio::time::timeout(ZEROCLAW_WS_CONNECT_TIMEOUT, connect_async(url.as_str())).await
+            {
                 return self
                     .submit_turn_ws_connected(ws_stream, session_id, message, &model)
                     .await;
@@ -615,10 +619,23 @@ impl ZeroclawClient {
             "model": model,
         });
 
-        ws_stream
-            .send(Message::Text(payload.to_string()))
-            .await
-            .map_err(|e| anyhow!("WebSocket send failed: {}", e))?;
+        match tokio::time::timeout(
+            ZEROCLAW_WS_SEND_TIMEOUT,
+            ws_stream.send(Message::Text(payload.to_string())),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(anyhow!("WebSocket send failed: {}", e)),
+            Err(_) => {
+                let wrapped = anyhow!(
+                    "WebSocket send timed out after {}s before a response completed",
+                    ZEROCLAW_WS_SEND_TIMEOUT.as_secs()
+                );
+                self.emit_failure(&wrapped);
+                return Err(wrapped);
+            }
+        }
 
         let mut response = String::new();
         let mut streamed = false;
