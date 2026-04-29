@@ -172,7 +172,7 @@ fn legacy_migrations(paths: &Paths) -> Result<Vec<LegacyMigration>, NczError> {
             }
             parse_legacy_json(value, fallback_name)
         } else {
-            parse_env(&body, fallback_name)
+            parse_env(&body, fallback_name, &path)?
         };
         validate_declaration(&parsed.declaration).map_err(|err| {
             NczError::Precondition(format!("invalid legacy provider {}: {err}", path.display()))
@@ -300,7 +300,7 @@ fn preflight_provider_files(files: &[PathBuf]) -> Result<(), NczError> {
             .unwrap_or("unknown")
             .to_string();
         let ext = path.extension().and_then(OsStr::to_str).unwrap_or("");
-        let declaration = parse_declaration_for_path(&body, &fallback_name, ext)?;
+        let declaration = parse_declaration_for_path(&body, &fallback_name, ext, path)?;
         validate_declaration(&declaration).map_err(|err| {
             NczError::Precondition(format!(
                 "invalid provider declaration {}: {err}",
@@ -397,7 +397,7 @@ pub fn exists_without_migration(paths: &Paths, name: &str) -> Result<bool, NczEr
         let declaration = if ext == "json" {
             parse_json(&body, fallback_name.clone())?
         } else {
-            parse_env(&body, fallback_name.clone()).declaration
+            parse_env(&body, fallback_name.clone(), &path)?.declaration
         };
         if declaration.name == name || fallback_name == name {
             return Ok(true);
@@ -465,7 +465,7 @@ pub fn remove(paths: &Paths, name: &str) -> Result<bool, NczError> {
             .to_string();
         let body = fs::read_to_string(&path)?;
         let ext = path.extension().and_then(OsStr::to_str).unwrap_or("");
-        let declaration = parse_declaration_for_path(&body, &fallback_name, ext);
+        let declaration = parse_declaration_for_path(&body, &fallback_name, ext, &path);
         if fallback_name == name {
             aliases.insert(fallback_name);
             if let Ok(declaration) = declaration {
@@ -513,7 +513,7 @@ pub fn removal_aliases(paths: &Paths, name: &str) -> Result<BTreeSet<String>, Nc
             .to_string();
         let body = fs::read_to_string(&path)?;
         let ext = path.extension().and_then(OsStr::to_str).unwrap_or("");
-        let declaration = parse_declaration_for_path(&body, &fallback_name, ext);
+        let declaration = parse_declaration_for_path(&body, &fallback_name, ext, &path);
         if fallback_name == name {
             aliases.insert(fallback_name);
             if let Ok(declaration) = declaration {
@@ -553,7 +553,9 @@ pub fn inline_credential_replacements(
             .and_then(OsStr::to_str)
             .unwrap_or(name)
             .to_string();
-        if let Some((key_env, secret)) = inline_credential_for_path(&body, ext, &fallback_name)? {
+        if let Some((key_env, secret)) =
+            inline_credential_for_path(&body, ext, &fallback_name, &path)?
+        {
             replacements.push(InlineCredentialReplacement {
                 file: path.display().to_string(),
                 key_env,
@@ -586,7 +588,7 @@ pub fn credential_references(paths: &Paths, key: &str) -> Result<Vec<String>, Nc
             .unwrap_or("unknown")
             .to_string();
         let ext = path.extension().and_then(OsStr::to_str).unwrap_or("");
-        let declaration = parse_declaration_for_path(&body, &fallback_name, ext)?;
+        let declaration = parse_declaration_for_path(&body, &fallback_name, ext, &path)?;
         if declaration.key_env == key {
             references.push(declaration.name);
         }
@@ -809,7 +811,7 @@ fn read_record(paths: &Paths, path: &Path) -> Result<Option<ProviderRecord>, Ncz
         }));
     }
 
-    let parsed = parse_env(&body, fallback_name);
+    let parsed = parse_env(&body, fallback_name, path)?;
     validate_declaration(&parsed.declaration).map_err(|err| {
         NczError::Precondition(format!("invalid legacy provider {}: {err}", path.display()))
     })?;
@@ -880,7 +882,7 @@ fn matching_provider_files(paths: &Paths, name: &str) -> Result<Vec<PathBuf>, Nc
         let declaration = if ext == "json" {
             parse_json(&body, fallback_name)?
         } else {
-            parse_env(&body, fallback_name).declaration
+            parse_env(&body, fallback_name, &path)?.declaration
         };
         if declaration.name == name {
             files.push(path);
@@ -893,11 +895,12 @@ fn parse_declaration_for_path(
     body: &str,
     fallback_name: &str,
     ext: &str,
+    source: &Path,
 ) -> Result<ProviderDeclaration, NczError> {
     if ext == "json" {
         parse_json(body, fallback_name.to_string())
     } else {
-        Ok(parse_env(body, fallback_name.to_string()).declaration)
+        Ok(parse_env(body, fallback_name.to_string(), source)?.declaration)
     }
 }
 
@@ -981,8 +984,12 @@ fn parse_legacy_json(value: Value, fallback_name: String) -> ParsedProvider {
     }
 }
 
-fn parse_env(body: &str, fallback_name: String) -> ParsedProvider {
-    let pairs = env_pairs(body);
+fn parse_env(
+    body: &str,
+    fallback_name: String,
+    source: &Path,
+) -> Result<ParsedProvider, NczError> {
+    let pairs = env_pairs(body, source)?;
 
     let name = lookup(&pairs, &["PROVIDER_NAME", "NAME"]).unwrap_or(fallback_name);
     let explicit_key_env = lookup(&pairs, &["KEY_ENV", "API_KEY_ENV", "TOKEN_ENV", "AUTH_ENV"]);
@@ -991,7 +998,7 @@ fn parse_env(body: &str, fallback_name: String) -> ParsedProvider {
         .or_else(|| legacy_secret.as_ref().map(|(key_env, _)| key_env.clone()))
         .unwrap_or_else(|| "API_KEY".to_string());
 
-    ParsedProvider {
+    Ok(ParsedProvider {
         declaration: ProviderDeclaration {
             schema_version: 1,
             name,
@@ -1010,13 +1017,14 @@ fn parse_env(body: &str, fallback_name: String) -> ParsedProvider {
             models: Vec::new(),
         },
         inline_secret: legacy_secret.map(|(_, secret)| secret),
-    }
+    })
 }
 
 fn inline_credential_for_path(
     body: &str,
     ext: &str,
     fallback_name: &str,
+    source: &Path,
 ) -> Result<Option<(String, String)>, NczError> {
     if ext == "json" {
         let value: Value = serde_json::from_str(body)?;
@@ -1028,7 +1036,7 @@ fn inline_credential_for_path(
             .inline_secret
             .map(|secret| (parsed.declaration.key_env, secret)));
     }
-    let parsed = parse_env(body, fallback_name.to_string());
+    let parsed = parse_env(body, fallback_name.to_string(), source)?;
     Ok(parsed
         .inline_secret
         .map(|secret| (parsed.declaration.key_env, secret)))
@@ -1092,17 +1100,27 @@ fn key_env_metadata_field(name: &str) -> bool {
         || name.ends_with("-env")
 }
 
-fn env_pairs(body: &str) -> Vec<(String, String)> {
+fn env_pairs(body: &str, source: &Path) -> Result<Vec<(String, String)>, NczError> {
     body.lines()
-        .filter_map(|line| {
+        .enumerate()
+        .filter_map(|(idx, line)| {
             let line = line.trim_start();
             if line.is_empty() || line.starts_with('#') {
                 return None;
             }
             let line = line.strip_prefix("export ").unwrap_or(line);
             let (key, value) = line.split_once('=')?;
-            let value = agent_env::parse_environment_file_value(value).ok()?;
-            Some((key.trim().to_string(), value))
+            Some(
+                agent_env::parse_environment_file_value(value)
+                    .map(|value| (key.trim().to_string(), value))
+                    .map_err(|err| {
+                        NczError::Precondition(format!(
+                            "failed to parse legacy provider env {} line {}: {err}",
+                            source.display(),
+                            idx + 1
+                        ))
+                    }),
+            )
         })
         .collect()
 }
@@ -1476,6 +1494,26 @@ mod tests {
     }
 
     #[test]
+    fn test_force_replacement_aborts_on_malformed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        fs::create_dir_all(paths.providers_dir()).unwrap();
+        fs::write(
+            paths.providers_dir().join("local.env"),
+            "API_KEY=\"secret\nMODEL=foo\n",
+        )
+        .unwrap();
+
+        let err = inline_credential_replacements(&paths, "local").unwrap_err();
+
+        assert!(
+            matches!(err, NczError::Precondition(message) if message.contains("local.env"))
+        );
+        assert!(paths.providers_dir().join("local.env").exists());
+        assert!(!paths.providers_dir().join("local.json").exists());
+    }
+
+    #[test]
     fn detects_secret_bearing_canonical_replacement_files() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = test_paths(tmp.path());
@@ -1614,6 +1652,27 @@ mod tests {
     }
 
     #[test]
+    fn test_migrate_legacy_aborts_on_unparseable_quote() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        fs::create_dir_all(paths.providers_dir()).unwrap();
+        fs::write(
+            paths.providers_dir().join("local.env"),
+            "API_KEY=\"secret\nMODEL=foo\n",
+        )
+        .unwrap();
+
+        let err = migrate_legacy(&paths).unwrap_err();
+
+        assert!(
+            matches!(err, NczError::Precondition(message) if message.contains("local.env"))
+        );
+        assert!(paths.providers_dir().join("local.env").exists());
+        assert!(!paths.providers_dir().join("local.json").exists());
+        assert!(!paths.agent_env().exists());
+    }
+
+    #[test]
     fn migrate_legacy_binds_matching_existing_secret() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = test_paths(tmp.path());
@@ -1711,7 +1770,9 @@ mod tests {
         let parsed = parse_env(
             "PROVIDER_NAME=local\nPROVIDER_URL=http://127.0.0.1:8080\nMODEL=mini\nAPI_KEY=\"line\\nnext\"\n",
             "local".to_string(),
-        );
+            std::path::Path::new("local.env"),
+        )
+        .unwrap();
 
         assert_eq!(parsed.inline_secret.as_deref(), Some("line\nnext"));
     }
