@@ -19,6 +19,7 @@ const ZEROCLAW_WEBHOOK_ENVELOPE_MAX_BYTES: usize = 64 * 1024;
 const ZEROCLAW_WEBHOOK_ERROR_BODY_MAX_BYTES: usize = 8 * 1024;
 const ZEROCLAW_CRON_ERROR_BODY_MAX_BYTES: usize = 2 * 1024;
 const ZEROCLAW_CRON_LIST_BODY_MAX_BYTES: usize = 512 * 1024;
+const ZEROCLAW_CRON_MUTATION_BODY_MAX_BYTES: usize = 16 * 1024;
 const ZEROCLAW_CONFIG_BODY_MAX_BYTES: usize = 512 * 1024;
 
 /// One row from the daemon's `[providers.models.<key>]` config table.
@@ -1097,13 +1098,11 @@ impl ZeroclawClient {
 
         match res.status().as_u16() {
             200 | 201 => {
-                let json: serde_json::Value = res
-                    .json()
-                    .await
-                    .map_err(|e| anyhow!("Failed to parse response: {}", e))?;
-                cron_response_id(&json).ok_or_else(|| {
-                    anyhow!("cron create response missing a non-empty job id; outcome unknown")
-                })
+                parse_cron_mutation_success_response(
+                    res,
+                    "cron create response missing a non-empty job id; outcome unknown",
+                )
+                .await
             }
             _ => Err(anyhow!("Failed to create cron job")),
         }
@@ -1128,13 +1127,11 @@ impl ZeroclawClient {
 
         match res.status().as_u16() {
             200 | 201 => {
-                let json: serde_json::Value = res
-                    .json()
-                    .await
-                    .map_err(|e| anyhow!("Failed to parse response: {}", e))?;
-                cron_response_id(&json).ok_or_else(|| {
-                    anyhow!("cron add-at response missing a non-empty job id; outcome unknown")
-                })
+                parse_cron_mutation_success_response(
+                    res,
+                    "cron add-at response missing a non-empty job id; outcome unknown",
+                )
+                .await
             }
             _ => Err(anyhow!("Failed to create task")),
         }
@@ -1195,6 +1192,16 @@ async fn ensure_success_response(res: reqwest::Response, context: &str) -> Resul
     } else {
         Err(anyhow!("{context}: {status}: {body}"))
     }
+}
+
+async fn parse_cron_mutation_success_response(
+    res: reqwest::Response,
+    missing_id_message: &str,
+) -> Result<String> {
+    let body = read_bounded_response_body(res, ZEROCLAW_CRON_MUTATION_BODY_MAX_BYTES).await;
+    let json: serde_json::Value =
+        serde_json::from_str(&body).map_err(|e| anyhow!("Failed to parse response: {}", e))?;
+    cron_response_id(&json).ok_or_else(|| anyhow!("{missing_id_message}"))
 }
 
 async fn read_bounded_response_body(res: reqwest::Response, max_bytes: usize) -> String {
@@ -1597,6 +1604,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_cron_job_success_body_is_bounded_before_parsing() {
+        let mut server = mockito::Server::new_async().await;
+        let huge = format!(
+            "{{\"id\":\"{}tail-marker\"}}",
+            "x".repeat(ZEROCLAW_CRON_MUTATION_BODY_MAX_BYTES + 512)
+        );
+        let _mock = server
+            .mock("POST", "/api/cron/add")
+            .with_status(201)
+            .with_body(huge)
+            .create_async()
+            .await;
+        let client = ZeroclawClient::new(server.url(), "test_token".to_string());
+
+        let err = client
+            .create_cron_job("0 9 * * *", "standup")
+            .await
+            .unwrap_err();
+
+        let msg = err.to_string();
+        assert!(msg.contains("Failed to parse response"));
+        assert!(!msg.contains("tail-marker"));
+    }
+
+    #[tokio::test]
     async fn create_cron_at_requires_non_empty_id() {
         let mut server = mockito::Server::new_async().await;
         let _mock = server
@@ -1613,6 +1645,31 @@ mod tests {
             .unwrap_err();
 
         assert!(err.to_string().contains("missing a non-empty job id"));
+    }
+
+    #[tokio::test]
+    async fn create_cron_at_success_body_is_bounded_before_parsing() {
+        let mut server = mockito::Server::new_async().await;
+        let huge = format!(
+            "{{\"task\":{{\"id\":\"{}tail-marker\"}}}}",
+            "x".repeat(ZEROCLAW_CRON_MUTATION_BODY_MAX_BYTES + 512)
+        );
+        let _mock = server
+            .mock("POST", "/api/cron/add-at")
+            .with_status(201)
+            .with_body(huge)
+            .create_async()
+            .await;
+        let client = ZeroclawClient::new(server.url(), "test_token".to_string());
+
+        let err = client
+            .create_cron_at("2026-04-29T12:00:00Z", "check")
+            .await
+            .unwrap_err();
+
+        let msg = err.to_string();
+        assert!(msg.contains("Failed to parse response"));
+        assert!(!msg.contains("tail-marker"));
     }
 
     #[test]

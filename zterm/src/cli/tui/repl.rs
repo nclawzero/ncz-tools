@@ -874,7 +874,7 @@ fn command_session_preflight(cmdline: &str) -> CommandSessionPreflight {
     let subcommand = parts.get(1).map(String::as_str);
 
     match command {
-        "/info" | "/status" | "/clear" | "/save" => CommandSessionPreflight::BeforeDispatch,
+        "/info" | "/status" => CommandSessionPreflight::BeforeDispatch,
         "/session" if matches!(subcommand, Some("info") | Some("delete")) => {
             CommandSessionPreflight::BeforeDispatch
         }

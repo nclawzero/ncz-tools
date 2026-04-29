@@ -2184,7 +2184,7 @@ fn command_session_preflight(cmdline: &str) -> CommandSessionPreflight {
     let subcommand = parts.get(1).map(String::as_str);
 
     match command {
-        "/info" | "/status" | "/clear" | "/save" => CommandSessionPreflight::BeforeDispatch,
+        "/info" | "/status" => CommandSessionPreflight::BeforeDispatch,
         "/session" if matches!(subcommand, Some("info") | Some("delete")) => {
             CommandSessionPreflight::BeforeDispatch
         }
@@ -7135,16 +7135,106 @@ mod tests {
         );
         assert_eq!(
             command_session_preflight("/clear"),
-            CommandSessionPreflight::BeforeDispatch
+            CommandSessionPreflight::None
         );
         assert_eq!(
             command_session_preflight("/save out.txt"),
-            CommandSessionPreflight::BeforeDispatch
+            CommandSessionPreflight::None
         );
         assert_eq!(
             command_session_preflight("/workspace switch prod"),
             CommandSessionPreflight::AfterWorkspaceSwitch
         );
+    }
+
+    #[test]
+    fn clear_incomplete_local_transcript_runs_without_backend_preflight() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+
+        let (rendered, finished_ok, marker_cleared) = runtime.block_on(async {
+            let app = Arc::new(Mutex::new(App {
+                workspaces: vec![crate::cli::workspace::Workspace {
+                    id: 0,
+                    config: crate::cli::workspace::WorkspaceConfig {
+                        id: Some("ws-clear".to_string()),
+                        name: "clear-ws".to_string(),
+                        backend: crate::cli::workspace::Backend::Zeroclaw,
+                        url: "http://offline.example".to_string(),
+                        token_env: None,
+                        token: None,
+                        label: None,
+                        namespace_aliases: Vec::new(),
+                    },
+                    client: None,
+                    cron: None,
+                }],
+                active: 0,
+                shared_mnemos: None,
+                config_path: std::path::PathBuf::from("test-config.toml"),
+            }));
+            let session = Session {
+                id: "main".to_string(),
+                name: "Main".to_string(),
+                model: "model".to_string(),
+                provider: "provider".to_string(),
+            };
+            let scope = {
+                let guard = app.lock().await;
+                local_storage_scope_for_workspace(guard.active_workspace().unwrap()).unwrap()
+            };
+            storage::mark_scoped_session_history_incomplete(
+                &scope,
+                &session.id,
+                "post-submit failure",
+            )
+            .unwrap();
+            let workspace_key = scope.identity();
+            let mut worker_sessions = HashMap::new();
+            remember_worker_session(&mut worker_sessions, workspace_key, &session);
+            let handler = CommandHandler::new(Arc::clone(&app));
+            let (sink, mut rx) = StreamSink::channel(8);
+
+            handle_worker_command_request(
+                "/clear".to_string(),
+                &app,
+                &mut worker_sessions,
+                &session.name,
+                &sink,
+                &handler,
+            )
+            .await;
+
+            let mut chunks = Vec::new();
+            while let Ok(chunk) = rx.try_recv() {
+                chunks.push(chunk);
+            }
+            let rendered = chunks
+                .iter()
+                .filter_map(|chunk| match chunk {
+                    TurnChunk::Token(text) => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<String>();
+            let finished_ok = chunks
+                .iter()
+                .any(|chunk| matches!(chunk, TurnChunk::Finished(Ok(_))));
+            let marker_cleared =
+                !storage::scoped_session_history_is_incomplete(&scope, &session.id).unwrap();
+            (rendered, finished_ok, marker_cleared)
+        });
+
+        match old_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+
+        assert!(rendered.contains("Local session transcript cleared"));
+        assert!(finished_ok);
+        assert!(marker_cleared);
     }
 
     #[test]
