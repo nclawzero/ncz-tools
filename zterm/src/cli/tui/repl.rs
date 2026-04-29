@@ -305,6 +305,50 @@ impl ReplLoop {
         Ok(session_id)
     }
 
+    async fn turn_session_id_for_active_workspace(&mut self) -> Result<String> {
+        let workspace_name = self.current_workspace_name().await?;
+        if let Some(binding) = self.workspace_sessions.get(&workspace_name).cloned() {
+            self.session.id = binding.id.clone();
+            self.session.name = binding.name;
+            self.status_bar.set_session(self.session.name.clone());
+            return Ok(binding.id);
+        }
+
+        let active_client = self.resolve_active_client().await?;
+        let session = active_client
+            .lock()
+            .await
+            .create_session(&self.fallback_session_name)
+            .await?;
+        let scope = self.current_storage_scope().await?;
+        if let Err(e) = save_legacy_session_metadata(&scope, &session) {
+            warn!(
+                "could not save local metadata for newly created session {}: {}",
+                session.id, e
+            );
+        }
+        let session_id = session.id.clone();
+        self.session = session.clone();
+        self.status_bar.set_session(self.session.name.clone());
+        self.remember_active_workspace_session(workspace_name, &session);
+        Ok(session_id)
+    }
+
+    async fn verify_session_for_active_workspace(&mut self) -> Result<String> {
+        let workspace_name = self.current_workspace_name().await?;
+        let binding = self
+            .workspace_sessions
+            .get(&workspace_name)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("no active session binding for workspace"))?;
+        let session = self.load_active_workspace_session(&binding.id).await?;
+        let session_id = session.id.clone();
+        self.session = session.clone();
+        self.status_bar.set_session(self.session.name.clone());
+        self.remember_active_workspace_session(workspace_name, &session);
+        Ok(session_id)
+    }
+
     async fn apply_legacy_session_action(&mut self, action: LegacySessionAction) -> Result<()> {
         let active_client = self.resolve_active_client().await?;
         let target = action.target().to_string();
@@ -448,7 +492,7 @@ impl ReplLoop {
             );
             io::stdout().flush()?;
 
-            let session_id = match self.ensure_session_for_active_workspace().await {
+            let session_id = match self.turn_session_id_for_active_workspace().await {
                 Ok(session_id) => session_id,
                 Err(e) => {
                     ui::print_error(
@@ -644,7 +688,7 @@ impl ReplLoop {
             };
 
         let command_session_id = if preflight == CommandSessionPreflight::BeforeDispatch {
-            self.ensure_session_for_active_workspace().await?
+            self.verify_session_for_active_workspace().await?
         } else {
             self.session.id.clone()
         };

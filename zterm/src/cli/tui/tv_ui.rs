@@ -613,7 +613,7 @@ pub async fn run(
         while let Some(req) = req_rx.recv().await {
             match req {
                 WorkerRequest::Turn(text) => {
-                    let worker_session_id = match ensure_session_for_active_workspace(
+                    let worker_session_id = match turn_session_id_for_active_workspace(
                         &worker_app,
                         &mut worker_sessions,
                         &fallback_session_name,
@@ -1084,25 +1084,20 @@ async fn handle_worker_command_request(
     )
     .await;
     if preflight == CommandSessionPreflight::BeforeDispatch {
-        command_session_id = match ensure_session_for_active_workspace(
-            worker_app,
-            worker_sessions,
-            fallback_session_name,
-        )
-        .await
-        {
-            Ok(session_id) => session_id,
-            Err(e) => {
-                send_worker_finished(
-                    worker_sink,
-                    Err(format!(
-                        "could not prepare session for active workspace: {e}"
-                    )),
-                )
-                .await;
-                return;
-            }
-        };
+        command_session_id =
+            match verify_session_for_active_workspace(worker_app, worker_sessions).await {
+                Ok(session_id) => session_id,
+                Err(e) => {
+                    send_worker_finished(
+                        worker_sink,
+                        Err(format!(
+                            "could not prepare session for active workspace: {e}"
+                        )),
+                    )
+                    .await;
+                    return;
+                }
+            };
     }
     let mut session_switched = false;
     if let Some(session_action) = session_action(&cmdline) {
@@ -1890,6 +1885,35 @@ async fn ensure_session_for_active_workspace(
     }
 
     let session = resolve_or_create_session_for_worker(app, fallback_session_name).await?;
+    remember_worker_session(sessions, workspace_key, &session);
+    Ok(session.id)
+}
+
+async fn turn_session_id_for_active_workspace(
+    app: &Arc<Mutex<App>>,
+    sessions: &mut HashMap<String, WorkerSessionBinding>,
+    fallback_session_name: &str,
+) -> Result<String> {
+    let workspace_key = current_workspace_binding_key(app).await?;
+    if let Some(binding) = sessions.get(&workspace_key) {
+        return Ok(binding.id.clone());
+    }
+
+    let session = create_new_session_for_worker(app, fallback_session_name).await?;
+    remember_worker_session(sessions, workspace_key, &session);
+    Ok(session.id)
+}
+
+async fn verify_session_for_active_workspace(
+    app: &Arc<Mutex<App>>,
+    sessions: &mut HashMap<String, WorkerSessionBinding>,
+) -> Result<String> {
+    let workspace_key = current_workspace_binding_key(app).await?;
+    let binding = sessions
+        .get(&workspace_key)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("no active session binding for workspace"))?;
+    let session = load_session_for_worker(app, &binding.id).await?;
     remember_worker_session(sessions, workspace_key, &session);
     Ok(session.id)
 }
@@ -7278,9 +7302,14 @@ mod tests {
     #[derive(Clone)]
     struct WorkerSessionFakeClient {
         listed_sessions: Vec<Session>,
+        list_sessions_error: Option<String>,
         loadable_sessions: Vec<Session>,
+        load_reject_ids: Vec<String>,
         created: Arc<StdMutex<Vec<Session>>>,
+        deleted: Arc<StdMutex<Vec<String>>>,
         submitted: Arc<StdMutex<Vec<(String, String)>>>,
+        list_calls: Arc<StdMutex<usize>>,
+        load_calls: Arc<StdMutex<Vec<String>>>,
     }
 
     #[async_trait::async_trait]
@@ -7315,6 +7344,10 @@ mod tests {
         }
 
         async fn list_sessions(&self) -> anyhow::Result<Vec<Session>> {
+            *self.list_calls.lock().unwrap() += 1;
+            if let Some(error) = &self.list_sessions_error {
+                anyhow::bail!("{error}");
+            }
             Ok(self.listed_sessions.clone())
         }
 
@@ -7330,6 +7363,10 @@ mod tests {
         }
 
         async fn load_session(&self, session_id: &str) -> anyhow::Result<Session> {
+            self.load_calls.lock().unwrap().push(session_id.to_string());
+            if self.load_reject_ids.iter().any(|id| id == session_id) {
+                anyhow::bail!("session is not loadable");
+            }
             if let Some(session) = self
                 .loadable_sessions
                 .iter()
@@ -7347,7 +7384,8 @@ mod tests {
                 .ok_or_else(|| anyhow::anyhow!("display-only session is not loadable"))
         }
 
-        async fn delete_session(&self, _session_id: &str) -> anyhow::Result<()> {
+        async fn delete_session(&self, session_id: &str) -> anyhow::Result<()> {
+            self.deleted.lock().unwrap().push(session_id.to_string());
             Ok(())
         }
 
@@ -7375,12 +7413,20 @@ mod tests {
                 provider: "provider".to_string(),
             };
             let created = Arc::new(StdMutex::new(Vec::new()));
+            let deleted = Arc::new(StdMutex::new(Vec::new()));
             let submitted = Arc::new(StdMutex::new(Vec::new()));
+            let list_calls = Arc::new(StdMutex::new(0));
+            let load_calls = Arc::new(StdMutex::new(Vec::new()));
             let fake = WorkerSessionFakeClient {
                 listed_sessions: vec![display_only],
+                list_sessions_error: None,
                 loadable_sessions: Vec::new(),
+                load_reject_ids: Vec::new(),
                 created: Arc::clone(&created),
+                deleted,
                 submitted: Arc::clone(&submitted),
+                list_calls,
+                load_calls,
             };
             let boxed: Box<dyn crate::cli::agent::AgentClient + Send + Sync> = Box::new(fake);
             let app = Arc::new(Mutex::new(App {
@@ -7411,7 +7457,7 @@ mod tests {
             let workspace_key = current_workspace_binding_key(&app).await.unwrap();
             remember_worker_session(&mut bindings, workspace_key, &session);
             let turn_session_id =
-                ensure_session_for_active_workspace(&app, &mut bindings, "fallback")
+                turn_session_id_for_active_workspace(&app, &mut bindings, "fallback")
                     .await
                     .unwrap();
             let client = {
@@ -7441,6 +7487,161 @@ mod tests {
             Some(home) => std::env::set_var("HOME", home),
             None => std::env::remove_var("HOME"),
         }
+    }
+
+    #[test]
+    fn turn_session_uses_remembered_binding_without_inventory() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let active = Session {
+                id: "active-id".to_string(),
+                name: "Main".to_string(),
+                model: "model".to_string(),
+                provider: "provider".to_string(),
+            };
+            let created = Arc::new(StdMutex::new(Vec::new()));
+            let deleted = Arc::new(StdMutex::new(Vec::new()));
+            let submitted = Arc::new(StdMutex::new(Vec::new()));
+            let list_calls = Arc::new(StdMutex::new(0));
+            let load_calls = Arc::new(StdMutex::new(Vec::new()));
+            let fake = WorkerSessionFakeClient {
+                listed_sessions: Vec::new(),
+                list_sessions_error: Some("inventory down".to_string()),
+                loadable_sessions: Vec::new(),
+                load_reject_ids: vec!["active-id".to_string()],
+                created: Arc::clone(&created),
+                deleted,
+                submitted: Arc::clone(&submitted),
+                list_calls: Arc::clone(&list_calls),
+                load_calls: Arc::clone(&load_calls),
+            };
+            let boxed: Box<dyn crate::cli::agent::AgentClient + Send + Sync> = Box::new(fake);
+            let app = Arc::new(Mutex::new(App {
+                workspaces: vec![crate::cli::workspace::Workspace {
+                    id: 0,
+                    config: crate::cli::workspace::WorkspaceConfig {
+                        id: Some("ws-turn".to_string()),
+                        name: "turn-ws".to_string(),
+                        backend: crate::cli::workspace::Backend::Zeroclaw,
+                        url: "http://gateway.example".to_string(),
+                        token_env: None,
+                        token: None,
+                        label: None,
+                        namespace_aliases: Vec::new(),
+                    },
+                    client: Some(Arc::new(Mutex::new(boxed))),
+                    cron: None,
+                }],
+                active: 0,
+                shared_mnemos: None,
+                config_path: std::path::PathBuf::from("test-config.toml"),
+            }));
+            let workspace_key = current_workspace_binding_key(&app).await.unwrap();
+            let mut bindings = HashMap::new();
+            remember_worker_session(&mut bindings, workspace_key, &active);
+
+            let turn_session_id =
+                turn_session_id_for_active_workspace(&app, &mut bindings, "fallback")
+                    .await
+                    .unwrap();
+            let client = {
+                let guard = app.lock().await;
+                guard.active_workspace().unwrap().client.clone().unwrap()
+            };
+            client
+                .lock()
+                .await
+                .submit_turn(&turn_session_id, "hello")
+                .await
+                .unwrap();
+
+            assert_eq!(turn_session_id, "active-id");
+            assert_eq!(*list_calls.lock().unwrap(), 0);
+            assert!(load_calls.lock().unwrap().is_empty());
+            assert!(created.lock().unwrap().is_empty());
+            assert_eq!(
+                submitted.lock().unwrap().as_slice(),
+                [("active-id".to_string(), "hello".to_string())]
+            );
+        });
+    }
+
+    #[test]
+    fn delete_preflight_rejects_stale_binding_without_creating_session() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let stale = Session {
+                id: "stale-id".to_string(),
+                name: "Old Main".to_string(),
+                model: "model".to_string(),
+                provider: "provider".to_string(),
+            };
+            let created = Arc::new(StdMutex::new(Vec::new()));
+            let deleted = Arc::new(StdMutex::new(Vec::new()));
+            let submitted = Arc::new(StdMutex::new(Vec::new()));
+            let list_calls = Arc::new(StdMutex::new(0));
+            let load_calls = Arc::new(StdMutex::new(Vec::new()));
+            let fake = WorkerSessionFakeClient {
+                listed_sessions: Vec::new(),
+                list_sessions_error: Some("inventory down".to_string()),
+                loadable_sessions: Vec::new(),
+                load_reject_ids: vec!["stale-id".to_string()],
+                created: Arc::clone(&created),
+                deleted: Arc::clone(&deleted),
+                submitted,
+                list_calls,
+                load_calls: Arc::clone(&load_calls),
+            };
+            let boxed: Box<dyn crate::cli::agent::AgentClient + Send + Sync> = Box::new(fake);
+            let app = Arc::new(Mutex::new(App {
+                workspaces: vec![crate::cli::workspace::Workspace {
+                    id: 0,
+                    config: crate::cli::workspace::WorkspaceConfig {
+                        id: Some("ws-delete".to_string()),
+                        name: "delete-ws".to_string(),
+                        backend: crate::cli::workspace::Backend::Zeroclaw,
+                        url: "http://gateway.example".to_string(),
+                        token_env: None,
+                        token: None,
+                        label: None,
+                        namespace_aliases: Vec::new(),
+                    },
+                    client: Some(Arc::new(Mutex::new(boxed))),
+                    cron: None,
+                }],
+                active: 0,
+                shared_mnemos: None,
+                config_path: std::path::PathBuf::from("test-config.toml"),
+            }));
+            let workspace_key = current_workspace_binding_key(&app).await.unwrap();
+            let mut bindings = HashMap::new();
+            remember_worker_session(&mut bindings, workspace_key, &stale);
+            let handler = CommandHandler::new(Arc::clone(&app));
+            let (sink, mut rx) = StreamSink::channel(8);
+
+            handle_worker_command_request(
+                "/session delete other-session".to_string(),
+                &app,
+                &mut bindings,
+                "fallback",
+                &sink,
+                &handler,
+            )
+            .await;
+
+            let mut terminal_error = None;
+            while let Ok(chunk) = rx.try_recv() {
+                if let TurnChunk::Finished(Err(message)) = chunk {
+                    terminal_error = Some(message);
+                }
+            }
+
+            let terminal_error = terminal_error.expect("preflight should reject stale binding");
+            assert!(terminal_error.contains("could not prepare session for active workspace"));
+            assert_eq!(load_calls.lock().unwrap().as_slice(), ["stale-id"]);
+            assert!(created.lock().unwrap().is_empty());
+            assert!(deleted.lock().unwrap().is_empty());
+        });
     }
 
     #[test]
