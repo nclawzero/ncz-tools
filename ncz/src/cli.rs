@@ -184,7 +184,12 @@ pub enum ProvidersAction {
         force: bool,
     },
     /// Remove a provider declaration.
-    Remove { name: String },
+    Remove {
+        name: String,
+        /// Delete legacy provider files even when they contain inline credentials.
+        #[arg(long)]
+        drop_inline_credentials: bool,
+    },
     /// Show a provider declaration.
     Show { name: String },
 }
@@ -233,6 +238,9 @@ pub enum McpAction {
         /// Environment variable containing an MCP auth token.
         #[arg(long = "auth-env")]
         auth_env: Option<String>,
+        /// Read and approve the MCP auth token from this process environment variable.
+        #[arg(long = "auth-value-env")]
+        auth_value_env: Option<String>,
     },
     /// Remove an MCP server declaration.
     Remove { name: String },

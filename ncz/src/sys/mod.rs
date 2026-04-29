@@ -9,7 +9,7 @@ pub mod apt;
 pub mod podman;
 pub mod systemd;
 
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::process::{Command, Stdio};
 use std::thread;
 
@@ -45,6 +45,30 @@ pub trait CommandRunner: Send + Sync {
             });
         }
         Ok(output)
+    }
+
+    fn run_stdout_limited_with_stdin(
+        &self,
+        cmd: &str,
+        args: &[&str],
+        stdin: &[u8],
+        stdout_limit_bytes: usize,
+    ) -> Result<ProcessOutput, NczError> {
+        let _ = stdin;
+        self.run_stdout_limited(cmd, args, stdout_limit_bytes)
+    }
+
+    fn run_stdout_limited_with_stdin_releasing(
+        &self,
+        cmd: &str,
+        args: &[&str],
+        stdin: &[u8],
+        stdout_limit_bytes: usize,
+        release: &mut dyn FnMut(),
+    ) -> Result<ProcessOutput, NczError> {
+        let result = self.run_stdout_limited_with_stdin(cmd, args, stdin, stdout_limit_bytes);
+        release();
+        result
     }
 
     /// Blocking GET against `http://127.0.0.1:<port><path>` for health
@@ -155,6 +179,146 @@ impl CommandRunner for RealRunner {
             stderr,
         })
     }
+
+    fn run_stdout_limited_with_stdin(
+        &self,
+        cmd: &str,
+        args: &[&str],
+        stdin: &[u8],
+        stdout_limit_bytes: usize,
+    ) -> Result<ProcessOutput, NczError> {
+        const STDERR_LIMIT_BYTES: usize = 64 * 1024;
+
+        let mut child = Command::new(cmd)
+            .args(args)
+            .env("LANG", "C")
+            .env("LC_ALL", "C")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| NczError::Exec {
+                cmd: cmd.into(),
+                msg: e.to_string(),
+            })?;
+
+        let mut child_stdin = child.stdin.take().ok_or_else(|| NczError::Exec {
+            cmd: cmd.into(),
+            msg: "failed to open stdin".to_string(),
+        })?;
+        child_stdin.write_all(stdin).map_err(|e| NczError::Exec {
+            cmd: cmd.into(),
+            msg: e.to_string(),
+        })?;
+        drop(child_stdin);
+
+        let stdout = child.stdout.take().ok_or_else(|| NczError::Exec {
+            cmd: cmd.into(),
+            msg: "failed to capture stdout".to_string(),
+        })?;
+        let stderr = child.stderr.take().ok_or_else(|| NczError::Exec {
+            cmd: cmd.into(),
+            msg: "failed to capture stderr".to_string(),
+        })?;
+
+        let stdout_handle = thread::spawn(move || read_capped(stdout, stdout_limit_bytes));
+        let stderr_handle = thread::spawn(move || read_capped(stderr, STDERR_LIMIT_BYTES));
+        let status = child.wait().map_err(|e| NczError::Exec {
+            cmd: cmd.into(),
+            msg: e.to_string(),
+        })?;
+
+        let (stdout, stdout_truncated) = join_reader(stdout_handle)?;
+        let (stderr, stderr_truncated) = join_reader(stderr_handle)?;
+        if stdout_truncated {
+            return Err(NczError::Exec {
+                cmd: cmd.into(),
+                msg: format!("stdout exceeded {stdout_limit_bytes} bytes"),
+            });
+        }
+
+        let mut stderr = String::from_utf8_lossy(&stderr).into_owned();
+        if stderr_truncated {
+            stderr.push_str("\n[stderr truncated]\n");
+        }
+
+        Ok(ProcessOutput {
+            status: status.code().unwrap_or(-1),
+            stdout: String::from_utf8_lossy(&stdout).into_owned(),
+            stderr,
+        })
+    }
+
+    fn run_stdout_limited_with_stdin_releasing(
+        &self,
+        cmd: &str,
+        args: &[&str],
+        stdin: &[u8],
+        stdout_limit_bytes: usize,
+        release: &mut dyn FnMut(),
+    ) -> Result<ProcessOutput, NczError> {
+        const STDERR_LIMIT_BYTES: usize = 64 * 1024;
+
+        let mut child = Command::new(cmd)
+            .args(args)
+            .env("LANG", "C")
+            .env("LC_ALL", "C")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| NczError::Exec {
+                cmd: cmd.into(),
+                msg: e.to_string(),
+            })?;
+
+        let mut child_stdin = child.stdin.take().ok_or_else(|| NczError::Exec {
+            cmd: cmd.into(),
+            msg: "failed to open stdin".to_string(),
+        })?;
+        child_stdin.write_all(stdin).map_err(|e| NczError::Exec {
+            cmd: cmd.into(),
+            msg: e.to_string(),
+        })?;
+        drop(child_stdin);
+
+        let stdout = child.stdout.take().ok_or_else(|| NczError::Exec {
+            cmd: cmd.into(),
+            msg: "failed to capture stdout".to_string(),
+        })?;
+        let stderr = child.stderr.take().ok_or_else(|| NczError::Exec {
+            cmd: cmd.into(),
+            msg: "failed to capture stderr".to_string(),
+        })?;
+
+        let stdout_handle = thread::spawn(move || read_capped(stdout, stdout_limit_bytes));
+        let stderr_handle = thread::spawn(move || read_capped(stderr, STDERR_LIMIT_BYTES));
+        let status = child.wait().map_err(|e| NczError::Exec {
+            cmd: cmd.into(),
+            msg: e.to_string(),
+        })?;
+        release();
+
+        let (stdout, stdout_truncated) = join_reader(stdout_handle)?;
+        let (stderr, stderr_truncated) = join_reader(stderr_handle)?;
+        if stdout_truncated {
+            return Err(NczError::Exec {
+                cmd: cmd.into(),
+                msg: format!("stdout exceeded {stdout_limit_bytes} bytes"),
+            });
+        }
+
+        let mut stderr = String::from_utf8_lossy(&stderr).into_owned();
+        if stderr_truncated {
+            stderr.push_str("\n[stderr truncated]\n");
+        }
+
+        Ok(ProcessOutput {
+            status: status.code().unwrap_or(-1),
+            stdout: String::from_utf8_lossy(&stdout).into_owned(),
+            stderr,
+        })
+    }
 }
 
 fn read_capped<R: Read>(mut reader: R, limit: usize) -> io::Result<(Vec<u8>, bool)> {
@@ -189,6 +353,78 @@ fn join_reader(
         .join()
         .map_err(|_| NczError::Io(io::Error::other("reader thread panicked")))?
         .map_err(NczError::Io)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn real_runner_releases_stdin_lock_after_child_exit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lock_path = tmp.path().join("run/nclawzero.lock");
+        let marker_path = tmp.path().join("child-started");
+        let script_path = tmp.path().join("hold-stdin.sh");
+        fs::write(
+            &script_path,
+            "#!/bin/sh\ncat >/dev/null\n: > \"$1\"\nsleep 1\nprintf done\n",
+        )
+        .unwrap();
+        fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let lock = crate::state::acquire_lock(&lock_path).unwrap();
+        let acquired = Arc::new(AtomicBool::new(false));
+        let waiter_acquired = acquired.clone();
+        let waiter_lock = lock_path.clone();
+        let waiter_marker = marker_path.clone();
+        let waiter = thread::spawn(move || {
+            wait_for_path(&waiter_marker);
+            let _guard = crate::state::acquire_lock(&waiter_lock).unwrap();
+            waiter_acquired.store(true, Ordering::SeqCst);
+        });
+
+        let runner_script = script_path.clone();
+        let runner_marker = marker_path.clone();
+        let runner = thread::spawn(move || {
+            let mut lock = Some(lock);
+            let mut release = || {
+                drop(lock.take());
+            };
+            RealRunner::new().run_stdout_limited_with_stdin_releasing(
+                runner_script.to_str().unwrap(),
+                &[runner_marker.to_str().unwrap()],
+                b"secret",
+                16,
+                &mut release,
+            )
+        });
+
+        wait_for_path(&marker_path);
+        thread::sleep(Duration::from_millis(100));
+        assert!(
+            !acquired.load(Ordering::SeqCst),
+            "lock was released before child process exited"
+        );
+
+        let output = runner.join().unwrap().unwrap();
+        waiter.join().unwrap();
+        assert_eq!(output.stdout, "done");
+        assert!(acquired.load(Ordering::SeqCst));
+    }
+
+    fn wait_for_path(path: &std::path::Path) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !path.exists() {
+            assert!(Instant::now() < deadline, "timed out waiting for path");
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
 }
 
 #[cfg(test)]

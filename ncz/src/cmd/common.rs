@@ -146,6 +146,7 @@ pub fn redact_line(line: &str, show_secrets: bool) -> String {
         "api_key",
         "apikey",
         "api-key",
+        "credential",
         "password",
         "secret",
         "token",
@@ -219,6 +220,7 @@ fn is_secret_field_name(name: &str) -> bool {
     name == "key"
         || name.contains("token")
         || name.contains("secret")
+        || name.contains("credential")
         || name.contains("password")
         || name.contains("authorization")
         || name.contains("api_key")

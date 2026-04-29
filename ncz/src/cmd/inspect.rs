@@ -12,7 +12,7 @@ use crate::cli::Context;
 use crate::cmd::{common, sandbox, status, version};
 use crate::error::NczError;
 use crate::output::{self, Render};
-use crate::state::{agent, Paths};
+use crate::state::{agent, url as url_state, Paths};
 
 #[derive(Debug, Serialize)]
 pub struct InspectReport {
@@ -214,7 +214,7 @@ fn collect_etc_files(paths: &Paths, show_secrets: bool) -> Result<Vec<EtcFileRep
     files.sort();
     let mut reports = Vec::new();
     for file in files {
-        let redacted_path = common::redact_path(&file);
+        let redacted_path = !show_secrets && common::redact_path(&file);
         let lines = if redacted_path {
             vec!["[redacted path]".to_string()]
         } else if is_agent_env_file(paths, &file) {
@@ -222,6 +222,10 @@ fn collect_etc_files(paths: &Paths, show_secrets: bool) -> Result<Vec<EtcFileRep
                 .lines()
                 .map(|line| redact_agent_env_line(line, show_secrets))
                 .collect()
+        } else if is_mcp_file(paths, &file) {
+            redact_mcp_file(&file, show_secrets)?
+        } else if is_legacy_provider_env_file(paths, &file) {
+            redact_legacy_provider_env_file(&file, show_secrets)?
         } else {
             fs::read_to_string(&file)?
                 .lines()
@@ -229,7 +233,11 @@ fn collect_etc_files(paths: &Paths, show_secrets: bool) -> Result<Vec<EtcFileRep
                 .collect()
         };
         reports.push(EtcFileReport {
-            path: file.display().to_string(),
+            path: if redacted_path {
+                "[redacted path]".to_string()
+            } else {
+                file.display().to_string()
+            },
             redacted_path,
             lines,
         });
@@ -244,13 +252,96 @@ fn is_agent_env_file(paths: &Paths, file: &Path) -> bool {
             .any(|agent_name| file == paths.agent_env_override(agent_name))
 }
 
+fn is_mcp_file(paths: &Paths, file: &Path) -> bool {
+    file.starts_with(paths.mcp_dir())
+        && file
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext == "json")
+}
+
+fn is_legacy_provider_env_file(paths: &Paths, file: &Path) -> bool {
+    file.starts_with(paths.providers_dir())
+        && file
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| matches!(ext, "env" | "conf"))
+}
+
+fn redact_legacy_provider_env_file(
+    file: &Path,
+    show_secrets: bool,
+) -> Result<Vec<String>, NczError> {
+    Ok(fs::read_to_string(file)?
+        .lines()
+        .map(|line| redact_legacy_provider_env_line(line, show_secrets))
+        .collect())
+}
+
+fn redact_legacy_provider_env_line(line: &str, show_secrets: bool) -> String {
+    if show_secrets {
+        return line.to_string();
+    }
+    let Some((left, _)) = line.split_once('=') else {
+        return common::redact_line(line, show_secrets);
+    };
+    format!("{left}=***")
+}
+
+fn redact_mcp_file(file: &Path, show_secrets: bool) -> Result<Vec<String>, NczError> {
+    let body = fs::read_to_string(file)?;
+    if show_secrets {
+        return Ok(body.lines().map(ToOwned::to_owned).collect());
+    }
+    let Ok(mut value) = serde_json::from_str::<Value>(&body) else {
+        return Ok(body
+            .lines()
+            .map(|line| common::redact_line(line, show_secrets))
+            .collect());
+    };
+    if value
+        .get("transport")
+        .and_then(Value::as_str)
+        .is_some_and(|transport| transport == "stdio")
+    {
+        if let Value::Object(obj) = &mut value {
+            if obj.contains_key("command") {
+                obj.insert("command".to_string(), Value::String("***".to_string()));
+            }
+        }
+    }
+    if let Value::Object(obj) = &mut value {
+        if obj
+            .get("url")
+            .and_then(Value::as_str)
+            .is_some_and(mcp_url_needs_redaction)
+        {
+            obj.insert("url".to_string(), Value::String("***".to_string()));
+        }
+    }
+    let rendered = serde_json::to_string_pretty(&value)?;
+    Ok(rendered
+        .lines()
+        .map(|line| common::redact_line(line, show_secrets))
+        .collect())
+}
+
+fn mcp_url_needs_redaction(url: &str) -> bool {
+    url_state::has_userinfo(url)
+        || url_state::has_query_or_fragment(url)
+        || url_state::contains_secret_path_material(url)
+}
+
 fn redact_agent_env_line(line: &str, show_secrets: bool) -> String {
     if show_secrets {
         return line.to_string();
     }
     let trimmed = line.trim_start();
-    if trimmed.is_empty() || trimmed.starts_with('#') {
+    if trimmed.is_empty() {
         return line.to_string();
+    }
+    if trimmed.starts_with('#') || trimmed.starts_with(';') {
+        return common::redact_line(line, show_secrets);
     }
     let Some((left, _)) = line.split_once('=') else {
         return line.to_string();
@@ -330,7 +421,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let paths = test_paths(tmp.path());
         fs::create_dir_all(paths.agent_env_override("hermes").parent().unwrap()).unwrap();
-        fs::write(paths.agent_env(), "FOO=plain\nOPENAI_KEY=secret\n").unwrap();
+        fs::write(
+            paths.agent_env(),
+            "FOO=plain\n# OLD_API_KEY=old-secret\n; TOKEN=old-token\nOPENAI_KEY=secret\n",
+        )
+        .unwrap();
         fs::write(paths.agent_env_override("hermes"), "BAR=override\n").unwrap();
 
         let files = collect_etc_files(&paths, false).unwrap();
@@ -339,7 +434,15 @@ mod tests {
             .iter()
             .find(|file| file.path == paths.agent_env().display().to_string())
             .unwrap();
-        assert_eq!(shared.lines, vec!["FOO=***", "OPENAI_KEY=***"]);
+        assert_eq!(
+            shared.lines,
+            vec![
+                "FOO=***",
+                "# OLD_API_KEY=***",
+                "; TOKEN=***",
+                "OPENAI_KEY=***"
+            ]
+        );
         let scoped = files
             .iter()
             .find(|file| file.path == paths.agent_env_override("hermes").display().to_string())
@@ -373,8 +476,177 @@ mod tests {
             .unwrap();
         assert_eq!(
             provider.lines,
-            vec!["KEY=***", "OPENAI_KEY=***", "NAME=local"]
+            vec!["KEY=***", "OPENAI_KEY=***", "NAME=***"]
         );
+    }
+
+    #[test]
+    fn inspect_redacts_custom_key_env_legacy_provider_credentials() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        fs::create_dir_all(paths.providers_dir()).unwrap();
+        fs::write(
+            paths.providers_dir().join("custom.env"),
+            "PROVIDER_NAME=custom\nKEY_ENV=FOO\nFOO=sk-live\n",
+        )
+        .unwrap();
+
+        let files = collect_etc_files(&paths, false).unwrap();
+
+        let provider = files
+            .iter()
+            .find(|file| {
+                file.path
+                    == paths
+                        .providers_dir()
+                        .join("custom.env")
+                        .display()
+                        .to_string()
+            })
+            .unwrap();
+        assert_eq!(
+            provider.lines,
+            vec!["PROVIDER_NAME=***", "KEY_ENV=***", "FOO=***"]
+        );
+    }
+
+    #[test]
+    fn inspect_redacts_model_cache_credential_fingerprints() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        fs::create_dir_all(paths.providers_dir()).unwrap();
+        fs::write(
+            paths.providers_dir().join("example.models.json"),
+            r#"{"schema_version":1,"provider":"example","provider_fingerprint":"public","credential_fingerprint":"ncz-v1:agent-env:deadbeef","fetched_at":"1","models":[]}"#,
+        )
+        .unwrap();
+
+        let files = collect_etc_files(&paths, false).unwrap();
+
+        let cache = files
+            .iter()
+            .find(|file| {
+                file.path
+                    == paths
+                        .providers_dir()
+                        .join("example.models.json")
+                        .display()
+                        .to_string()
+            })
+            .unwrap();
+        assert!(!cache.lines.iter().any(|line| line.contains("deadbeef")));
+        assert!(cache
+            .lines
+            .iter()
+            .any(|line| line.contains("credential_fingerprint") && line.contains("***")));
+    }
+
+    #[test]
+    fn inspect_redacts_secret_bearing_paths_in_text_and_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        fs::create_dir_all(paths.providers_dir()).unwrap();
+        fs::write(
+            paths.providers_dir().join("provider-token-secret.json"),
+            "secret path contents\n",
+        )
+        .unwrap();
+
+        let etc_files = collect_etc_files(&paths, false).unwrap();
+        let report = InspectReport {
+            schema_version: 1,
+            generated_at: "2026-04-28T00:00:00+00:00".to_string(),
+            version: None,
+            status: None,
+            services: Vec::new(),
+            recent_logs: Vec::new(),
+            sandbox: None,
+            etc_dir: paths.etc_dir.display().to_string(),
+            etc_missing: false,
+            etc_files,
+        };
+        let mut rendered = Vec::new();
+        report.render_text(&mut rendered).unwrap();
+        let text = String::from_utf8(rendered).unwrap();
+        let json = serde_json::to_string(&report).unwrap();
+
+        assert!(!text.contains("provider-token-secret"));
+        assert!(!json.contains("provider-token-secret"));
+        assert!(text.contains("-- [redacted path] --"));
+        assert!(json.contains(r#""path":"[redacted path]""#));
+    }
+
+    #[test]
+    fn inspect_redacts_mcp_stdio_command_by_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        fs::create_dir_all(paths.mcp_dir()).unwrap();
+        fs::write(
+            paths.mcp_dir().join("search.json"),
+            r#"{"schema_version":1,"name":"search","transport":"stdio","command":"search-mcp --user alice:secret","url":null,"auth_env":null}"#,
+        )
+        .unwrap();
+
+        let files = collect_etc_files(&paths, false).unwrap();
+
+        let mcp = files
+            .iter()
+            .find(|file| file.path == paths.mcp_dir().join("search.json").display().to_string())
+            .unwrap();
+        assert!(mcp.lines.iter().any(|line| line == r#"  "command": "***","#));
+        assert!(!mcp.lines.iter().any(|line| line.contains("alice:secret")));
+    }
+
+    #[test]
+    fn inspect_redacts_secret_bearing_mcp_urls_by_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        fs::create_dir_all(paths.mcp_dir()).unwrap();
+        fs::write(
+            paths.mcp_dir().join("search.json"),
+            r#"{"schema_version":1,"name":"search","transport":"http","command":null,"url":"https://mcp.example.test/sse/sk-live","auth_env":null}"#,
+        )
+        .unwrap();
+        fs::write(
+            paths.mcp_dir().join("query.json"),
+            r#"{"schema_version":1,"name":"query","transport":"http","command":null,"url":"https://mcp.example.test/sse?token=secret","auth_env":null}"#,
+        )
+        .unwrap();
+
+        let files = collect_etc_files(&paths, false).unwrap();
+
+        for name in ["search", "query"] {
+            let mcp = files
+                .iter()
+                .find(|file| file.path == paths.mcp_dir().join(format!("{name}.json")).display().to_string())
+                .unwrap();
+            assert!(mcp.lines.iter().any(|line| line.contains(r#""url": "***""#)));
+            assert!(!mcp.lines.iter().any(|line| line.contains("sk-live")));
+            assert!(!mcp.lines.iter().any(|line| line.contains("token=secret")));
+        }
+    }
+
+    #[test]
+    fn inspect_reveals_mcp_stdio_command_with_show_secrets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        fs::create_dir_all(paths.mcp_dir()).unwrap();
+        fs::write(
+            paths.mcp_dir().join("search.json"),
+            r#"{"schema_version":1,"name":"search","transport":"stdio","command":"search-mcp --socket /run/search.sock","url":null,"auth_env":null}"#,
+        )
+        .unwrap();
+
+        let files = collect_etc_files(&paths, true).unwrap();
+
+        let mcp = files
+            .iter()
+            .find(|file| file.path == paths.mcp_dir().join("search.json").display().to_string())
+            .unwrap();
+        assert!(mcp
+            .lines
+            .iter()
+            .any(|line| line.contains("search-mcp --socket /run/search.sock")));
     }
 
     #[test]

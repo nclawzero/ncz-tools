@@ -2,20 +2,23 @@
 //!
 //! `/etc/nclawzero/agent-env` is loaded by quadlets through
 //! `EnvironmentFile=`. The writer emits systemd-compatible assignments and
-//! quotes values when needed; the reader tolerates `export KEY=value` from
-//! hand-edited files.
+//! quotes values when needed. Runtime reads intentionally match systemd
+//! `EnvironmentFile=` assignments rather than shell `export KEY=value` syntax.
 
 use std::fmt::Write as _;
 use std::fs;
 use std::io;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 use crate::error::NczError;
 use crate::state::{self, Paths};
 
 const PROVIDER_BINDING_PREFIX: &str = "NCZ_PROVIDER_BINDING_";
+const MCP_BINDING_PREFIX: &str = "NCZ_MCP_BINDING_";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentEnvEntry {
@@ -44,11 +47,11 @@ pub fn redacted_list(
 ) -> Result<Vec<RedactedAgentEnvEntry>, NczError> {
     Ok(read(paths)?
         .into_iter()
-        .filter(|entry| !entry.key.starts_with(PROVIDER_BINDING_PREFIX))
+        .filter(|entry| !is_internal_binding_key(&entry.key))
         .map(|entry| RedactedAgentEnvEntry {
             key: entry.key,
-            set: true,
-            value: if show_secrets {
+            set: !entry.value.is_empty(),
+            value: if show_secrets || entry.value.is_empty() {
                 entry.value
             } else {
                 "***".to_string()
@@ -58,11 +61,12 @@ pub fn redacted_list(
 }
 
 pub fn set(paths: &Paths, key: &str, value: &str) -> Result<bool, NczError> {
+    validate_public_key(key)?;
     set_path(&paths.agent_env(), key, value)
 }
 
 pub fn set_if_absent(paths: &Paths, key: &str, value: &str) -> Result<bool, NczError> {
-    validate_key(key)?;
+    validate_public_key(key)?;
     validate_value(value)?;
     if read(paths)?
         .iter()
@@ -75,10 +79,12 @@ pub fn set_if_absent(paths: &Paths, key: &str, value: &str) -> Result<bool, NczE
 }
 
 pub fn set_override(paths: &Paths, agent: &str, key: &str, value: &str) -> Result<bool, NczError> {
+    validate_public_key(key)?;
     set_path(&paths.agent_env_override(agent), key, value)
 }
 
 pub fn remove(paths: &Paths, key: &str) -> Result<bool, NczError> {
+    validate_public_key(key)?;
     remove_path(&paths.agent_env(), key)
 }
 
@@ -88,7 +94,7 @@ pub fn set_provider_binding(
     key_env: &str,
     url: &str,
 ) -> Result<bool, NczError> {
-    validate_key(key_env)?;
+    validate_public_key(key_env)?;
     validate_value(url)?;
     if url.contains(' ') {
         return Err(NczError::Usage(format!(
@@ -106,27 +112,164 @@ pub fn provider_binding_matches(
     key_env: &str,
     url: &str,
 ) -> Result<bool, NczError> {
+    validate_public_key(key_env)?;
     let binding_key = provider_binding_key(provider)?;
     Ok(entries.iter().any(|entry| {
         entry.key == binding_key
-            && parse_provider_binding_value(&entry.value).is_some_and(
+            && parse_binding_value(&entry.value).is_some_and(
                 |(bound_key_env, bound_url)| bound_key_env == key_env && bound_url == url,
             )
     }))
+}
+
+pub fn provider_binding_exists(
+    entries: &[AgentEnvEntry],
+    provider: &str,
+) -> Result<bool, NczError> {
+    let binding_key = provider_binding_key(provider)?;
+    Ok(entries.iter().any(|entry| entry.key == binding_key))
+}
+
+pub fn set_mcp_binding(
+    paths: &Paths,
+    server: &str,
+    auth_env: &str,
+    url: &str,
+) -> Result<bool, NczError> {
+    validate_public_key(auth_env)?;
+    validate_value(url)?;
+    if url.contains(' ') {
+        return Err(NczError::Usage(format!(
+            "MCP URL for {server} cannot contain spaces"
+        )));
+    }
+    let binding_key = mcp_binding_key(server)?;
+    let binding_value = format!("{auth_env} {url}");
+    set_path(&paths.agent_env(), &binding_key, &binding_value)
+}
+
+pub fn set_mcp_stdio_binding(
+    paths: &Paths,
+    server: &str,
+    auth_env: &str,
+    command: &str,
+) -> Result<bool, NczError> {
+    validate_public_key(auth_env)?;
+    let binding_key = mcp_binding_key(server)?;
+    let binding_value = format!("{auth_env} {}", mcp_stdio_binding_target(command)?);
+    set_path(&paths.agent_env(), &binding_key, &binding_value)
+}
+
+pub fn mcp_binding_matches(
+    entries: &[AgentEnvEntry],
+    server: &str,
+    auth_env: &str,
+    url: &str,
+) -> Result<bool, NczError> {
+    validate_public_key(auth_env)?;
+    let binding_key = mcp_binding_key(server)?;
+    Ok(entries.iter().any(|entry| {
+        entry.key == binding_key
+            && parse_binding_value(&entry.value).is_some_and(
+                |(bound_auth_env, bound_url)| bound_auth_env == auth_env && bound_url == url,
+            )
+    }))
+}
+
+pub fn mcp_stdio_binding_matches(
+    entries: &[AgentEnvEntry],
+    server: &str,
+    auth_env: &str,
+    command: &str,
+) -> Result<bool, NczError> {
+    validate_public_key(auth_env)?;
+    let binding_key = mcp_binding_key(server)?;
+    let target = mcp_stdio_binding_target(command)?;
+    Ok(entries.iter().any(|entry| {
+        entry.key == binding_key
+            && parse_binding_value(&entry.value).is_some_and(
+                |(bound_auth_env, bound_target)| {
+                    bound_auth_env == auth_env && bound_target == target.as_str()
+                },
+            )
+    }))
+}
+
+pub fn remove_mcp_binding(paths: &Paths, server: &str) -> Result<bool, NczError> {
+    let binding_key = mcp_binding_key(server)?;
+    remove_path(&paths.agent_env(), &binding_key)
+}
+
+pub fn remove_mcp_bindings_for_key(
+    paths: &Paths,
+    auth_env: &str,
+) -> Result<Vec<String>, NczError> {
+    validate_public_key(auth_env)?;
+    let entries = read(paths)?;
+    let mut removed = Vec::new();
+    for entry in entries {
+        if !entry.key.starts_with(MCP_BINDING_PREFIX) {
+            continue;
+        }
+        let Some((bound_auth_env, _)) = parse_binding_value(&entry.value) else {
+            continue;
+        };
+        if bound_auth_env == auth_env && remove_path(&paths.agent_env(), &entry.key)? {
+            removed.push(mcp_from_binding_key(&entry.key).unwrap_or(entry.key));
+        }
+    }
+    removed.sort();
+    removed.dedup();
+    Ok(removed)
+}
+
+pub fn remove_mcp_bindings_for_key_lenient(
+    paths: &Paths,
+    auth_env: &str,
+) -> Result<Vec<String>, NczError> {
+    let records = mcp_binding_records_for_key_lenient(paths, auth_env)?;
+    let mut removed = Vec::new();
+    for (binding_key, server) in records {
+        if remove_path(&paths.agent_env(), &binding_key)? {
+            removed.push(server);
+        }
+    }
+    Ok(removed)
+}
+
+pub fn mcp_bindings_for_key(paths: &Paths, auth_env: &str) -> Result<Vec<String>, NczError> {
+    validate_public_key(auth_env)?;
+    let mut servers = Vec::new();
+    for entry in read(paths)? {
+        if !entry.key.starts_with(MCP_BINDING_PREFIX) {
+            continue;
+        }
+        let Some((bound_auth_env, _)) = parse_binding_value(&entry.value) else {
+            continue;
+        };
+        if bound_auth_env == auth_env {
+            if let Some(server) = mcp_from_binding_key(&entry.key) {
+                servers.push(server);
+            }
+        }
+    }
+    servers.sort();
+    servers.dedup();
+    Ok(servers)
 }
 
 pub fn remove_provider_bindings_for_key(
     paths: &Paths,
     key_env: &str,
 ) -> Result<Vec<String>, NczError> {
-    validate_key(key_env)?;
+    validate_public_key(key_env)?;
     let entries = read(paths)?;
     let mut removed = Vec::new();
     for entry in entries {
         if !entry.key.starts_with(PROVIDER_BINDING_PREFIX) {
             continue;
         }
-        let Some((bound_key_env, _)) = parse_provider_binding_value(&entry.value) else {
+        let Some((bound_key_env, _)) = parse_binding_value(&entry.value) else {
             continue;
         };
         if bound_key_env == key_env && remove_path(&paths.agent_env(), &entry.key)? {
@@ -134,6 +277,115 @@ pub fn remove_provider_bindings_for_key(
         }
     }
     Ok(removed)
+}
+
+pub fn remove_provider_bindings_for_key_lenient(
+    paths: &Paths,
+    key_env: &str,
+) -> Result<Vec<String>, NczError> {
+    let records = provider_binding_records_for_key_lenient(paths, key_env)?;
+    let mut removed = Vec::new();
+    for (binding_key, provider) in records {
+        if remove_path(&paths.agent_env(), &binding_key)? {
+            removed.push(provider);
+        }
+    }
+    Ok(removed)
+}
+
+pub fn provider_bindings_for_key(paths: &Paths, key_env: &str) -> Result<Vec<String>, NczError> {
+    validate_public_key(key_env)?;
+    let mut providers = Vec::new();
+    for entry in read(paths)? {
+        if !entry.key.starts_with(PROVIDER_BINDING_PREFIX) {
+            continue;
+        }
+        let Some((bound_key_env, _)) = parse_binding_value(&entry.value) else {
+            continue;
+        };
+        if bound_key_env == key_env {
+            if let Some(provider) = provider_from_binding_key(&entry.key) {
+                providers.push(provider);
+            }
+        }
+    }
+    providers.sort();
+    providers.dedup();
+    Ok(providers)
+}
+
+pub fn provider_bindings_for_key_lenient(
+    paths: &Paths,
+    key_env: &str,
+) -> Result<Vec<String>, NczError> {
+    let mut providers: Vec<String> = provider_binding_records_for_key_lenient(paths, key_env)?
+        .into_iter()
+        .map(|(_, provider)| provider)
+        .collect();
+    providers.sort();
+    providers.dedup();
+    Ok(providers)
+}
+
+fn provider_binding_records_for_key_lenient(
+    paths: &Paths,
+    key_env: &str,
+) -> Result<Vec<(String, String)>, NczError> {
+    validate_public_key(key_env)?;
+    let body = read_to_string_or_empty(&paths.agent_env())?;
+    let mut records = Vec::new();
+    for line in body.lines() {
+        let Some(binding_key) = line_key(line) else {
+            continue;
+        };
+        if !binding_key.starts_with(PROVIDER_BINDING_PREFIX) {
+            continue;
+        }
+        let Ok(Some((parsed_key, value))) = parse_assignment(line) else {
+            continue;
+        };
+        let Some((bound_key_env, _)) = parse_binding_value(&value) else {
+            continue;
+        };
+        if bound_key_env == key_env {
+            let provider =
+                provider_from_binding_key(&parsed_key).unwrap_or_else(|| parsed_key.clone());
+            records.push((parsed_key, provider));
+        }
+    }
+    records.sort_by(|left, right| left.0.cmp(&right.0));
+    records.dedup_by(|left, right| left.0 == right.0);
+    Ok(records)
+}
+
+fn mcp_binding_records_for_key_lenient(
+    paths: &Paths,
+    auth_env: &str,
+) -> Result<Vec<(String, String)>, NczError> {
+    validate_public_key(auth_env)?;
+    let body = read_to_string_or_empty(&paths.agent_env())?;
+    let mut records = Vec::new();
+    for line in body.lines() {
+        let Some(binding_key) = line_key(line) else {
+            continue;
+        };
+        if !binding_key.starts_with(MCP_BINDING_PREFIX) {
+            continue;
+        }
+        let Ok(Some((parsed_key, value))) = parse_assignment(line) else {
+            continue;
+        };
+        let Some((bound_auth_env, _)) = parse_binding_value(&value) else {
+            continue;
+        };
+        if bound_auth_env == auth_env {
+            let server = mcp_from_binding_key(&parsed_key).unwrap_or_else(|| parsed_key.clone());
+            records.push((parsed_key, server));
+        }
+    }
+    records.sort_by(|left, right| left.0.cmp(&right.0));
+    records.dedup_by(|left, right| left.0 == right.0);
+    Ok(records)
 }
 
 pub fn remove_provider_bindings_for_providers(
@@ -152,6 +404,7 @@ pub fn remove_provider_bindings_for_providers(
 }
 
 pub fn remove_override(paths: &Paths, agent: &str, key: &str) -> Result<bool, NczError> {
+    validate_public_key(key)?;
     remove_path(&paths.agent_env_override(agent), key)
 }
 
@@ -171,17 +424,44 @@ pub fn validate_key(key: &str) -> Result<(), NczError> {
     Ok(())
 }
 
+pub fn validate_public_key(key: &str) -> Result<(), NczError> {
+    validate_key(key)?;
+    if is_internal_binding_key(key) {
+        return Err(NczError::Usage(format!(
+            "environment key {key} uses a reserved ncz internal prefix"
+        )));
+    }
+    Ok(())
+}
+
 fn provider_binding_key(provider: &str) -> Result<String, NczError> {
     validate_provider_binding_name(provider)?;
-    let mut key = String::from(PROVIDER_BINDING_PREFIX);
-    for byte in provider.as_bytes() {
+    binding_key(PROVIDER_BINDING_PREFIX, provider)
+}
+
+fn provider_from_binding_key(key: &str) -> Option<String> {
+    binding_name_from_key(PROVIDER_BINDING_PREFIX, key)
+}
+
+fn mcp_binding_key(server: &str) -> Result<String, NczError> {
+    validate_mcp_binding_name(server)?;
+    binding_key(MCP_BINDING_PREFIX, server)
+}
+
+fn mcp_from_binding_key(key: &str) -> Option<String> {
+    binding_name_from_key(MCP_BINDING_PREFIX, key)
+}
+
+fn binding_key(prefix: &str, name: &str) -> Result<String, NczError> {
+    let mut key = String::from(prefix);
+    for byte in name.as_bytes() {
         let _ = write!(&mut key, "{byte:02X}");
     }
     Ok(key)
 }
 
-fn provider_from_binding_key(key: &str) -> Option<String> {
-    let hex = key.strip_prefix(PROVIDER_BINDING_PREFIX)?;
+fn binding_name_from_key(prefix: &str, key: &str) -> Option<String> {
+    let hex = key.strip_prefix(prefix)?;
     if hex.is_empty() || hex.len() % 2 != 0 {
         return None;
     }
@@ -191,6 +471,10 @@ fn provider_from_binding_key(key: &str) -> Option<String> {
         bytes.push(byte);
     }
     String::from_utf8(bytes).ok()
+}
+
+fn is_internal_binding_key(key: &str) -> bool {
+    key.starts_with(PROVIDER_BINDING_PREFIX) || key.starts_with(MCP_BINDING_PREFIX)
 }
 
 fn validate_provider_binding_name(provider: &str) -> Result<(), NczError> {
@@ -209,12 +493,41 @@ fn validate_provider_binding_name(provider: &str) -> Result<(), NczError> {
     Ok(())
 }
 
-fn parse_provider_binding_value(value: &str) -> Option<(&str, &str)> {
+fn validate_mcp_binding_name(server: &str) -> Result<(), NczError> {
+    if server.is_empty()
+        || server.starts_with('.')
+        || server.contains("..")
+        || !server
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+    {
+        return Err(NczError::Usage(format!("invalid MCP name: {server}")));
+    }
+    Ok(())
+}
+
+fn parse_binding_value(value: &str) -> Option<(&str, &str)> {
     let (key_env, url) = value.split_once(' ')?;
     if key_env.is_empty() || url.is_empty() || url.contains(' ') {
         return None;
     }
     Some((key_env, url))
+}
+
+fn mcp_stdio_binding_target(command: &str) -> Result<String, NczError> {
+    validate_value(command)?;
+    let digest = Sha256::digest(command.as_bytes());
+    Ok(format!("stdio-sha256:{}", hex_encode(&digest)))
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
 }
 
 fn read_path(path: &Path) -> Result<Vec<AgentEnvEntry>, NczError> {
@@ -270,11 +583,26 @@ pub fn set_path(path: &Path, key: &str, value: &str) -> Result<bool, NczError> {
 
     let mut out = lines.join("\n");
     out.push('\n');
-    if changed || body != out {
+    if changed || body != out || file_mode_needs_repair(path, 0o600)? {
         state::atomic_write(path, out.as_bytes(), 0o600)?;
         return Ok(true);
     }
     Ok(false)
+}
+
+fn file_mode_needs_repair(path: &Path, mode: u32) -> Result<bool, NczError> {
+    match fs::metadata(path) {
+        Ok(metadata) => Ok(metadata.permissions().mode() & 0o777 != mode),
+        Err(err)
+            if matches!(
+                err.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Ok(false)
+        }
+        Err(err) => Err(NczError::Io(err)),
+    }
 }
 
 fn remove_path(path: &Path, key: &str) -> Result<bool, NczError> {
@@ -321,10 +649,6 @@ pub fn validate_value(value: &str) -> Result<(), NczError> {
     Ok(())
 }
 
-pub fn parse_environment_file_value(raw: &str) -> Result<String, NczError> {
-    parse_value(raw)
-}
-
 fn is_safe_unquoted_value_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric()
         || matches!(
@@ -333,8 +657,8 @@ fn is_safe_unquoted_value_byte(byte: u8) -> bool {
         )
 }
 
-fn parse_assignment(line: &str) -> Result<Option<(String, String)>, NczError> {
-    let assignment = normalized_assignment(line);
+pub(crate) fn parse_assignment(line: &str) -> Result<Option<(String, String)>, NczError> {
+    let assignment = runtime_assignment(line);
     if assignment.is_empty() || assignment.starts_with('#') || assignment.starts_with(';') {
         return Ok(None);
     }
@@ -370,13 +694,6 @@ fn parse_unquoted(raw: &str) -> String {
             escaped = false;
         } else if ch == '\\' {
             escaped = true;
-        } else if ch == '#'
-            && (out.is_empty() || out.chars().last().is_some_and(char::is_whitespace))
-        {
-            while out.chars().last().is_some_and(char::is_whitespace) {
-                out.pop();
-            }
-            break;
         } else {
             out.push(ch);
         }
@@ -392,9 +709,7 @@ fn parse_double_quoted(raw: &str) -> Result<String, NczError> {
     let mut escaped = false;
     for (idx, ch) in raw.char_indices() {
         if escaped {
-            if ch == 'n' {
-                out.push('\n');
-            } else if matches!(ch, '"' | '\\' | '$' | '`') {
+            if matches!(ch, '"' | '\\' | '$' | '`') {
                 out.push(ch);
             } else {
                 out.push('\\');
@@ -458,7 +773,7 @@ fn escape_double_quoted(value: &str) -> String {
 }
 
 fn line_key(line: &str) -> Option<&str> {
-    let assignment = normalized_assignment(line);
+    let assignment = editable_assignment(line);
     if assignment.is_empty() || assignment.starts_with('#') || assignment.starts_with(';') {
         return None;
     }
@@ -468,10 +783,13 @@ fn line_key(line: &str) -> Option<&str> {
     Some(key)
 }
 
-fn normalized_assignment(line: &str) -> &str {
+fn runtime_assignment(line: &str) -> &str {
     line.trim_start()
-        .strip_prefix("export ")
-        .unwrap_or_else(|| line.trim_start())
+}
+
+fn editable_assignment(line: &str) -> &str {
+    let trimmed = runtime_assignment(line);
+    trimmed.strip_prefix("export ").unwrap_or(trimmed)
 }
 
 #[cfg(test)]
@@ -536,6 +854,20 @@ mod tests {
     }
 
     #[test]
+    fn redacted_list_reports_empty_values_as_unset() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        fs::create_dir_all(&paths.etc_dir).unwrap();
+        fs::write(paths.agent_env(), "TOGETHER_API_KEY=\n").unwrap();
+
+        let entries = redacted_list(&paths, false).unwrap();
+
+        assert_eq!(entries[0].key, "TOGETHER_API_KEY");
+        assert_eq!(entries[0].value, "");
+        assert!(!entries[0].set);
+    }
+
+    #[test]
     fn read_parses_systemd_quoted_values() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = test_paths(tmp.path());
@@ -588,11 +920,95 @@ mod tests {
     }
 
     #[test]
+    fn public_keys_reject_provider_binding_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        fs::create_dir_all(&paths.etc_dir).unwrap();
+
+        for key in [
+            "NCZ_PROVIDER_BINDING_6578616D706C65",
+            "NCZ_MCP_BINDING_736561726368",
+        ] {
+            assert!(matches!(validate_public_key(key), Err(NczError::Usage(_))));
+            assert!(matches!(set(&paths, key, "secret"), Err(NczError::Usage(_))));
+            assert!(matches!(remove(&paths, key), Err(NczError::Usage(_))));
+        }
+        assert!(!paths.agent_env().exists());
+    }
+
+    #[test]
+    fn provider_binding_exists_detects_provider_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        fs::create_dir_all(&paths.etc_dir).unwrap();
+        set_provider_binding(&paths, "example", "EXAMPLE_API_KEY", "https://api.example.test")
+            .unwrap();
+        let entries = read(&paths).unwrap();
+
+        assert!(provider_binding_exists(&entries, "example").unwrap());
+        assert!(!provider_binding_exists(&entries, "other").unwrap());
+    }
+
+    #[test]
+    fn mcp_binding_matches_and_is_hidden_from_list() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        fs::create_dir_all(&paths.etc_dir).unwrap();
+        set(&paths, "MCP_TOKEN", "secret").unwrap();
+        set_mcp_binding(&paths, "search", "MCP_TOKEN", "https://mcp.example.test").unwrap();
+
+        let entries = read(&paths).unwrap();
+
+        assert!(mcp_binding_matches(
+            &entries,
+            "search",
+            "MCP_TOKEN",
+            "https://mcp.example.test"
+        )
+        .unwrap());
+        assert_eq!(redacted_list(&paths, false).unwrap().len(), 1);
+        assert_eq!(remove_mcp_bindings_for_key(&paths, "MCP_TOKEN").unwrap(), vec!["search"]);
+        assert_eq!(fs::read_to_string(paths.agent_env()).unwrap(), "MCP_TOKEN=secret\n");
+    }
+
+    #[test]
+    fn mcp_stdio_binding_matches_command_hash_and_is_hidden_from_list() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        fs::create_dir_all(&paths.etc_dir).unwrap();
+        set(&paths, "MCP_TOKEN", "secret").unwrap();
+        set_mcp_stdio_binding(&paths, "filesystem", "MCP_TOKEN", "mcp-filesystem /srv").unwrap();
+
+        let entries = read(&paths).unwrap();
+
+        assert!(mcp_stdio_binding_matches(
+            &entries,
+            "filesystem",
+            "MCP_TOKEN",
+            "mcp-filesystem /srv"
+        )
+        .unwrap());
+        assert!(!mcp_stdio_binding_matches(
+            &entries,
+            "filesystem",
+            "MCP_TOKEN",
+            "mcp-filesystem /tmp"
+        )
+        .unwrap());
+        assert_eq!(redacted_list(&paths, false).unwrap().len(), 1);
+        assert_eq!(
+            remove_mcp_bindings_for_key(&paths, "MCP_TOKEN").unwrap(),
+            vec!["filesystem"]
+        );
+        assert_eq!(fs::read_to_string(paths.agent_env()).unwrap(), "MCP_TOKEN=secret\n");
+    }
+
+    #[test]
     fn read_uses_last_duplicate_assignment() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = test_paths(tmp.path());
         fs::create_dir_all(&paths.etc_dir).unwrap();
-        fs::write(paths.agent_env(), "TOKEN=old\nOTHER=1\nexport TOKEN=\n").unwrap();
+        fs::write(paths.agent_env(), "TOKEN=old\nOTHER=1\nTOKEN=\n").unwrap();
 
         let entries = read(&paths).unwrap();
 
@@ -600,5 +1016,34 @@ mod tests {
         assert_eq!(entries[0].key, "TOKEN");
         assert_eq!(entries[0].value, "");
         assert_eq!(entries[1].key, "OTHER");
+    }
+
+    #[test]
+    fn read_ignores_export_prefixed_assignments() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        fs::create_dir_all(&paths.etc_dir).unwrap();
+        fs::write(paths.agent_env(), "export TOKEN=secret\nOTHER=1\n").unwrap();
+
+        let entries = read(&paths).unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].key, "OTHER");
+        assert_eq!(entries[0].value, "1");
+    }
+
+    #[test]
+    fn set_rewrites_export_prefixed_assignment() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        fs::create_dir_all(&paths.etc_dir).unwrap();
+        fs::write(paths.agent_env(), "export TOKEN=old\nOTHER=1\n").unwrap();
+
+        assert!(set(&paths, "TOKEN", "new").unwrap());
+
+        assert_eq!(
+            fs::read_to_string(paths.agent_env()).unwrap(),
+            "TOKEN=new\nOTHER=1\n"
+        );
     }
 }

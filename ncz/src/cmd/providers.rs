@@ -72,6 +72,10 @@ pub struct ProviderSetPrimaryReport {
     pub active_agent: String,
     pub primary_provider_file: String,
     pub agent_provider_file: String,
+    pub agent_provider_files: Vec<String>,
+    pub updated_agent_provider_files: Vec<String>,
+    pub restart_required: bool,
+    pub restart_agents: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -119,7 +123,11 @@ impl Render for ProviderTestReport {
 
 impl Render for ProviderSetPrimaryReport {
     fn render_text(&self, w: &mut dyn Write) -> io::Result<()> {
-        writeln!(w, "Primary provider: {}", self.name)
+        writeln!(w, "Primary provider: {}", self.name)?;
+        if self.restart_required {
+            writeln!(w, "Restart required: {}", self.restart_agents.join(", "))?;
+        }
+        Ok(())
     }
 }
 
@@ -186,16 +194,19 @@ pub fn run_with_paths(
                 force,
             },
         )?)),
-        ProvidersAction::Remove { name } => Ok(ProvidersReport::Remove(remove(paths, &name)?)),
+        ProvidersAction::Remove {
+            name,
+            drop_inline_credentials,
+        } => Ok(ProvidersReport::Remove(remove_with_options(
+            paths,
+            &name,
+            drop_inline_credentials,
+        )?)),
         ProvidersAction::Show { name } => Ok(ProvidersReport::Show(show(ctx, paths, &name)?)),
     }
 }
 
 pub fn list(ctx: &Context, paths: &Paths) -> Result<ProvidersListReport, NczError> {
-    {
-        let _lock = state::acquire_lock(&paths.lock_path)?;
-        provider_state::migrate_legacy(paths)?;
-    }
     let primary = provider_state::read_primary(paths)?.unwrap_or_default();
     let mut providers = Vec::new();
     for record in provider_state::read_all(paths)? {
@@ -213,10 +224,6 @@ pub fn test_provider(
     paths: &Paths,
     name: &str,
 ) -> Result<ProviderTestReport, NczError> {
-    {
-        let _lock = state::acquire_lock(&paths.lock_path)?;
-        provider_state::migrate_legacy(paths)?;
-    }
     let record = provider_state::read(paths, name)?
         .ok_or_else(|| NczError::Usage(format!("unknown provider: {name}")))?;
     let health = provider_health(ctx, &record.declaration);
@@ -234,41 +241,76 @@ pub fn test_provider(
 }
 
 pub fn set_primary(paths: &Paths, name: &str) -> Result<ProviderSetPrimaryReport, NczError> {
-    {
-        let _lock = state::acquire_lock(&paths.lock_path)?;
-        provider_state::migrate_legacy(paths)?;
-    }
-    let initial = provider_state::read(paths, name)?
-        .ok_or_else(|| NczError::Usage(format!("unknown provider: {name}")))?;
-
+    provider_state::validate_name(name)?;
     let _lock = state::acquire_lock(&paths.lock_path)?;
-    let record = provider_state::read_record_path(paths, &initial.path)?
-        .ok_or_else(|| NczError::Usage(format!("unknown provider: {name}")))?;
-    if record.declaration.name != initial.declaration.name {
-        return Err(NczError::Precondition(format!(
-            "provider {name} changed during set-primary; retry set-primary"
-        )));
-    }
-    provider_state::validate_declaration(&record.declaration)?;
-    require_provider_credential(paths, &record)?;
-    let provider_name = record.declaration.name.clone();
     let active_agent = agent::read(paths)?;
     common::validate_agent(&active_agent)?;
     let agent_provider_file = paths.agent_primary_provider(&active_agent);
-    let target_paths = vec![paths.primary_provider(), agent_provider_file.clone()];
+    let agent_provider_files = vec![(active_agent.clone(), agent_provider_file.clone())];
+    let mut target_paths = vec![paths.agent_env(), paths.primary_provider()];
+    target_paths.extend(agent_provider_files.iter().map(|(_, path)| path.clone()));
+    target_paths.extend(provider_state::legacy_migration_snapshot_paths_for_provider(
+        paths, name,
+    )?);
+    target_paths.sort();
+    target_paths.dedup();
     let snapshots = snapshot_paths(&target_paths, 0o644)?;
-    let result = (|| {
+    let agent_env_snapshot = snapshots
+        .iter()
+        .find(|snapshot| snapshot.path == paths.agent_env());
+    let result = (|| -> Result<(String, bool, Vec<String>, Vec<String>), NczError> {
+        provider_state::migrate_legacy_for_provider(paths, name)?;
+        let record = provider_state::read(paths, name)?
+            .ok_or_else(|| NczError::Usage(format!("unknown provider: {name}")))?;
+        provider_state::validate_declaration(&record.declaration)?;
+        require_provider_credential(paths, &record)?;
+        let provider_name = record.declaration.name.clone();
         provider_state::write_primary(paths, &provider_name)?;
-        state::atomic_write(
-            &agent_provider_file,
-            format!("{provider_name}\n").as_bytes(),
-            0o644,
-        )
+        let agent_provider_body = format!("{provider_name}\n");
+        for (_, path) in &agent_provider_files {
+            state::atomic_write(path, agent_provider_body.as_bytes(), 0o644)?;
+        }
+        let agent_env_changed = agent_env_snapshot
+            .map(snapshot_changed)
+            .transpose()?
+            .unwrap_or(false);
+        let primary_changed = snapshot_for_path(&snapshots, &paths.primary_provider())
+            .map(snapshot_changed)
+            .transpose()?
+            .unwrap_or(false);
+        let mut updated_agent_provider_files = Vec::new();
+        let mut changed_agent_names = Vec::new();
+        for (agent_name, path) in &agent_provider_files {
+            if snapshot_for_path(&snapshots, path)
+                .map(snapshot_changed)
+                .transpose()?
+                .unwrap_or(false)
+            {
+                updated_agent_provider_files.push(path.display().to_string());
+                changed_agent_names.push(agent_name.clone());
+            }
+        }
+        let restart_agents = if agent_env_changed || primary_changed {
+            agent::AGENTS.iter().map(|agent| (*agent).to_string()).collect()
+        } else {
+            changed_agent_names
+        };
+        let restart_required = !restart_agents.is_empty();
+        Ok((
+            provider_name,
+            restart_required,
+            restart_agents,
+            updated_agent_provider_files,
+        ))
     })();
-    if let Err(err) = result {
-        restore_snapshots(&snapshots)?;
-        return Err(err);
-    }
+    let (provider_name, restart_required, restart_agents, updated_agent_provider_files) =
+        match result {
+            Ok(result) => result,
+            Err(err) => {
+                restore_snapshots(&snapshots)?;
+                return Err(err);
+            }
+        };
 
     Ok(ProviderSetPrimaryReport {
         schema_version: common::SCHEMA_VERSION,
@@ -276,6 +318,13 @@ pub fn set_primary(paths: &Paths, name: &str) -> Result<ProviderSetPrimaryReport
         active_agent,
         primary_provider_file: paths.primary_provider().display().to_string(),
         agent_provider_file: agent_provider_file.display().to_string(),
+        agent_provider_files: agent_provider_files
+            .iter()
+            .map(|(_, path)| path.display().to_string())
+            .collect(),
+        updated_agent_provider_files,
+        restart_required,
+        restart_agents,
     })
 }
 
@@ -290,7 +339,7 @@ pub struct ProviderAddInput {
 }
 
 pub fn add(
-    ctx: &Context,
+    _ctx: &Context,
     paths: &Paths,
     input: ProviderAddInput,
 ) -> Result<ProviderAddReport, NczError> {
@@ -314,19 +363,16 @@ pub fn add(
             require_replacement_credentials_preserved(paths, &inline_replacements)?;
         }
         let primary_references = primary_references(paths, &aliases)?;
-        if let Some((primary, path)) = primary_references
-            .iter()
-            .find(|(primary, _)| primary != &declaration.name)
-        {
+        if let Some((primary, path)) = primary_references.first() {
             return Err(NczError::Usage(format!(
-                "provider {primary} is primary in {path}; run `ncz providers set-primary {}` before replacing provider aliases",
-                declaration.name
+                "provider {primary} is primary in {path}; run `ncz providers set-primary <other>` before replacing provider declarations"
             )));
         }
-        if !primary_references.is_empty() {
-            require_agent_env_credential(paths, &declaration)?;
+        let mut aliases_to_revoke = aliases;
+        if provider_binding_matches_declaration(paths, &declaration)? {
+            aliases_to_revoke.remove(&declaration.name);
         }
-        revoked_binding_aliases = Some(aliases);
+        revoked_binding_aliases = Some(aliases_to_revoke);
     }
     let path = if let Some(aliases) = revoked_binding_aliases {
         let snapshots = snapshot_paths(&[paths.agent_env()], 0o600)?;
@@ -345,14 +391,28 @@ pub fn add(
     };
     Ok(ProviderAddReport {
         schema_version: common::SCHEMA_VERSION,
-        provider: provider_report_from_parts(ctx, &declaration, path.display().to_string()),
+        provider: provider_report_unmeasured(&declaration, path.display().to_string()),
     })
 }
 
 pub fn remove(paths: &Paths, name: &str) -> Result<ProviderRemoveReport, NczError> {
+    remove_with_options(paths, name, false)
+}
+
+pub fn remove_with_options(
+    paths: &Paths,
+    name: &str,
+    drop_inline_credentials: bool,
+) -> Result<ProviderRemoveReport, NczError> {
     let _lock = state::acquire_lock(&paths.lock_path)?;
     let aliases = provider_state::removal_aliases(paths, name)?;
     reject_primary_references(paths, &aliases)?;
+    if !drop_inline_credentials {
+        let inline_replacements = provider_state::inline_credential_replacements(paths, name)?;
+        if !inline_replacements.is_empty() {
+            require_replacement_credentials_preserved(paths, &inline_replacements)?;
+        }
+    }
     let snapshots = snapshot_paths(&[paths.agent_env()], 0o600)?;
     let removed = match (|| {
         agent_env::remove_provider_bindings_for_providers(paths, &aliases)?;
@@ -371,11 +431,20 @@ pub fn remove(paths: &Paths, name: &str) -> Result<ProviderRemoveReport, NczErro
     })
 }
 
+fn provider_binding_matches_declaration(
+    paths: &Paths,
+    declaration: &provider_state::ProviderDeclaration,
+) -> Result<bool, NczError> {
+    let entries = agent_env::read(paths)?;
+    agent_env::provider_binding_matches(
+        &entries,
+        &declaration.name,
+        &declaration.key_env,
+        &declaration.url,
+    )
+}
+
 pub fn show(ctx: &Context, paths: &Paths, name: &str) -> Result<ProviderShowReport, NczError> {
-    {
-        let _lock = state::acquire_lock(&paths.lock_path)?;
-        provider_state::migrate_legacy(paths)?;
-    }
     let record = provider_state::read(paths, name)?
         .ok_or_else(|| NczError::Usage(format!("unknown provider: {name}")))?;
     Ok(ProviderShowReport {
@@ -430,13 +499,17 @@ pub fn provider_url(base_url: &str, path: &str) -> String {
 }
 
 fn provider_report(ctx: &Context, record: &provider_state::ProviderRecord) -> ProviderReport {
-    provider_report_from_parts(ctx, &record.declaration, record.path.display().to_string())
+    provider_report_from_parts(
+        &record.declaration,
+        record.path.display().to_string(),
+        provider_health(ctx, &record.declaration),
+    )
 }
 
 fn provider_report_from_parts(
-    ctx: &Context,
     provider: &provider_state::ProviderDeclaration,
     file: String,
+    health: String,
 ) -> ProviderReport {
     ProviderReport {
         name: provider.name.clone(),
@@ -445,9 +518,16 @@ fn provider_report_from_parts(
         key_env: provider.key_env.clone(),
         provider_type: provider.provider_type.clone(),
         health_path: provider.health_path.clone(),
-        health: provider_health(ctx, provider),
+        health,
         file,
     }
+}
+
+fn provider_report_unmeasured(
+    provider: &provider_state::ProviderDeclaration,
+    file: String,
+) -> ProviderReport {
+    provider_report_from_parts(provider, file, "unknown".to_string())
 }
 
 fn render_provider_line(w: &mut dyn Write, provider: &ProviderReport) -> io::Result<()> {
@@ -498,7 +578,7 @@ fn primary_references(
     names: &std::collections::BTreeSet<String>,
 ) -> Result<Vec<(String, String)>, NczError> {
     let mut references = Vec::new();
-    if let Some(primary) = provider_state::read_primary(paths)? {
+    if let Some(primary) = read_primary_reference(&paths.primary_provider())? {
         if names.contains(&primary) {
             references.push((primary, paths.primary_provider().display().to_string()));
         }
@@ -514,6 +594,31 @@ fn primary_references(
     Ok(references)
 }
 
+fn read_primary_reference(path: &Path) -> Result<Option<String>, NczError> {
+    let body = match fs::read_to_string(path) {
+        Ok(body) => body,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(NczError::Io(e)),
+    };
+    let mut lines = body.lines().map(str::trim).filter(|line| !line.is_empty());
+    let Some(primary) = lines.next() else {
+        return Ok(None);
+    };
+    provider_state::validate_name(primary).map_err(|_| {
+        NczError::Precondition(format!(
+            "malformed primary provider state in {}: invalid provider name",
+            path.display()
+        ))
+    })?;
+    if lines.next().is_some() {
+        return Err(NczError::Precondition(format!(
+            "malformed primary provider state in {}: expected one provider name",
+            path.display()
+        )));
+    }
+    Ok(Some(primary.to_string()))
+}
+
 fn primary_remove_error(name: &str, path: String) -> NczError {
     NczError::Usage(format!(
         "provider {name} is primary in {path}; run `ncz providers set-primary <other>` first"
@@ -525,32 +630,33 @@ fn require_provider_credential(
     record: &provider_state::ProviderRecord,
 ) -> Result<(), NczError> {
     let declaration = &record.declaration;
-    let present = agent_env::read(paths)?
-        .into_iter()
-        .any(|entry| entry.key == declaration.key_env && !entry.value.is_empty());
-    if present
-        || record
-            .inline_secret
-            .as_ref()
-            .is_some_and(|secret| !secret.is_empty())
+    let entries = agent_env::read(paths)?;
+    if entries
+        .iter()
+        .any(|entry| entry.key == declaration.key_env && !entry.value.is_empty())
     {
-        return Ok(());
+        if agent_env::provider_binding_matches(
+            &entries,
+            &declaration.name,
+            &declaration.key_env,
+            &declaration.url,
+        )? {
+            return Ok(());
+        }
+        return Err(NczError::Precondition(format!(
+            "provider credential {} is not bound to provider {}; run `ncz api set {} --providers={}` to approve {}",
+            declaration.key_env, declaration.name, declaration.key_env, declaration.name, declaration.url
+        )));
     }
-    Err(NczError::Precondition(format!(
-        "provider {} requires non-empty credential {} in agent-env or legacy provider file",
-        declaration.name, declaration.key_env
-    )))
-}
-
-fn require_agent_env_credential(
-    paths: &Paths,
-    declaration: &provider_state::ProviderDeclaration,
-) -> Result<(), NczError> {
-    let present = agent_env::read(paths)?
-        .into_iter()
-        .any(|entry| entry.key == declaration.key_env && !entry.value.is_empty());
-    if present {
-        return Ok(());
+    if record
+        .inline_secret
+        .as_ref()
+        .is_some_and(|secret| !secret.is_empty())
+    {
+        return Err(NczError::Precondition(format!(
+            "provider {} still has an inline credential after migration; move it to agent-env and bind {} before setting primary",
+            declaration.name, declaration.key_env
+        )));
     }
     Err(NczError::Precondition(format!(
         "provider {} requires non-empty credential {} in agent-env",
@@ -569,7 +675,7 @@ fn require_replacement_credentials_preserved(
             .any(|entry| entry.key == replacement.key_env && entry.value == replacement.secret);
         if !preserved {
             return Err(NczError::Precondition(format!(
-                "legacy provider {} contains an inline credential for {}; set the same value in agent-env before --force",
+                "legacy provider {} contains an inline credential for {}; set the same value in agent-env before replacing or removing it",
                 replacement.file, replacement.key_env
             )));
         }
@@ -635,6 +741,21 @@ fn restore_snapshots(snapshots: &[FileSnapshot]) -> Result<(), NczError> {
     Ok(())
 }
 
+fn snapshot_changed(snapshot: &FileSnapshot) -> Result<bool, NczError> {
+    match fs::read(&snapshot.path) {
+        Ok(body) => Ok(snapshot.body.as_deref() != Some(body.as_slice())),
+        Err(e) if matches!(
+            e.kind(),
+            io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+        ) => Ok(snapshot.body.is_some()),
+        Err(e) => Err(NczError::Io(e)),
+    }
+}
+
+fn snapshot_for_path<'a>(snapshots: &'a [FileSnapshot], path: &Path) -> Option<&'a FileSnapshot> {
+    snapshots.iter().find(|snapshot| snapshot.path == path)
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -652,6 +773,36 @@ mod tests {
             show_secrets: false,
             runner,
         }
+    }
+
+    fn all_agents() -> Vec<String> {
+        agent::AGENTS
+            .iter()
+            .map(|agent| (*agent).to_string())
+            .collect()
+    }
+
+    fn expect_health(runner: &FakeRunner, url: &str, status: i32) {
+        runner.expect(
+            "curl",
+            &[
+                "-q",
+                "-fsS",
+                "-o",
+                "/dev/null",
+                "--max-time",
+                "3",
+                "--max-filesize",
+                "65536",
+                "--noproxy",
+                "*",
+                "--proxy",
+                "",
+                "--",
+                url,
+            ],
+            out(status, "", ""),
+        );
     }
 
     #[test]
@@ -675,36 +826,18 @@ mod tests {
         )
         .unwrap();
         let runner = FakeRunner::new();
-        runner.expect(
-            "curl",
-            &[
-                "-q",
-                "-fsS",
-                "-o",
-                "/dev/null",
-                "--max-time",
-                "3",
-                "--max-filesize",
-                "65536",
-                "--noproxy",
-                "*",
-                "--proxy",
-                "",
-                "--",
-                "http://127.0.0.1:8080/health",
-            ],
-            out(0, "", ""),
-        );
+        expect_health(&runner, "http://127.0.0.1:8080/health", 0);
 
         let report = list(&ctx(&runner), &paths).unwrap();
         assert_eq!(report.schema_version, 1);
         assert_eq!(report.primary, "local");
         assert_eq!(report.providers[0].key_env, "LOCAL_API_KEY");
         assert_eq!(report.providers[0].health, "ok");
+        runner.assert_done();
     }
 
     #[test]
-    fn providers_list_migrates_legacy_env_configs() {
+    fn providers_list_reads_legacy_env_configs_without_migrating() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = test_paths(tmp.path());
         fs::create_dir_all(paths.providers_dir()).unwrap();
@@ -714,36 +847,36 @@ mod tests {
         )
         .unwrap();
         let runner = FakeRunner::new();
-        runner.expect(
-            "curl",
-            &[
-                "-q",
-                "-fsS",
-                "-o",
-                "/dev/null",
-                "--max-time",
-                "3",
-                "--max-filesize",
-                "65536",
-                "--noproxy",
-                "*",
-                "--proxy",
-                "",
-                "--",
-                "http://127.0.0.1:8080/health",
-            ],
-            out(0, "", ""),
-        );
+        expect_health(&runner, "http://127.0.0.1:8080/health", 0);
 
         let report = list(&ctx(&runner), &paths).unwrap();
 
         assert_eq!(report.providers[0].name, "local");
-        assert!(paths.providers_dir().join("local.json").exists());
-        assert!(!paths.providers_dir().join("local.env").exists());
-        assert_eq!(
-            fs::read_to_string(paths.agent_env()).unwrap(),
-            "LOCAL_API_KEY=abc\nNCZ_PROVIDER_BINDING_6C6F63616C=\"LOCAL_API_KEY http://127.0.0.1:8080\"\n"
-        );
+        assert_eq!(report.providers[0].key_env, "LOCAL_API_KEY");
+        assert_eq!(report.providers[0].health, "ok");
+        assert!(!paths.providers_dir().join("local.json").exists());
+        assert!(paths.providers_dir().join("local.env").exists());
+        assert!(!paths.agent_env().exists());
+        runner.assert_done();
+    }
+
+    #[test]
+    fn providers_show_measures_health_without_failing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        fs::create_dir_all(paths.providers_dir()).unwrap();
+        fs::write(
+            paths.providers_dir().join("bad.json"),
+            r#"{"schema_version":1,"name":"bad","url":"https://bad.example","model":"m","key_env":"BAD_API_KEY","type":"openai-compat","health_path":"/health"}"#,
+        )
+        .unwrap();
+        let runner = FakeRunner::new();
+        expect_health(&runner, "https://bad.example/health", 7);
+
+        let report = show(&ctx(&runner), &paths, "bad").unwrap();
+
+        assert_eq!(report.provider.health, "unhealthy");
+        runner.assert_done();
     }
 
     #[test]
@@ -790,6 +923,13 @@ mod tests {
         fs::create_dir_all(&paths.etc_dir).unwrap();
         fs::write(paths.agent_state(), "hermes\n").unwrap();
         fs::write(paths.agent_env(), "LOCAL_API_KEY=secret\n").unwrap();
+        agent_env::set_provider_binding(
+            &paths,
+            "local",
+            "LOCAL_API_KEY",
+            "http://127.0.0.1:8080",
+        )
+        .unwrap();
         fs::write(
             paths.providers_dir().join("local.json"),
             r#"{"schema_version":1,"name":"local","url":"http://127.0.0.1:8080","model":"m","key_env":"LOCAL_API_KEY","type":"openai-compat","health_path":"/health"}"#,
@@ -810,6 +950,16 @@ mod tests {
             panic!("expected set-primary report");
         };
         assert_eq!(report.schema_version, 1);
+        assert!(report.restart_required);
+        assert_eq!(report.restart_agents, all_agents());
+        assert_eq!(
+            report.agent_provider_files,
+            vec![paths.agent_primary_provider("hermes").display().to_string()]
+        );
+        assert_eq!(
+            report.updated_agent_provider_files,
+            vec![paths.agent_primary_provider("hermes").display().to_string()]
+        );
         assert_eq!(
             fs::read_to_string(paths.primary_provider()).unwrap(),
             "local\n"
@@ -818,6 +968,36 @@ mod tests {
             fs::read_to_string(paths.agent_primary_provider("hermes")).unwrap(),
             "local\n"
         );
+        assert!(!paths.agent_primary_provider("zeroclaw").exists());
+        assert!(!paths.agent_primary_provider("openclaw").exists());
+    }
+
+    #[test]
+    fn providers_set_primary_rejects_unbound_existing_credential() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        fs::create_dir_all(paths.providers_dir()).unwrap();
+        fs::create_dir_all(&paths.etc_dir).unwrap();
+        fs::write(paths.agent_state(), "hermes\n").unwrap();
+        fs::write(paths.agent_env(), "LOCAL_API_KEY=secret\n").unwrap();
+        fs::write(
+            paths.providers_dir().join("local.json"),
+            r#"{"schema_version":1,"name":"local","url":"https://api.attacker.test","model":"m","key_env":"LOCAL_API_KEY","type":"openai-compat","health_path":"/health"}"#,
+        )
+        .unwrap();
+        let runner = FakeRunner::new();
+
+        let err = run_with_paths(
+            &ctx(&runner),
+            &paths,
+            ProvidersAction::SetPrimary {
+                name: "local".to_string(),
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, NczError::Precondition(message) if message.contains("not bound")));
+        assert!(!paths.primary_provider().exists());
     }
 
     #[test]
@@ -847,6 +1027,8 @@ mod tests {
             panic!("expected set-primary report");
         };
         assert_eq!(report.name, "local");
+        assert!(report.restart_required);
+        assert_eq!(report.restart_agents, all_agents());
         assert_eq!(
             fs::read_to_string(paths.primary_provider()).unwrap(),
             "local\n"
@@ -855,12 +1037,217 @@ mod tests {
             fs::read_to_string(paths.agent_primary_provider("hermes")).unwrap(),
             "local\n"
         );
+        assert!(!paths.agent_primary_provider("zeroclaw").exists());
+        assert!(!paths.agent_primary_provider("openclaw").exists());
         assert!(paths.providers_dir().join("local.json").exists());
         assert!(!paths.providers_dir().join("local.env").exists());
         assert_eq!(
             fs::read_to_string(paths.agent_env()).unwrap(),
             "LOCAL_API_KEY=legacy\nNCZ_PROVIDER_BINDING_6C6F63616C=\"LOCAL_API_KEY http://127.0.0.1:8080\"\n"
         );
+    }
+
+    #[test]
+    fn providers_set_primary_rejects_conflicting_legacy_binding() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        fs::create_dir_all(paths.providers_dir()).unwrap();
+        fs::create_dir_all(&paths.etc_dir).unwrap();
+        fs::write(paths.agent_state(), "hermes\n").unwrap();
+        fs::write(paths.agent_env(), "LOCAL_API_KEY=secret\n").unwrap();
+        agent_env::set_provider_binding(
+            &paths,
+            "local",
+            "LOCAL_API_KEY",
+            "https://api.old.test",
+        )
+        .unwrap();
+        let legacy_file = paths.providers_dir().join("local.env");
+        let legacy = "PROVIDER_NAME=local\nPROVIDER_URL=https://api.new.test\nMODEL=mini\nKEY_ENV=LOCAL_API_KEY\nLOCAL_API_KEY=secret\n";
+        fs::write(&legacy_file, legacy).unwrap();
+        let runner = FakeRunner::new();
+
+        let err = run_with_paths(
+            &ctx(&runner),
+            &paths,
+            ProvidersAction::SetPrimary {
+                name: "local".to_string(),
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(err, NczError::Precondition(message) if message.contains("different key or URL"))
+        );
+        assert!(!paths.primary_provider().exists());
+        assert_eq!(fs::read_to_string(legacy_file).unwrap(), legacy);
+        assert!(!paths.providers_dir().join("local.json").exists());
+        assert!(agent_env::provider_binding_matches(
+            &agent_env::read(&paths).unwrap(),
+            "local",
+            "LOCAL_API_KEY",
+            "https://api.old.test"
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn providers_set_primary_legacy_migration_restarts_active_agent_for_agent_env_change() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        fs::create_dir_all(paths.providers_dir()).unwrap();
+        fs::create_dir_all(&paths.etc_dir).unwrap();
+        fs::write(paths.agent_state(), "hermes\n").unwrap();
+        fs::write(paths.primary_provider(), "local\n").unwrap();
+        for agent_name in agent::AGENTS {
+            fs::create_dir_all(paths.agent_primary_provider(agent_name).parent().unwrap()).unwrap();
+            fs::write(paths.agent_primary_provider(agent_name), "local\n").unwrap();
+        }
+        fs::write(
+            paths.providers_dir().join("local.env"),
+            "PROVIDER_NAME=local\nPROVIDER_URL=http://127.0.0.1:8080\nMODEL=mini\nAPI_KEY=legacy\n",
+        )
+        .unwrap();
+
+        let report = set_primary(&paths, "local").unwrap();
+
+        assert!(report.restart_required);
+        assert_eq!(report.restart_agents, all_agents());
+        assert_eq!(
+            fs::read_to_string(paths.agent_env()).unwrap(),
+            "LOCAL_API_KEY=legacy\nNCZ_PROVIDER_BINDING_6C6F63616C=\"LOCAL_API_KEY http://127.0.0.1:8080\"\n"
+        );
+    }
+
+    #[test]
+    fn providers_set_primary_reports_restart_when_provider_files_change() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        fs::create_dir_all(paths.providers_dir()).unwrap();
+        fs::create_dir_all(&paths.etc_dir).unwrap();
+        fs::write(paths.agent_state(), "hermes\n").unwrap();
+        fs::write(paths.primary_provider(), "old\n").unwrap();
+        for agent_name in agent::AGENTS {
+            fs::create_dir_all(paths.agent_primary_provider(agent_name).parent().unwrap()).unwrap();
+            fs::write(paths.agent_primary_provider(agent_name), "old\n").unwrap();
+        }
+        fs::write(paths.agent_env(), "LOCAL_API_KEY=secret\n").unwrap();
+        agent_env::set_provider_binding(
+            &paths,
+            "local",
+            "LOCAL_API_KEY",
+            "http://127.0.0.1:8080",
+        )
+        .unwrap();
+        fs::write(
+            paths.providers_dir().join("local.json"),
+            r#"{"schema_version":1,"name":"local","url":"http://127.0.0.1:8080","model":"m","key_env":"LOCAL_API_KEY","type":"openai-compat","health_path":"/health"}"#,
+        )
+        .unwrap();
+        fs::write(
+            paths.providers_dir().join("old.json"),
+            r#"{"schema_version":1,"name":"old","url":"http://127.0.0.1:9090","model":"m","key_env":"OLD_API_KEY","type":"openai-compat","health_path":"/health"}"#,
+        )
+        .unwrap();
+
+        let report = set_primary(&paths, "local").unwrap();
+
+        assert!(report.restart_required);
+        assert_eq!(report.restart_agents, all_agents());
+        assert_eq!(
+            fs::read_to_string(paths.primary_provider()).unwrap(),
+            "local\n"
+        );
+        assert_eq!(
+            fs::read_to_string(paths.agent_primary_provider("hermes")).unwrap(),
+            "local\n"
+        );
+        assert_eq!(
+            fs::read_to_string(paths.agent_primary_provider("zeroclaw")).unwrap(),
+            "old\n"
+        );
+        assert_eq!(
+            fs::read_to_string(paths.agent_primary_provider("openclaw")).unwrap(),
+            "old\n"
+        );
+    }
+
+    #[test]
+    fn providers_set_primary_preserves_inactive_agent_primary_references() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        fs::create_dir_all(paths.providers_dir()).unwrap();
+        fs::create_dir_all(&paths.etc_dir).unwrap();
+        fs::write(paths.agent_state(), "hermes\n").unwrap();
+        fs::write(paths.primary_provider(), "old\n").unwrap();
+        for agent_name in agent::AGENTS {
+            fs::create_dir_all(paths.agent_primary_provider(agent_name).parent().unwrap()).unwrap();
+            fs::write(paths.agent_primary_provider(agent_name), "old\n").unwrap();
+        }
+        fs::write(paths.agent_env(), "LOCAL_API_KEY=secret\n").unwrap();
+        agent_env::set_provider_binding(
+            &paths,
+            "local",
+            "LOCAL_API_KEY",
+            "http://127.0.0.1:8080",
+        )
+        .unwrap();
+        fs::write(
+            paths.providers_dir().join("local.json"),
+            r#"{"schema_version":1,"name":"local","url":"http://127.0.0.1:8080","model":"m","key_env":"LOCAL_API_KEY","type":"openai-compat","health_path":"/health"}"#,
+        )
+        .unwrap();
+        fs::write(
+            paths.providers_dir().join("old.json"),
+            r#"{"schema_version":1,"name":"old","url":"http://127.0.0.1:9090","model":"m","key_env":"OLD_API_KEY","type":"openai-compat","health_path":"/health"}"#,
+        )
+        .unwrap();
+
+        set_primary(&paths, "local").unwrap();
+
+        assert!(paths.providers_dir().join("old.json").exists());
+        assert_eq!(
+            fs::read_to_string(paths.agent_primary_provider("hermes")).unwrap(),
+            "local\n"
+        );
+        assert_eq!(
+            fs::read_to_string(paths.agent_primary_provider("zeroclaw")).unwrap(),
+            "old\n"
+        );
+        assert_eq!(
+            fs::read_to_string(paths.agent_primary_provider("openclaw")).unwrap(),
+            "old\n"
+        );
+    }
+
+    #[test]
+    fn providers_set_primary_unknown_provider_rolls_back_legacy_migration() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        fs::create_dir_all(paths.providers_dir()).unwrap();
+        fs::create_dir_all(&paths.etc_dir).unwrap();
+        fs::write(paths.agent_state(), "hermes\n").unwrap();
+        let legacy_file = paths.providers_dir().join("local.env");
+        let legacy =
+            "PROVIDER_NAME=local\nPROVIDER_URL=http://127.0.0.1:8080\nMODEL=mini\nAPI_KEY=legacy\n";
+        fs::write(&legacy_file, legacy).unwrap();
+        let runner = FakeRunner::new();
+
+        let err = run_with_paths(
+            &ctx(&runner),
+            &paths,
+            ProvidersAction::SetPrimary {
+                name: "missing".to_string(),
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, NczError::Usage(message) if message.contains("unknown provider")));
+        assert_eq!(fs::read_to_string(legacy_file).unwrap(), legacy);
+        assert!(!paths.providers_dir().join("local.json").exists());
+        assert!(!paths.agent_env().exists());
+        assert!(!paths.primary_provider().exists());
+        assert!(!paths.agent_primary_provider("hermes").exists());
     }
 
     #[test]
@@ -989,6 +1376,13 @@ mod tests {
         fs::write(paths.agent_state(), "hermes\n").unwrap();
         fs::write(paths.agent_config_dir(), "not a directory").unwrap();
         fs::write(paths.agent_env(), "LOCAL_API_KEY=secret\n").unwrap();
+        agent_env::set_provider_binding(
+            &paths,
+            "local",
+            "LOCAL_API_KEY",
+            "http://127.0.0.1:8080",
+        )
+        .unwrap();
         fs::write(
             paths.providers_dir().join("local.json"),
             r#"{"schema_version":1,"name":"local","url":"http://127.0.0.1:8080","model":"m","key_env":"LOCAL_API_KEY","type":"openai-compat","health_path":"/health"}"#,
@@ -1043,26 +1437,6 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let paths = test_paths(tmp.path());
         let runner = FakeRunner::new();
-        runner.expect(
-            "curl",
-            &[
-                "-q",
-                "-fsS",
-                "-o",
-                "/dev/null",
-                "--max-time",
-                "3",
-                "--max-filesize",
-                "65536",
-                "--noproxy",
-                "*",
-                "--proxy",
-                "",
-                "--",
-                "https://api.example.test/health",
-            ],
-            out(0, "", ""),
-        );
 
         let report = run_with_paths(
             &ctx(&runner),
@@ -1083,7 +1457,9 @@ mod tests {
             panic!("expected add report");
         };
         assert_eq!(report.provider.name, "example");
+        assert_eq!(report.provider.health, "unknown");
         assert!(paths.providers_dir().join("example.json").exists());
+        runner.assert_done();
     }
 
     #[test]
@@ -1176,6 +1552,68 @@ mod tests {
     }
 
     #[test]
+    fn providers_remove_rejects_unpreserved_legacy_inline_credential() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        fs::create_dir_all(paths.providers_dir()).unwrap();
+        let legacy_file = paths.providers_dir().join("local.env");
+        let legacy =
+            "PROVIDER_NAME=local\nPROVIDER_URL=http://127.0.0.1:8080\nMODEL=mini\nAPI_KEY=abc\n";
+        fs::write(&legacy_file, legacy).unwrap();
+
+        let err = remove(&paths, "local").unwrap_err();
+
+        assert!(
+            matches!(err, NczError::Precondition(message) if message.contains("inline credential"))
+        );
+        assert_eq!(fs::read_to_string(legacy_file).unwrap(), legacy);
+        assert!(!paths.agent_env().exists());
+    }
+
+    #[test]
+    fn providers_remove_can_drop_legacy_inline_credential() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        fs::create_dir_all(paths.providers_dir()).unwrap();
+        let legacy_file = paths.providers_dir().join("local.env");
+        fs::write(
+            &legacy_file,
+            "PROVIDER_NAME=local\nPROVIDER_URL=http://127.0.0.1:8080\nMODEL=mini\nKEY_ENV=LOCAL_API_KEY\nPROXY_TOKEN=proxy-secret\n",
+        )
+        .unwrap();
+
+        let report = remove_with_options(&paths, "local", true).unwrap();
+
+        assert!(report.removed);
+        assert!(!legacy_file.exists());
+        assert!(!paths.agent_env().exists());
+    }
+
+    #[test]
+    fn providers_remove_allows_preserved_legacy_inline_credential() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        fs::create_dir_all(paths.providers_dir()).unwrap();
+        fs::create_dir_all(&paths.etc_dir).unwrap();
+        let legacy_file = paths.providers_dir().join("local.env");
+        fs::write(
+            &legacy_file,
+            "PROVIDER_NAME=local\nPROVIDER_URL=http://127.0.0.1:8080\nMODEL=mini\nAPI_KEY=abc\n",
+        )
+        .unwrap();
+        fs::write(paths.agent_env(), "LOCAL_API_KEY=abc\n").unwrap();
+
+        let report = remove(&paths, "local").unwrap();
+
+        assert!(report.removed);
+        assert!(!legacy_file.exists());
+        assert_eq!(
+            fs::read_to_string(paths.agent_env()).unwrap(),
+            "LOCAL_API_KEY=abc\n"
+        );
+    }
+
+    #[test]
     fn providers_remove_rolls_back_binding_on_remove_failure() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = test_paths(tmp.path());
@@ -1203,13 +1641,13 @@ mod tests {
     }
 
     #[test]
-    fn providers_add_force_rejects_primary_replacement_with_missing_credential() {
+    fn providers_add_force_rejects_primary_replacement() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = test_paths(tmp.path());
         fs::create_dir_all(paths.providers_dir()).unwrap();
         fs::create_dir_all(&paths.etc_dir).unwrap();
         fs::write(paths.primary_provider(), "example\n").unwrap();
-        fs::write(paths.agent_env(), "OLD_API_KEY=secret\n").unwrap();
+        fs::write(paths.agent_env(), "OLD_API_KEY=old\nNEW_API_KEY=new\n").unwrap();
         let provider_file = paths.providers_dir().join("example.json");
         let original = r#"{"schema_version":1,"name":"example","url":"https://api.example.test","model":"old","key_env":"OLD_API_KEY","type":"openai-compat","health_path":"/health"}"#;
         fs::write(&provider_file, original).unwrap();
@@ -1230,7 +1668,41 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(matches!(err, NczError::Precondition(_)));
+        assert!(matches!(err, NczError::Usage(_)));
+        assert_eq!(fs::read_to_string(provider_file).unwrap(), original);
+    }
+
+    #[test]
+    fn providers_add_force_rejects_malformed_global_primary_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        fs::create_dir_all(paths.providers_dir()).unwrap();
+        fs::create_dir_all(&paths.etc_dir).unwrap();
+        fs::write(paths.primary_provider(), "example\nbackup\n").unwrap();
+        fs::write(paths.agent_env(), "OLD_API_KEY=old\nNEW_API_KEY=new\n").unwrap();
+        let provider_file = paths.providers_dir().join("example.json");
+        let original = r#"{"schema_version":1,"name":"example","url":"https://api.example.test","model":"old","key_env":"OLD_API_KEY","type":"openai-compat","health_path":"/health"}"#;
+        fs::write(&provider_file, original).unwrap();
+        let runner = FakeRunner::new();
+
+        let err = run_with_paths(
+            &ctx(&runner),
+            &paths,
+            ProvidersAction::Add {
+                name: "example".to_string(),
+                url: "https://api.example.test".to_string(),
+                model: "new".to_string(),
+                key_env: "NEW_API_KEY".to_string(),
+                provider_type: "openai-compat".to_string(),
+                health_path: "/health".to_string(),
+                force: true,
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(err, NczError::Precondition(message) if message.contains("malformed primary provider state"))
+        );
         assert_eq!(fs::read_to_string(provider_file).unwrap(), original);
     }
 
@@ -1303,6 +1775,95 @@ mod tests {
     }
 
     #[test]
+    fn providers_add_force_rejects_custom_key_env_legacy_secret_without_rebound_credential() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        fs::create_dir_all(paths.providers_dir()).unwrap();
+        let legacy_file = paths.providers_dir().join("local.env");
+        let legacy = "PROVIDER_NAME=local\nPROVIDER_URL=http://127.0.0.1:8080\nMODEL=mini\nKEY_ENV=FOO\nFOO=sk-live\n";
+        fs::write(&legacy_file, legacy).unwrap();
+        let runner = FakeRunner::new();
+
+        let err = run_with_paths(
+            &ctx(&runner),
+            &paths,
+            ProvidersAction::Add {
+                name: "local".to_string(),
+                url: "http://127.0.0.1:8080".to_string(),
+                model: "new".to_string(),
+                key_env: "FOO".to_string(),
+                provider_type: "openai-compat".to_string(),
+                health_path: "/health".to_string(),
+                force: true,
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, NczError::Precondition(message) if message.contains("FOO")));
+        assert_eq!(fs::read_to_string(legacy_file).unwrap(), legacy);
+        assert!(!paths.providers_dir().join("local.json").exists());
+    }
+
+    #[test]
+    fn providers_add_force_rejects_unmigratable_nested_legacy_json_secret() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        fs::create_dir_all(paths.providers_dir()).unwrap();
+        let legacy_file = paths.providers_dir().join("local.json");
+        let legacy = r#"{"provider":"local","base_url":"http://127.0.0.1:8080","default_model":"mini","api_key_env":"LOCAL_API_KEY","headers":[{"proxy_token":"proxy-secret"}]}"#;
+        fs::write(&legacy_file, legacy).unwrap();
+        let runner = FakeRunner::new();
+
+        let err = run_with_paths(
+            &ctx(&runner),
+            &paths,
+            ProvidersAction::Add {
+                name: "local".to_string(),
+                url: "http://127.0.0.1:8080".to_string(),
+                model: "new".to_string(),
+                key_env: "LOCAL_API_KEY".to_string(),
+                provider_type: "openai-compat".to_string(),
+                health_path: "/health".to_string(),
+                force: true,
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, NczError::Precondition(_)));
+        assert_eq!(fs::read_to_string(legacy_file).unwrap(), legacy);
+    }
+
+    #[test]
+    fn providers_add_force_rejects_unmigratable_legacy_env_secret() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        fs::create_dir_all(paths.providers_dir()).unwrap();
+        let legacy_file = paths.providers_dir().join("local.env");
+        let legacy = "PROVIDER_NAME=local\nPROVIDER_URL=http://127.0.0.1:8080\nMODEL=mini\nKEY_ENV=LOCAL_API_KEY\nPROXY_TOKEN=proxy-secret\n";
+        fs::write(&legacy_file, legacy).unwrap();
+        let runner = FakeRunner::new();
+
+        let err = run_with_paths(
+            &ctx(&runner),
+            &paths,
+            ProvidersAction::Add {
+                name: "local".to_string(),
+                url: "http://127.0.0.1:8080".to_string(),
+                model: "new".to_string(),
+                key_env: "LOCAL_API_KEY".to_string(),
+                provider_type: "openai-compat".to_string(),
+                health_path: "/health".to_string(),
+                force: true,
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, NczError::Precondition(message) if message.contains("PROXY_TOKEN")));
+        assert_eq!(fs::read_to_string(legacy_file).unwrap(), legacy);
+        assert!(!paths.providers_dir().join("local.json").exists());
+    }
+
+    #[test]
     fn providers_add_force_rejects_mismatched_legacy_inline_credential() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = test_paths(tmp.path());
@@ -1338,7 +1899,40 @@ mod tests {
     }
 
     #[test]
-    fn providers_add_force_revokes_stale_provider_binding() {
+    fn providers_add_force_rejects_multiple_canonical_inline_credentials() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        fs::create_dir_all(paths.providers_dir()).unwrap();
+        fs::create_dir_all(&paths.etc_dir).unwrap();
+        fs::write(paths.agent_env(), "LOCAL_API_KEY=old-secret\n").unwrap();
+        let original_file = paths.providers_dir().join("local.json");
+        let original = r#"{"schema_version":1,"name":"local","url":"http://127.0.0.1:8080","model":"mini","key_env":"LOCAL_API_KEY","type":"openai-compat","health_path":"/health","api_key":"old-secret","proxy_token":"other-secret"}"#;
+        fs::write(&original_file, original).unwrap();
+        let runner = FakeRunner::new();
+
+        let err = run_with_paths(
+            &ctx(&runner),
+            &paths,
+            ProvidersAction::Add {
+                name: "local".to_string(),
+                url: "http://127.0.0.1:8080".to_string(),
+                model: "new".to_string(),
+                key_env: "LOCAL_API_KEY".to_string(),
+                provider_type: "openai-compat".to_string(),
+                health_path: "/health".to_string(),
+                force: true,
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(err, NczError::Precondition(message) if message.contains("multiple inline credential fields"))
+        );
+        assert_eq!(fs::read_to_string(original_file).unwrap(), original);
+    }
+
+    #[test]
+    fn providers_add_force_preserves_matching_provider_binding() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = test_paths(tmp.path());
         fs::create_dir_all(paths.providers_dir()).unwrap();
@@ -1354,26 +1948,6 @@ mod tests {
         )
         .unwrap();
         let runner = FakeRunner::new();
-        runner.expect(
-            "curl",
-            &[
-                "-q",
-                "-fsS",
-                "-o",
-                "/dev/null",
-                "--max-time",
-                "3",
-                "--max-filesize",
-                "65536",
-                "--noproxy",
-                "*",
-                "--proxy",
-                "",
-                "--",
-                "https://api.example.test/health",
-            ],
-            out(0, "", ""),
-        );
 
         run_with_paths(
             &ctx(&runner),
@@ -1392,13 +1966,59 @@ mod tests {
 
         assert_eq!(
             fs::read_to_string(paths.agent_env()).unwrap(),
-            "EXAMPLE_API_KEY=secret\nOTHER=1\n"
+            "EXAMPLE_API_KEY=secret\nNCZ_PROVIDER_BINDING_6578616D706C65=\"EXAMPLE_API_KEY https://api.example.test\"\nOTHER=1\n"
         );
         assert!(
             fs::read_to_string(paths.providers_dir().join("example.json"))
                 .unwrap()
                 .contains(r#""model": "new""#)
         );
+        runner.assert_done();
+    }
+
+    #[test]
+    fn providers_add_force_revokes_provider_binding_when_url_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        fs::create_dir_all(paths.providers_dir()).unwrap();
+        fs::create_dir_all(&paths.etc_dir).unwrap();
+        fs::write(
+            paths.providers_dir().join("example.json"),
+            r#"{"schema_version":1,"name":"example","url":"https://api.example.test","model":"old","key_env":"EXAMPLE_API_KEY","type":"openai-compat","health_path":"/health"}"#,
+        )
+        .unwrap();
+        fs::write(
+            paths.agent_env(),
+            "EXAMPLE_API_KEY=secret\nNCZ_PROVIDER_BINDING_6578616D706C65=\"EXAMPLE_API_KEY https://api.example.test\"\nOTHER=1\n",
+        )
+        .unwrap();
+        let runner = FakeRunner::new();
+
+        run_with_paths(
+            &ctx(&runner),
+            &paths,
+            ProvidersAction::Add {
+                name: "example".to_string(),
+                url: "https://api2.example.test".to_string(),
+                model: "new".to_string(),
+                key_env: "EXAMPLE_API_KEY".to_string(),
+                provider_type: "openai-compat".to_string(),
+                health_path: "/health".to_string(),
+                force: true,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(paths.agent_env()).unwrap(),
+            "EXAMPLE_API_KEY=secret\nOTHER=1\n"
+        );
+        assert!(
+            fs::read_to_string(paths.providers_dir().join("example.json"))
+                .unwrap()
+                .contains(r#""url": "https://api2.example.test""#)
+        );
+        runner.assert_done();
     }
 
     #[test]
@@ -1449,6 +2069,25 @@ mod tests {
         let err = remove(&paths, "example").unwrap_err();
 
         assert!(matches!(err, NczError::Usage(_)));
+    }
+
+    #[test]
+    fn providers_remove_rejects_malformed_global_primary_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        fs::create_dir_all(paths.providers_dir()).unwrap();
+        fs::create_dir_all(&paths.etc_dir).unwrap();
+        fs::write(paths.primary_provider(), "example\nbackup\n").unwrap();
+        let provider_file = paths.providers_dir().join("example.json");
+        let original = r#"{"schema_version":1,"name":"example","url":"https://api.example.test","model":"old","key_env":"EXAMPLE_API_KEY","type":"openai-compat","health_path":"/health"}"#;
+        fs::write(&provider_file, original).unwrap();
+
+        let err = remove(&paths, "example").unwrap_err();
+
+        assert!(
+            matches!(err, NczError::Precondition(message) if message.contains("malformed primary provider state"))
+        );
+        assert_eq!(fs::read_to_string(provider_file).unwrap(), original);
     }
 
     #[test]
