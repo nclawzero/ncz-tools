@@ -1096,7 +1096,7 @@ fn slash_command_may_mutate_state(cmdline: &str) -> bool {
     let command = tokens.first().map(String::as_str);
     let subcommand = tokens.get(1).map(String::as_str);
     match (command, subcommand) {
-        (Some("/clear"), _) => true,
+        (Some("/clear" | "/save"), _) => true,
         (Some("/models" | "/model"), Some("set")) => true,
         (Some("/workspace" | "/workspaces"), Some("switch")) => true,
         (Some("/memory"), Some("post" | "add" | "delete" | "rm")) => true,
@@ -7521,6 +7521,7 @@ mod tests {
             "/session create \"Research Notes\"",
             "/workspace switch prod",
             "/models set primary",
+            "/save backup.txt",
         ] {
             assert_eq!(
                 slash_command_deadline(cmdline),
@@ -7529,7 +7530,7 @@ mod tests {
             );
         }
 
-        for cmdline in ["/memory list", "/session list", "/save backup.txt"] {
+        for cmdline in ["/memory list", "/session list"] {
             assert_eq!(
                 slash_command_deadline(cmdline),
                 SlashCommandDeadline::read_only(COMMAND_WORKER_TIMEOUT),
@@ -7676,12 +7677,12 @@ mod tests {
             "/save missing/parent.txt",
             &WorkerRequest::Command("/save missing/parent.txt".to_string()),
         );
-        assert!(!save.mutating_slash);
-        assert!(mutation_fence_reason_for_terminal_failure(
-            "failed to create export file",
-            Some(&save)
-        )
-        .is_none());
+        assert!(save.mutating_slash);
+        let reason =
+            mutation_fence_reason_for_terminal_failure("failed to create export file", Some(&save))
+                .expect("save export failures should fence ambiguous filesystem state");
+        assert!(reason.contains("/save missing/parent.txt"));
+        assert!(reason.contains("failed to create export file"));
     }
 
     #[tokio::test]
