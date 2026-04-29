@@ -47,6 +47,7 @@
 use anyhow::{anyhow, Context, Result};
 use futures::{SinkExt, StreamExt};
 use sha2::{Digest as _, Sha256};
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -73,6 +74,9 @@ const DEFAULT_SESSION_NAMESPACE: &str = "openclaw";
 /// Channel capacity for server-pushed events. Streaming turns can push
 /// bursty deltas; bump higher than outbound.
 const EVENT_CAPACITY: usize = 256;
+const RELIABLE_EVENT_OVERFLOW_CAPACITY: usize = 64;
+const RELIABLE_EVENT_FLUSH_INTERVAL: Duration = Duration::from_millis(10);
+const RELIABLE_EVENT_DELIVERY_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// WebSocket-connected openclaw gateway client. This struct is the
 /// single outward-facing handle — caller tasks clone the `outbound_tx`
@@ -870,7 +874,42 @@ async fn read_loop(
     event_tx: mpsc::Sender<super::wire::EventFrame>,
     connected: Arc<AtomicBool>,
 ) {
-    while let Some(msg_res) = ws_stream.next().await {
+    let mut reliable_overflow = VecDeque::new();
+    let mut overflow_since = None;
+
+    loop {
+        flush_reliable_overflow(&event_tx, &mut reliable_overflow, &mut overflow_since);
+        if reliable_overflow_delivery_expired(overflow_since) {
+            tracing::warn!(
+                "openclaw: reliable event channel stayed full for {:?}; closing connection",
+                RELIABLE_EVENT_DELIVERY_TIMEOUT
+            );
+            break;
+        }
+
+        let msg_res = if reliable_overflow.is_empty() {
+            match ws_stream.next().await {
+                Some(msg_res) => msg_res,
+                None => break,
+            }
+        } else {
+            tokio::select! {
+                _ = tokio::time::sleep(RELIABLE_EVENT_FLUSH_INTERVAL) => continue,
+                msg_res = ws_stream.next() => match msg_res {
+                    Some(msg_res) => msg_res,
+                    None => {
+                        wait_for_reliable_overflow_flush(
+                            &event_tx,
+                            &mut reliable_overflow,
+                            &mut overflow_since,
+                        )
+                        .await;
+                        break;
+                    }
+                },
+            }
+        };
+
         match msg_res {
             Ok(WsMessage::Text(text)) => match Frame::from_json(&text) {
                 Ok(Frame::Res(res)) => {
@@ -878,7 +917,14 @@ async fn read_loop(
                 }
                 Ok(Frame::Event(ev)) => {
                     if event_requires_reliable_delivery(&ev) {
-                        deliver_reliable_event(&event_tx, ev);
+                        if !queue_reliable_event(
+                            &event_tx,
+                            &mut reliable_overflow,
+                            &mut overflow_since,
+                            ev,
+                        ) {
+                            break;
+                        }
                     } else {
                         match event_tx.try_send(ev) {
                             Ok(()) => {}
@@ -930,29 +976,78 @@ fn event_requires_reliable_delivery(event: &super::wire::EventFrame) -> bool {
     event.event == "session.message" || is_terminal_run_event_name(&event.event)
 }
 
-fn deliver_reliable_event(
+fn queue_reliable_event(
     event_tx: &mpsc::Sender<super::wire::EventFrame>,
+    reliable_overflow: &mut VecDeque<super::wire::EventFrame>,
+    overflow_since: &mut Option<tokio::time::Instant>,
     event: super::wire::EventFrame,
-) {
+) -> bool {
     match event_tx.try_send(event) {
-        Ok(()) => {}
+        Ok(()) => true,
         Err(mpsc::error::TrySendError::Full(event)) => {
-            let event_name = event.event.clone();
-            let event_tx = event_tx.clone();
-            let handle = tokio::spawn(async move {
-                if event_tx.send(event).await.is_err() {
-                    tracing::debug!(
-                        "openclaw: dropping reliable event {event_name} because receiver closed"
-                    );
-                }
-            });
-            drop(handle);
+            if reliable_overflow.len() >= RELIABLE_EVENT_OVERFLOW_CAPACITY {
+                tracing::warn!(
+                    "openclaw: reliable event overflow cap ({}) exhausted while delivering {}; closing connection",
+                    RELIABLE_EVENT_OVERFLOW_CAPACITY,
+                    event.event
+                );
+                return false;
+            }
+            if overflow_since.is_none() {
+                *overflow_since = Some(tokio::time::Instant::now());
+            }
+            reliable_overflow.push_back(event);
+            true
         }
         Err(mpsc::error::TrySendError::Closed(_)) => {
             // Receiver dropped — no one cares about events. Keep the
             // read loop alive anyway so response correlation still works.
+            true
         }
     }
+}
+
+fn flush_reliable_overflow(
+    event_tx: &mpsc::Sender<super::wire::EventFrame>,
+    reliable_overflow: &mut VecDeque<super::wire::EventFrame>,
+    overflow_since: &mut Option<tokio::time::Instant>,
+) {
+    while let Some(event) = reliable_overflow.pop_front() {
+        match event_tx.try_send(event) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(event)) => {
+                reliable_overflow.push_front(event);
+                return;
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                reliable_overflow.clear();
+                *overflow_since = None;
+                return;
+            }
+        }
+    }
+    *overflow_since = None;
+}
+
+async fn wait_for_reliable_overflow_flush(
+    event_tx: &mpsc::Sender<super::wire::EventFrame>,
+    reliable_overflow: &mut VecDeque<super::wire::EventFrame>,
+    overflow_since: &mut Option<tokio::time::Instant>,
+) {
+    let deadline = tokio::time::Instant::now() + RELIABLE_EVENT_DELIVERY_TIMEOUT;
+    while !reliable_overflow.is_empty() && tokio::time::Instant::now() < deadline {
+        flush_reliable_overflow(event_tx, reliable_overflow, overflow_since);
+        if reliable_overflow.is_empty() {
+            return;
+        }
+        tokio::time::sleep(RELIABLE_EVENT_FLUSH_INTERVAL).await;
+    }
+}
+
+fn reliable_overflow_delivery_expired(overflow_since: Option<tokio::time::Instant>) -> bool {
+    overflow_since
+        .map(|since| since.elapsed() >= RELIABLE_EVENT_DELIVERY_TIMEOUT)
+        .unwrap_or(false)
 }
 
 async fn write_loop(
@@ -4632,6 +4727,65 @@ mod tests {
         assert_eq!(delivered.event, "session.run.completed");
         read_task.await.expect("read loop should join");
         assert!(!connected.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn read_loop_fails_closed_when_reliable_overflow_cap_is_exhausted() {
+        let pending = PendingRequests::new();
+        let response_id = "req-after-overflow-cap".to_string();
+        let response_rx = pending.register(response_id.clone()).await;
+        let (event_tx, mut event_rx) = mpsc::channel::<super::super::wire::EventFrame>(1);
+        event_tx
+            .try_send(super::super::wire::EventFrame {
+                event: "already.full".to_string(),
+                payload: None,
+                seq: None,
+                state_version: None,
+            })
+            .expect("test event channel should start full");
+
+        let mut frames = Vec::new();
+        for i in 0..=RELIABLE_EVENT_OVERFLOW_CAPACITY {
+            frames.push(Ok(WsMessage::Text(
+                Frame::Event(run_completed_event("session-a", &format!("run-{i}")))
+                    .to_json()
+                    .unwrap(),
+            )));
+        }
+        frames.push(Ok(WsMessage::Text(
+            Frame::Res(ResponseFrame {
+                id: response_id,
+                ok: true,
+                payload: Some(serde_json::json!({ "done": true })),
+                error: None,
+            })
+            .to_json()
+            .unwrap(),
+        )));
+        let stream = futures::stream::iter(frames);
+        let connected = Arc::new(AtomicBool::new(true));
+
+        let read_task = tokio::spawn(read_loop(
+            stream,
+            pending.clone(),
+            event_tx,
+            Arc::clone(&connected),
+        ));
+        let response = tokio::time::timeout(Duration::from_millis(50), response_rx)
+            .await
+            .expect("pending response should be aborted when reliable overflow is exhausted");
+        assert!(
+            response.is_err(),
+            "overflow cap must fail closed instead of allocating unbounded reliable deliveries"
+        );
+        read_task.await.expect("read loop should join");
+        assert!(!connected.load(Ordering::Relaxed));
+
+        let retained = event_rx
+            .recv()
+            .await
+            .expect("pre-filled event should still be queued first");
+        assert_eq!(retained.event, "already.full");
     }
 
     #[tokio::test]

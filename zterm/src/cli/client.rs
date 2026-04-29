@@ -13,6 +13,8 @@ use crate::cli::agent::{StreamSink, TurnChunk, TurnUsage};
 
 const ZEROCLAW_WS_TURN_TIMEOUT: Duration = Duration::from_secs(120);
 const ZEROCLAW_TURN_RESPONSE_MAX_BYTES: usize = 2 * 1024 * 1024;
+const ZEROCLAW_WEBHOOK_ENVELOPE_MAX_BYTES: usize = 64 * 1024;
+const ZEROCLAW_WEBHOOK_ERROR_BODY_MAX_BYTES: usize = 8 * 1024;
 
 /// One row from the daemon's `[providers.models.<key>]` config table.
 ///
@@ -793,7 +795,36 @@ impl ZeroclawClient {
             }
         };
 
-        let json: serde_json::Value = match response.json().await {
+        let status = response.status();
+        if !status.is_success() {
+            let body = match Self::read_response_body_limited(
+                response,
+                ZEROCLAW_WEBHOOK_ERROR_BODY_MAX_BYTES,
+            )
+            .await
+            {
+                Ok(body) => String::from_utf8_lossy(&body).trim().to_string(),
+                Err(e) => format!("could not read error body: {e}"),
+            };
+            let wrapped = if body.is_empty() {
+                anyhow!("Webhook request failed: HTTP {}", status)
+            } else {
+                anyhow!("Webhook request failed: HTTP {}: {}", status, body)
+            };
+            self.emit_failure(&wrapped);
+            return Err(wrapped);
+        }
+
+        let body_limit = max_response_bytes.saturating_add(ZEROCLAW_WEBHOOK_ENVELOPE_MAX_BYTES);
+        let body = match Self::read_response_body_limited(response, body_limit).await {
+            Ok(body) => body,
+            Err(e) => {
+                self.emit_failure(&e);
+                return Err(e);
+            }
+        };
+
+        let json: serde_json::Value = match serde_json::from_slice(&body) {
             Ok(j) => j,
             Err(e) => {
                 let wrapped = anyhow!("Failed to parse response: {}", e);
@@ -802,11 +833,14 @@ impl ZeroclawClient {
             }
         };
 
-        let text = json
-            .get("response")
-            .and_then(|v| v.as_str())
-            .unwrap_or("(no response)")
-            .to_string();
+        let text = match json.get("response").and_then(|v| v.as_str()) {
+            Some(text) => text.to_string(),
+            None => {
+                let wrapped = anyhow!("Webhook response missing string 'response' field");
+                self.emit_failure(&wrapped);
+                return Err(wrapped);
+            }
+        };
 
         if text.len() > max_response_bytes {
             let wrapped = anyhow!(
@@ -831,6 +865,22 @@ impl ZeroclawClient {
         }
 
         Ok(text)
+    }
+
+    async fn read_response_body_limited(
+        response: reqwest::Response,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>> {
+        let mut stream = response.bytes_stream();
+        let mut body = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| anyhow!("Failed to read response body: {}", e))?;
+            if body.len().saturating_add(chunk.len()) > max_bytes {
+                anyhow::bail!("Webhook response body exceeded {} byte limit", max_bytes);
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok(body)
     }
 
     fn emit_token(&self, text: &str) -> Result<()> {
@@ -1298,6 +1348,98 @@ mod tests {
                 assert!(message.contains("Webhook response exceeded"));
             }
             other => panic!("expected oversized webhook error, got {other:?}"),
+        }
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn webhook_submit_rejects_non_success_json_without_assistant_text() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/webhook")
+            .with_status(401)
+            .with_header("content-type", "application/json")
+            .with_body(serde_json::json!({ "error": "denied" }).to_string())
+            .create_async()
+            .await;
+        let mut client = ZeroclawClient::new(server.url(), String::new());
+        let (sink, mut rx) = StreamSink::channel(8);
+        client.set_stream_sink(Some(sink));
+
+        let err = client
+            .submit_turn_webhook_with_limit("main", "hello", "primary", 1024)
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("HTTP 401"));
+        assert!(err.to_string().contains("denied"));
+        match rx.recv().await {
+            Some(TurnChunk::Finished(Err(message))) => {
+                assert!(message.contains("HTTP 401"));
+            }
+            other => panic!("expected webhook HTTP error, got {other:?}"),
+        }
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn webhook_submit_rejects_missing_response_field() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/webhook")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(serde_json::json!({ "message": "ok without response" }).to_string())
+            .create_async()
+            .await;
+        let mut client = ZeroclawClient::new(server.url(), String::new());
+        let (sink, mut rx) = StreamSink::channel(8);
+        client.set_stream_sink(Some(sink));
+
+        let err = client
+            .submit_turn_webhook_with_limit("main", "hello", "primary", 1024)
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("missing string 'response' field"));
+        match rx.recv().await {
+            Some(TurnChunk::Finished(Err(message))) => {
+                assert!(message.contains("missing string 'response' field"));
+            }
+            other => panic!("expected missing response error, got {other:?}"),
+        }
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn webhook_submit_rejects_oversized_body_before_json_parse() {
+        let mut server = mockito::Server::new_async().await;
+        let oversized_body = format!(
+            "{{\"response\":\"ok\",\"padding\":\"{}\"}}",
+            "x".repeat(ZEROCLAW_WEBHOOK_ENVELOPE_MAX_BYTES + 32)
+        );
+        let _mock = server
+            .mock("POST", "/webhook")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(oversized_body)
+            .create_async()
+            .await;
+        let mut client = ZeroclawClient::new(server.url(), String::new());
+        let (sink, mut rx) = StreamSink::channel(8);
+        client.set_stream_sink(Some(sink));
+
+        let err = client
+            .submit_turn_webhook_with_limit("main", "hello", "primary", 16)
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("response body exceeded"));
+        match rx.recv().await {
+            Some(TurnChunk::Finished(Err(message))) => {
+                assert!(message.contains("response body exceeded"));
+            }
+            other => panic!("expected oversized body error, got {other:?}"),
         }
         assert!(rx.try_recv().is_err());
     }
