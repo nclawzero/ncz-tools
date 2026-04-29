@@ -8,7 +8,10 @@ use std::io::{self, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 use tokio::sync::Mutex;
 use tracing::warn;
 
@@ -56,6 +59,7 @@ impl CommandHandlerOutput {
 pub struct CommandHandler {
     app: std::sync::Arc<tokio::sync::Mutex<crate::cli::workspace::App>>,
     workspace_activator: WorkspaceActivator,
+    workspace_switch_generation: AtomicU64,
 }
 
 impl CommandHandler {
@@ -69,6 +73,7 @@ impl CommandHandler {
             workspace_activator: Arc::new(|config| {
                 Box::pin(async move { Workspace::activate_detached_client(&config).await })
             }),
+            workspace_switch_generation: AtomicU64::new(0),
         }
     }
 
@@ -80,6 +85,7 @@ impl CommandHandler {
         Self {
             app,
             workspace_activator,
+            workspace_switch_generation: AtomicU64::new(0),
         }
     }
 
@@ -116,6 +122,10 @@ impl CommandHandler {
             workspace.config.id.as_deref(),
         )
         .ok()
+    }
+
+    fn workspace_switch_is_current(&self, switch_generation: u64) -> bool {
+        self.workspace_switch_generation.load(Ordering::SeqCst) == switch_generation
     }
 
     /// Handle a slash command (maps to zeroclaw CLI)
@@ -1460,12 +1470,19 @@ impl CommandHandler {
                 "❌ no workspace named \"{name}\"\n   /workspace list to see names\n"
             )));
         };
+        let switch_generation = self
+            .workspace_switch_generation
+            .fetch_add(1, Ordering::SeqCst)
+            + 1;
 
         let activation = {
             let mut app = self.app.lock().await;
             if !app.workspaces[target_idx].is_activated() {
                 Some(app.workspaces[target_idx].config.clone())
             } else {
+                if !self.workspace_switch_is_current(switch_generation) {
+                    return Ok(Some(workspace_switch_superseded_message(name)));
+                }
                 app.active = target_idx;
                 None
             }
@@ -1474,10 +1491,18 @@ impl CommandHandler {
         if let Some(config) = activation {
             let activated_client = match (self.workspace_activator)(config).await {
                 Ok(client) => client,
-                Err(e) => return Ok(Some(format!("❌ failed to activate \"{name}\": {e}\n"))),
+                Err(e) => {
+                    if !self.workspace_switch_is_current(switch_generation) {
+                        return Ok(Some(workspace_switch_superseded_message(name)));
+                    }
+                    return Ok(Some(format!("❌ failed to activate \"{name}\": {e}\n")));
+                }
             };
 
             let mut app = self.app.lock().await;
+            if !self.workspace_switch_is_current(switch_generation) {
+                return Ok(Some(workspace_switch_superseded_message(name)));
+            }
             let Some(target_idx) = app.workspaces.iter().position(|w| w.config.name == name) else {
                 return Ok(Some(format!(
                     "❌ workspace \"{name}\" disappeared during activation\n"
@@ -1491,6 +1516,10 @@ impl CommandHandler {
 
         Ok(Some(format!("✅ 🗂  switched to workspace: {name}\n")))
     }
+}
+
+fn workspace_switch_superseded_message(name: &str) -> String {
+    format!("workspace switch to \"{name}\" was superseded by a newer request\n")
 }
 
 fn create_private_export_file(path: &Path) -> io::Result<fs::File> {
@@ -3695,6 +3724,142 @@ token = "legacy-secret"
             .expect("switch command should return output");
 
         assert!(out.contains("switched to workspace: beta"));
+        let app = app.lock().await;
+        assert_eq!(app.active_workspace().unwrap().config.name, "beta");
+        assert!(app.active_workspace().unwrap().is_activated());
+    }
+
+    #[tokio::test]
+    async fn concurrent_workspace_switch_keeps_last_requested_workspace() {
+        let app = app_with_pending_openclaw_workspace();
+        {
+            let mut app = app.lock().await;
+            app.workspaces.push(Workspace {
+                id: 2,
+                config: WorkspaceConfig {
+                    id: Some("ws_gamma".to_string()),
+                    name: "gamma".to_string(),
+                    backend: Backend::Openclaw,
+                    url: "ws://gamma.example".to_string(),
+                    token_env: None,
+                    token: None,
+                    label: None,
+                    namespace_aliases: Vec::new(),
+                },
+                client: None,
+                cron: None,
+            });
+        }
+
+        let (beta_entered_tx, beta_entered_rx) = tokio::sync::oneshot::channel();
+        let (beta_release_tx, beta_release_rx) = tokio::sync::oneshot::channel();
+        let beta_entered_tx = Arc::new(StdMutex::new(Some(beta_entered_tx)));
+        let beta_release_rx = Arc::new(StdMutex::new(Some(beta_release_rx)));
+        let activator: super::WorkspaceActivator = Arc::new(move |config| {
+            let beta_entered_tx = Arc::clone(&beta_entered_tx);
+            let beta_release_rx = Arc::clone(&beta_release_rx);
+            Box::pin(async move {
+                match config.name.as_str() {
+                    "beta" => {
+                        if let Some(tx) = beta_entered_tx.lock().unwrap().take() {
+                            let _ = tx.send(());
+                        }
+                        let release_rx = {
+                            let mut guard = beta_release_rx.lock().unwrap();
+                            guard.take().expect("beta activation should run once")
+                        };
+                        let _ = release_rx.await;
+                    }
+                    "gamma" => {}
+                    other => panic!("unexpected activation for {other}"),
+                }
+                Ok(fake_client_handle(FakeAgentClient::default()))
+            })
+        });
+        let handler = Arc::new(super::CommandHandler::new_with_workspace_activator(
+            Arc::clone(&app),
+            activator,
+        ));
+
+        let beta_handler = Arc::clone(&handler);
+        let beta_task =
+            tokio::spawn(async move { beta_handler.handle("/workspace switch beta", "s").await });
+        beta_entered_rx
+            .await
+            .expect("beta activation should be in flight");
+
+        let gamma_out = handler
+            .handle("/workspace switch gamma", "s")
+            .await
+            .expect("gamma switch should complete")
+            .expect("gamma switch should return output");
+        assert!(gamma_out.contains("switched to workspace: gamma"));
+        assert_eq!(
+            app.lock().await.active_workspace().unwrap().config.name,
+            "gamma"
+        );
+
+        beta_release_tx.send(()).unwrap();
+        let beta_out = beta_task
+            .await
+            .expect("beta switch task should not panic")
+            .expect("beta switch command should complete")
+            .expect("beta switch command should return output");
+        assert!(beta_out.contains("superseded"));
+        let app = app.lock().await;
+        assert_eq!(app.active_workspace().unwrap().config.name, "gamma");
+        assert!(app.active_workspace().unwrap().is_activated());
+    }
+
+    #[tokio::test]
+    async fn invalid_workspace_switch_does_not_cancel_valid_in_flight_switch() {
+        let app = app_with_pending_openclaw_workspace();
+        let (beta_entered_tx, beta_entered_rx) = tokio::sync::oneshot::channel();
+        let (beta_release_tx, beta_release_rx) = tokio::sync::oneshot::channel();
+        let beta_entered_tx = Arc::new(StdMutex::new(Some(beta_entered_tx)));
+        let beta_release_rx = Arc::new(StdMutex::new(Some(beta_release_rx)));
+        let activator: super::WorkspaceActivator = Arc::new(move |config| {
+            let beta_entered_tx = Arc::clone(&beta_entered_tx);
+            let beta_release_rx = Arc::clone(&beta_release_rx);
+            Box::pin(async move {
+                assert_eq!(config.name, "beta");
+                if let Some(tx) = beta_entered_tx.lock().unwrap().take() {
+                    let _ = tx.send(());
+                }
+                let release_rx = {
+                    let mut guard = beta_release_rx.lock().unwrap();
+                    guard.take().expect("beta activation should run once")
+                };
+                let _ = release_rx.await;
+                Ok(fake_client_handle(FakeAgentClient::default()))
+            })
+        });
+        let handler = Arc::new(super::CommandHandler::new_with_workspace_activator(
+            Arc::clone(&app),
+            activator,
+        ));
+
+        let beta_handler = Arc::clone(&handler);
+        let beta_task =
+            tokio::spawn(async move { beta_handler.handle("/workspace switch beta", "s").await });
+        beta_entered_rx
+            .await
+            .expect("beta activation should be in flight");
+
+        let missing_out = handler
+            .handle("/workspace switch missing", "s")
+            .await
+            .expect("missing workspace switch should complete")
+            .expect("missing workspace switch should return output");
+        assert!(missing_out.contains("no workspace named \"missing\""));
+
+        beta_release_tx.send(()).unwrap();
+        let beta_out = beta_task
+            .await
+            .expect("beta switch task should not panic")
+            .expect("beta switch command should complete")
+            .expect("beta switch command should return output");
+        assert!(beta_out.contains("switched to workspace: beta"));
         let app = app.lock().await;
         assert_eq!(app.active_workspace().unwrap().config.name, "beta");
         assert!(app.active_workspace().unwrap().is_activated());
