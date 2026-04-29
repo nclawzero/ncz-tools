@@ -158,6 +158,8 @@ const TURN_STREAM_MAX_BYTES: usize = 2 * 1024 * 1024;
 const COMMAND_ERROR_ALREADY_RENDERED: &str = "__zterm_command_error_already_rendered__";
 const PARTIAL_STREAM_INCOMPLETE_REASON: &str =
     "partial response incomplete; backend stream ended without a finished frame";
+const TURN_TRANSCRIPT_PENDING_REASON: &str =
+    "turn submitted to backend; terminal transcript entry pending";
 const MUTATION_FENCE_TOAST: &str = "Mutation state unknown: run /resync";
 const STATUS_LABEL_MAX_CHARS: usize = 48;
 const STATUS_TOAST_MAX_CHARS: usize = 96;
@@ -650,17 +652,37 @@ pub async fn run(
                                 .await;
                                 continue;
                             }
+                            if let Err(e) =
+                                mark_turn_transcript_pending(&transcript_scope, &worker_session_id)
+                            {
+                                send_worker_finished(
+                                    &worker_sink,
+                                    Err(format!(
+                                        "could not mark transcript pending for session {}; turn not submitted: {e}",
+                                        worker_session_id
+                                    )),
+                                )
+                                .await;
+                                continue;
+                            }
                             if let Err(e) = append_turn_transcript_entry(
                                 &transcript_scope,
                                 &worker_session_id,
                                 "user",
                                 &text,
                             ) {
-                                send_worker_finished(
-                                    &worker_sink,
-                                    Err(format!("{e}; turn not submitted")),
+                                let clear_error = clear_turn_transcript_pending_marker(
+                                    &transcript_scope,
+                                    &worker_session_id,
                                 )
-                                .await;
+                                .err();
+                                let mut message = format!("{e}; turn not submitted");
+                                if let Some(clear_error) = clear_error {
+                                    message.push_str(&format!(
+                                        "; additionally failed to clear pending transcript marker: {clear_error}"
+                                    ));
+                                }
+                                send_worker_finished(&worker_sink, Err(message)).await;
                                 continue;
                             }
                             let mut client = client_arc.lock().await;
@@ -711,11 +733,13 @@ pub async fn run(
                             let forwarded_any = forwarded_token.load(Ordering::Acquire);
                             let forwarded_terminal_error =
                                 forwarded_terminal.as_ref().is_some_and(Result::is_err);
+                            let mut transcript_incomplete = false;
                             if partial_stream_without_terminal_frame(
                                 &submit_result,
                                 saw_finished,
                                 forwarded_any,
                             ) {
+                                transcript_incomplete = true;
                                 let _ = mark_turn_transcript_incomplete_reason(
                                     &transcript_scope,
                                     &worker_session_id,
@@ -724,6 +748,7 @@ pub async fn run(
                             }
                             let mut terminal_override: Option<Result<String, String>> = None;
                             if forwarded_terminal_error && submit_result.is_ok() {
+                                transcript_incomplete = true;
                                 let _ = mark_turn_transcript_incomplete_reason(
                                     &transcript_scope,
                                     &worker_session_id,
@@ -731,13 +756,14 @@ pub async fn run(
                                 );
                             } else {
                                 match &submit_result {
-                                    Ok(response) if !response.is_empty() => {
+                                    Ok(response) => {
                                         if let Err(e) = append_turn_transcript_entry(
                                             &transcript_scope,
                                             &worker_session_id,
                                             "assistant",
                                             response,
                                         ) {
+                                            transcript_incomplete = true;
                                             let message =
                                                 mark_turn_transcript_incomplete_after_append_failure(
                                                     &transcript_scope,
@@ -755,6 +781,7 @@ pub async fn run(
                                             "error",
                                             &error_text,
                                         ) {
+                                            transcript_incomplete = true;
                                             let message =
                                                 mark_turn_transcript_incomplete_after_append_failure(
                                                     &transcript_scope,
@@ -764,7 +791,6 @@ pub async fn run(
                                             terminal_override = Some(Err(message));
                                         }
                                     }
-                                    _ => {}
                                 }
                             }
                             if let Some(error_text) = submit_error_text.as_deref() {
@@ -772,11 +798,22 @@ pub async fn run(
                                     error_text,
                                     forwarded_any,
                                 ) {
+                                    transcript_incomplete = true;
                                     let _ = mark_turn_transcript_incomplete_reason(
                                         &transcript_scope,
                                         &worker_session_id,
                                         error_text,
                                     );
+                                }
+                            }
+                            if !transcript_incomplete {
+                                if let Err(e) = clear_turn_transcript_pending_marker(
+                                    &transcript_scope,
+                                    &worker_session_id,
+                                ) {
+                                    terminal_override = Some(Err(format!(
+                                        "terminal transcript persisted, but pending transcript marker could not be cleared: {e}; /save remains disabled until /clear"
+                                    )));
                                 }
                             }
                             send_worker_chunks_reliably(
@@ -1882,6 +1919,27 @@ fn append_turn_transcript_entry(
     storage::append_scoped_session_history(scope, session_id, role, content).map_err(|e| {
         anyhow::anyhow!("could not append {role} transcript entry for session {session_id}: {e}")
     })
+}
+
+fn mark_turn_transcript_pending(
+    scope: &storage::LocalWorkspaceScope,
+    session_id: &str,
+) -> Result<()> {
+    storage::mark_scoped_session_history_incomplete(
+        scope,
+        session_id,
+        TURN_TRANSCRIPT_PENDING_REASON,
+    )
+    .map_err(|e| anyhow::anyhow!("could not persist pending transcript marker: {e}"))
+}
+
+fn clear_turn_transcript_pending_marker(
+    scope: &storage::LocalWorkspaceScope,
+    session_id: &str,
+) -> Result<()> {
+    storage::clear_scoped_session_history_incomplete_marker(scope, session_id)
+        .map(|_| ())
+        .map_err(|e| anyhow::anyhow!("could not clear pending transcript marker: {e}"))
 }
 
 fn mark_turn_transcript_incomplete_after_append_failure(
@@ -6476,6 +6534,33 @@ mod tests {
 
         assert!(message.contains("transcript marked incomplete"));
         assert!(storage::scoped_session_history_is_incomplete(&scope, "main").unwrap());
+    }
+
+    #[test]
+    fn pending_turn_marker_blocks_until_terminal_transcript_is_durable() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let scope = storage::workspace_scope(
+            "zeroclaw",
+            &format!("pending-turn-transcript-{}", uuid::Uuid::new_v4()),
+            None,
+        )
+        .unwrap();
+
+        mark_turn_transcript_pending(&scope, "main").unwrap();
+        assert!(storage::scoped_session_history_is_incomplete(&scope, "main").unwrap());
+        let err = storage::ensure_scoped_session_history_complete(&scope, "main").unwrap_err();
+        assert!(err.to_string().contains("run /clear"));
+
+        append_turn_transcript_entry(&scope, "main", "user", "hello").unwrap();
+        append_turn_transcript_entry(&scope, "main", "assistant", "hi").unwrap();
+        clear_turn_transcript_pending_marker(&scope, "main").unwrap();
+
+        assert!(!storage::scoped_session_history_is_incomplete(&scope, "main").unwrap());
+        let history =
+            std::fs::read_to_string(storage::scoped_session_history_file(&scope, "main").unwrap())
+                .unwrap();
+        assert!(history.contains(r#""role":"user""#));
+        assert!(history.contains(r#""role":"assistant""#));
     }
 
     #[test]

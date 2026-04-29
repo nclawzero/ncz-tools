@@ -354,6 +354,8 @@ pub fn append_scoped_session_history(
         "content": content,
     });
     writeln!(out, "{entry}").map_err(|e| anyhow!("Failed to append session history: {}", e))?;
+    out.sync_all()
+        .map_err(|e| anyhow!("Failed to sync session history: {}", e))?;
     Ok(())
 }
 
@@ -416,6 +418,14 @@ pub fn mark_scoped_session_history_incomplete(
     let mut out = open_private_write_file(&file)?;
     writeln!(out, "{reason}")
         .map_err(|e| anyhow!("Failed to write session history incomplete marker: {}", e))?;
+    out.sync_all()
+        .map_err(|e| anyhow!("Failed to sync session history incomplete marker: {}", e))?;
+    sync_parent_dir(&file).map_err(|e| {
+        anyhow!(
+            "Failed to sync session history incomplete marker directory: {}",
+            e
+        )
+    })?;
     Ok(())
 }
 
@@ -443,6 +453,37 @@ pub fn ensure_scoped_session_history_complete(
     Ok(())
 }
 
+/// Clear only the incomplete marker for a scoped transcript.
+pub fn clear_scoped_session_history_incomplete_marker(
+    scope: &LocalWorkspaceScope,
+    session_id: &str,
+) -> Result<bool> {
+    if !is_safe_session_id(session_id) {
+        return Err(anyhow!("unsafe session id for local history marker clear"));
+    }
+
+    let file = scoped_session_history_incomplete_file(scope, session_id)?;
+    let removed = match fs::remove_file(&file) {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => {
+            return Err(anyhow!(
+                "Failed to clear session history incomplete marker: {}",
+                e
+            ))
+        }
+    };
+    if removed {
+        sync_parent_dir(&file).map_err(|e| {
+            anyhow!(
+                "Failed to sync session history incomplete marker directory after clear: {}",
+                e
+            )
+        })?;
+    }
+    Ok(removed)
+}
+
 /// Remove workspace-scoped transcript history for a session, leaving metadata intact.
 pub fn clear_scoped_session_history(scope: &LocalWorkspaceScope, session_id: &str) -> Result<bool> {
     if !is_safe_session_id(session_id) {
@@ -461,6 +502,19 @@ pub fn clear_scoped_session_history(scope: &LocalWorkspaceScope, session_id: &st
         }
     }
     Ok(removed)
+}
+
+#[cfg(unix)]
+fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_parent_dir(_path: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 /// Load config from file
@@ -813,6 +867,23 @@ mod tests {
             .unwrap()
             .exists());
         assert!(!scoped_session_history_is_incomplete(&scope, "main").unwrap());
+    }
+
+    #[test]
+    fn clear_scoped_incomplete_marker_leaves_transcript_history() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let scope = scope(&format!("pending-clear-{}", uuid::Uuid::new_v4()));
+
+        append_scoped_session_history(&scope, "main", "user", "hello").unwrap();
+        mark_scoped_session_history_incomplete(&scope, "main", "turn pending").unwrap();
+
+        assert!(scoped_session_history_is_incomplete(&scope, "main").unwrap());
+        assert!(clear_scoped_session_history_incomplete_marker(&scope, "main").unwrap());
+        assert!(!scoped_session_history_is_incomplete(&scope, "main").unwrap());
+        let history =
+            fs::read_to_string(scoped_session_history_file(&scope, "main").unwrap()).unwrap();
+        assert!(history.contains(r#""content":"hello""#));
+        assert!(!clear_scoped_session_history_incomplete_marker(&scope, "main").unwrap());
     }
 
     #[test]

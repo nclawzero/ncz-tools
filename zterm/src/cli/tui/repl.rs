@@ -377,12 +377,27 @@ impl ReplLoop {
                 ui::print_error("turn not submitted", Some(&e.to_string()));
                 continue;
             }
+            if let Err(e) = mark_repl_transcript_pending(&transcript_scope, &session_id) {
+                ui::print_error(
+                    "could not persist pending transcript marker; turn not submitted",
+                    Some(&e.to_string()),
+                );
+                continue;
+            }
             if let Err(e) =
                 append_repl_transcript_entry(&transcript_scope, &session_id, "user", &input)
             {
+                let clear_error =
+                    clear_repl_transcript_pending_marker(&transcript_scope, &session_id).err();
+                let mut detail = e.to_string();
+                if let Some(clear_error) = clear_error {
+                    detail.push_str(&format!(
+                        "; additionally failed to clear pending transcript marker: {clear_error}"
+                    ));
+                }
                 ui::print_error(
                     "could not persist user transcript; turn not submitted",
-                    Some(&e.to_string()),
+                    Some(&detail),
                 );
                 continue;
             }
@@ -392,14 +407,24 @@ impl ReplLoop {
             };
             match turn_res {
                 Ok(response) => {
-                    if !response.is_empty() {
-                        if let Err(e) = append_repl_transcript_entry(
-                            &transcript_scope,
-                            &session_id,
-                            "assistant",
-                            &response,
-                        ) {
-                            surface_repl_transcript_incomplete(&transcript_scope, &session_id, &e);
+                    let mut transcript_incomplete = false;
+                    if let Err(e) = append_repl_transcript_entry(
+                        &transcript_scope,
+                        &session_id,
+                        "assistant",
+                        &response,
+                    ) {
+                        transcript_incomplete = true;
+                        surface_repl_transcript_incomplete(&transcript_scope, &session_id, &e);
+                    }
+                    if !transcript_incomplete {
+                        if let Err(e) =
+                            clear_repl_transcript_pending_marker(&transcript_scope, &session_id)
+                        {
+                            ui::print_error(
+                                "terminal transcript persisted, but pending marker remains",
+                                Some(&e.to_string()),
+                            );
                         }
                     }
                     // Response already printed by streaming handler
@@ -410,12 +435,14 @@ impl ReplLoop {
                 }
                 Err(e) => {
                     let error_text = e.to_string();
+                    let mut transcript_incomplete = false;
                     if let Err(append_error) = append_repl_transcript_entry(
                         &transcript_scope,
                         &session_id,
                         "error",
                         &error_text,
                     ) {
+                        transcript_incomplete = true;
                         surface_repl_transcript_incomplete(
                             &transcript_scope,
                             &session_id,
@@ -423,11 +450,22 @@ impl ReplLoop {
                         );
                     }
                     if repl_submit_error_requires_incomplete_transcript(&error_text) {
+                        transcript_incomplete = true;
                         surface_repl_transcript_incomplete_reason(
                             &transcript_scope,
                             &session_id,
                             &error_text,
                         );
+                    }
+                    if !transcript_incomplete {
+                        if let Err(e) =
+                            clear_repl_transcript_pending_marker(&transcript_scope, &session_id)
+                        {
+                            ui::print_error(
+                                "terminal transcript persisted, but pending marker remains",
+                                Some(&e.to_string()),
+                            );
+                        }
                     }
                     eprintln!("\n❌ Error: {}", e);
                 }
@@ -936,6 +974,27 @@ fn append_repl_transcript_entry(
     storage::append_scoped_session_history(scope, session_id, role, content).map_err(|e| {
         anyhow::anyhow!("could not append {role} transcript entry for session {session_id}: {e}")
     })
+}
+
+fn mark_repl_transcript_pending(
+    scope: &storage::LocalWorkspaceScope,
+    session_id: &str,
+) -> Result<()> {
+    storage::mark_scoped_session_history_incomplete(
+        scope,
+        session_id,
+        "turn submitted to backend; terminal transcript entry pending",
+    )
+    .map_err(|e| anyhow::anyhow!("could not persist pending transcript marker: {e}"))
+}
+
+fn clear_repl_transcript_pending_marker(
+    scope: &storage::LocalWorkspaceScope,
+    session_id: &str,
+) -> Result<()> {
+    storage::clear_scoped_session_history_incomplete_marker(scope, session_id)
+        .map(|_| ())
+        .map_err(|e| anyhow::anyhow!("could not clear pending transcript marker: {e}"))
 }
 
 fn surface_repl_transcript_incomplete(

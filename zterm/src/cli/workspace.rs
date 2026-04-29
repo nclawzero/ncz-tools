@@ -299,7 +299,7 @@ impl Workspace {
             Backend::Zeroclaw => {
                 let token = config
                     .resolved_token()
-                    .unwrap_or_else(|| "unset".to_string());
+                    .ok_or_else(|| missing_zeroclaw_token_error(&config))?;
                 let concrete = ZeroclawClient::new(config.url.clone(), token);
                 let cron = Some(concrete.clone());
                 let boxed: Box<dyn AgentClient + Send + Sync> = Box::new(concrete);
@@ -1145,6 +1145,8 @@ impl App {
     /// Honors `config.active` when resolvable; falls back to the
     /// first successfully-instantiated workspace.
     pub fn from_config(cfg: AppConfig, config_path: PathBuf) -> Result<Self> {
+        validate_zeroclaw_workspace_tokens(&cfg)?;
+
         let mut workspaces: Vec<Workspace> = Vec::new();
         for (idx, wc) in cfg.workspaces.into_iter().enumerate() {
             match Workspace::instantiate(workspaces.len(), wc.clone()) {
@@ -1206,6 +1208,7 @@ impl App {
         url: impl Into<String>,
         token: Option<String>,
     ) -> Result<Self> {
+        let token = Some(token.unwrap_or_default());
         let cfg = WorkspaceConfig {
             id: None,
             name: "default".to_string(),
@@ -1279,6 +1282,26 @@ impl App {
         }
         Self::synthesize_single_zeroclaw(remote, token)
     }
+}
+
+fn validate_zeroclaw_workspace_tokens(cfg: &AppConfig) -> Result<()> {
+    for workspace in &cfg.workspaces {
+        if workspace.backend == Backend::Zeroclaw && workspace.resolved_token().is_none() {
+            return Err(missing_zeroclaw_token_error(workspace));
+        }
+    }
+    Ok(())
+}
+
+fn missing_zeroclaw_token_error(config: &WorkspaceConfig) -> anyhow::Error {
+    let source = match config.token_env.as_deref().filter(|name| !name.is_empty()) {
+        Some(name) => format!("token_env `{name}` is unset or empty and no inline token is set"),
+        None => "no token_env or inline token is set".to_string(),
+    };
+    anyhow!(
+        "zeroclaw workspace `{}` has no resolved token ({source}); set token_env, set token, pass --token for the selected workspace, or set token = \"\" only for an explicitly unauthenticated local gateway",
+        config.name
+    )
 }
 
 fn apply_cli_token_override(
@@ -2050,6 +2073,68 @@ url = "ws://c"
     #[test]
     fn synthesize_single_zeroclaw_handles_missing_token() {
         let app = App::synthesize_single_zeroclaw("http://a", None).unwrap();
+        assert_eq!(app.workspaces.len(), 1);
+        assert!(app.active_workspace().unwrap().is_activated());
+    }
+
+    #[test]
+    fn from_config_rejects_zeroclaw_workspace_without_token() {
+        let cfg = AppConfig::parse(
+            r#"
+[[workspaces]]
+name = "z1"
+backend = "zeroclaw"
+url = "http://a"
+"#,
+        )
+        .unwrap();
+
+        let err = match App::from_config(cfg, PathBuf::from("/dev/null")) {
+            Ok(_) => panic!("missing zeroclaw token should fail closed"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("zeroclaw workspace `z1`"));
+        assert!(err.to_string().contains("no resolved token"));
+    }
+
+    #[test]
+    fn from_config_rejects_unresolved_zeroclaw_token_env() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        std::env::remove_var("ZTERM_TEST_MISSING_TOKEN_ENV");
+        let cfg = AppConfig::parse(
+            r#"
+[[workspaces]]
+name = "z1"
+backend = "zeroclaw"
+url = "http://a"
+token_env = "ZTERM_TEST_MISSING_TOKEN_ENV"
+"#,
+        )
+        .unwrap();
+
+        let err = match App::from_config(cfg, PathBuf::from("/dev/null")) {
+            Ok(_) => panic!("unresolved zeroclaw token_env should fail closed"),
+            Err(err) => err,
+        };
+        assert!(err
+            .to_string()
+            .contains("token_env `ZTERM_TEST_MISSING_TOKEN_ENV` is unset or empty"));
+    }
+
+    #[test]
+    fn from_config_allows_explicit_empty_zeroclaw_token_for_local_unauth() {
+        let cfg = AppConfig::parse(
+            r#"
+[[workspaces]]
+name = "local"
+backend = "zeroclaw"
+url = "http://127.0.0.1:42617"
+token = ""
+"#,
+        )
+        .unwrap();
+
+        let app = App::from_config(cfg, PathBuf::from("/dev/null")).unwrap();
         assert_eq!(app.workspaces.len(), 1);
         assert!(app.active_workspace().unwrap().is_activated());
     }

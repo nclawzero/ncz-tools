@@ -141,7 +141,7 @@ zterm tui --workspace openclaw-typhon
 #   /workspace switch <name>     activate another workspace at runtime
 ```
 
-See `docs/config.toml.example` for a commented multi-workspace template (zeroclaw + openclaw side by side, inline + env-var tokens, optional labels).
+See `docs/config.toml.example` for a commented multi-workspace template (zeroclaw + openclaw side by side, inline + env-var tokens, optional labels). In multi-workspace mode, each `zeroclaw` workspace must resolve a bearer token from `token_env` or `token`; use `token = ""` only for an explicitly unauthenticated local gateway.
 
 ---
 
