@@ -1617,7 +1617,14 @@ fn turn_collection_failure_requires_incomplete_transcript(message: &str) -> bool
 fn submit_error_requires_incomplete_transcript(message: &str, forwarded_token: bool) -> bool {
     forwarded_token
         || turn_collection_failure_requires_incomplete_transcript(message)
+        || openclaw_submit_failure_requires_incomplete_transcript(message)
         || response_size_failure_requires_incomplete_transcript(message)
+}
+
+fn openclaw_submit_failure_requires_incomplete_transcript(message: &str) -> bool {
+    message.contains("openclaw: turn collection failed")
+        || message.contains("openclaw: session.message stream timed out")
+        || message.contains("run state unresolved")
 }
 
 fn response_size_failure_requires_incomplete_transcript(message: &str) -> bool {
@@ -5147,6 +5154,25 @@ mod tests {
         .unwrap();
         storage::append_scoped_session_history(&scope, "main", "user", "hello").unwrap();
         let reason = "Webhook response exceeded 16 byte limit".to_string();
+
+        assert!(submit_error_requires_incomplete_transcript(&reason, false));
+        let message = mark_turn_transcript_incomplete_reason(&scope, "main", &reason);
+
+        assert!(message.contains("transcript marked incomplete"));
+        assert!(storage::scoped_session_history_is_incomplete(&scope, "main").unwrap());
+    }
+
+    #[test]
+    fn openclaw_post_ack_submit_error_marks_history_incomplete_without_tokens() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let scope = storage::workspace_scope(
+            "openclaw",
+            &format!("openclaw-post-ack-transcript-{}", uuid::Uuid::new_v4()),
+            None,
+        )
+        .unwrap();
+        storage::append_scoped_session_history(&scope, "main", "user", "hello").unwrap();
+        let reason = "openclaw: turn collection failed for run current-run; abort failed; run state unresolved: openclaw: session.message stream timed out after 1s".to_string();
 
         assert!(submit_error_requires_incomplete_transcript(&reason, false));
         let message = mark_turn_transcript_incomplete_reason(&scope, "main", &reason);

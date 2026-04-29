@@ -649,62 +649,10 @@ impl OpenClawClient {
         opts: SessionsSendOpts,
         timeout: std::time::Duration,
     ) -> anyhow::Result<String> {
-        // Stage 1: subscribe — server starts routing session.message
-        // events for this key to our connection.
-        let sub_res = self
-            .send_request(
-                "sessions.messages.subscribe",
-                Some(serde_json::json!({ "key": key })),
-            )
+        let turn = self
+            .rpc_sessions_send_and_collect_rich(key, message, opts, timeout)
             .await?;
-        if !sub_res.ok {
-            let err = sub_res
-                .error
-                .as_ref()
-                .map(|e| format!("{} ({})", e.message, e.code))
-                .unwrap_or_else(|| "no error body".to_string());
-            anyhow::bail!("openclaw: sessions.messages.subscribe failed: {}", err);
-        }
-
-        // Stage 2: fire the turn.
-        let ack = self.rpc_sessions_send(key, message, opts).await?;
-        let expected_run_id = ack.run_id.clone();
-
-        // Stage 3: take event_rx for the collect loop, then put it back
-        // on a best-effort basis so subsequent calls still work even if
-        // the collect errors out.
-        let event_rx = self
-            .event_rx
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("openclaw: event_rx already taken"));
-        let mut event_rx = match event_rx {
-            Ok(event_rx) => event_rx,
-            Err(e) => {
-                let e = self
-                    .abort_acknowledged_run_after_failure(key, &expected_run_id, e)
-                    .await;
-                self.unsubscribe_session_messages_best_effort(key).await;
-                return Err(e);
-            }
-        };
-
-        let collect_res = collect_assistant_message(&mut event_rx, key, timeout).await;
-
-        self.event_rx = Some(event_rx);
-
-        let collect_res = match collect_res {
-            Ok(message) => Ok(message),
-            Err(e) => Err(self
-                .abort_acknowledged_run_after_failure(key, &expected_run_id, e)
-                .await),
-        };
-
-        // Stage 4: unsubscribe — best effort. A failure here is not
-        // fatal (server GCs subscribers on disconnect) so we log and
-        // return the collect result either way.
-        self.unsubscribe_session_messages_best_effort(key).await;
-
-        collect_res
+        Ok(turn.text)
     }
 
     /// Rich variant of `rpc_sessions_send_and_collect` that returns
@@ -1081,97 +1029,11 @@ async fn write_loop(
 // closed connection.
 // ----------------------------------------------------------------------
 
-/// Drain `session.message` events until we see an assistant reply
-/// for the given session key, then return its `content` text.
-///
-/// Non-matching events (other sessions, non-message events) are
-/// skipped in place. On timeout returns a clear error so callers
-/// can retry or abort. On channel-closed returns an error — the
-/// WebSocket has dropped out from under us.
-async fn collect_assistant_message(
-    event_rx: &mut tokio::sync::mpsc::Receiver<super::wire::EventFrame>,
-    session_key: &str,
-    timeout: std::time::Duration,
-) -> anyhow::Result<String> {
-    let deadline = tokio::time::Instant::now() + timeout;
-
-    loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            anyhow::bail!(
-                "openclaw: session.message stream timed out after {:?}",
-                timeout
-            );
-        }
-
-        let rx_res = tokio::time::timeout(remaining, event_rx.recv()).await;
-        let event = match rx_res {
-            Ok(Some(ev)) => ev,
-            Ok(None) => anyhow::bail!("openclaw: event channel closed mid-stream"),
-            Err(_) => anyhow::bail!(
-                "openclaw: session.message stream timed out after {:?}",
-                timeout
-            ),
-        };
-
-        if event.event != "session.message" {
-            continue;
-        }
-
-        let payload = match &event.payload {
-            Some(p) => p,
-            None => continue,
-        };
-
-        // Only messages for this session.
-        if payload
-            .get("sessionKey")
-            .and_then(|v| v.as_str())
-            .map(|s| s != session_key)
-            .unwrap_or(true)
-        {
-            continue;
-        }
-
-        let message = match payload.get("message") {
-            Some(m) => m,
-            None => continue,
-        };
-
-        let role = message.get("role").and_then(|v| v.as_str()).unwrap_or("");
-
-        if role != "assistant" {
-            continue;
-        }
-
-        // Parse content parts and return the display-text view —
-        // concatenation of `text`-type parts only. Thinking +
-        // tool-call parts are surfaced through AssistantContent's
-        // other accessors (see slice 3h + handshake.rs).
-        let parsed = match message.get("content") {
-            Some(v) => super::handshake::AssistantContent::parse(v),
-            None => super::handshake::AssistantContent { parts: Vec::new() },
-        };
-
-        // Common agent pattern: first assistant turn is pure tool_use
-        // (run a command), second turn carries the actual text reply.
-        // Skip tool-only messages and keep consuming — the subscribe
-        // is still active, so the next session.message for this key
-        // arrives on the same event_rx. Outer timeout bounds the wait.
-        if parsed.is_tool_only() {
-            tracing::debug!("openclaw: assistant turn was tool-only; waiting for text reply");
-            continue;
-        }
-
-        return Ok(parsed.display_text());
-    }
-}
-
-/// Like `collect_assistant_message` but accumulates tool_calls,
-/// tool_results, and thinking from all intermediate assistant
-/// messages into `turn`, and returns `()` only after the expected
-/// run/message reaches an explicit terminal completion marker. The
-/// caller owns the TurnResult; this function only mutates it in place.
+/// Accumulates tool_calls, tool_results, and thinking from all
+/// intermediate assistant messages into `turn`, and returns `()` only
+/// after the expected run/message reaches an explicit terminal
+/// completion marker. The caller owns the TurnResult; this function
+/// only mutates it in place.
 async fn collect_turn_result(
     event_rx: &mut tokio::sync::mpsc::Receiver<super::wire::EventFrame>,
     session_key: &str,
@@ -3197,6 +3059,97 @@ mod tests {
             .expect("current run should collect");
         assert_eq!(turn.run_id.as_deref(), Some("current-run"));
         assert_eq!(turn.text, "current");
+    }
+
+    #[tokio::test]
+    async fn plain_send_collect_uses_correlated_rich_turn_collection() {
+        let pending = PendingRequests::new();
+        let (outbound_tx, mut outbound_rx) = mpsc::channel::<RequestFrame>(OUTBOUND_CAPACITY);
+        let (event_tx, event_rx) = mpsc::channel::<super::super::wire::EventFrame>(EVENT_CAPACITY);
+        let mut client = OpenClawClient {
+            pending: pending.clone(),
+            outbound_tx: Some(outbound_tx),
+            event_rx: Some(event_rx),
+            connected: Arc::new(AtomicBool::new(true)),
+            hello_ok: None,
+            stream_sink: None,
+            session_namespace: DEFAULT_SESSION_NAMESPACE.to_string(),
+            session_namespace_aliases: Vec::new(),
+            read_task: None,
+            write_task: None,
+        };
+
+        let collect_task = tokio::spawn(async move {
+            client
+                .rpc_sessions_send_and_collect(
+                    "session-a",
+                    "hello",
+                    SessionsSendOpts::default(),
+                    Duration::from_secs(1),
+                )
+                .await
+        });
+
+        let subscribe = outbound_rx
+            .recv()
+            .await
+            .expect("subscribe request should be sent");
+        pending
+            .resolve(ResponseFrame {
+                id: subscribe.id,
+                ok: true,
+                payload: Some(serde_json::json!({})),
+                error: None,
+            })
+            .await;
+
+        let send = outbound_rx
+            .recv()
+            .await
+            .expect("send request should be sent");
+        event_tx
+            .send(assistant_event("session-a", "old-run", "stale"))
+            .await
+            .expect("stale event should queue");
+        pending
+            .resolve(ResponseFrame {
+                id: send.id,
+                ok: true,
+                payload: Some(serde_json::json!({
+                    "runId": "current-run",
+                    "interruptedActiveRun": false
+                })),
+                error: None,
+            })
+            .await;
+        event_tx
+            .send(assistant_event("session-a", "current-run", "current"))
+            .await
+            .expect("current event should queue");
+        event_tx
+            .send(run_completed_event("session-a", "current-run"))
+            .await
+            .expect("completion event should queue");
+
+        let unsubscribe = outbound_rx
+            .recv()
+            .await
+            .expect("unsubscribe request should be sent");
+        assert_eq!(unsubscribe.method, "sessions.messages.unsubscribe");
+        pending
+            .resolve(ResponseFrame {
+                id: unsubscribe.id,
+                ok: true,
+                payload: Some(serde_json::json!({})),
+                error: None,
+            })
+            .await;
+
+        let text = collect_task
+            .await
+            .expect("collect task should join")
+            .expect("current run should collect");
+        assert_eq!(text, "current");
     }
 
     #[tokio::test]
