@@ -315,7 +315,11 @@ pub fn prune(
     dry_run: bool,
 ) -> Result<SessionsPruneReport, NczError> {
     validate_cutoff(before)?;
-    let _lock = state::acquire_lock(&paths.lock_path)?;
+    let _lock = if !dry_run {
+        Some(state::acquire_lock(&paths.lock_path)?)
+    } else {
+        None
+    };
     let (sessions, skipped_agents) = collect_sessions(ctx, paths, requested_agent)?;
     let mut candidates: Vec<PrunedSession> = sessions
         .into_iter()
@@ -728,9 +732,7 @@ fn secret_value_ranges(text: &str) -> Vec<(usize, usize)> {
                 continue;
             }
         } else if bytes[idx..].starts_with(b"xoxb-") {
-            let end = scan_while(bytes, idx + 5, |byte| {
-                byte.is_ascii_digit() || byte == b'-'
-            });
+            let end = scan_while(bytes, idx + 5, |byte| byte.is_ascii_digit() || byte == b'-');
             if end > idx + 5 {
                 ranges.push((idx, end));
                 idx = end;
@@ -760,11 +762,7 @@ fn secret_value_ranges(text: &str) -> Vec<(usize, usize)> {
     ranges
 }
 
-fn scan_while(
-    bytes: &[u8],
-    mut idx: usize,
-    mut predicate: impl FnMut(u8) -> bool,
-) -> usize {
+fn scan_while(bytes: &[u8], mut idx: usize, mut predicate: impl FnMut(u8) -> bool) -> usize {
     while idx < bytes.len() && predicate(bytes[idx]) {
         idx += 1;
     }
@@ -1192,7 +1190,31 @@ mod tests {
 
         assert_eq!(report.sessions.len(), 1);
         assert!(!report.sessions[0].deleted);
-        assert!(paths.lock_path.exists());
+        assert!(!paths.lock_path.exists());
+        runner.assert_done();
+    }
+
+    #[test]
+    fn prune_dry_run_does_not_acquire_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        fs::create_dir_all(&paths.etc_dir).unwrap();
+        let runner = FakeRunner::new();
+        expect_one_active(&runner, "zeroclaw", true);
+        runner.expect_http_body(42617, "/api/sessions", 200, sessions_body());
+
+        let report = prune(
+            &ctx(&runner, false),
+            &paths,
+            "2026-01-01",
+            Some("zeroclaw"),
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(report.sessions.len(), 1);
+        assert!(!paths.lock_path.exists());
+        assert!(!paths.lock_path.parent().unwrap().exists());
         runner.assert_done();
     }
 
