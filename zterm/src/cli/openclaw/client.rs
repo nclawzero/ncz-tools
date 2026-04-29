@@ -520,6 +520,30 @@ impl OpenClawClient {
             .context("openclaw: sessions.send payload did not match SessionSendAck schema")
     }
 
+    pub async fn rpc_sessions_abort(&self, key: &str, run_id: Option<&str>) -> anyhow::Result<()> {
+        let mut params = serde_json::Map::new();
+        params.insert("key".into(), serde_json::json!(key));
+        if let Some(run_id) = run_id {
+            params.insert("runId".into(), serde_json::json!(run_id));
+        }
+        let res = self
+            .send_request_with_timeout(
+                "sessions.abort",
+                Some(serde_json::Value::Object(params)),
+                Duration::from_secs(5),
+            )
+            .await?;
+        if !res.ok {
+            let err = res
+                .error
+                .as_ref()
+                .map(|e| format!("{} ({})", e.message, e.code))
+                .unwrap_or_else(|| "no error body".to_string());
+            anyhow::bail!("openclaw: sessions.abort failed: {}", err);
+        }
+        Ok(())
+    }
+
     /// Fire `sessions.create` with optional filter / seed params.
     /// Returns the canonical key of the created session.
     pub async fn rpc_sessions_create(
@@ -629,32 +653,42 @@ impl OpenClawClient {
         }
 
         // Stage 2: fire the turn.
-        let _ack = self.rpc_sessions_send(key, message, opts).await?;
+        let ack = self.rpc_sessions_send(key, message, opts).await?;
+        let expected_run_id = ack.run_id.clone();
 
         // Stage 3: take event_rx for the collect loop, then put it back
         // on a best-effort basis so subsequent calls still work even if
         // the collect errors out.
-        let mut event_rx = self
+        let event_rx = self
             .event_rx
             .take()
-            .ok_or_else(|| anyhow::anyhow!("openclaw: event_rx already taken"))?;
+            .ok_or_else(|| anyhow::anyhow!("openclaw: event_rx already taken"));
+        let mut event_rx = match event_rx {
+            Ok(event_rx) => event_rx,
+            Err(e) => {
+                let e = self
+                    .abort_acknowledged_run_after_failure(key, &expected_run_id, e)
+                    .await;
+                self.unsubscribe_session_messages_best_effort(key).await;
+                return Err(e);
+            }
+        };
 
         let collect_res = collect_assistant_message(&mut event_rx, key, timeout).await;
 
         self.event_rx = Some(event_rx);
 
+        let collect_res = match collect_res {
+            Ok(message) => Ok(message),
+            Err(e) => Err(self
+                .abort_acknowledged_run_after_failure(key, &expected_run_id, e)
+                .await),
+        };
+
         // Stage 4: unsubscribe — best effort. A failure here is not
         // fatal (server GCs subscribers on disconnect) so we log and
         // return the collect result either way.
-        if let Err(e) = self
-            .send_request(
-                "sessions.messages.unsubscribe",
-                Some(serde_json::json!({ "key": key })),
-            )
-            .await
-        {
-            tracing::debug!("openclaw: sessions.messages.unsubscribe error (ignored): {e}");
-        }
+        self.unsubscribe_session_messages_best_effort(key).await;
 
         collect_res
     }
@@ -710,6 +744,9 @@ impl OpenClawClient {
         let mut event_rx = match event_rx {
             Ok(event_rx) => event_rx,
             Err(e) => {
+                let e = self
+                    .abort_acknowledged_run_after_failure(key, &expected_run_id, e)
+                    .await;
                 self.unsubscribe_session_messages_best_effort(key).await;
                 return Err(e);
             }
@@ -734,10 +771,21 @@ impl OpenClawClient {
 
         self.event_rx = Some(event_rx);
 
+        let collect_err = match collect_res {
+            Ok(()) => None,
+            Err(e) => Some(
+                self.abort_acknowledged_run_after_failure(key, &expected_run_id, e)
+                    .await,
+            ),
+        };
+
         // Stage 4: unsubscribe (best effort).
         self.unsubscribe_session_messages_best_effort(key).await;
 
-        collect_res.map(|_| turn)
+        if let Some(e) = collect_err {
+            return Err(e);
+        }
+        Ok(turn)
     }
 
     async fn unsubscribe_session_messages_best_effort(&self, key: &str) {
@@ -749,6 +797,22 @@ impl OpenClawClient {
             .await
         {
             tracing::debug!("openclaw: sessions.messages.unsubscribe error (ignored): {e}");
+        }
+    }
+
+    async fn abort_acknowledged_run_after_failure(
+        &self,
+        key: &str,
+        run_id: &str,
+        failure: anyhow::Error,
+    ) -> anyhow::Error {
+        match self.rpc_sessions_abort(key, Some(run_id)).await {
+            Ok(()) => anyhow::anyhow!(
+                "openclaw: turn collection failed for run {run_id}; abort confirmed: {failure}"
+            ),
+            Err(abort_error) => anyhow::anyhow!(
+                "openclaw: turn collection failed for run {run_id}; abort failed; run state unresolved: {failure}; abort error: {abort_error}"
+            ),
         }
     }
 
@@ -1487,6 +1551,10 @@ use crate::cli::client::{Config, Model, Provider, Session};
 
 const SUBMIT_TURN_DEFAULT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
+fn duration_millis_u64(duration: Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
 fn display_name_for_row(row: &super::handshake::OpenClawSessionRow) -> String {
     row.derived_title
         .clone()
@@ -1592,14 +1660,32 @@ impl AgentClient for OpenClawClient {
                 }
             }
         }
-        let legacy_result = self
+        let legacy_result = match self
             .rpc_sessions_list(SessionsListOpts {
                 limit: Some(500),
                 include_derived_titles: true,
                 ..Default::default()
             })
-            .await?;
-        ensure_session_list_not_truncated(&legacy_result, 500)?;
+            .await
+        {
+            Ok(result) => result,
+            Err(e) if !sessions.is_empty() => {
+                tracing::warn!(
+                    "openclaw: legacy session compatibility scan failed; returning scoped sessions only: {e}"
+                );
+                return Ok(sessions);
+            }
+            Err(e) => return Err(e),
+        };
+        if let Err(e) = ensure_session_list_not_truncated(&legacy_result, 500) {
+            if sessions.is_empty() {
+                return Err(e);
+            }
+            tracing::warn!(
+                "openclaw: legacy session compatibility scan was truncated; returning scoped sessions only: {e}"
+            );
+            return Ok(sessions);
+        }
         for row in self.legacy_server_key_session_rows(legacy_result.sessions) {
             if seen.insert(row.key.clone()) {
                 sessions.push(row_into_session(row));
@@ -1672,6 +1758,7 @@ impl AgentClient for OpenClawClient {
                 session_id,
                 message,
                 SessionsSendOpts {
+                    timeout_ms: Some(duration_millis_u64(SUBMIT_TURN_DEFAULT_TIMEOUT)),
                     idempotency_key: Some(uuid::Uuid::new_v4().to_string()),
                     ..Default::default()
                 },
@@ -2850,6 +2937,110 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rich_send_collect_aborts_acknowledged_run_after_collect_timeout() {
+        let pending = PendingRequests::new();
+        let (outbound_tx, mut outbound_rx) = mpsc::channel::<RequestFrame>(OUTBOUND_CAPACITY);
+        let (_event_tx, event_rx) = mpsc::channel::<super::super::wire::EventFrame>(EVENT_CAPACITY);
+        let mut client = OpenClawClient {
+            pending: pending.clone(),
+            outbound_tx: Some(outbound_tx),
+            event_rx: Some(event_rx),
+            connected: Arc::new(AtomicBool::new(true)),
+            hello_ok: None,
+            stream_sink: None,
+            session_namespace: DEFAULT_SESSION_NAMESPACE.to_string(),
+            session_namespace_aliases: Vec::new(),
+            read_task: None,
+            write_task: None,
+        };
+
+        let collect_task = tokio::spawn(async move {
+            client
+                .rpc_sessions_send_and_collect_rich(
+                    "session-a",
+                    "hello",
+                    SessionsSendOpts::default(),
+                    Duration::from_millis(1),
+                )
+                .await
+        });
+
+        let subscribe = outbound_rx
+            .recv()
+            .await
+            .expect("subscribe request should be sent");
+        pending
+            .resolve(ResponseFrame {
+                id: subscribe.id,
+                ok: true,
+                payload: Some(serde_json::json!({})),
+                error: None,
+            })
+            .await;
+
+        let send = outbound_rx
+            .recv()
+            .await
+            .expect("send request should be sent");
+        assert_eq!(send.method, "sessions.send");
+        pending
+            .resolve(ResponseFrame {
+                id: send.id,
+                ok: true,
+                payload: Some(serde_json::json!({
+                    "runId": "current-run",
+                    "interruptedActiveRun": false
+                })),
+                error: None,
+            })
+            .await;
+
+        let abort = outbound_rx
+            .recv()
+            .await
+            .expect("abort request should be sent after collect timeout");
+        assert_eq!(abort.method, "sessions.abort");
+        assert_eq!(
+            abort.params.as_ref().unwrap()["key"].as_str(),
+            Some("session-a")
+        );
+        assert_eq!(
+            abort.params.as_ref().unwrap()["runId"].as_str(),
+            Some("current-run")
+        );
+        pending
+            .resolve(ResponseFrame {
+                id: abort.id,
+                ok: true,
+                payload: Some(serde_json::json!({ "aborted": 1 })),
+                error: None,
+            })
+            .await;
+
+        let unsubscribe = outbound_rx
+            .recv()
+            .await
+            .expect("unsubscribe request should follow abort");
+        assert_eq!(unsubscribe.method, "sessions.messages.unsubscribe");
+        pending
+            .resolve(ResponseFrame {
+                id: unsubscribe.id,
+                ok: true,
+                payload: Some(serde_json::json!({})),
+                error: None,
+            })
+            .await;
+
+        let err = collect_task
+            .await
+            .expect("collect task should join")
+            .expect_err("collect timeout should still return an error");
+        let message = err.to_string();
+        assert!(message.contains("timed out"));
+        assert!(message.contains("abort confirmed"));
+    }
+
+    #[tokio::test]
     async fn rich_send_collect_unsubscribes_when_event_rx_unavailable() {
         let pending = PendingRequests::new();
         let (outbound_tx, mut outbound_rx) = mpsc::channel::<RequestFrame>(OUTBOUND_CAPACITY);
@@ -2906,10 +3097,28 @@ mod tests {
             })
             .await;
 
+        let abort = outbound_rx
+            .recv()
+            .await
+            .expect("abort request should be sent after event_rx failure");
+        assert_eq!(abort.method, "sessions.abort");
+        assert_eq!(
+            abort.params.as_ref().unwrap()["runId"].as_str(),
+            Some("current-run")
+        );
+        pending
+            .resolve(ResponseFrame {
+                id: abort.id,
+                ok: true,
+                payload: Some(serde_json::json!({})),
+                error: None,
+            })
+            .await;
+
         let unsubscribe = outbound_rx
             .recv()
             .await
-            .expect("unsubscribe request should be sent after event_rx failure");
+            .expect("unsubscribe request should be sent after abort");
         assert_eq!(unsubscribe.method, "sessions.messages.unsubscribe");
         pending
             .resolve(ResponseFrame {
@@ -2925,6 +3134,7 @@ mod tests {
             .expect("collect task should join")
             .expect_err("event_rx failure should propagate");
         assert!(err.to_string().contains("event_rx already taken"));
+        assert!(err.to_string().contains("abort confirmed"));
     }
 
     #[tokio::test]
@@ -3428,20 +3638,7 @@ mod tests {
         let (outbound_tx, mut outbound_rx) = mpsc::channel::<RequestFrame>(OUTBOUND_CAPACITY);
         let mut client = tests_support_new_fake(pending.clone(), Some(outbound_tx), true);
         let active_namespace = "backend=openclaw;workspace_id=ws_active";
-        let foreign_namespace = "backend=openclaw;workspace_id=ws_foreign";
         client.set_session_namespace(active_namespace);
-
-        let foreign_sessions: Vec<_> = (0..250)
-            .map(|idx| {
-                let label = format!("Foreign {idx}");
-                serde_json::json!({
-                    "key": stable_session_key(foreign_namespace, &label),
-                    "kind": "direct",
-                    "label": label
-                })
-            })
-            .collect();
-        assert!(foreign_sessions.len() > 200);
 
         let active_one = stable_session_key(active_namespace, "Research");
         let active_two = stable_session_key(active_namespace, "Planning");
@@ -3475,12 +3672,32 @@ mod tests {
                 error: None,
             })
             .await;
-        resolve_empty_legacy_session_scan(&pending, &mut outbound_rx).await;
+        let legacy_req = outbound_rx
+            .recv()
+            .await
+            .expect("legacy compatibility scan should be sent");
+        assert_eq!(legacy_req.method, "sessions.list");
+        assert_eq!(legacy_req.params.as_ref().unwrap()["limit"], 500);
+        assert!(legacy_req.params.as_ref().unwrap().get("search").is_none());
+        pending
+            .resolve(ResponseFrame {
+                id: legacy_req.id,
+                ok: true,
+                payload: Some(serde_json::json!({
+                    "ts": 1,
+                    "path": "sessions.jsonl",
+                    "count": 600,
+                    "defaults": {},
+                    "sessions": []
+                })),
+                error: None,
+            })
+            .await;
 
         let sessions = list_task
             .await
             .expect("list task should join")
-            .expect("active namespace list should not fail on foreign global cap");
+            .expect("active namespace list should not fail on truncated legacy global scan");
         assert_eq!(sessions.len(), 2);
         assert_eq!(sessions[0].name, "Research");
         assert_eq!(sessions[1].name, "Planning");
