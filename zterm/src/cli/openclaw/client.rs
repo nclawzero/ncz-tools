@@ -662,8 +662,18 @@ impl OpenClawClient {
             run_id,
             ..Default::default()
         };
-        let collect_res =
-            collect_turn_result(&mut event_rx, key, &expected_run_id, timeout, &mut turn).await;
+        let expected_message_id = ack_message_id(&ack).map(str::to_string);
+        let expected_message_seq = ack_message_seq(&ack);
+        let collect_res = collect_turn_result(
+            &mut event_rx,
+            key,
+            &expected_run_id,
+            expected_message_id.as_deref(),
+            expected_message_seq,
+            timeout,
+            &mut turn,
+        )
+        .await;
 
         self.event_rx = Some(event_rx);
 
@@ -736,10 +746,19 @@ async fn read_loop(
                     let _delivered = pending.resolve(res).await;
                 }
                 Ok(Frame::Event(ev)) => {
-                    if event_tx.send(ev).await.is_err() {
-                        // Receiver dropped — no one cares about events.
-                        // Keep the read loop alive anyway so response
-                        // correlation still works.
+                    match event_tx.try_send(ev) {
+                        Ok(()) => {}
+                        Err(mpsc::error::TrySendError::Full(ev)) => {
+                            tracing::debug!(
+                                "openclaw: dropping event {} because event channel is full",
+                                ev.event
+                            );
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            // Receiver dropped — no one cares about events.
+                            // Keep the read loop alive anyway so response
+                            // correlation still works.
+                        }
                     }
                 }
                 Ok(Frame::Req(_)) => {
@@ -898,12 +917,15 @@ async fn collect_turn_result(
     event_rx: &mut tokio::sync::mpsc::Receiver<super::wire::EventFrame>,
     session_key: &str,
     expected_run_id: &str,
+    expected_ack_message_id: Option<&str>,
+    expected_message_seq: Option<u64>,
     timeout: std::time::Duration,
     turn: &mut super::handshake::TurnResult,
 ) -> anyhow::Result<()> {
     let deadline = tokio::time::Instant::now() + timeout;
     let mut saw_terminal_completion = false;
-    let mut expected_message_id: Option<String> = None;
+    let mut expected_message_id: Option<String> = expected_ack_message_id.map(str::to_string);
+    let mut pending_runless_messages: Vec<BufferedAssistantMessage> = Vec::new();
 
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -919,13 +941,21 @@ async fn collect_turn_result(
         };
 
         if event.event != "session.message" {
-            if event_marks_expected_turn_completed(
+            if let Some(completion) = event_marks_expected_turn_completed(
                 &event,
                 session_key,
                 expected_run_id,
                 expected_message_id.as_deref(),
             ) {
                 saw_terminal_completion = true;
+                if expected_message_id.is_none() {
+                    expected_message_id = completion.message_id.clone();
+                }
+                merge_buffered_runless_messages(
+                    turn,
+                    &mut pending_runless_messages,
+                    expected_message_id.as_deref(),
+                );
                 if turn_can_finish(turn) {
                     return Ok(());
                 }
@@ -952,8 +982,18 @@ async fn collect_turn_result(
         if role != "assistant" {
             continue;
         }
+        let message_id = session_message_id(payload, message).map(str::to_string);
         match session_message_run_id(payload, message) {
-            Some(run_id) if run_id == expected_run_id => {}
+            Some(run_id) if run_id == expected_run_id => {
+                if expected_message_id.is_none() {
+                    expected_message_id = message_id.clone();
+                }
+                merge_buffered_runless_messages(
+                    turn,
+                    &mut pending_runless_messages,
+                    expected_message_id.as_deref(),
+                );
+            }
             Some(run_id) => {
                 tracing::debug!(
                     "openclaw: ignoring stale assistant message for session {session_key}: runId {run_id} != expected {expected_run_id}"
@@ -961,31 +1001,35 @@ async fn collect_turn_result(
                 continue;
             }
             None => {
-                tracing::debug!(
-                    "openclaw: accepting assistant message for session {session_key} without runId; waiting for completion of expected runId {expected_run_id}"
-                );
+                if runless_message_matches_expected_turn(
+                    payload,
+                    message,
+                    expected_message_id.as_deref(),
+                    expected_message_seq,
+                ) {
+                    tracing::debug!(
+                        "openclaw: accepting runId-less assistant message for session {session_key} using explicit message correlation"
+                    );
+                } else if let Some(message_id) = message_id {
+                    tracing::debug!(
+                        "openclaw: buffering runId-less assistant message for session {session_key}; waiting for expected run correlation"
+                    );
+                    pending_runless_messages.push(BufferedAssistantMessage {
+                        message_id,
+                        payload: payload.clone(),
+                        message: message.clone(),
+                    });
+                    continue;
+                } else {
+                    tracing::debug!(
+                        "openclaw: ignoring runId-less assistant message for session {session_key} without explicit run/message correlation"
+                    );
+                    continue;
+                }
             }
         }
-        if expected_message_id.is_none() {
-            expected_message_id = session_message_id(payload, message).map(str::to_string);
-        }
 
-        let content = match message.get("content") {
-            Some(v) => super::handshake::AssistantContent::parse(v),
-            None => super::handshake::AssistantContent { parts: Vec::new() },
-        };
-
-        let previous_text = turn.text.clone();
-        let content_text = content.display_text();
-        let append_text_delta = !content_text.is_empty() && message_is_text_delta(payload, message);
-        turn.merge(&content);
-        if append_text_delta {
-            turn.text = previous_text;
-            turn.text.push_str(&content_text);
-        }
-        turn.usage = crate::cli::agent::TurnUsage::from_json_candidates(message)
-            .or_else(|| crate::cli::agent::TurnUsage::from_json_candidates(payload))
-            .or(turn.usage);
+        merge_assistant_message_into_turn(turn, payload, message);
 
         let message_completed =
             message_marks_run_completed(payload, message) || saw_terminal_completion;
@@ -1002,6 +1046,70 @@ async fn collect_turn_result(
             turn.tool_results.len()
         );
     }
+}
+
+struct BufferedAssistantMessage {
+    message_id: String,
+    payload: serde_json::Value,
+    message: serde_json::Value,
+}
+
+fn merge_buffered_runless_messages(
+    turn: &mut super::handshake::TurnResult,
+    pending: &mut Vec<BufferedAssistantMessage>,
+    expected_message_id: Option<&str>,
+) {
+    let Some(expected_message_id) = expected_message_id else {
+        return;
+    };
+    let mut idx = 0;
+    while idx < pending.len() {
+        if pending[idx].message_id == expected_message_id {
+            let buffered = pending.remove(idx);
+            merge_assistant_message_into_turn(turn, &buffered.payload, &buffered.message);
+        } else {
+            idx += 1;
+        }
+    }
+}
+
+fn merge_assistant_message_into_turn(
+    turn: &mut super::handshake::TurnResult,
+    payload: &serde_json::Value,
+    message: &serde_json::Value,
+) {
+    let content = match message.get("content") {
+        Some(v) => super::handshake::AssistantContent::parse(v),
+        None => super::handshake::AssistantContent { parts: Vec::new() },
+    };
+
+    let previous_text = turn.text.clone();
+    let content_text = content.display_text();
+    let append_text_delta = !content_text.is_empty() && message_is_text_delta(payload, message);
+    turn.merge(&content);
+    if append_text_delta {
+        turn.text = previous_text;
+        turn.text.push_str(&content_text);
+    }
+    turn.usage = crate::cli::agent::TurnUsage::from_json_candidates(message)
+        .or_else(|| crate::cli::agent::TurnUsage::from_json_candidates(payload))
+        .or(turn.usage);
+}
+
+fn runless_message_matches_expected_turn(
+    payload: &serde_json::Value,
+    message: &serde_json::Value,
+    expected_message_id: Option<&str>,
+    expected_message_seq: Option<u64>,
+) -> bool {
+    expected_message_id
+        .zip(session_message_id(payload, message))
+        .map(|(expected, actual)| expected == actual)
+        .unwrap_or(false)
+        || expected_message_seq
+            .zip(session_message_seq(payload, message))
+            .map(|(expected, actual)| expected == actual)
+            .unwrap_or(false)
 }
 
 fn session_message_run_id<'a>(
@@ -1030,31 +1138,70 @@ fn session_message_id<'a>(
         .or_else(|| payload.get("id").and_then(|v| v.as_str()))
 }
 
+fn session_message_seq(payload: &serde_json::Value, message: &serde_json::Value) -> Option<u64> {
+    value_message_seq(message).or_else(|| value_message_seq(payload))
+}
+
+fn value_message_seq(value: &serde_json::Value) -> Option<u64> {
+    value
+        .get("messageSeq")
+        .or_else(|| value.get("message_seq"))
+        .and_then(|v| {
+            v.as_u64()
+                .or_else(|| v.as_i64().and_then(|n| u64::try_from(n).ok()))
+                .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
+        })
+}
+
+fn ack_message_id(ack: &super::handshake::OpenClawSessionSendAck) -> Option<&str> {
+    ack.extra
+        .get("messageId")
+        .and_then(|v| v.as_str())
+        .or_else(|| ack.extra.get("message_id").and_then(|v| v.as_str()))
+        .or_else(|| ack.extra.get("assistantMessageId").and_then(|v| v.as_str()))
+        .or_else(|| {
+            ack.extra
+                .get("assistant_message_id")
+                .and_then(|v| v.as_str())
+        })
+}
+
+fn ack_message_seq(ack: &super::handshake::OpenClawSessionSendAck) -> Option<u64> {
+    ack.message_seq
+        .map(u64::from)
+        .or_else(|| value_message_seq(&serde_json::Value::Object(ack.extra.clone())))
+}
+
+#[derive(Debug, Clone)]
+struct TurnCompletion {
+    message_id: Option<String>,
+}
+
 fn event_marks_expected_turn_completed(
     event: &super::wire::EventFrame,
     session_key: &str,
     expected_run_id: &str,
     expected_message_id: Option<&str>,
-) -> bool {
+) -> Option<TurnCompletion> {
     if !is_terminal_run_event_name(&event.event) {
-        return false;
+        return None;
     }
-    let Some(payload) = event.payload.as_ref() else {
-        return false;
-    };
+    let payload = event.payload.as_ref()?;
     if !payload_matches_session_key(payload, session_key) {
-        return false;
+        return None;
     }
+    let message_id = event_payload_message_id(payload).map(str::to_string);
     if event_payload_run_id(payload)
         .map(|run_id| run_id == expected_run_id)
         .unwrap_or(false)
     {
-        return true;
+        return Some(TurnCompletion { message_id });
     }
-    expected_message_id
+    let matches_expected_message = expected_message_id
         .zip(event_payload_message_id(payload))
         .map(|(expected, actual)| expected == actual)
-        .unwrap_or(false)
+        .unwrap_or(false);
+    matches_expected_message.then_some(TurnCompletion { message_id })
 }
 
 fn is_terminal_run_event_name(event: &str) -> bool {
@@ -1540,7 +1687,6 @@ impl OpenClawClient {
         row: &super::handshake::OpenClawSessionRow,
     ) -> bool {
         self.row_metadata_matches_session_namespace(row)
-            || self.row_title_matches_session_namespace(row)
     }
 
     fn session_key_belongs_to_session_namespace(&self, key: &str, label: &str) -> bool {
@@ -1579,37 +1725,6 @@ impl OpenClawClient {
         }) || identities
             .iter()
             .any(|identity| identity.matches_metadata_fields(&metadata_strings))
-    }
-
-    fn row_title_matches_session_namespace(
-        &self,
-        row: &super::handshake::OpenClawSessionRow,
-    ) -> bool {
-        let mut text_fields = Vec::new();
-        for value in [
-            row.label.as_deref(),
-            row.display_name.as_deref(),
-            row.derived_title.as_deref(),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            let trimmed = value.trim();
-            if !trimmed.is_empty() {
-                text_fields.push(trimmed);
-            }
-        }
-
-        if text_fields.is_empty() {
-            return false;
-        }
-
-        self.session_namespaces().into_iter().any(|namespace| {
-            let identity = SessionNamespaceIdentity::from_namespace(namespace);
-            text_fields
-                .iter()
-                .any(|field| identity.matches_title(field))
-        })
     }
 }
 
@@ -1654,19 +1769,6 @@ impl<'a> SessionNamespaceIdentity<'a> {
                     .any(|value| urls_equivalent(value.trim(), url));
                 has_name && has_url
             }
-            _ => false,
-        }
-    }
-
-    fn matches_title(&self, title: &str) -> bool {
-        if title.contains(self.namespace) {
-            return true;
-        }
-        if let Some(workspace_id) = self.workspace_id {
-            return title.contains(workspace_id);
-        }
-        match (self.workspace_name, self.workspace_url) {
-            (Some(name), Some(url)) => title.contains(name) && title.contains(url),
             _ => false,
         }
     }
@@ -1988,6 +2090,48 @@ mod tests {
         }
     }
 
+    fn assistant_event_without_run_id_with_message_seq(
+        session_key: &str,
+        message_seq: u64,
+        text: &str,
+    ) -> super::super::wire::EventFrame {
+        super::super::wire::EventFrame {
+            event: "session.message".to_string(),
+            payload: Some(serde_json::json!({
+                "sessionKey": session_key,
+                "messageSeq": message_seq,
+                "message": {
+                    "role": "assistant",
+                    "messageSeq": message_seq,
+                    "content": [{ "type": "text", "text": text }]
+                }
+            })),
+            seq: None,
+            state_version: None,
+        }
+    }
+
+    fn assistant_event_without_run_id_with_message_id(
+        session_key: &str,
+        message_id: &str,
+        text: &str,
+    ) -> super::super::wire::EventFrame {
+        super::super::wire::EventFrame {
+            event: "session.message".to_string(),
+            payload: Some(serde_json::json!({
+                "sessionKey": session_key,
+                "messageId": message_id,
+                "message": {
+                    "id": message_id,
+                    "role": "assistant",
+                    "content": [{ "type": "text", "text": text }]
+                }
+            })),
+            seq: None,
+            state_version: None,
+        }
+    }
+
     fn assistant_tool_event(session_key: &str, run_id: &str) -> super::super::wire::EventFrame {
         super::super::wire::EventFrame {
             event: "session.message".to_string(),
@@ -2029,6 +2173,24 @@ mod tests {
         }
     }
 
+    fn run_completed_event_with_message_id(
+        session_key: &str,
+        run_id: &str,
+        message_id: &str,
+    ) -> super::super::wire::EventFrame {
+        super::super::wire::EventFrame {
+            event: "session.run.completed".to_string(),
+            payload: Some(serde_json::json!({
+                "sessionKey": session_key,
+                "runId": run_id,
+                "messageId": message_id,
+                "status": "completed"
+            })),
+            seq: None,
+            state_version: None,
+        }
+    }
+
     #[tokio::test]
     async fn collect_turn_result_accumulates_text_deltas_until_completion() {
         let (event_tx, mut event_rx) = mpsc::channel::<super::super::wire::EventFrame>(4);
@@ -2063,6 +2225,8 @@ mod tests {
             &mut event_rx,
             "session-a",
             "current-run",
+            None,
+            None,
             Duration::from_millis(50),
             &mut turn,
         )
@@ -2074,10 +2238,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn collect_turn_result_accepts_run_id_less_text_until_completion() {
+    async fn collect_turn_result_accepts_run_id_less_text_with_ack_message_seq() {
         let (event_tx, mut event_rx) = mpsc::channel::<super::super::wire::EventFrame>(4);
         event_tx
-            .send(assistant_event_without_run_id("session-a", "compat text"))
+            .send(assistant_event_without_run_id_with_message_seq(
+                "session-a",
+                42,
+                "compat text",
+            ))
             .await
             .unwrap();
         event_tx
@@ -2093,14 +2261,89 @@ mod tests {
             &mut event_rx,
             "session-a",
             "current-run",
+            None,
+            Some(42),
             Duration::from_millis(50),
             &mut turn,
         )
         .await
-        .expect("runId-less text followed by expected completion should collect");
+        .expect("runId-less text with expected ack messageSeq should collect");
 
         assert_eq!(turn.run_id.as_deref(), Some("current-run"));
         assert_eq!(turn.text, "compat text");
+    }
+
+    #[tokio::test]
+    async fn collect_turn_result_accepts_buffered_run_id_less_text_when_completion_ties_message_id()
+    {
+        let (event_tx, mut event_rx) = mpsc::channel::<super::super::wire::EventFrame>(4);
+        event_tx
+            .send(assistant_event_without_run_id_with_message_id(
+                "session-a",
+                "message-1",
+                "compat text",
+            ))
+            .await
+            .unwrap();
+        event_tx
+            .send(run_completed_event_with_message_id(
+                "session-a",
+                "current-run",
+                "message-1",
+            ))
+            .await
+            .unwrap();
+
+        let mut turn = super::super::handshake::TurnResult {
+            run_id: Some("current-run".to_string()),
+            ..Default::default()
+        };
+        collect_turn_result(
+            &mut event_rx,
+            "session-a",
+            "current-run",
+            None,
+            None,
+            Duration::from_millis(50),
+            &mut turn,
+        )
+        .await
+        .expect("completion with matching messageId should tie buffered runId-less text");
+
+        assert_eq!(turn.run_id.as_deref(), Some("current-run"));
+        assert_eq!(turn.text, "compat text");
+    }
+
+    #[tokio::test]
+    async fn collect_turn_result_rejects_stale_run_id_less_text_followed_by_expected_completion() {
+        let (event_tx, mut event_rx) = mpsc::channel::<super::super::wire::EventFrame>(4);
+        event_tx
+            .send(assistant_event_without_run_id("session-a", "stale text"))
+            .await
+            .unwrap();
+        event_tx
+            .send(run_completed_event("session-a", "current-run"))
+            .await
+            .unwrap();
+
+        let mut turn = super::super::handshake::TurnResult {
+            run_id: Some("current-run".to_string()),
+            ..Default::default()
+        };
+        let err = collect_turn_result(
+            &mut event_rx,
+            "session-a",
+            "current-run",
+            None,
+            None,
+            Duration::from_millis(1),
+            &mut turn,
+        )
+        .await
+        .expect_err("unmatched runId-less text must fail closed");
+
+        assert!(err.to_string().contains("timed out"));
+        assert!(turn.text.is_empty());
     }
 
     #[tokio::test]
@@ -2123,6 +2366,8 @@ mod tests {
             &mut event_rx,
             "session-a",
             "current-run",
+            None,
+            None,
             Duration::from_millis(50),
             &mut turn,
         )
@@ -2151,6 +2396,8 @@ mod tests {
             &mut event_rx,
             "session-a",
             "current-run",
+            None,
+            None,
             Duration::from_millis(1),
             &mut turn,
         )
@@ -3148,6 +3395,153 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_server_keys_do_not_trust_titles_for_workspace_ownership() {
+        let pending = PendingRequests::new();
+        let (outbound_tx, mut outbound_rx) = mpsc::channel::<RequestFrame>(OUTBOUND_CAPACITY);
+        let mut client = tests_support_new_fake(pending.clone(), Some(outbound_tx), true);
+        let active_namespace =
+            "backend=openclaw;workspace_id=ws_active;workspace=alpha;url=ws://shared";
+        let foreign_namespace =
+            "backend=openclaw;workspace_id=ws_foreign;workspace=beta;url=ws://shared";
+        client.set_session_namespace(active_namespace);
+        let foreign_server_key = "oc-server-generated-foreign-title";
+        let title = format!("Recovered for {active_namespace} ws_active alpha ws://shared");
+        let client = Arc::new(client);
+
+        let list_client = Arc::clone(&client);
+        let list_task = tokio::spawn(async move { list_client.list_sessions().await });
+        let stable_req = outbound_rx
+            .recv()
+            .await
+            .expect("stable namespace scan should be sent first");
+        pending
+            .resolve(ResponseFrame {
+                id: stable_req.id,
+                ok: true,
+                payload: Some(serde_json::json!({
+                    "ts": 1,
+                    "path": "sessions.jsonl",
+                    "count": 0,
+                    "defaults": {},
+                    "sessions": []
+                })),
+                error: None,
+            })
+            .await;
+
+        let legacy_req = outbound_rx
+            .recv()
+            .await
+            .expect("legacy compatibility scan should be sent");
+        pending
+            .resolve(ResponseFrame {
+                id: legacy_req.id,
+                ok: true,
+                payload: Some(serde_json::json!({
+                    "ts": 1,
+                    "path": "sessions.jsonl",
+                    "count": 1,
+                    "defaults": {},
+                    "sessions": [{
+                        "key": foreign_server_key,
+                        "kind": "direct",
+                        "label": "alpha",
+                        "displayName": "alpha ws://shared",
+                        "derivedTitle": title,
+                        "metadata": {
+                            "zterm": { "sessionNamespace": foreign_namespace }
+                        }
+                    }]
+                })),
+                error: None,
+            })
+            .await;
+        let sessions = list_task
+            .await
+            .expect("list task should join")
+            .expect("legacy title-spoof list should succeed");
+        assert!(sessions.is_empty());
+
+        let load_client = Arc::clone(&client);
+        let load_task =
+            tokio::spawn(async move { load_client.load_session(foreign_server_key).await });
+        let load_req = outbound_rx
+            .recv()
+            .await
+            .expect("load should search by server-generated key");
+        pending
+            .resolve(ResponseFrame {
+                id: load_req.id,
+                ok: true,
+                payload: Some(serde_json::json!({
+                    "ts": 1,
+                    "path": "sessions.jsonl",
+                    "count": 1,
+                    "defaults": {},
+                    "sessions": [{
+                        "key": foreign_server_key,
+                        "kind": "direct",
+                        "label": "alpha",
+                        "displayName": "alpha ws://shared",
+                        "derivedTitle": title,
+                        "metadata": {
+                            "zterm": { "sessionNamespace": foreign_namespace }
+                        }
+                    }]
+                })),
+                error: None,
+            })
+            .await;
+        let err = load_task
+            .await
+            .expect("load task should join")
+            .expect_err("title-spoofed foreign legacy row must not load");
+        assert!(err.to_string().contains("session not found"));
+
+        let delete_client = Arc::clone(&client);
+        let delete_task =
+            tokio::spawn(async move { delete_client.delete_session(foreign_server_key).await });
+        let delete_lookup_req = outbound_rx
+            .recv()
+            .await
+            .expect("delete should validate by loading first");
+        pending
+            .resolve(ResponseFrame {
+                id: delete_lookup_req.id,
+                ok: true,
+                payload: Some(serde_json::json!({
+                    "ts": 1,
+                    "path": "sessions.jsonl",
+                    "count": 1,
+                    "defaults": {},
+                    "sessions": [{
+                        "key": foreign_server_key,
+                        "kind": "direct",
+                        "label": "alpha",
+                        "displayName": "alpha ws://shared",
+                        "derivedTitle": title,
+                        "metadata": {
+                            "zterm": { "sessionNamespace": foreign_namespace }
+                        }
+                    }]
+                })),
+                error: None,
+            })
+            .await;
+        let err = delete_task
+            .await
+            .expect("delete task should join")
+            .expect_err("title-spoofed foreign legacy row must not delete");
+        assert!(err.to_string().contains("session not found"));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), outbound_rx.recv())
+                .await
+                .is_err(),
+            "title-spoofed delete must not send sessions.delete"
+        );
+    }
+
+    #[tokio::test]
     async fn list_sessions_fails_closed_when_sessions_list_hits_cap() {
         let pending = PendingRequests::new();
         let (outbound_tx, mut outbound_rx) = mpsc::channel::<RequestFrame>(OUTBOUND_CAPACITY);
@@ -3397,6 +3791,69 @@ mod tests {
                 error: None,
             })
             .await;
+    }
+
+    #[tokio::test]
+    async fn read_loop_drops_saturated_events_without_starving_responses() {
+        let pending = PendingRequests::new();
+        let response_id = "req-response-after-event".to_string();
+        let response_rx = pending.register(response_id.clone()).await;
+        let (event_tx, mut event_rx) = mpsc::channel::<super::super::wire::EventFrame>(1);
+        event_tx
+            .try_send(super::super::wire::EventFrame {
+                event: "already.full".to_string(),
+                payload: None,
+                seq: None,
+                state_version: None,
+            })
+            .expect("test event channel should start full");
+
+        let unsolicited_event = Frame::Event(super::super::wire::EventFrame {
+            event: "presence.update".to_string(),
+            payload: Some(serde_json::json!({ "online": true })),
+            seq: None,
+            state_version: None,
+        })
+        .to_json()
+        .unwrap();
+        let response = Frame::Res(ResponseFrame {
+            id: response_id.clone(),
+            ok: true,
+            payload: Some(serde_json::json!({ "done": true })),
+            error: None,
+        })
+        .to_json()
+        .unwrap();
+        let stream = futures::stream::iter(vec![
+            Ok(WsMessage::Text(unsolicited_event)),
+            Ok(WsMessage::Text(response)),
+        ]);
+        let connected = Arc::new(AtomicBool::new(true));
+
+        let read_task = tokio::spawn(read_loop(
+            stream,
+            pending.clone(),
+            event_tx,
+            Arc::clone(&connected),
+        ));
+        let got = tokio::time::timeout(Duration::from_millis(50), response_rx)
+            .await
+            .expect("response should not be blocked by saturated event channel")
+            .expect("response oneshot should deliver");
+
+        assert_eq!(got.id, response_id);
+        assert_eq!(got.payload.unwrap()["done"], true);
+        read_task.await.expect("read loop should join");
+        assert!(!connected.load(Ordering::Relaxed));
+
+        let retained = event_rx
+            .try_recv()
+            .expect("pre-filled event should remain in channel");
+        assert_eq!(retained.event, "already.full");
+        assert!(
+            event_rx.try_recv().is_err(),
+            "unsolicited event should have been dropped when channel was full"
+        );
     }
 
     #[tokio::test]

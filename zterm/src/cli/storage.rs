@@ -577,6 +577,7 @@ mod tests {
 
     #[test]
     fn scoped_metadata_history_clear_and_delete_do_not_cross_contaminate() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
         let suffix = uuid::Uuid::new_v4();
         let alpha = scope(&format!("alpha-{suffix}"));
         let beta = scope(&format!("beta-{suffix}"));
@@ -586,19 +587,13 @@ mod tests {
         let mut beta_meta = metadata("main");
         beta_meta.name = "Beta main".to_string();
         beta_meta.message_count = 9;
+        let alpha_history = scoped_session_history_file(&alpha, "main").unwrap();
+        let beta_history = scoped_session_history_file(&beta, "main").unwrap();
 
         save_scoped_session_metadata(&alpha, &alpha_meta).unwrap();
         save_scoped_session_metadata(&beta, &beta_meta).unwrap();
-        fs::write(
-            scoped_session_history_file(&alpha, "main").unwrap(),
-            "alpha history\n",
-        )
-        .unwrap();
-        fs::write(
-            scoped_session_history_file(&beta, "main").unwrap(),
-            "beta history\n",
-        )
-        .unwrap();
+        fs::write(&alpha_history, "alpha history\n").unwrap();
+        fs::write(&beta_history, "beta history\n").unwrap();
 
         let mut cleared_alpha = load_scoped_session_metadata(&alpha, "main").unwrap();
         cleared_alpha.message_count = 0;
@@ -617,30 +612,22 @@ mod tests {
             9
         );
         assert_eq!(
-            fs::read_to_string(scoped_session_history_file(&alpha, "main").unwrap()).unwrap(),
+            fs::read_to_string(&alpha_history).unwrap(),
             "alpha history\n"
         );
-        assert_eq!(
-            fs::read_to_string(scoped_session_history_file(&beta, "main").unwrap()).unwrap(),
-            "beta history\n"
-        );
+        assert_eq!(fs::read_to_string(&beta_history).unwrap(), "beta history\n");
 
         delete_scoped_session(&alpha, "main").unwrap();
 
         assert!(load_scoped_session_metadata(&alpha, "main").is_err());
-        assert!(!scoped_session_history_file(&alpha, "main")
-            .unwrap()
-            .exists());
+        assert!(!alpha_history.exists());
         assert_eq!(
             load_scoped_session_metadata(&beta, "main")
                 .unwrap()
                 .message_count,
             9
         );
-        assert_eq!(
-            fs::read_to_string(scoped_session_history_file(&beta, "main").unwrap()).unwrap(),
-            "beta history\n"
-        );
+        assert_eq!(fs::read_to_string(&beta_history).unwrap(), "beta history\n");
 
         delete_scoped_session(&beta, "main").unwrap();
     }

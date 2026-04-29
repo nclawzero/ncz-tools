@@ -407,7 +407,7 @@ mod tests {
     use super::*;
     use crate::cli::agent::{AgentClient, StreamSink};
     use crate::cli::client::{Config, Model, Provider};
-    use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+    use std::sync::{Arc, Mutex as StdMutex};
     use tokio::sync::Mutex;
 
     #[derive(Clone)]
@@ -505,11 +505,6 @@ mod tests {
         Arc::new(Mutex::new(Box::new(fake)))
     }
 
-    fn env_lock() -> &'static StdMutex<()> {
-        static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| StdMutex::new(()))
-    }
-
     struct EnvGuard {
         key: &'static str,
         prior: Option<std::ffi::OsString>,
@@ -535,7 +530,7 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn boot_returns_workspace_state_error_before_legacy_pairing_token_write() {
-        let _env = env_lock().lock().unwrap();
+        let _env = crate::cli::test_env_lock().lock().unwrap();
         let home = tempfile::TempDir::new().unwrap();
         let zterm_config_dir = tempfile::TempDir::new().unwrap();
         let _home_guard = EnvGuard::set_path("HOME", home.path());
