@@ -1569,6 +1569,11 @@ async fn connect_splash_for_captured_workspace(
     let Some(config) = config else {
         return Ok(Some(delighters::local_connect_splash(workspace_name)));
     };
+    if !detached_connect_splash_backend_supported(config) {
+        let fallback = delighters::local_connect_splash(workspace_name);
+        write_connect_splash_cache(cache_path, &fallback);
+        return Ok(Some(fallback));
+    }
     match generate_connect_splash_from_detached_config(config, workspace_name, restore_sink).await {
         Ok(generated) => {
             write_connect_splash_cache(cache_path, &generated);
@@ -1604,8 +1609,15 @@ async fn generate_connect_splash_from_detached_config(
     workspace_name: &str,
     restore_sink: Option<StreamSink>,
 ) -> Result<String> {
+    if !detached_connect_splash_backend_supported(config) {
+        anyhow::bail!("backend does not support detached connect-splash generation");
+    }
     let client = detached_connect_splash_client(config).await?;
     generate_connect_splash_from_client(client, workspace_name, restore_sink).await
+}
+
+fn detached_connect_splash_backend_supported(config: &WorkspaceConfig) -> bool {
+    matches!(config.backend, Backend::Zeroclaw)
 }
 
 async fn detached_connect_splash_client(config: &WorkspaceConfig) -> Result<SharedAgentClient> {
@@ -5933,6 +5945,60 @@ mod tests {
             assert!(deleted.lock().unwrap().is_empty());
             let path = delighters::default_connect_splash_cache_path("alpha").unwrap();
             assert!(!path.exists());
+        });
+
+        match old_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    #[test]
+    fn captured_openclaw_connect_splash_caches_local_fallback_without_detached_activation() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let config = crate::cli::workspace::WorkspaceConfig {
+                id: Some("ws-alpha".to_string()),
+                name: "alpha".to_string(),
+                backend: crate::cli::workspace::Backend::Openclaw,
+                url: "ws://127.0.0.1:9".to_string(),
+                token_env: None,
+                token: None,
+                label: None,
+                namespace_aliases: Vec::new(),
+            };
+            assert!(!detached_connect_splash_backend_supported(&config));
+
+            let splash = connect_splash_for_captured_workspace(
+                Some(&config),
+                "alpha",
+                None,
+                ConnectSplashPolicy {
+                    display: true,
+                    backend: true,
+                },
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+            let fallback = delighters::local_connect_splash("alpha");
+            assert_eq!(splash, fallback);
+            let path = delighters::default_connect_splash_cache_path("alpha").unwrap();
+            assert_eq!(
+                delighters::read_cached_connect_splash(
+                    &path,
+                    std::time::SystemTime::now(),
+                    delighters::CONNECT_SPLASH_TTL,
+                )
+                .as_deref(),
+                Some(fallback.as_str())
+            );
         });
 
         match old_home {
