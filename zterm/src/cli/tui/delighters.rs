@@ -6,6 +6,7 @@ use std::io::{self, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use rand::seq::SliceRandom;
@@ -18,6 +19,7 @@ const CONNECT_SPLASH_MAX_LINES: usize = 6;
 const CONNECT_SPLASH_MAX_LINE_CHARS: usize = 96;
 const STATE_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
 const STATE_LOCK_POLL: Duration = Duration::from_millis(20);
+static MUTATION_FENCE_DISPATCH_SEQ: AtomicU64 = AtomicU64::new(1);
 
 const WELCOME_QUOTES: &[&str] = &[
     "Turbo Pascal says: Hello, world!",
@@ -43,6 +45,17 @@ pub struct MutationFenceState {
     pub command: String,
     pub reason: String,
     pub created_at_unix: u64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub dispatch_id: String,
+}
+
+pub fn new_mutation_fence_dispatch_id() -> String {
+    let seq = MUTATION_FENCE_DISPATCH_SEQ.fetch_add(1, Ordering::Relaxed);
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    format!("{}-{now}-{seq}", std::process::id())
 }
 
 pub fn sanitize_workspace_name(workspace: &str) -> String {
@@ -442,6 +455,36 @@ pub fn set_mutation_fence_for_workspace_at(
     })
 }
 
+pub fn acquire_mutation_fence_for_workspace(
+    workspace_key: &str,
+    fence: MutationFenceState,
+) -> std::io::Result<Result<ZtermState, MutationFenceState>> {
+    let Some(path) = default_state_path() else {
+        return Err(std::io::Error::other(
+            "no home directory; cannot persist zterm mutation fence",
+        ));
+    };
+    acquire_mutation_fence_for_workspace_at(&path, workspace_key, fence)
+}
+
+pub fn acquire_mutation_fence_for_workspace_at(
+    path: &Path,
+    workspace_key: &str,
+    fence: MutationFenceState,
+) -> std::io::Result<Result<ZtermState, MutationFenceState>> {
+    with_state_lock(path, || {
+        let mut state = load_state_unlocked(path)?;
+        if let Some(existing) = state.mutation_fences.get(workspace_key).cloned() {
+            return Ok(Err(existing));
+        }
+        state
+            .mutation_fences
+            .insert(workspace_key.to_string(), fence);
+        save_state_unlocked(path, &state)?;
+        Ok(Ok(state))
+    })
+}
+
 pub fn replace_mutation_fence_for_workspace(
     old_workspace_key: Option<&str>,
     workspace_key: &str,
@@ -474,6 +517,59 @@ pub fn replace_mutation_fence_for_workspace_at(
     })
 }
 
+pub fn replace_mutation_fence_for_workspace_if_dispatch(
+    old_workspace_key: &str,
+    old_dispatch_id: &str,
+    workspace_key: &str,
+    fence: MutationFenceState,
+) -> std::io::Result<bool> {
+    let Some(path) = default_state_path() else {
+        return Err(std::io::Error::other(
+            "no home directory; cannot persist zterm mutation fence",
+        ));
+    };
+    replace_mutation_fence_for_workspace_if_dispatch_at(
+        &path,
+        old_workspace_key,
+        old_dispatch_id,
+        workspace_key,
+        fence,
+    )
+}
+
+pub fn replace_mutation_fence_for_workspace_if_dispatch_at(
+    path: &Path,
+    old_workspace_key: &str,
+    old_dispatch_id: &str,
+    workspace_key: &str,
+    fence: MutationFenceState,
+) -> std::io::Result<bool> {
+    with_state_lock(path, || {
+        let mut state = load_state_unlocked(path)?;
+        let owns_old = state
+            .mutation_fences
+            .get(old_workspace_key)
+            .map(|existing| existing.dispatch_id == old_dispatch_id)
+            .unwrap_or(false);
+        if !owns_old {
+            return Ok(false);
+        }
+        if old_workspace_key != workspace_key {
+            if let Some(existing_target) = state.mutation_fences.get(workspace_key) {
+                if existing_target.dispatch_id != old_dispatch_id {
+                    return Ok(false);
+                }
+            }
+            state.mutation_fences.remove(old_workspace_key);
+        }
+        state
+            .mutation_fences
+            .insert(workspace_key.to_string(), fence);
+        save_state_unlocked(path, &state)?;
+        Ok(true)
+    })
+}
+
 pub fn clear_mutation_fence_for_workspace(workspace_key: &str) -> std::io::Result<ZtermState> {
     let Some(path) = default_state_path() else {
         return Err(std::io::Error::other(
@@ -492,6 +588,39 @@ pub fn clear_mutation_fence_for_workspace_at(
         state.mutation_fences.remove(workspace_key);
         save_state_unlocked(path, &state)?;
         Ok(state)
+    })
+}
+
+pub fn clear_mutation_fence_for_workspace_if_dispatch(
+    workspace_key: &str,
+    dispatch_id: &str,
+) -> std::io::Result<bool> {
+    let Some(path) = default_state_path() else {
+        return Err(std::io::Error::other(
+            "no home directory; cannot persist zterm mutation fence",
+        ));
+    };
+    clear_mutation_fence_for_workspace_if_dispatch_at(&path, workspace_key, dispatch_id)
+}
+
+pub fn clear_mutation_fence_for_workspace_if_dispatch_at(
+    path: &Path,
+    workspace_key: &str,
+    dispatch_id: &str,
+) -> std::io::Result<bool> {
+    with_state_lock(path, || {
+        let mut state = load_state_unlocked(path)?;
+        let owns_fence = state
+            .mutation_fences
+            .get(workspace_key)
+            .map(|existing| existing.dispatch_id == dispatch_id)
+            .unwrap_or(false);
+        if !owns_fence {
+            return Ok(false);
+        }
+        state.mutation_fences.remove(workspace_key);
+        save_state_unlocked(path, &state)?;
+        Ok(true)
     })
 }
 
@@ -701,11 +830,13 @@ mod tests {
             command: "/cron add '0 9 * * *' standup".to_string(),
             reason: "slash command outcome unknown".to_string(),
             created_at_unix: 42,
+            dispatch_id: "dispatch-prod".to_string(),
         };
         let other_fence = MutationFenceState {
             command: "/session create scratch".to_string(),
             reason: "session outcome unknown".to_string(),
             created_at_unix: 43,
+            dispatch_id: "dispatch-dev".to_string(),
         };
 
         set_mutation_fence_for_workspace_at(&path, "id:prod", fence.clone()).unwrap();
@@ -728,6 +859,151 @@ mod tests {
         assert_eq!(
             mutation_fence_for_workspace_at(&path, "id:dev").unwrap(),
             Some(other_fence)
+        );
+    }
+
+    #[test]
+    fn mutation_fence_acquire_refuses_to_replace_existing_owner() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("state.toml");
+        let fence = MutationFenceState {
+            command: "/memory post one".to_string(),
+            reason: "first dispatch pending".to_string(),
+            created_at_unix: 42,
+            dispatch_id: "dispatch-one".to_string(),
+        };
+        let competing = MutationFenceState {
+            command: "/memory post two".to_string(),
+            reason: "second dispatch pending".to_string(),
+            created_at_unix: 43,
+            dispatch_id: "dispatch-two".to_string(),
+        };
+
+        assert!(
+            acquire_mutation_fence_for_workspace_at(&path, "id:prod", fence.clone())
+                .unwrap()
+                .is_ok()
+        );
+        let existing =
+            acquire_mutation_fence_for_workspace_at(&path, "id:prod", competing).unwrap();
+
+        let existing = existing.expect_err("second acquire should return existing fence");
+        assert_eq!(existing, fence.clone());
+        assert_eq!(
+            mutation_fence_for_workspace_at(&path, "id:prod").unwrap(),
+            Some(fence)
+        );
+    }
+
+    #[test]
+    fn mutation_fence_acquire_is_atomic_for_competing_writers() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("state.toml");
+        let writers = 8;
+        let barrier = Arc::new(Barrier::new(writers));
+        let handles = (0..writers)
+            .map(|idx| {
+                let path = path.clone();
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    let dispatch_id = format!("dispatch-{idx}");
+                    let fence = MutationFenceState {
+                        command: format!("/memory post {idx}"),
+                        reason: format!("dispatch {idx} pending"),
+                        created_at_unix: idx as u64,
+                        dispatch_id: dispatch_id.clone(),
+                    };
+                    barrier.wait();
+                    let acquired = acquire_mutation_fence_for_workspace_at(&path, "id:prod", fence)
+                        .unwrap()
+                        .is_ok();
+                    (dispatch_id, acquired)
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let winners = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .filter_map(|(dispatch_id, acquired)| acquired.then_some(dispatch_id))
+            .collect::<Vec<_>>();
+        let persisted = mutation_fence_for_workspace_at(&path, "id:prod")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(winners.len(), 1);
+        assert_eq!(persisted.dispatch_id, winners[0]);
+    }
+
+    #[test]
+    fn mutation_fence_replace_and_clear_require_matching_dispatch_owner() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("state.toml");
+        let original = MutationFenceState {
+            command: "/workspace switch beta".to_string(),
+            reason: "switch pending".to_string(),
+            created_at_unix: 42,
+            dispatch_id: "owner-a".to_string(),
+        };
+        let replacement = MutationFenceState {
+            command: "/workspace switch beta".to_string(),
+            reason: "switch outcome unknown".to_string(),
+            created_at_unix: 43,
+            dispatch_id: "owner-a".to_string(),
+        };
+
+        set_mutation_fence_for_workspace_at(&path, "id:alpha", original.clone()).unwrap();
+
+        assert!(!replace_mutation_fence_for_workspace_if_dispatch_at(
+            &path,
+            "id:alpha",
+            "wrong-owner",
+            "id:beta",
+            replacement.clone()
+        )
+        .unwrap());
+        assert_eq!(
+            mutation_fence_for_workspace_at(&path, "id:alpha").unwrap(),
+            Some(original)
+        );
+        assert_eq!(
+            mutation_fence_for_workspace_at(&path, "id:beta").unwrap(),
+            None
+        );
+
+        assert!(replace_mutation_fence_for_workspace_if_dispatch_at(
+            &path,
+            "id:alpha",
+            "owner-a",
+            "id:beta",
+            replacement.clone()
+        )
+        .unwrap());
+        assert_eq!(
+            mutation_fence_for_workspace_at(&path, "id:alpha").unwrap(),
+            None
+        );
+        assert_eq!(
+            mutation_fence_for_workspace_at(&path, "id:beta").unwrap(),
+            Some(replacement.clone())
+        );
+
+        assert!(!clear_mutation_fence_for_workspace_if_dispatch_at(
+            &path,
+            "id:beta",
+            "wrong-owner"
+        )
+        .unwrap());
+        assert_eq!(
+            mutation_fence_for_workspace_at(&path, "id:beta").unwrap(),
+            Some(replacement)
+        );
+        assert!(
+            clear_mutation_fence_for_workspace_if_dispatch_at(&path, "id:beta", "owner-a").unwrap()
+        );
+        assert_eq!(
+            mutation_fence_for_workspace_at(&path, "id:beta").unwrap(),
+            None
         );
     }
 

@@ -19,6 +19,12 @@ use tokio::sync::Mutex;
 
 const LEGACY_MUTATING_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LegacyMutationFenceOwner {
+    key: String,
+    dispatch_id: String,
+}
+
 /// REPL loop state
 pub struct ReplLoop {
     /// Shared App. ReplLoop + CommandHandler both lock this
@@ -133,23 +139,36 @@ impl ReplLoop {
     async fn persist_mutation_fence_replacing(
         &self,
         reason: &str,
-        old_key: Option<&str>,
+        old_owner: Option<&LegacyMutationFenceOwner>,
     ) -> String {
         let key = match self.current_mutation_fence_key().await {
             Ok(key) => key,
             Err(e) => return format!("{reason}; failed to identify active workspace: {e}"),
         };
-        let fence =
-            legacy_mutation_fence_state(&legacy_mutation_fence_command_from_reason(reason), reason);
-        let result = if let Some(old_key) = old_key {
-            delighters::replace_mutation_fence_for_workspace(Some(old_key), &key, fence)
+        let dispatch_id = old_owner
+            .map(|owner| owner.dispatch_id.as_str())
+            .unwrap_or_default();
+        let fence = legacy_mutation_fence_state_with_dispatch(
+            &legacy_mutation_fence_command_from_reason(reason),
+            reason,
+            dispatch_id,
+        );
+        let result = if let Some(owner) = old_owner {
+            delighters::replace_mutation_fence_for_workspace_if_dispatch(
+                &owner.key,
+                &owner.dispatch_id,
+                &key,
+                fence,
+            )
         } else {
-            delighters::set_mutation_fence_for_workspace(&key, fence)
+            delighters::set_mutation_fence_for_workspace(&key, fence).map(|_| true)
         };
-        if let Err(e) = result {
-            format!("{reason}; failed to persist fence: {e}")
-        } else {
-            reason.to_string()
+        match result {
+            Ok(true) => reason.to_string(),
+            Ok(false) => format!(
+                "{reason}; failed to persist fence: durable write-ahead fence is no longer owned by this dispatch"
+            ),
+            Err(e) => format!("{reason}; failed to persist fence: {e}"),
         }
     }
 
@@ -157,12 +176,21 @@ impl ReplLoop {
         self.persist_mutation_fence_replacing(reason, None).await
     }
 
-    async fn write_ahead_mutation_fence_for_dispatch(&self, cmdline: &str) -> Result<String> {
+    async fn write_ahead_mutation_fence_for_dispatch(
+        &self,
+        cmdline: &str,
+    ) -> Result<LegacyMutationFenceOwner> {
         let key = self.current_mutation_fence_key().await?;
         let reason = legacy_write_ahead_mutation_fence_message(cmdline);
-        let fence = legacy_mutation_fence_state(cmdline, &reason);
-        delighters::set_mutation_fence_for_workspace(&key, fence)?;
-        Ok(key)
+        let dispatch_id = delighters::new_mutation_fence_dispatch_id();
+        let fence = legacy_mutation_fence_state_with_dispatch(cmdline, &reason, &dispatch_id);
+        match delighters::acquire_mutation_fence_for_workspace(&key, fence)? {
+            Ok(_) => Ok(LegacyMutationFenceOwner { key, dispatch_id }),
+            Err(existing) => Err(anyhow::anyhow!(
+                "mutation fence already active for this workspace: {}",
+                existing.reason
+            )),
+        }
     }
 
     async fn handle_legacy_resync(&mut self, input: &str) -> Result<Option<String>> {
@@ -516,16 +544,16 @@ impl ReplLoop {
         }
 
         if let Some(action) = legacy_session_action(input) {
-            let mutation_fence_key = match self.write_ahead_mutation_fence_for_dispatch(input).await
-            {
-                Ok(key) => key,
-                Err(e) => {
-                    return Ok(Some(format!(
-                        "[blocked] {}\n",
-                        legacy_write_ahead_persist_failure_message(input, &e)
-                    )));
-                }
-            };
+            let mutation_fence_owner =
+                match self.write_ahead_mutation_fence_for_dispatch(input).await {
+                    Ok(owner) => owner,
+                    Err(e) => {
+                        return Ok(Some(format!(
+                            "[blocked] {}\n",
+                            legacy_write_ahead_persist_failure_message(input, &e)
+                        )));
+                    }
+                };
             match tokio::time::timeout(
                 LEGACY_MUTATING_COMMAND_TIMEOUT,
                 self.apply_legacy_session_action(action),
@@ -534,7 +562,7 @@ impl ReplLoop {
             {
                 Ok(Ok(())) => {
                     if let Some(reason) =
-                        clear_legacy_write_ahead_mutation_fence(&mutation_fence_key)
+                        clear_legacy_write_ahead_mutation_fence(&mutation_fence_owner)
                     {
                         return Ok(Some(format!("[blocked] {reason}\n")));
                     }
@@ -542,14 +570,14 @@ impl ReplLoop {
                 Ok(Err(e)) => {
                     let reason = legacy_mutating_unknown_outcome_message(input, &e.to_string());
                     let reason = self
-                        .persist_mutation_fence_replacing(&reason, Some(&mutation_fence_key))
+                        .persist_mutation_fence_replacing(&reason, Some(&mutation_fence_owner))
                         .await;
                     return Ok(Some(format!("[blocked] {reason}\n")));
                 }
                 Err(_) => {
                     let reason = legacy_mutating_timeout_message(input);
                     let reason = self
-                        .persist_mutation_fence_replacing(&reason, Some(&mutation_fence_key))
+                        .persist_mutation_fence_replacing(&reason, Some(&mutation_fence_owner))
                         .await;
                     return Ok(Some(format!("[blocked] {reason}\n")));
                 }
@@ -575,9 +603,9 @@ impl ReplLoop {
             self.session.id.clone()
         };
 
-        let mutation_fence_key = if legacy_slash_command_may_mutate_state(input) {
+        let mutation_fence_owner = if legacy_slash_command_may_mutate_state(input) {
             match self.write_ahead_mutation_fence_for_dispatch(input).await {
-                Ok(key) => Some(key),
+                Ok(owner) => Some(owner),
                 Err(e) => {
                     return Ok(Some(format!(
                         "[blocked] {}\n",
@@ -589,7 +617,7 @@ impl ReplLoop {
             None
         };
 
-        let command_result = if mutation_fence_key.is_some() {
+        let command_result = if mutation_fence_owner.is_some() {
             match tokio::time::timeout(
                 LEGACY_MUTATING_COMMAND_TIMEOUT,
                 self.command_handler
@@ -601,14 +629,14 @@ impl ReplLoop {
                 Ok(Err(e)) => {
                     let reason = legacy_mutating_unknown_outcome_message(input, &e.to_string());
                     let reason = self
-                        .persist_mutation_fence_replacing(&reason, mutation_fence_key.as_deref())
+                        .persist_mutation_fence_replacing(&reason, mutation_fence_owner.as_ref())
                         .await;
                     return Ok(Some(format!("[blocked] {reason}\n")));
                 }
                 Err(_) => {
                     let reason = legacy_mutating_timeout_message(input);
                     let reason = self
-                        .persist_mutation_fence_replacing(&reason, mutation_fence_key.as_deref())
+                        .persist_mutation_fence_replacing(&reason, mutation_fence_owner.as_ref())
                         .await;
                     return Ok(Some(format!("[blocked] {reason}\n")));
                 }
@@ -631,7 +659,7 @@ impl ReplLoop {
                 if let Err(e) = self.ensure_session_for_active_workspace().await {
                     let reason = legacy_workspace_switch_session_setup_failure_message(input, &e);
                     let reason = self
-                        .persist_mutation_fence_replacing(&reason, mutation_fence_key.as_deref())
+                        .persist_mutation_fence_replacing(&reason, mutation_fence_owner.as_ref())
                         .await;
                     return Ok(Some(legacy_output_with_blocked(
                         result.clone().unwrap_or_default(),
@@ -645,7 +673,7 @@ impl ReplLoop {
             let rendered = result.as_deref().unwrap_or_default();
             let reason = legacy_mutating_unknown_outcome_message(input, rendered);
             let reason = self
-                .persist_mutation_fence_replacing(&reason, mutation_fence_key.as_deref())
+                .persist_mutation_fence_replacing(&reason, mutation_fence_owner.as_ref())
                 .await;
             return Ok(Some(legacy_output_with_blocked(
                 result.unwrap_or_default(),
@@ -653,8 +681,8 @@ impl ReplLoop {
             )));
         }
 
-        if let Some(key) = mutation_fence_key {
-            if let Some(reason) = clear_legacy_write_ahead_mutation_fence(&key) {
+        if let Some(owner) = mutation_fence_owner {
+            if let Some(reason) = clear_legacy_write_ahead_mutation_fence(&owner) {
                 return Ok(Some(legacy_output_with_blocked(
                     result.unwrap_or_default(),
                     &reason,
@@ -921,10 +949,19 @@ fn legacy_mutation_fence_now_unix() -> u64 {
 }
 
 fn legacy_mutation_fence_state(command: &str, reason: &str) -> delighters::MutationFenceState {
+    legacy_mutation_fence_state_with_dispatch(command, reason, "")
+}
+
+fn legacy_mutation_fence_state_with_dispatch(
+    command: &str,
+    reason: &str,
+    dispatch_id: &str,
+) -> delighters::MutationFenceState {
     delighters::MutationFenceState {
         command: sanitize_terminal_text(command).replace('`', "'"),
         reason: reason.to_string(),
         created_at_unix: legacy_mutation_fence_now_unix(),
+        dispatch_id: dispatch_id.to_string(),
     }
 }
 
@@ -943,12 +980,20 @@ fn legacy_write_ahead_persist_failure_message(cmdline: &str, error: &anyhow::Err
     )
 }
 
-fn clear_legacy_write_ahead_mutation_fence(key: &str) -> Option<String> {
-    delighters::clear_mutation_fence_for_workspace(key).err().map(|e| {
-        format!(
+fn clear_legacy_write_ahead_mutation_fence(owner: &LegacyMutationFenceOwner) -> Option<String> {
+    match delighters::clear_mutation_fence_for_workspace_if_dispatch(
+        &owner.key,
+        &owner.dispatch_id,
+    ) {
+        Ok(true) => None,
+        Ok(false) => Some(
+            "mutating slash command completed, but zterm did not own the durable write-ahead mutation fence; run /resync --force after manual reconciliation"
+                .to_string(),
+        ),
+        Err(e) => Some(format!(
             "mutating slash command completed, but zterm could not clear the durable write-ahead mutation fence: {e}; run /resync --force after manual reconciliation"
-        )
-    })
+        )),
+    }
 }
 
 fn legacy_output_with_blocked(mut output: String, reason: &str) -> String {
@@ -1540,17 +1585,19 @@ mod tests {
             )
             .unwrap();
 
-            let key = repl
+            let owner = repl
                 .write_ahead_mutation_fence_for_dispatch("/memory post remember this")
                 .await
                 .unwrap();
 
-            assert_eq!(key, "name:alpha");
+            assert_eq!(owner.key, "name:alpha");
+            assert!(!owner.dispatch_id.is_empty());
             let fence = delighters::mutation_fence_for_workspace("name:alpha")
                 .unwrap()
                 .unwrap();
             assert_eq!(fence.command, "/memory post remember this");
             assert!(fence.reason.contains("backend outcome is pending"));
+            assert_eq!(fence.dispatch_id, owner.dispatch_id);
             assert!(submitted.lock().unwrap().is_empty());
         });
 

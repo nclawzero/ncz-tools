@@ -89,10 +89,16 @@ enum WorkerRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct MutationFenceOwner {
+    key: String,
+    dispatch_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct InFlightRequest {
     label: String,
     mutating_slash: bool,
-    mutation_fence_key: Option<String>,
+    mutation_fence_owner: Option<MutationFenceOwner>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -3136,7 +3142,7 @@ fn drain_stream_events(
                                         status_state,
                                         &reason,
                                         in_flight_request.as_ref().and_then(|request| {
-                                            request.mutation_fence_key.as_deref()
+                                            request.mutation_fence_owner.as_ref()
                                         }),
                                     );
                                     status_state.set_toast(MUTATION_FENCE_TOAST);
@@ -3191,7 +3197,7 @@ fn drain_stream_events(
                             &reason,
                             in_flight_request
                                 .as_ref()
-                                .and_then(|request| request.mutation_fence_key.as_deref()),
+                                .and_then(|request| request.mutation_fence_owner.as_ref()),
                         );
                         status_state.set_toast(MUTATION_FENCE_TOAST);
                         rendered_message = reason;
@@ -3275,7 +3281,7 @@ fn dispatch_worker_backed_submission(
     let mut in_flight_request = in_flight_request_for_worker_request(label, &request);
     if in_flight_request.mutating_slash {
         match write_ahead_mutation_fence_for_dispatch(status_state, label) {
-            Ok(key) => in_flight_request.mutation_fence_key = Some(key),
+            Ok(owner) => in_flight_request.mutation_fence_owner = Some(owner),
             Err(e) => {
                 status_state.set_toast("Mutation not dispatched");
                 chat_lines.borrow_mut().push(format!(
@@ -3330,7 +3336,7 @@ fn in_flight_request_for_worker_request(label: &str, request: &WorkerRequest) ->
     InFlightRequest {
         label: label.to_string(),
         mutating_slash,
-        mutation_fence_key: None,
+        mutation_fence_owner: None,
     }
 }
 
@@ -3861,10 +3867,19 @@ fn cap_sanitized_text(input: &str, max_chars: usize) -> String {
 }
 
 fn mutation_fence_state_for_command(command: &str, reason: &str) -> delighters::MutationFenceState {
+    mutation_fence_state_for_command_with_dispatch(command, reason, "")
+}
+
+fn mutation_fence_state_for_command_with_dispatch(
+    command: &str,
+    reason: &str,
+    dispatch_id: &str,
+) -> delighters::MutationFenceState {
     delighters::MutationFenceState {
         command: cap_sanitized_text(command, MUTATION_FENCE_COMMAND_MAX_CHARS),
         reason: cap_sanitized_text(reason, MUTATION_FENCE_REASON_MAX_CHARS),
         created_at_unix: mutation_fence_now_unix(),
+        dispatch_id: dispatch_id.to_string(),
     }
 }
 
@@ -3878,13 +3893,24 @@ fn write_ahead_mutation_fence_reason(cmdline: &str) -> String {
 fn write_ahead_mutation_fence_for_dispatch(
     status_state: &mut StatusState,
     cmdline: &str,
-) -> Result<String> {
+) -> Result<MutationFenceOwner> {
     let key = mutation_fence_key_for_status(status_state);
     let reason = write_ahead_mutation_fence_reason(cmdline);
-    let fence = mutation_fence_state_for_command(cmdline, &reason);
-    delighters::set_mutation_fence_for_workspace(&key, fence.clone())?;
-    status_state.mutation_fence = Some(fence.reason);
-    Ok(key)
+    let dispatch_id = delighters::new_mutation_fence_dispatch_id();
+    let fence = mutation_fence_state_for_command_with_dispatch(cmdline, &reason, &dispatch_id);
+    match delighters::acquire_mutation_fence_for_workspace(&key, fence.clone())? {
+        Ok(_) => {
+            status_state.mutation_fence = Some(fence.reason);
+            Ok(MutationFenceOwner { key, dispatch_id })
+        }
+        Err(existing) => {
+            status_state.mutation_fence = Some(existing.reason.clone());
+            Err(anyhow::anyhow!(
+                "mutation fence already active for this workspace: {}",
+                existing.reason
+            ))
+        }
+    }
 }
 
 fn load_persisted_mutation_fence_for_status(
@@ -3899,6 +3925,7 @@ fn load_persisted_mutation_fence_for_status(
                 "could not read zterm mutation-fence state: {e}; run /resync --force only after manual reconciliation"
             ),
             created_at_unix: 0,
+            dispatch_id: String::new(),
         }),
     }
 }
@@ -3968,20 +3995,42 @@ fn set_local_and_persisted_mutation_fence(status_state: &mut StatusState, reason
 fn set_local_and_persisted_mutation_fence_replacing(
     status_state: &mut StatusState,
     reason: &str,
-    old_workspace_key: Option<&str>,
+    old_owner: Option<&MutationFenceOwner>,
 ) {
     let key = mutation_fence_key_for_status(status_state);
     let command = mutation_fence_command_from_reason(reason);
-    let fence = mutation_fence_state_for_command(&command, reason);
-    if let Err(e) =
-        delighters::replace_mutation_fence_for_workspace(old_workspace_key, &key, fence.clone())
-    {
-        status_state.mutation_fence = Some(cap_sanitized_text(
-            &format!("{reason}; failed to persist fence: {e}"),
-            MUTATION_FENCE_REASON_MAX_CHARS,
-        ));
-    } else {
-        status_state.mutation_fence = Some(fence.reason);
+    let dispatch_id = old_owner
+        .map(|owner| owner.dispatch_id.as_str())
+        .unwrap_or_default();
+    let fence = mutation_fence_state_for_command_with_dispatch(&command, reason, dispatch_id);
+    let result = match old_owner {
+        Some(owner) => delighters::replace_mutation_fence_for_workspace_if_dispatch(
+            &owner.key,
+            &owner.dispatch_id,
+            &key,
+            fence.clone(),
+        ),
+        None => delighters::replace_mutation_fence_for_workspace(None, &key, fence.clone())
+            .map(|_| true),
+    };
+    match result {
+        Ok(true) => status_state.mutation_fence = Some(fence.reason),
+        Ok(false) => {
+            status_state.mutation_fence = Some(cap_sanitized_text(
+                &format!(
+                    "{reason}; failed to persist fence: durable write-ahead fence is no longer owned by this dispatch"
+                ),
+                MUTATION_FENCE_REASON_MAX_CHARS,
+            ));
+            status_state.set_toast(MUTATION_FENCE_TOAST);
+        }
+        Err(e) => {
+            status_state.mutation_fence = Some(cap_sanitized_text(
+                &format!("{reason}; failed to persist fence: {e}"),
+                MUTATION_FENCE_REASON_MAX_CHARS,
+            ));
+            status_state.set_toast(MUTATION_FENCE_TOAST);
+        }
     }
 }
 
@@ -4003,12 +4052,22 @@ fn clear_write_ahead_mutation_fence_after_safe_terminal(
     let Some(request) = in_flight_request.filter(|request| request.mutating_slash) else {
         return;
     };
-    let key = request
-        .mutation_fence_key
-        .clone()
-        .unwrap_or_else(|| mutation_fence_key_for_status(status_state));
-    match delighters::clear_mutation_fence_for_workspace(&key) {
-        Ok(_) => status_state.mutation_fence = None,
+    let Some(owner) = request.mutation_fence_owner.as_ref() else {
+        return;
+    };
+    match delighters::clear_mutation_fence_for_workspace_if_dispatch(&owner.key, &owner.dispatch_id)
+    {
+        Ok(true) => {
+            status_state.mutation_fence =
+                load_persisted_mutation_fence_for_status(status_state).map(|fence| fence.reason);
+        }
+        Ok(false) => {
+            status_state.mutation_fence = Some(cap_sanitized_text(
+                "mutating slash command completed, but zterm did not own the durable write-ahead mutation fence; run /resync --force after manual reconciliation",
+                MUTATION_FENCE_REASON_MAX_CHARS,
+            ));
+            status_state.set_toast(MUTATION_FENCE_TOAST);
+        }
         Err(e) => {
             status_state.mutation_fence = Some(cap_sanitized_text(
                 &format!(
@@ -5563,6 +5622,7 @@ mod tests {
             command: "/memory post hello".to_string(),
             reason: "slash command outcome unknown for `/memory post hello`".to_string(),
             created_at_unix: 42,
+            dispatch_id: String::new(),
         };
 
         assert!(mutation_fence_blocks_submission_with(
@@ -5596,6 +5656,7 @@ mod tests {
                 command: "/session create x".to_string(),
                 reason: "slash command outcome unknown for `/session create x`".to_string(),
                 created_at_unix: 42,
+                dispatch_id: String::new(),
             })
         ));
         assert!(state.mutation_fence.is_some());
@@ -5646,6 +5707,7 @@ mod tests {
         assert_eq!(state.mutation_fence, Some(persisted.reason.clone()));
         assert!(persisted.reason.contains("backend outcome is pending"));
         assert_eq!(persisted.command, "/memory post hello");
+        assert!(!persisted.dispatch_id.is_empty());
         assert!(matches!(queued, WorkerRequest::Command(cmd) if cmd == "/memory post hello"));
     }
 
@@ -5946,6 +6008,7 @@ mod tests {
             command: "/memory post x".to_string(),
             reason: "unknown outcome".to_string(),
             created_at_unix: 1,
+            dispatch_id: String::new(),
         };
         delighters::set_mutation_fence_for_workspace("id:ws-stable", fence).unwrap();
         let mut status = StatusState::new(
@@ -6051,14 +6114,14 @@ mod tests {
             false,
         );
         state.workspace_id = Some("ws-alpha".to_string());
-        let old_key =
+        let old_owner =
             write_ahead_mutation_fence_for_dispatch(&mut state, "/workspace switch beta").unwrap();
 
         state.apply_status(Some("beta".to_string()), Some("ws-beta".to_string()), None);
         set_local_and_persisted_mutation_fence_replacing(
             &mut state,
             "slash command outcome unknown for `/workspace switch beta` after session setup failed",
-            Some(&old_key),
+            Some(&old_owner),
         );
 
         assert_eq!(state.workspace, "beta");
@@ -6106,6 +6169,7 @@ mod tests {
                 command: "/cron add".to_string(),
                 reason: "slash command outcome unknown".to_string(),
                 created_at_unix: 1,
+                dispatch_id: String::new(),
             },
         )
         .unwrap();
@@ -6205,7 +6269,7 @@ mod tests {
         state.in_flight_request = Some(InFlightRequest {
             label: "/memory post hello".to_string(),
             mutating_slash: true,
-            mutation_fence_key: None,
+            mutation_fence_owner: None,
         });
         let lines = Rc::new(RefCell::new(vec![
             "> /memory post hello".to_string(),
@@ -6260,7 +6324,7 @@ mod tests {
         let readonly = InFlightRequest {
             label: "/models list".to_string(),
             mutating_slash: false,
-            mutation_fence_key: None,
+            mutation_fence_owner: None,
         };
         assert!(mutation_fence_reason_for_terminal_failure(
             "worker channel disconnected before the request completed",
@@ -6271,7 +6335,7 @@ mod tests {
         let mutating = InFlightRequest {
             label: "/workspace switch prod".to_string(),
             mutating_slash: true,
-            mutation_fence_key: None,
+            mutation_fence_owner: None,
         };
         assert!(mutation_fence_reason_for_terminal_failure(
             COMMAND_ERROR_ALREADY_RENDERED,
