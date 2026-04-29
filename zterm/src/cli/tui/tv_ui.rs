@@ -103,6 +103,12 @@ struct InFlightRequest {
     mutation_fence_owner: Option<MutationFenceOwner>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ConnectSplashPolicy {
+    display: bool,
+    backend: bool,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum SubmissionStatus {
     Started,
@@ -562,8 +568,13 @@ pub async fn run(
     model: String,
     provider: String,
     connect_splash_enabled: bool,
+    backend_connect_splash_enabled: bool,
 ) -> Result<()> {
     info!("Starting tv_ui (E-2 async bridge)");
+    let connect_splash_policy = ConnectSplashPolicy {
+        display: connect_splash_enabled,
+        backend: backend_connect_splash_enabled,
+    };
 
     // Snapshot the active workspace name for the status line. A later
     // slice replaces this one-shot read with a live subscription so
@@ -583,13 +594,9 @@ pub async fn run(
     let (req_tx, mut req_rx) = mpsc::channel::<WorkerRequest>(32);
     let (event_tx, event_rx) = StreamSink::channel(UI_EVENT_CAPACITY);
 
-    let connect_splash = connect_splash_for_workspace_if_enabled(
-        &app,
-        &workspace_name,
-        None,
-        connect_splash_enabled,
-    )
-    .await?;
+    let connect_splash =
+        connect_splash_for_workspace_if_enabled(&app, &workspace_name, None, connect_splash_policy)
+            .await?;
 
     // Install the streaming sink on the boot workspace. The worker
     // also reinstalls before every submitted turn and after every
@@ -619,7 +626,7 @@ pub async fn run(
     let fallback_session_name = session.name.clone();
     let worker_sink = event_tx.clone();
     let worker_cmd_handler = CommandHandler::new(Arc::clone(&app));
-    let worker_connect_splash_enabled = connect_splash_enabled;
+    let worker_connect_splash_policy = connect_splash_policy;
     tokio::spawn(async move {
         while let Some(req) = req_rx.recv().await {
             match req {
@@ -667,29 +674,15 @@ pub async fn run(
                                     continue;
                                 }
                             };
-                            if let Err(e) = storage::ensure_scoped_session_history_complete(
+                            let (pending_marker_id, turn_lock) = match acquire_turn_transcript_lock(
                                 &transcript_scope,
                                 &worker_session_id,
                             ) {
-                                send_worker_finished(
-                                    &worker_sink,
-                                    Err(format!("{e}; turn not submitted")),
-                                )
-                                .await;
-                                continue;
-                            }
-                            let pending_marker_id = match mark_turn_transcript_pending(
-                                &transcript_scope,
-                                &worker_session_id,
-                            ) {
-                                Ok(marker_id) => marker_id,
+                                Ok(lock) => lock,
                                 Err(e) => {
                                     send_worker_finished(
                                         &worker_sink,
-                                        Err(format!(
-                                            "could not mark transcript pending for session {}; turn not submitted: {e}",
-                                            worker_session_id
-                                        )),
+                                        Err(format!("{e}; turn not submitted")),
                                     )
                                     .await;
                                     continue;
@@ -707,10 +700,16 @@ pub async fn run(
                                     &pending_marker_id,
                                 )
                                 .err();
+                                let release_error = turn_lock.release().err();
                                 let mut message = format!("{e}; turn not submitted");
                                 if let Some(clear_error) = clear_error {
                                     message.push_str(&format!(
                                         "; additionally failed to clear pending transcript marker: {clear_error}"
+                                    ));
+                                }
+                                if let Some(release_error) = release_error {
+                                    message.push_str(&format!(
+                                        "; additionally failed to release transcript turn lock: {release_error}"
                                     ));
                                 }
                                 send_worker_finished(&worker_sink, Err(message)).await;
@@ -852,6 +851,11 @@ pub async fn run(
                                     )));
                                 }
                             }
+                            if let Err(e) = turn_lock.release() {
+                                terminal_override = Some(Err(format!(
+                                    "terminal transcript state finalized, but turn lock could not be released: {e}; /clear is required before another turn"
+                                )));
+                            }
                             send_worker_chunks_reliably(
                                 &worker_sink,
                                 final_turn_terminal_chunks(
@@ -910,7 +914,7 @@ pub async fn run(
                         &fallback_session_name,
                         &worker_sink,
                         &worker_cmd_handler,
-                        worker_connect_splash_enabled,
+                        worker_connect_splash_policy,
                     );
                     run_worker_command_with_deadline(
                         &worker_sink,
@@ -1037,9 +1041,9 @@ fn spawn_connect_splash_typewriter(
     app: Arc<Mutex<App>>,
     worker_sink: StreamSink,
     workspace_name: String,
-    enabled: bool,
+    policy: ConnectSplashPolicy,
 ) {
-    if !enabled {
+    if !policy.display {
         return;
     }
 
@@ -1048,7 +1052,7 @@ fn spawn_connect_splash_typewriter(
             &app,
             &workspace_name,
             Some(worker_sink.clone()),
-            enabled,
+            policy,
         )
         .await
         {
@@ -1104,7 +1108,7 @@ async fn handle_worker_command_request(
     fallback_session_name: &str,
     worker_sink: &StreamSink,
     worker_cmd_handler: &CommandHandler,
-    connect_splash_enabled: bool,
+    connect_splash_policy: ConnectSplashPolicy,
 ) {
     // Route slash commands through the shared `CommandHandler`.
     // Advertised commands return structured strings so side effects
@@ -1263,7 +1267,7 @@ async fn handle_worker_command_request(
                                 Arc::clone(worker_app),
                                 worker_sink.clone(),
                                 name,
-                                connect_splash_enabled,
+                                connect_splash_policy,
                             );
                         }
                     }
@@ -1450,10 +1454,13 @@ async fn connect_splash_for_workspace_if_enabled(
     app: &Arc<Mutex<App>>,
     workspace_name: &str,
     restore_sink: Option<StreamSink>,
-    enabled: bool,
+    policy: ConnectSplashPolicy,
 ) -> Result<Option<String>> {
-    if !enabled {
+    if !policy.display {
         return Ok(None);
+    }
+    if !policy.backend {
+        return Ok(Some(delighters::local_connect_splash(workspace_name)));
     }
     connect_splash_for_workspace(app, workspace_name, restore_sink)
         .await
@@ -2334,6 +2341,21 @@ fn mark_turn_transcript_pending(
     )
     .map_err(|e| anyhow::anyhow!("could not persist pending transcript marker: {e}"))?;
     Ok(marker_id)
+}
+
+fn acquire_turn_transcript_lock(
+    scope: &storage::LocalWorkspaceScope,
+    session_id: &str,
+) -> Result<(String, storage::ScopedSessionTurnLock)> {
+    let marker_id = format!("turn-{}", uuid::Uuid::new_v4());
+    let lock = storage::acquire_scoped_session_history_turn_lock(
+        scope,
+        session_id,
+        &marker_id,
+        TURN_TRANSCRIPT_PENDING_REASON,
+    )
+    .map_err(|e| anyhow::anyhow!("could not acquire transcript turn lock: {e}"))?;
+    Ok((marker_id, lock))
 }
 
 fn clear_turn_transcript_pending_marker(
@@ -5520,9 +5542,17 @@ mod tests {
                 config_path: std::path::PathBuf::from("test-config.toml"),
             }));
 
-            let splash = connect_splash_for_workspace_if_enabled(&app, "alpha", None, false)
-                .await
-                .unwrap();
+            let splash = connect_splash_for_workspace_if_enabled(
+                &app,
+                "alpha",
+                None,
+                ConnectSplashPolicy {
+                    display: false,
+                    backend: true,
+                },
+            )
+            .await
+            .unwrap();
 
             assert!(splash.is_none());
             assert!(
@@ -5533,6 +5563,86 @@ mod tests {
             assert!(submitted.lock().unwrap().is_empty());
             assert!(deleted.lock().unwrap().is_empty());
             assert!(sink_set_states.lock().unwrap().is_empty());
+        });
+
+        match old_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    #[test]
+    fn connect_splash_backend_generation_is_opt_in() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let created = Arc::new(StdMutex::new(Vec::new()));
+            let deleted = Arc::new(StdMutex::new(Vec::new()));
+            let submitted = Arc::new(StdMutex::new(Vec::new()));
+            let fake = WorkerSessionFakeClient {
+                listed_sessions: Vec::new(),
+                list_sessions_error: None,
+                loadable_sessions: Vec::new(),
+                load_reject_ids: Vec::new(),
+                created: Arc::clone(&created),
+                deleted: Arc::clone(&deleted),
+                submitted: Arc::clone(&submitted),
+                list_calls: Arc::new(StdMutex::new(0)),
+                load_calls: Arc::new(StdMutex::new(Vec::new())),
+                submit_response: "SHOULD NOT BE USED".to_string(),
+                submit_error: None,
+                submit_never: false,
+                cancellation_safe: true,
+                sink_set_states: Arc::new(StdMutex::new(Vec::new())),
+                delete_error: None,
+            };
+            let boxed: Box<dyn crate::cli::agent::AgentClient + Send + Sync> = Box::new(fake);
+            let app = Arc::new(Mutex::new(App {
+                workspaces: vec![crate::cli::workspace::Workspace {
+                    id: 0,
+                    config: crate::cli::workspace::WorkspaceConfig {
+                        id: Some("ws-alpha".to_string()),
+                        name: "alpha".to_string(),
+                        backend: crate::cli::workspace::Backend::Openclaw,
+                        url: "ws://gateway.example".to_string(),
+                        token_env: None,
+                        token: None,
+                        label: None,
+                        namespace_aliases: Vec::new(),
+                    },
+                    client: Some(Arc::new(Mutex::new(boxed))),
+                    cron: None,
+                }],
+                active: 0,
+                shared_mnemos: None,
+                config_path: std::path::PathBuf::from("test-config.toml"),
+            }));
+
+            let splash = connect_splash_for_workspace_if_enabled(
+                &app,
+                "alpha",
+                None,
+                ConnectSplashPolicy {
+                    display: true,
+                    backend: false,
+                },
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(
+                splash.as_deref(),
+                Some(delighters::local_connect_splash("alpha").as_str())
+            );
+            assert!(created.lock().unwrap().is_empty());
+            assert!(submitted.lock().unwrap().is_empty());
+            assert!(deleted.lock().unwrap().is_empty());
+            let path = delighters::default_connect_splash_cache_path("alpha").unwrap();
+            assert!(!path.exists());
         });
 
         match old_home {
@@ -8133,7 +8243,10 @@ mod tests {
                 &session.name,
                 &sink,
                 &handler,
-                true,
+                ConnectSplashPolicy {
+                    display: true,
+                    backend: true,
+                },
             )
             .await;
 
@@ -8419,7 +8532,10 @@ mod tests {
                 &active_session.name,
                 &sink,
                 &handler,
-                true,
+                ConnectSplashPolicy {
+                    display: true,
+                    backend: true,
+                },
             )
             .await;
 
@@ -8574,7 +8690,10 @@ mod tests {
                     &active_session.name,
                     &sink,
                     &handler,
-                    true,
+                    ConnectSplashPolicy {
+                        display: true,
+                        backend: true,
+                    },
                 ),
             )
             .await
@@ -8917,7 +9036,10 @@ mod tests {
                 "fallback",
                 &sink,
                 &handler,
-                true,
+                ConnectSplashPolicy {
+                    display: true,
+                    backend: true,
+                },
             )
             .await;
 
@@ -9045,7 +9167,10 @@ mod tests {
                 &active.name,
                 &event_tx,
                 &handler,
-                true,
+                ConnectSplashPolicy {
+                    display: true,
+                    backend: true,
+                },
             )
             .await;
         });

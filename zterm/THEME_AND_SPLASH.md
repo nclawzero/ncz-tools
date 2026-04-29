@@ -10,14 +10,15 @@
 > runtime palette presets, `~/.zterm/theme.toml`, cached
 > connect-splash text at `~/.zterm/cache/connect-splash/`, and
 > `~/.zterm/state.toml` for launch count plus `beep_on_error`. The
-> v0.3.1 connect splash asks the active backend for period-style text
-> through a bounded scratch session, caches only confirmed generated
-> output for 24h, and falls back to a local modem sequence on timeout
-> or backend error before scratch-session cleanup. Cleanup failures
-> after backend state is created are surfaced to the UI instead of
-> silently falling back. Setting `[ui].splash_screen = false` disables
-> both the legacy ANSI splash and the TV connect-splash cache/backend
-> path. State writes use a
+> v0.3.1 connect splash defaults to a local modem sequence. Setting
+> `[ui].connect_splash_backend = true` opts into asking the active
+> backend for period-style text through a bounded scratch session,
+> caching only confirmed generated output for 24h, and falling back to
+> local text on backend errors before scratch-session cleanup. Cleanup
+> failures after backend state is created are surfaced to the UI
+> instead of silently falling back. Setting `[ui].splash_screen = false`
+> disables both the legacy ANSI splash and the TV connect-splash path.
+> State writes use a
 > bounded lock wait, and the TV path persists a mutation fence after
 > timed-out mutating slash commands until `/resync --force`.
 

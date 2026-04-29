@@ -206,6 +206,15 @@ pub fn scoped_session_history_pending_dir(
     Ok(scoped_session_dir(scope, session_id)?.join("history.incomplete.d"))
 }
 
+/// Cross-process lock held while a turn is being submitted and its
+/// terminal transcript entry is persisted.
+pub fn scoped_session_history_turn_lock_dir(
+    scope: &LocalWorkspaceScope,
+    session_id: &str,
+) -> Result<PathBuf> {
+    Ok(scoped_session_dir(scope, session_id)?.join("history.turn.lock"))
+}
+
 /// One pending marker owned by a single submitted turn.
 pub fn scoped_session_history_pending_marker_file(
     scope: &LocalWorkspaceScope,
@@ -216,6 +225,18 @@ pub fn scoped_session_history_pending_marker_file(
         return Err(anyhow!("unsafe turn marker id for local history marker"));
     }
     Ok(scoped_session_history_pending_dir(scope, session_id)?.join(marker_id))
+}
+
+#[derive(Debug)]
+#[must_use]
+pub struct ScopedSessionTurnLock {
+    lock_dir: PathBuf,
+}
+
+impl ScopedSessionTurnLock {
+    pub fn release(&self) -> Result<bool> {
+        release_scoped_session_turn_lock_path(&self.lock_dir)
+    }
 }
 
 /// Ensure config directory exists
@@ -481,6 +502,56 @@ pub fn mark_scoped_session_history_pending_turn(
     Ok(())
 }
 
+/// Atomically acquire a cross-process turn lock and write this turn's
+/// pending marker while the lock is held.
+pub fn acquire_scoped_session_history_turn_lock(
+    scope: &LocalWorkspaceScope,
+    session_id: &str,
+    marker_id: &str,
+    reason: &str,
+) -> Result<ScopedSessionTurnLock> {
+    if !is_safe_session_id(session_id) {
+        return Err(anyhow!("unsafe session id for local history lock"));
+    }
+    if !is_safe_session_id(marker_id) {
+        return Err(anyhow!("unsafe turn marker id for local history lock"));
+    }
+
+    ensure_scoped_session_dir(scope, session_id)?;
+    let lock_dir = scoped_session_history_turn_lock_dir(scope, session_id)?;
+    match fs::create_dir(&lock_dir) {
+        Ok(()) => {
+            harden_private_dirs(&lock_dir)?;
+            sync_parent_dir(&lock_dir).map_err(|e| {
+                anyhow!("Failed to sync session history turn lock directory: {}", e)
+            })?;
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(anyhow!(
+                "session `{session_id}` already has a turn in progress; wait for it to finish or run /clear if another zterm exited mid-turn"
+            ));
+        }
+        Err(e) => {
+            return Err(anyhow!(
+                "Failed to acquire session history turn lock: {}",
+                e
+            ))
+        }
+    }
+
+    if let Err(e) = ensure_scoped_session_history_complete(scope, session_id) {
+        let _ = release_scoped_session_turn_lock_path(&lock_dir);
+        return Err(e);
+    }
+
+    if let Err(e) = mark_scoped_session_history_pending_turn(scope, session_id, marker_id, reason) {
+        let _ = release_scoped_session_turn_lock_path(&lock_dir);
+        return Err(e);
+    }
+
+    Ok(ScopedSessionTurnLock { lock_dir })
+}
+
 /// True when `/save` should refuse to export this scoped transcript.
 pub fn scoped_session_history_is_incomplete(
     scope: &LocalWorkspaceScope,
@@ -618,6 +689,25 @@ pub fn clear_scoped_session_history_pending_turn_marker(
     Ok(removed)
 }
 
+fn release_scoped_session_turn_lock_path(lock_dir: &Path) -> Result<bool> {
+    match fs::remove_dir(lock_dir) {
+        Ok(()) => {
+            sync_parent_dir(lock_dir).map_err(|e| {
+                anyhow!(
+                    "Failed to sync session history turn lock parent after release: {}",
+                    e
+                )
+            })?;
+            Ok(true)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(anyhow!(
+            "Failed to release session history turn lock: {}",
+            e
+        )),
+    }
+}
+
 /// Remove workspace-scoped transcript history for a session, leaving metadata intact.
 pub fn clear_scoped_session_history(scope: &LocalWorkspaceScope, session_id: &str) -> Result<bool> {
     clear_scoped_session_history_with_sync(scope, session_id, sync_parent_dir)
@@ -699,6 +789,20 @@ where
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(anyhow!("Failed to clear session history: {}", e)),
+    }
+    let lock_dir = scoped_session_history_turn_lock_dir(scope, session_id)?;
+    match fs::remove_dir(&lock_dir) {
+        Ok(()) => {
+            removed = true;
+            sync_removed_path_parent(&lock_dir).map_err(|e| {
+                anyhow!(
+                    "Failed to sync session history turn lock parent after clear: {}",
+                    e
+                )
+            })?;
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(anyhow!("Failed to clear session history turn lock: {}", e)),
     }
     Ok(removed)
 }
@@ -1187,6 +1291,52 @@ mod tests {
             clear_scoped_session_history_pending_turn_marker(&scope, "main", "turn-b").unwrap()
         );
         assert!(!scoped_session_history_is_incomplete(&scope, "main").unwrap());
+    }
+
+    #[test]
+    fn turn_lock_serializes_pending_marker_acquisition() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let scope = scope(&format!("turn-lock-{}", uuid::Uuid::new_v4()));
+
+        let lock =
+            acquire_scoped_session_history_turn_lock(&scope, "main", "turn-a", "turn A pending")
+                .unwrap();
+        assert!(scoped_session_history_is_incomplete(&scope, "main").unwrap());
+        assert!(scoped_session_history_turn_lock_dir(&scope, "main")
+            .unwrap()
+            .exists());
+
+        let err =
+            acquire_scoped_session_history_turn_lock(&scope, "main", "turn-b", "turn B pending")
+                .unwrap_err();
+        assert!(err.to_string().contains("turn in progress"));
+
+        lock.release().unwrap();
+        clear_scoped_session_history_pending_turn_marker(&scope, "main", "turn-a").unwrap();
+        acquire_scoped_session_history_turn_lock(&scope, "main", "turn-b", "turn B pending")
+            .unwrap()
+            .release()
+            .unwrap();
+    }
+
+    #[test]
+    fn clear_scoped_history_removes_turn_lock() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let scope = scope(&format!("clear-turn-lock-{}", uuid::Uuid::new_v4()));
+
+        let lock =
+            acquire_scoped_session_history_turn_lock(&scope, "main", "turn-a", "turn A pending")
+                .unwrap();
+        assert!(scoped_session_history_turn_lock_dir(&scope, "main")
+            .unwrap()
+            .exists());
+
+        assert!(clear_scoped_session_history(&scope, "main").unwrap());
+        assert!(!scoped_session_history_turn_lock_dir(&scope, "main")
+            .unwrap()
+            .exists());
+        assert!(!scoped_session_history_is_incomplete(&scope, "main").unwrap());
+        assert!(!lock.release().unwrap());
     }
 
     #[test]

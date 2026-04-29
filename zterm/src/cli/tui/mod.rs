@@ -282,6 +282,11 @@ pub async fn run(
         .and_then(|v| v.get("splash_screen"))
         .and_then(|v| v.as_bool())
         .unwrap_or(true); // Default: show splash
+    let backend_connect_splash = config
+        .get("ui")
+        .and_then(|v| v.get("connect_splash_backend"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     if show_splash {
         splash::display_splash(&session_name, &active_gateway_url, &model, &provider);
@@ -294,7 +299,15 @@ pub async fn run(
         let mut repl = repl::ReplLoop::new(shared_app, session, model, provider)?;
         repl.run().await?;
     } else {
-        tv_ui::run(shared_app, session, model, provider, show_splash).await?;
+        tv_ui::run(
+            shared_app,
+            session,
+            model,
+            provider,
+            show_splash,
+            backend_connect_splash,
+        )
+        .await?;
     }
 
     Ok(())
