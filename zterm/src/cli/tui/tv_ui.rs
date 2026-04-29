@@ -69,6 +69,8 @@ use crate::cli::tui::delighters;
 use crate::cli::tui::themes;
 use crate::cli::workspace::App;
 
+type SharedAgentClient = Arc<Mutex<Box<dyn AgentClient + Send + Sync>>>;
+
 /// TUI → worker: user-initiated actions the worker should dispatch
 /// against the active workspace. Unified envelope so the TUI holds
 /// only one `Sender` and the worker matches on one type.
@@ -1039,8 +1041,10 @@ async fn run_worker_command_with_deadline<F>(
 
 fn spawn_connect_splash_typewriter(
     app: Arc<Mutex<App>>,
+    client: Option<SharedAgentClient>,
     worker_sink: StreamSink,
     workspace_name: String,
+    workspace_id: Option<String>,
     policy: ConnectSplashPolicy,
 ) {
     if !policy.display {
@@ -1048,14 +1052,17 @@ fn spawn_connect_splash_typewriter(
     }
 
     tokio::spawn(async move {
-        match connect_splash_for_workspace_if_enabled(
-            &app,
+        let result = connect_splash_for_captured_workspace(
+            client,
             &workspace_name,
             Some(worker_sink.clone()),
             policy,
         )
-        .await
-        {
+        .await;
+        if !workspace_still_active(&app, &workspace_name, workspace_id.as_deref()).await {
+            return;
+        }
+        match result {
             Ok(Some(splash)) => {
                 let _ =
                     send_worker_chunk_reliably(&worker_sink, TurnChunk::Typewriter(splash)).await;
@@ -1262,11 +1269,14 @@ async fn handle_worker_command_request(
                             .await;
                             return;
                         }
-                        if let Some((name, _)) = switched_workspace {
+                        if let Some((name, workspace_id)) = switched_workspace {
+                            let client = active_workspace_client_for_worker(worker_app).await;
                             spawn_connect_splash_typewriter(
                                 Arc::clone(worker_app),
+                                client,
                                 worker_sink.clone(),
                                 name,
+                                workspace_id,
                                 connect_splash_policy,
                             );
                         }
@@ -1467,6 +1477,26 @@ async fn connect_splash_for_workspace_if_enabled(
         .map(Some)
 }
 
+async fn connect_splash_for_captured_workspace(
+    client: Option<SharedAgentClient>,
+    workspace_name: &str,
+    restore_sink: Option<StreamSink>,
+    policy: ConnectSplashPolicy,
+) -> Result<Option<String>> {
+    if !policy.display {
+        return Ok(None);
+    }
+    if !policy.backend {
+        return Ok(Some(delighters::local_connect_splash(workspace_name)));
+    }
+    let Some(client) = client else {
+        return Ok(Some(delighters::local_connect_splash(workspace_name)));
+    };
+    connect_splash_for_workspace_with_client(client, workspace_name, restore_sink)
+        .await
+        .map(Some)
+}
+
 async fn generate_connect_splash_from_active_backend(
     app: &Arc<Mutex<App>>,
     workspace_name: &str,
@@ -1478,6 +1508,14 @@ async fn generate_connect_splash_from_active_backend(
     }
     .ok_or_else(|| anyhow::anyhow!("no active workspace client"))?;
 
+    generate_connect_splash_from_client(client, workspace_name, restore_sink).await
+}
+
+async fn generate_connect_splash_from_client(
+    client: SharedAgentClient,
+    workspace_name: &str,
+    restore_sink: Option<StreamSink>,
+) -> Result<String> {
     let mut locked = client.lock().await;
     if !locked.submit_turn_is_cancellation_safe() {
         anyhow::bail!("active backend does not support cancellable splash generation");
@@ -1490,6 +1528,24 @@ async fn generate_connect_splash_from_active_backend(
         None => locked.set_stream_sink(None),
     }
     result
+}
+
+async fn connect_splash_for_workspace_with_client(
+    client: SharedAgentClient,
+    workspace_name: &str,
+    restore_sink: Option<StreamSink>,
+) -> Result<String> {
+    match generate_connect_splash_from_client(client, workspace_name, restore_sink).await {
+        Ok(generated) => Ok(generated),
+        Err(e) if is_connect_splash_cleanup_failure(&e) => {
+            warn!("connect-splash cleanup failed after creating backend state: {e}");
+            Err(e)
+        }
+        Err(e) => {
+            warn!("connect-splash backend generation failed: {e}; using local fallback");
+            Ok(delighters::local_connect_splash(workspace_name))
+        }
+    }
 }
 
 async fn generate_connect_splash_with_client(
@@ -2030,12 +2086,32 @@ async fn status_snapshot_for_worker(
     Some((workspace, workspace_id, model))
 }
 
+async fn active_workspace_client_for_worker(app: &Arc<Mutex<App>>) -> Option<SharedAgentClient> {
+    let guard = app.lock().await;
+    guard.active_workspace()?.client.clone()
+}
+
 async fn active_workspace_identity_for_worker(
     app: &Arc<Mutex<App>>,
 ) -> Option<(String, Option<String>)> {
     let guard = app.lock().await;
     let workspace = guard.active_workspace()?;
     Some((workspace.config.name.clone(), workspace.config.id.clone()))
+}
+
+async fn workspace_still_active(
+    app: &Arc<Mutex<App>>,
+    expected_name: &str,
+    expected_id: Option<&str>,
+) -> bool {
+    let guard = app.lock().await;
+    let Some(workspace) = guard.active_workspace() else {
+        return false;
+    };
+    match expected_id {
+        Some(id) => workspace.config.id.as_deref() == Some(id),
+        None => workspace.config.name == expected_name,
+    }
 }
 
 async fn remembered_session_id_for_active_workspace(
@@ -8714,6 +8790,170 @@ mod tests {
             tokio::task::yield_now().await;
             if !beta_submitted.lock().unwrap().is_empty() {
                 assert!(beta_deleted.lock().unwrap().is_empty());
+            }
+        });
+
+        match old_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    #[test]
+    fn stale_workspace_switch_splash_does_not_target_new_active_client() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let alpha_fake = WorkerSessionFakeClient {
+                listed_sessions: Vec::new(),
+                list_sessions_error: None,
+                loadable_sessions: Vec::new(),
+                load_reject_ids: Vec::new(),
+                created: Arc::new(StdMutex::new(Vec::new())),
+                deleted: Arc::new(StdMutex::new(Vec::new())),
+                submitted: Arc::new(StdMutex::new(Vec::new())),
+                list_calls: Arc::new(StdMutex::new(0)),
+                load_calls: Arc::new(StdMutex::new(Vec::new())),
+                submit_response: String::new(),
+                submit_error: None,
+                submit_never: false,
+                cancellation_safe: true,
+                sink_set_states: Arc::new(StdMutex::new(Vec::new())),
+                delete_error: None,
+            };
+            let beta_submitted = Arc::new(StdMutex::new(Vec::new()));
+            let beta_fake = WorkerSessionFakeClient {
+                listed_sessions: Vec::new(),
+                list_sessions_error: None,
+                loadable_sessions: Vec::new(),
+                load_reject_ids: Vec::new(),
+                created: Arc::new(StdMutex::new(Vec::new())),
+                deleted: Arc::new(StdMutex::new(Vec::new())),
+                submitted: Arc::clone(&beta_submitted),
+                list_calls: Arc::new(StdMutex::new(0)),
+                load_calls: Arc::new(StdMutex::new(Vec::new())),
+                submit_response: "SHOULD NOT BE USED".to_string(),
+                submit_error: None,
+                submit_never: true,
+                cancellation_safe: true,
+                sink_set_states: Arc::new(StdMutex::new(Vec::new())),
+                delete_error: None,
+            };
+            let gamma_submitted = Arc::new(StdMutex::new(Vec::new()));
+            let gamma_fake = WorkerSessionFakeClient {
+                listed_sessions: Vec::new(),
+                list_sessions_error: None,
+                loadable_sessions: Vec::new(),
+                load_reject_ids: Vec::new(),
+                created: Arc::new(StdMutex::new(Vec::new())),
+                deleted: Arc::new(StdMutex::new(Vec::new())),
+                submitted: Arc::clone(&gamma_submitted),
+                list_calls: Arc::new(StdMutex::new(0)),
+                load_calls: Arc::new(StdMutex::new(Vec::new())),
+                submit_response: "GAMMA SHOULD NOT BE USED".to_string(),
+                submit_error: None,
+                submit_never: false,
+                cancellation_safe: true,
+                sink_set_states: Arc::new(StdMutex::new(Vec::new())),
+                delete_error: None,
+            };
+            let app = Arc::new(Mutex::new(App {
+                workspaces: vec![
+                    crate::cli::workspace::Workspace {
+                        id: 0,
+                        config: crate::cli::workspace::WorkspaceConfig {
+                            id: Some("ws-alpha".to_string()),
+                            name: "alpha".to_string(),
+                            backend: crate::cli::workspace::Backend::Openclaw,
+                            url: "ws://alpha.example".to_string(),
+                            token_env: None,
+                            token: None,
+                            label: None,
+                            namespace_aliases: Vec::new(),
+                        },
+                        client: Some(Arc::new(Mutex::new(Box::new(alpha_fake)))),
+                        cron: None,
+                    },
+                    crate::cli::workspace::Workspace {
+                        id: 1,
+                        config: crate::cli::workspace::WorkspaceConfig {
+                            id: Some("ws-beta".to_string()),
+                            name: "beta".to_string(),
+                            backend: crate::cli::workspace::Backend::Openclaw,
+                            url: "ws://beta.example".to_string(),
+                            token_env: None,
+                            token: None,
+                            label: None,
+                            namespace_aliases: Vec::new(),
+                        },
+                        client: Some(Arc::new(Mutex::new(Box::new(beta_fake)))),
+                        cron: None,
+                    },
+                    crate::cli::workspace::Workspace {
+                        id: 2,
+                        config: crate::cli::workspace::WorkspaceConfig {
+                            id: Some("ws-gamma".to_string()),
+                            name: "gamma".to_string(),
+                            backend: crate::cli::workspace::Backend::Openclaw,
+                            url: "ws://gamma.example".to_string(),
+                            token_env: None,
+                            token: None,
+                            label: None,
+                            namespace_aliases: Vec::new(),
+                        },
+                        client: Some(Arc::new(Mutex::new(Box::new(gamma_fake)))),
+                        cron: None,
+                    },
+                ],
+                active: 0,
+                shared_mnemos: None,
+                config_path: std::path::PathBuf::from("test-config.toml"),
+            }));
+            let active_session = Session {
+                id: "main".to_string(),
+                name: "Main".to_string(),
+                model: "model".to_string(),
+                provider: "provider".to_string(),
+            };
+            let workspace_key = current_workspace_binding_key(&app).await.unwrap();
+            let mut bindings = HashMap::new();
+            remember_worker_session(&mut bindings, workspace_key, &active_session);
+            let handler = CommandHandler::new(Arc::clone(&app));
+            let (sink, mut rx) = StreamSink::channel(32);
+
+            handle_worker_command_request(
+                "/workspace switch beta".to_string(),
+                &app,
+                &mut bindings,
+                &active_session.name,
+                &sink,
+                &handler,
+                ConnectSplashPolicy {
+                    display: true,
+                    backend: true,
+                },
+            )
+            .await;
+            app.lock().await.active = 2;
+            tokio::task::yield_now().await;
+
+            let mut typewriter_chunks = 0usize;
+            while let Ok(chunk) = rx.try_recv() {
+                if matches!(chunk, TurnChunk::Typewriter(_)) {
+                    typewriter_chunks += 1;
+                }
+            }
+
+            assert_eq!(typewriter_chunks, 0);
+            assert!(gamma_submitted.lock().unwrap().is_empty());
+            if !beta_submitted.lock().unwrap().is_empty() {
+                assert!(beta_submitted.lock().unwrap()[0]
+                    .1
+                    .contains("workspace named `beta`"));
             }
         });
 
