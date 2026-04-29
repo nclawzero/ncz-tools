@@ -1066,7 +1066,6 @@ async fn collect_turn_result(
 ) -> anyhow::Result<()> {
     let deadline = tokio::time::Instant::now() + timeout;
     let mut saw_terminal_completion = false;
-    let mut saw_uncorrelated_assistant_message = false;
     let mut expected_message_id: Option<String> = expected_ack_message_id.map(str::to_string);
     let mut pending_runless_messages: Vec<BufferedAssistantMessage> = Vec::new();
     let mut pending_runless_bytes = 0usize;
@@ -1074,12 +1073,7 @@ async fn collect_turn_result(
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
-            return finish_completed_or_timeout(
-                timeout,
-                turn,
-                saw_terminal_completion,
-                saw_uncorrelated_assistant_message,
-            );
+            return finish_completed_or_timeout(timeout, turn, saw_terminal_completion);
         }
 
         let rx_res = tokio::time::timeout(remaining, event_rx.recv()).await;
@@ -1087,12 +1081,7 @@ async fn collect_turn_result(
             Ok(Some(ev)) => ev,
             Ok(None) => anyhow::bail!("openclaw: event channel closed mid-stream"),
             Err(_) => {
-                return finish_completed_or_timeout(
-                    timeout,
-                    turn,
-                    saw_terminal_completion,
-                    saw_uncorrelated_assistant_message,
-                );
+                return finish_completed_or_timeout(timeout, turn, saw_terminal_completion);
             }
         };
 
@@ -1113,7 +1102,7 @@ async fn collect_turn_result(
                     &mut pending_runless_bytes,
                     expected_message_id.as_deref(),
                 )?;
-                if turn_completion_can_finish(turn, saw_uncorrelated_assistant_message) {
+                if turn_completion_can_finish(turn) {
                     return Ok(());
                 }
             }
@@ -1187,7 +1176,6 @@ async fn collect_turn_result(
                     tracing::debug!(
                         "openclaw: ignoring runId-less assistant message for session {session_key} without explicit run/message correlation"
                     );
-                    saw_uncorrelated_assistant_message = true;
                     continue;
                 }
             }
@@ -1201,8 +1189,7 @@ async fn collect_turn_result(
         // Text-bearing events can be deltas or intermediate snapshots;
         // success still requires the expected run/message completion
         // marker so we do not truncate a streaming reply.
-        if message_completed && turn_completion_can_finish(turn, saw_uncorrelated_assistant_message)
-        {
+        if message_completed && turn_completion_can_finish(turn) {
             return Ok(());
         }
         tracing::debug!(
@@ -1537,22 +1524,16 @@ fn turn_can_finish(turn: &super::handshake::TurnResult) -> bool {
     !turn.text.is_empty() || turn_can_finish_without_text(turn)
 }
 
-fn turn_completion_can_finish(
-    turn: &super::handshake::TurnResult,
-    saw_uncorrelated_assistant_message: bool,
-) -> bool {
-    turn_can_finish(turn) || !saw_uncorrelated_assistant_message
+fn turn_completion_can_finish(turn: &super::handshake::TurnResult) -> bool {
+    turn_can_finish(turn)
 }
 
 fn finish_completed_or_timeout(
     timeout: std::time::Duration,
     turn: &super::handshake::TurnResult,
     saw_terminal_completion: bool,
-    saw_uncorrelated_assistant_message: bool,
 ) -> anyhow::Result<()> {
-    if saw_terminal_completion
-        && turn_completion_can_finish(turn, saw_uncorrelated_assistant_message)
-    {
+    if saw_terminal_completion && turn_completion_can_finish(turn) {
         return Ok(());
     }
     anyhow::bail!(
@@ -2965,7 +2946,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn collect_turn_result_accepts_completion_only_run() {
+    async fn collect_turn_result_rejects_completion_only_run() {
         let (event_tx, mut event_rx) = mpsc::channel::<super::super::wire::EventFrame>(1);
         event_tx
             .send(run_completed_event("session-a", "current-run"))
@@ -2976,7 +2957,7 @@ mod tests {
             run_id: Some("current-run".to_string()),
             ..Default::default()
         };
-        collect_turn_result(
+        let err = collect_turn_result(
             &mut event_rx,
             "session-a",
             "current-run",
@@ -2986,8 +2967,9 @@ mod tests {
             &mut turn,
         )
         .await
-        .expect("completion-only run should finish as an empty successful turn");
+        .expect_err("completion-only run should fail closed instead of persisting a blank turn");
 
+        assert!(err.to_string().contains("timed out"));
         assert_eq!(turn.run_id.as_deref(), Some("current-run"));
         assert!(turn.text.is_empty());
         assert!(turn.tool_calls.is_empty());
