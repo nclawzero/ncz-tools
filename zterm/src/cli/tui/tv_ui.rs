@@ -1086,6 +1086,13 @@ async fn handle_worker_command_request(
         Ok(Some(text)) => {
             let model_switched = successful_model_switch_command(&cmdline, &text);
             let command_failed = command_output_indicates_error(&text);
+            let command_terminal_error = command_failed.then(|| {
+                if command_failure_requires_mutation_fence(&cmdline, &text) {
+                    mutating_command_unknown_outcome_message(&cmdline, &text)
+                } else {
+                    COMMAND_ERROR_ALREADY_RENDERED.to_string()
+                }
+            });
             let _ = worker_sink.send(TurnChunk::Token(text));
             let mut workspace_switched = false;
             if preflight == CommandSessionPreflight::AfterWorkspaceSwitch {
@@ -1132,9 +1139,8 @@ async fn handle_worker_command_request(
                     });
                 }
             }
-            if command_failed {
-                send_worker_finished(worker_sink, Err(COMMAND_ERROR_ALREADY_RENDERED.to_string()))
-                    .await;
+            if let Some(command_terminal_error) = command_terminal_error {
+                send_worker_finished(worker_sink, Err(command_terminal_error)).await;
             } else {
                 send_worker_finished(worker_sink, Ok(String::new())).await;
             }
@@ -1421,6 +1427,42 @@ fn command_output_indicates_error(output: &str) -> bool {
         || output
             .lines()
             .any(|line| line.trim_start().starts_with("❌"))
+}
+
+fn command_failure_requires_mutation_fence(cmdline: &str, rendered_text: &str) -> bool {
+    slash_command_may_mutate_state(cmdline)
+        && command_output_indicates_error(rendered_text)
+        && rendered_command_error_indicates_transport_uncertainty(rendered_text)
+}
+
+fn rendered_command_error_indicates_transport_uncertainty(rendered_text: &str) -> bool {
+    let lower = rendered_text.to_ascii_lowercase();
+    [
+        "timed out",
+        "timeout",
+        "deadline",
+        "request failed",
+        "connection refused",
+        "connection reset",
+        "connection closed",
+        "network unreachable",
+        "temporary failure",
+        "transport",
+        "read failed",
+        "send failed",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn mutating_command_unknown_outcome_message(cmdline: &str, rendered_text: &str) -> String {
+    let rendered = sanitize_terminal_text(rendered_text.trim());
+    format!(
+        "{} Backend/client returned a transport error after dispatch: {}",
+        SlashCommandDeadline::mutating(MUTATING_COMMAND_WORKER_TIMEOUT)
+            .timeout_message(Some(cmdline)),
+        rendered
+    )
 }
 
 async fn install_stream_sink_on_active_client(app: &Arc<Mutex<App>>, sink: StreamSink) -> bool {
@@ -1844,6 +1886,7 @@ fn submit_error_requires_incomplete_transcript(message: &str, forwarded_token: b
     forwarded_token
         || turn_collection_failure_requires_incomplete_transcript(message)
         || openclaw_submit_failure_requires_incomplete_transcript(message)
+        || zeroclaw_post_send_failure_requires_incomplete_transcript(message)
         || response_size_failure_requires_incomplete_transcript(message)
 }
 
@@ -1857,6 +1900,12 @@ fn response_size_failure_requires_incomplete_transcript(message: &str) -> bool {
     message.contains("response exceeded")
         || message.contains("response frame exceeded")
         || message.contains("TUI stream limit")
+}
+
+fn zeroclaw_post_send_failure_requires_incomplete_transcript(message: &str) -> bool {
+    message.contains("WebSocket turn timed out")
+        || message.contains("WebSocket read failed")
+        || message.contains("WebSocket closed before a response completed")
 }
 
 #[derive(Debug)]
@@ -5469,6 +5518,34 @@ mod tests {
     }
 
     #[test]
+    fn mutating_rendered_transport_error_requires_fence() {
+        let timeout_text =
+            "❌ Failed to create cron job: Request timed out. Check your connection.\n";
+        assert!(command_failure_requires_mutation_fence(
+            "/cron add '0 9 * * *' 'standup'",
+            timeout_text
+        ));
+        assert!(command_failure_requires_mutation_fence(
+            "/memory delete mem_1",
+            "❌ Delete failed: request failed: connection closed\n"
+        ));
+        assert!(!command_failure_requires_mutation_fence(
+            "/cron list",
+            timeout_text
+        ));
+        assert!(!command_failure_requires_mutation_fence(
+            "/cron add '0 9 * * *' 'standup'",
+            "❌ Failed to create cron job: HTTP 400\n"
+        ));
+
+        let message = mutating_command_unknown_outcome_message(
+            "/cron add '0 9 * * *' 'standup'",
+            timeout_text,
+        );
+        assert!(mutation_timeout_requires_fence(&message));
+    }
+
+    #[test]
     fn spinner_advances_only_after_interval_and_wraps() {
         assert!(!should_advance_spinner(
             SPINNER_INTERVAL - Duration::from_millis(1)
@@ -6058,6 +6135,24 @@ mod tests {
 
         assert!(message.contains("transcript marked incomplete"));
         assert!(storage::scoped_session_history_is_incomplete(&scope, "main").unwrap());
+    }
+
+    #[test]
+    fn zeroclaw_post_send_failures_mark_history_incomplete_without_tokens() {
+        for reason in [
+            "WebSocket turn timed out after 30s before a response completed",
+            "WebSocket read failed: connection reset",
+            "WebSocket closed before a response completed",
+        ] {
+            assert!(
+                submit_error_requires_incomplete_transcript(reason, false),
+                "{reason}"
+            );
+        }
+        assert!(!submit_error_requires_incomplete_transcript(
+            "WebSocket send failed: connection refused",
+            false
+        ));
     }
 
     #[test]
