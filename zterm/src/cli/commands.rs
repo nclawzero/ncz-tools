@@ -734,8 +734,12 @@ impl CommandHandler {
                         let id = result
                             .get("id")
                             .and_then(|v| v.as_str())
+                            .filter(|s| !s.trim().is_empty())
                             .map(|s| s.to_string())
-                            .unwrap_or_else(|| "(unknown id)".to_string());
+                            .unwrap_or_else(|| {
+                                mutation_outcome_unknown = true;
+                                "(unknown id)".to_string()
+                            });
                         out.push_str(&format!("📝 Memory saved: {id}\n"));
                     }
                     Err(e) => out.push_str(&format!("❌ Failed to save memory: {e}\n")),
@@ -2268,7 +2272,7 @@ fn format_memory_list(memories: &[serde_json::Value]) -> String {
         let id = mem.get("id").and_then(|v| v.as_str()).unwrap_or("?");
         let content = mem.get("content").and_then(|v| v.as_str()).unwrap_or("");
         let category = mem.get("category").and_then(|v| v.as_str()).unwrap_or("");
-        let short_id = if id.len() > 12 { &id[..12] } else { id };
+        let short_id: String = id.chars().take(12).collect();
         let preview: String = content.chars().take(80).collect();
         let suffix = if content.chars().count() > 80 {
             "…"
@@ -2439,6 +2443,43 @@ mod tests {
             .output
             .unwrap()
             .contains("Failed to create cron job: Failed to parse response"));
+    }
+
+    #[tokio::test]
+    async fn memory_post_success_status_without_id_marks_unknown_outcome() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/memories")
+            .with_status(201)
+            .with_body("{not-json")
+            .create_async()
+            .await;
+        let mnemos = crate::cli::mnemos::MnemosClient::new(server.url(), "test_token");
+        let handler = super::CommandHandler::new(app_with_fake_client_and_mnemos(mnemos).await);
+
+        let result = handler
+            .handle_with_outcome("/memory post 'remember this' --category work", "main")
+            .await
+            .unwrap();
+
+        assert!(result.mutation_outcome_unknown);
+        assert!(result
+            .output
+            .unwrap()
+            .contains("Memory saved: (unknown id)"));
+    }
+
+    #[test]
+    fn memory_list_truncates_unicode_ids_on_char_boundaries() {
+        let memories = vec![serde_json::json!({
+            "id": "memory-😀😀",
+            "content": "hello",
+            "category": "work"
+        })];
+
+        let out = super::format_memory_list(&memories);
+
+        assert!(out.contains("[memory-😀😀]"));
     }
 
     #[test]
@@ -2773,6 +2814,14 @@ mod tests {
     async fn app_with_fake_client_and_cron(cron: ZeroclawClient) -> Arc<Mutex<App>> {
         let app = app_with_fake_client(FakeAgentClient::default());
         app.lock().await.workspaces[0].cron = Some(cron);
+        app
+    }
+
+    async fn app_with_fake_client_and_mnemos(
+        mnemos: crate::cli::mnemos::MnemosClient,
+    ) -> Arc<Mutex<App>> {
+        let app = app_with_fake_client(FakeAgentClient::default());
+        app.lock().await.shared_mnemos = Some(mnemos);
         app
     }
 
