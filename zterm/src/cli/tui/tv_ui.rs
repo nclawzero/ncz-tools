@@ -1926,7 +1926,7 @@ async fn turn_session_id_for_active_workspace(
         return Ok(binding.id.clone());
     }
 
-    let session = create_new_session_for_worker(app, fallback_session_name).await?;
+    let session = resolve_or_create_session_for_worker(app, fallback_session_name).await?;
     remember_worker_session(sessions, workspace_key, &session);
     Ok(session.id)
 }
@@ -7687,6 +7687,84 @@ mod tests {
                 submitted.lock().unwrap().as_slice(),
                 [("active-id".to_string(), "hello".to_string())]
             );
+        });
+    }
+
+    #[test]
+    fn turn_session_rebinds_unique_backend_session_after_resync_drops_stale_binding() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let stale = Session {
+                id: "stale-id".to_string(),
+                name: "Main".to_string(),
+                model: "model".to_string(),
+                provider: "provider".to_string(),
+            };
+            let existing = Session {
+                id: "backend-main".to_string(),
+                name: "Main".to_string(),
+                model: "model".to_string(),
+                provider: "provider".to_string(),
+            };
+            let created = Arc::new(StdMutex::new(Vec::new()));
+            let deleted = Arc::new(StdMutex::new(Vec::new()));
+            let submitted = Arc::new(StdMutex::new(Vec::new()));
+            let list_calls = Arc::new(StdMutex::new(0));
+            let load_calls = Arc::new(StdMutex::new(Vec::new()));
+            let fake = WorkerSessionFakeClient {
+                listed_sessions: vec![existing.clone()],
+                list_sessions_error: None,
+                loadable_sessions: vec![existing.clone()],
+                load_reject_ids: Vec::new(),
+                created: Arc::clone(&created),
+                deleted,
+                submitted,
+                list_calls: Arc::clone(&list_calls),
+                load_calls: Arc::clone(&load_calls),
+            };
+            let boxed: Box<dyn crate::cli::agent::AgentClient + Send + Sync> = Box::new(fake);
+            let app = Arc::new(Mutex::new(App {
+                workspaces: vec![crate::cli::workspace::Workspace {
+                    id: 0,
+                    config: crate::cli::workspace::WorkspaceConfig {
+                        id: Some("ws-turn".to_string()),
+                        name: "turn-ws".to_string(),
+                        backend: crate::cli::workspace::Backend::Openclaw,
+                        url: "ws://gateway.example".to_string(),
+                        token_env: None,
+                        token: None,
+                        label: None,
+                        namespace_aliases: Vec::new(),
+                    },
+                    client: Some(Arc::new(Mutex::new(boxed))),
+                    cron: None,
+                }],
+                active: 0,
+                shared_mnemos: None,
+                config_path: std::path::PathBuf::from("test-config.toml"),
+            }));
+            let workspace_key = current_workspace_binding_key(&app).await.unwrap();
+            let mut bindings = HashMap::new();
+            remember_worker_session(&mut bindings, workspace_key.clone(), &stale);
+            let (sink, _rx) = StreamSink::channel(8);
+
+            resync_worker_state(&app, &mut bindings, &sink)
+                .await
+                .unwrap();
+            assert!(!bindings.contains_key(&workspace_key));
+
+            let turn_session_id = turn_session_id_for_active_workspace(&app, &mut bindings, "Main")
+                .await
+                .unwrap();
+
+            assert_eq!(turn_session_id, "backend-main");
+            assert_eq!(bindings[&workspace_key].id, "backend-main");
+            assert_eq!(*list_calls.lock().unwrap(), 2);
+            assert_eq!(
+                *load_calls.lock().unwrap(),
+                vec!["backend-main".to_string()]
+            );
+            assert!(created.lock().unwrap().is_empty());
         });
     }
 
