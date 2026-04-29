@@ -299,6 +299,7 @@ pub enum McpAction {
 #[derive(Subcommand, Debug)]
 pub enum BackupAction {
     /// Create a tar.gz backup archive.
+    #[non_exhaustive]
     Create {
         /// Archive path to write.
         #[arg(long)]
@@ -309,6 +310,12 @@ pub enum BackupAction {
         /// Skip Podman volume exports.
         #[arg(long)]
         exclude_volumes: bool,
+        /// Export Podman volumes without quiescing the owning service first.
+        ///
+        /// Faster, but risks capturing a volume mid-write. The default path stops
+        /// the systemd unit before `podman volume export` and restarts it after.
+        #[arg(long, conflicts_with = "exclude_volumes")]
+        unsafe_live_volumes: bool,
     },
     /// Verify manifest hashes in a backup archive.
     Verify {
