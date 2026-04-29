@@ -139,12 +139,26 @@ impl ReplLoop {
 
     async fn active_mutation_fence_reason(&self) -> Option<String> {
         let key = self.current_mutation_fence_key().await.ok()?;
-        match delighters::mutation_fence_for_workspace(&key) {
-            Ok(Some(fence)) => Some(fence.reason),
-            Ok(None) => None,
-            Err(e) => Some(format!(
-                "could not read zterm mutation-fence state: {e}; run /resync --force only after manual reconciliation"
-            )),
+        legacy_mutation_fence_reason_for_key(&key).or_else(|| {
+            legacy_mutation_fence_reason_for_key(crate::cli::tui::GLOBAL_MEMORY_MUTATION_FENCE_KEY)
+        })
+    }
+
+    async fn mutation_fence_key_for_command(&self, cmdline: &str) -> Result<String> {
+        if super::slash_command_uses_global_memory_fence(cmdline) {
+            Ok(crate::cli::tui::GLOBAL_MEMORY_MUTATION_FENCE_KEY.to_string())
+        } else {
+            self.current_mutation_fence_key().await
+        }
+    }
+
+    async fn mutation_fence_clear_keys(&self) -> Result<Vec<String>> {
+        let workspace_key = self.current_mutation_fence_key().await?;
+        let global_key = crate::cli::tui::GLOBAL_MEMORY_MUTATION_FENCE_KEY.to_string();
+        if workspace_key == global_key {
+            Ok(vec![workspace_key])
+        } else {
+            Ok(vec![workspace_key, global_key])
         }
     }
 
@@ -163,9 +177,14 @@ impl ReplLoop {
         reason: &str,
         old_owner: Option<&LegacyMutationFenceOwner>,
     ) -> String {
-        let key = match self.current_mutation_fence_key().await {
-            Ok(key) => key,
-            Err(e) => return format!("{reason}; failed to identify active workspace: {e}"),
+        let key = match old_owner {
+            Some(owner) if owner.key == crate::cli::tui::GLOBAL_MEMORY_MUTATION_FENCE_KEY => {
+                owner.key.clone()
+            }
+            _ => match self.current_mutation_fence_key().await {
+                Ok(key) => key,
+                Err(e) => return format!("{reason}; failed to identify active workspace: {e}"),
+            },
         };
         let dispatch_id = old_owner
             .map(|owner| owner.dispatch_id.as_str())
@@ -202,7 +221,7 @@ impl ReplLoop {
         &self,
         cmdline: &str,
     ) -> Result<LegacyMutationFenceOwner> {
-        let key = self.current_mutation_fence_key().await?;
+        let key = self.mutation_fence_key_for_command(cmdline).await?;
         let reason = legacy_write_ahead_mutation_fence_message(cmdline);
         let dispatch_id = delighters::new_mutation_fence_dispatch_id();
         let fence = legacy_mutation_fence_state_with_dispatch(cmdline, &reason, &dispatch_id);
@@ -228,8 +247,12 @@ impl ReplLoop {
         let force = tokens.len() == 2
             && matches!(tokens.get(1).map(String::as_str), Some("--force" | "force"));
         if force {
-            let key = self.current_mutation_fence_key().await?;
-            let result = delighters::force_clear_mutation_fence_for_workspace(&key)?;
+            let mut result = None;
+            for key in self.mutation_fence_clear_keys().await? {
+                result = Some(delighters::force_clear_mutation_fence_for_workspace(&key)?);
+            }
+            let result =
+                result.ok_or_else(|| anyhow::anyhow!("no mutation fence keys resolved"))?;
             let message = if let Some(path) = result.quarantined_state_path {
                 format!(
                     "[sync] unreadable zterm state moved to {}; mutation fence cleared by explicit /resync --force\n",
@@ -1063,6 +1086,16 @@ fn legacy_mutation_fence_workspace_key(workspace: &str, workspace_id: Option<&st
     match workspace_id {
         Some(id) if !id.trim().is_empty() => format!("id:{}", id.trim()),
         _ => format!("name:{workspace}"),
+    }
+}
+
+fn legacy_mutation_fence_reason_for_key(key: &str) -> Option<String> {
+    match delighters::mutation_fence_for_workspace(key) {
+        Ok(Some(fence)) => Some(fence.reason),
+        Ok(None) => None,
+        Err(e) => Some(format!(
+            "could not read zterm mutation-fence state: {e}; run /resync --force only after manual reconciliation"
+        )),
     }
 }
 
@@ -1982,6 +2015,127 @@ mod tests {
             );
             assert!(submitted.lock().unwrap().is_empty());
             assert!(deleted.lock().unwrap().is_empty());
+        });
+
+        match old_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    #[test]
+    fn legacy_repl_global_memory_fence_blocks_from_other_workspace() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let existing = delighters::MutationFenceState {
+                command: "/memory post remember".to_string(),
+                reason: "slash command outcome unknown".to_string(),
+                created_at_unix: 42,
+                dispatch_id: "global-dispatch".to_string(),
+            };
+            delighters::set_mutation_fence_for_workspace(
+                crate::cli::tui::GLOBAL_MEMORY_MUTATION_FENCE_KEY,
+                existing.clone(),
+            )
+            .unwrap();
+            let submitted = Arc::new(StdMutex::new(Vec::new()));
+            let deleted = Arc::new(StdMutex::new(Vec::new()));
+            let beta = session("beta-session", "chat");
+            let app = Arc::new(Mutex::new(App {
+                workspaces: vec![workspace(
+                    0,
+                    "beta",
+                    vec![beta.clone()],
+                    Arc::clone(&submitted),
+                    Arc::clone(&deleted),
+                )],
+                active: 0,
+                shared_mnemos: None,
+                config_path: PathBuf::from("test-config.toml"),
+            }));
+            let mut repl = ReplLoop::new(
+                Arc::clone(&app),
+                beta,
+                "model".to_string(),
+                "provider".to_string(),
+            )
+            .unwrap();
+
+            let out = repl
+                .handle_slash_command("/memory post remember")
+                .await
+                .unwrap()
+                .unwrap();
+
+            assert!(out.contains("mutation outcome is unknown"));
+            assert_eq!(
+                delighters::mutation_fence_for_workspace(
+                    crate::cli::tui::GLOBAL_MEMORY_MUTATION_FENCE_KEY
+                )
+                .unwrap(),
+                Some(existing)
+            );
+            assert!(submitted.lock().unwrap().is_empty());
+            assert!(deleted.lock().unwrap().is_empty());
+        });
+
+        match old_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    #[test]
+    fn legacy_repl_memory_write_ahead_fence_uses_global_key() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let submitted = Arc::new(StdMutex::new(Vec::new()));
+            let deleted = Arc::new(StdMutex::new(Vec::new()));
+            let alpha = session("alpha-session", "chat");
+            let app = Arc::new(Mutex::new(App {
+                workspaces: vec![workspace(
+                    0,
+                    "alpha",
+                    vec![alpha.clone()],
+                    Arc::clone(&submitted),
+                    Arc::clone(&deleted),
+                )],
+                active: 0,
+                shared_mnemos: None,
+                config_path: PathBuf::from("test-config.toml"),
+            }));
+            let repl = ReplLoop::new(
+                Arc::clone(&app),
+                alpha,
+                "model".to_string(),
+                "provider".to_string(),
+            )
+            .unwrap();
+
+            let owner = repl
+                .write_ahead_mutation_fence_for_dispatch("/memory post remember this")
+                .await
+                .unwrap();
+
+            assert_eq!(owner.key, crate::cli::tui::GLOBAL_MEMORY_MUTATION_FENCE_KEY);
+            assert!(delighters::mutation_fence_for_workspace(
+                crate::cli::tui::GLOBAL_MEMORY_MUTATION_FENCE_KEY
+            )
+            .unwrap()
+            .is_some());
+            assert!(delighters::mutation_fence_for_workspace("name:alpha")
+                .unwrap()
+                .is_none());
         });
 
         match old_home {

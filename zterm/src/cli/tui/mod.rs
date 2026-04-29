@@ -18,6 +18,18 @@ pub mod splash;
 pub mod themes;
 pub mod tv_ui;
 
+pub(crate) const GLOBAL_MEMORY_MUTATION_FENCE_KEY: &str = "global:mnemos";
+
+pub(crate) fn slash_command_uses_global_memory_fence(input: &str) -> bool {
+    let Ok(tokens) = tokenize_slash_command(input) else {
+        return false;
+    };
+    let command = tokens.first().map(String::as_str);
+    let subcommand = tokens.get(1).map(String::as_str);
+    matches!(command, Some("/memory"))
+        && matches!(subcommand, Some("post" | "add" | "delete" | "rm"))
+}
+
 pub(crate) fn mutation_fence_allows_recovery_input(input: &str) -> bool {
     let Ok(tokens) = tokenize_slash_command(input) else {
         return false;

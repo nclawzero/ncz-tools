@@ -4386,6 +4386,14 @@ fn mutation_fence_key_for_status(status_state: &StatusState) -> String {
     )
 }
 
+fn mutation_fence_key_for_command(status_state: &StatusState, cmdline: &str) -> String {
+    if super::slash_command_uses_global_memory_fence(cmdline) {
+        crate::cli::tui::GLOBAL_MEMORY_MUTATION_FENCE_KEY.to_string()
+    } else {
+        mutation_fence_key_for_status(status_state)
+    }
+}
+
 fn mutation_fence_now_unix() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -4433,7 +4441,7 @@ fn write_ahead_mutation_fence_for_dispatch(
     status_state: &mut StatusState,
     cmdline: &str,
 ) -> Result<MutationFenceOwner> {
-    let key = mutation_fence_key_for_status(status_state);
+    let key = mutation_fence_key_for_command(status_state, cmdline);
     let reason = write_ahead_mutation_fence_reason(cmdline);
     let dispatch_id = delighters::new_mutation_fence_dispatch_id();
     let fence = mutation_fence_state_for_command_with_dispatch(cmdline, &reason, &dispatch_id);
@@ -4455,8 +4463,14 @@ fn write_ahead_mutation_fence_for_dispatch(
 fn load_persisted_mutation_fence_for_status(
     status_state: &StatusState,
 ) -> Option<delighters::MutationFenceState> {
-    let key = mutation_fence_key_for_status(status_state);
-    match delighters::mutation_fence_for_workspace(&key) {
+    let workspace_key = mutation_fence_key_for_status(status_state);
+    load_persisted_mutation_fence_for_key(&workspace_key).or_else(|| {
+        load_persisted_mutation_fence_for_key(crate::cli::tui::GLOBAL_MEMORY_MUTATION_FENCE_KEY)
+    })
+}
+
+fn load_persisted_mutation_fence_for_key(key: &str) -> Option<delighters::MutationFenceState> {
+    match delighters::mutation_fence_for_workspace(key) {
         Ok(fence) => fence,
         Err(e) => Some(delighters::MutationFenceState {
             command: String::new(),
@@ -4536,7 +4550,12 @@ fn set_local_and_persisted_mutation_fence_replacing(
     reason: &str,
     old_owner: Option<&MutationFenceOwner>,
 ) {
-    let key = mutation_fence_key_for_status(status_state);
+    let key = match old_owner {
+        Some(owner) if owner.key == crate::cli::tui::GLOBAL_MEMORY_MUTATION_FENCE_KEY => {
+            owner.key.clone()
+        }
+        _ => mutation_fence_key_for_status(status_state),
+    };
     let command = mutation_fence_command_from_reason(reason);
     let dispatch_id = old_owner
         .map(|owner| owner.dispatch_id.as_str())
@@ -4623,32 +4642,52 @@ fn force_clear_mutation_fence(
     status_state: &mut StatusState,
     chat_lines: &Rc<RefCell<Vec<String>>>,
 ) {
-    let key = mutation_fence_key_for_status(status_state);
-    match delighters::force_clear_mutation_fence_for_workspace(&key) {
-        Ok(result) => {
-            status_state.mutation_fence = None;
-            if let Some(path) = result.quarantined_state_path {
-                status_state.set_toast("Mutation state reset");
-                chat_lines.borrow_mut().push(format!(
-                    "[sync] unreadable zterm state moved to {}; mutation fence cleared by explicit /resync --force",
-                    path.display()
-                ));
-            } else {
-                status_state.set_toast("Mutation fence cleared");
-                chat_lines.borrow_mut().push(format!(
-                    "[sync] mutation fence cleared by explicit /resync --force ({} tracked fences remain)",
-                    result.state.mutation_fences.len()
-                ));
+    let keys = mutation_fence_clear_keys_for_status(status_state);
+    let mut quarantined_state_path = None;
+    let mut remaining = 0;
+    for key in keys {
+        match delighters::force_clear_mutation_fence_for_workspace(&key) {
+            Ok(result) => {
+                if quarantined_state_path.is_none() {
+                    quarantined_state_path = result.quarantined_state_path;
+                }
+                remaining = result.state.mutation_fences.len();
+            }
+            Err(e) => {
+                status_state.set_toast("Mutation fence clear failed");
+                chat_lines
+                    .borrow_mut()
+                    .push(format!("[error] could not clear mutation fence: {e}"));
+                chat_lines.borrow_mut().push(String::new());
+                return;
             }
         }
-        Err(e) => {
-            status_state.set_toast("Mutation fence clear failed");
-            chat_lines
-                .borrow_mut()
-                .push(format!("[error] could not clear mutation fence: {e}"));
-        }
+    }
+    status_state.mutation_fence =
+        load_persisted_mutation_fence_for_status(status_state).map(|fence| fence.reason);
+    if let Some(path) = quarantined_state_path {
+        status_state.set_toast("Mutation state reset");
+        chat_lines.borrow_mut().push(format!(
+            "[sync] unreadable zterm state moved to {}; mutation fence cleared by explicit /resync --force",
+            path.display()
+        ));
+    } else {
+        status_state.set_toast("Mutation fence cleared");
+        chat_lines.borrow_mut().push(format!(
+            "[sync] mutation fence cleared by explicit /resync --force ({remaining} tracked fences remain)"
+        ));
     }
     chat_lines.borrow_mut().push(String::new());
+}
+
+fn mutation_fence_clear_keys_for_status(status_state: &StatusState) -> Vec<String> {
+    let workspace_key = mutation_fence_key_for_status(status_state);
+    let global_key = crate::cli::tui::GLOBAL_MEMORY_MUTATION_FENCE_KEY.to_string();
+    if workspace_key == global_key {
+        vec![workspace_key]
+    } else {
+        vec![workspace_key, global_key]
+    }
 }
 
 fn append_prompt_placeholder(label: &str, chat_lines: &Rc<RefCell<Vec<String>>>) {
@@ -7116,6 +7155,91 @@ mod tests {
         }
 
         assert_eq!(persisted_after, Some(existing));
+        assert!(lines
+            .borrow()
+            .join("\n")
+            .contains("mutation outcome is unknown"));
+    }
+
+    #[test]
+    fn memory_mutation_write_ahead_fence_uses_global_key() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+
+        let mut state = StatusState::new(
+            "alpha".to_string(),
+            "gpt-test".to_string(),
+            "borland".to_string(),
+            false,
+        );
+        let workspace_key = mutation_fence_key_for_status(&state);
+
+        let owner =
+            write_ahead_mutation_fence_for_dispatch(&mut state, "/memory post remember").unwrap();
+        let global_fence = delighters::mutation_fence_for_workspace(
+            crate::cli::tui::GLOBAL_MEMORY_MUTATION_FENCE_KEY,
+        )
+        .unwrap();
+        let workspace_fence = delighters::mutation_fence_for_workspace(&workspace_key).unwrap();
+
+        match old_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+
+        assert_eq!(owner.key, crate::cli::tui::GLOBAL_MEMORY_MUTATION_FENCE_KEY);
+        assert!(global_fence.is_some());
+        assert!(workspace_fence.is_none());
+    }
+
+    #[test]
+    fn global_memory_fence_blocks_memory_mutation_from_other_workspace() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+
+        let existing = delighters::MutationFenceState {
+            command: "/memory post remember".to_string(),
+            reason: "slash command outcome unknown".to_string(),
+            created_at_unix: 42,
+            dispatch_id: "global-dispatch".to_string(),
+        };
+        delighters::set_mutation_fence_for_workspace(
+            crate::cli::tui::GLOBAL_MEMORY_MUTATION_FENCE_KEY,
+            existing.clone(),
+        )
+        .unwrap();
+        let mut state = StatusState::new(
+            "beta".to_string(),
+            "gpt-test".to_string(),
+            "borland".to_string(),
+            false,
+        );
+        let lines = Rc::new(RefCell::new(Vec::new()));
+
+        assert!(mutation_fence_blocks_submission(
+            &mut state,
+            "/memory delete mem-1",
+            &lines
+        ));
+        let persisted_after = delighters::mutation_fence_for_workspace(
+            crate::cli::tui::GLOBAL_MEMORY_MUTATION_FENCE_KEY,
+        )
+        .unwrap();
+
+        match old_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+
+        assert_eq!(persisted_after, Some(existing));
+        assert_eq!(
+            state.mutation_fence.as_deref(),
+            Some("slash command outcome unknown")
+        );
         assert!(lines
             .borrow()
             .join("\n")
