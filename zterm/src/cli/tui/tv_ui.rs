@@ -1080,80 +1080,82 @@ async fn handle_worker_command_request(
         }
     }
     match worker_cmd_handler
-        .handle(&cmdline, &command_session_id)
+        .handle_with_outcome(&cmdline, &command_session_id)
         .await
     {
-        Ok(Some(text)) => {
-            let model_switched = successful_model_switch_command(&cmdline, &text);
-            let command_failed = command_output_indicates_error(&text);
-            let command_terminal_error = command_failed.then(|| {
-                if command_failure_requires_mutation_fence(&cmdline, &text) {
-                    mutating_command_unknown_outcome_message(&cmdline, &text)
-                } else {
-                    COMMAND_ERROR_ALREADY_RENDERED.to_string()
-                }
-            });
-            let _ = worker_sink.send(TurnChunk::Token(text));
-            let mut workspace_switched = false;
-            if preflight == CommandSessionPreflight::AfterWorkspaceSwitch {
-                let switched_workspace = {
-                    let guard = worker_app.lock().await;
-                    guard.active_workspace().map(|w| w.config.name.clone())
-                };
-                if switched_workspace != workspace_before_dispatch {
-                    workspace_switched = true;
-                    install_stream_sink_on_active_client(worker_app, worker_sink.clone()).await;
-                    if let Err(e) = ensure_session_for_active_workspace(
-                        worker_app,
-                        worker_sessions,
-                        fallback_session_name,
-                    )
-                    .await
-                    {
-                        let _ = worker_sink.send(TurnChunk::ClearUsage);
-                        send_worker_finished(
-                            worker_sink,
-                            Err(format!("workspace switched, but session setup failed: {e}")),
+        Ok(command_output) => match command_output.output {
+            Some(text) => {
+                let model_switched = successful_model_switch_command(&cmdline, &text);
+                let command_failed = command_output_indicates_error(&text);
+                let command_terminal_error = command_failed.then(|| {
+                    if command_output.mutation_outcome_unknown {
+                        mutating_command_unknown_outcome_message(&cmdline, &text)
+                    } else {
+                        COMMAND_ERROR_ALREADY_RENDERED.to_string()
+                    }
+                });
+                let _ = worker_sink.send(TurnChunk::Token(text));
+                let mut workspace_switched = false;
+                if preflight == CommandSessionPreflight::AfterWorkspaceSwitch {
+                    let switched_workspace = {
+                        let guard = worker_app.lock().await;
+                        guard.active_workspace().map(|w| w.config.name.clone())
+                    };
+                    if switched_workspace != workspace_before_dispatch {
+                        workspace_switched = true;
+                        install_stream_sink_on_active_client(worker_app, worker_sink.clone()).await;
+                        if let Err(e) = ensure_session_for_active_workspace(
+                            worker_app,
+                            worker_sessions,
+                            fallback_session_name,
                         )
-                        .await;
-                        return;
-                    }
-                    if let Some(name) = switched_workspace {
-                        let splash = connect_splash_for_workspace(&name);
-                        let _ = worker_sink.send(TurnChunk::Typewriter(splash));
+                        .await
+                        {
+                            let _ = worker_sink.send(TurnChunk::ClearUsage);
+                            send_worker_finished(
+                                worker_sink,
+                                Err(format!("workspace switched, but session setup failed: {e}")),
+                            )
+                            .await;
+                            return;
+                        }
+                        if let Some(name) = switched_workspace {
+                            let splash = connect_splash_for_workspace(&name);
+                            let _ = worker_sink.send(TurnChunk::Typewriter(splash));
+                        }
                     }
                 }
-            }
-            if should_clear_usage_after_command(
-                workspace_switched,
-                session_switched,
-                model_switched,
-            ) {
-                let _ = worker_sink.send(TurnChunk::ClearUsage);
-            }
-            if workspace_switched || model_switched {
-                if let Some((workspace, model)) = status_snapshot_for_worker(worker_app).await {
-                    let _ = worker_sink.send(TurnChunk::Status {
-                        workspace: Some(workspace),
-                        model: Some(model),
-                    });
+                if should_clear_usage_after_command(
+                    workspace_switched,
+                    session_switched,
+                    model_switched,
+                ) {
+                    let _ = worker_sink.send(TurnChunk::ClearUsage);
+                }
+                if workspace_switched || model_switched {
+                    if let Some((workspace, model)) = status_snapshot_for_worker(worker_app).await {
+                        let _ = worker_sink.send(TurnChunk::Status {
+                            workspace: Some(workspace),
+                            model: Some(model),
+                        });
+                    }
+                }
+                if let Some(command_terminal_error) = command_terminal_error {
+                    send_worker_finished(worker_sink, Err(command_terminal_error)).await;
+                } else {
+                    send_worker_finished(worker_sink, Ok(String::new())).await;
                 }
             }
-            if let Some(command_terminal_error) = command_terminal_error {
-                send_worker_finished(worker_sink, Err(command_terminal_error)).await;
-            } else {
+            None => {
+                let _ = worker_sink.send(TurnChunk::Token(format!(
+                    "Command `{cmdline}` completed without structured TUI output."
+                )));
+                if should_clear_usage_after_command(false, session_switched, false) {
+                    let _ = worker_sink.send(TurnChunk::ClearUsage);
+                }
                 send_worker_finished(worker_sink, Ok(String::new())).await;
             }
-        }
-        Ok(None) => {
-            let _ = worker_sink.send(TurnChunk::Token(format!(
-                "Command `{cmdline}` completed without structured TUI output."
-            )));
-            if should_clear_usage_after_command(false, session_switched, false) {
-                let _ = worker_sink.send(TurnChunk::ClearUsage);
-            }
-            send_worker_finished(worker_sink, Ok(String::new())).await;
-        }
+        },
         Err(e) if e.to_string() == "EXIT" => {
             // `/exit` bubbled up; mirror the rustyline behavior by
             // signalling a clean shutdown via Finished(Ok). E-6
@@ -1427,32 +1429,6 @@ fn command_output_indicates_error(output: &str) -> bool {
         || output
             .lines()
             .any(|line| line.trim_start().starts_with("❌"))
-}
-
-fn command_failure_requires_mutation_fence(cmdline: &str, rendered_text: &str) -> bool {
-    slash_command_may_mutate_state(cmdline)
-        && command_output_indicates_error(rendered_text)
-        && rendered_command_error_indicates_transport_uncertainty(rendered_text)
-}
-
-fn rendered_command_error_indicates_transport_uncertainty(rendered_text: &str) -> bool {
-    let lower = rendered_text.to_ascii_lowercase();
-    [
-        "timed out",
-        "timeout",
-        "deadline",
-        "request failed",
-        "connection refused",
-        "connection reset",
-        "connection closed",
-        "network unreachable",
-        "temporary failure",
-        "transport",
-        "read failed",
-        "send failed",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle))
 }
 
 fn mutating_command_unknown_outcome_message(cmdline: &str, rendered_text: &str) -> String {
@@ -2383,6 +2359,11 @@ fn refresh_status_line(
     state: &mut StatusState,
     app: &Arc<Mutex<App>>,
 ) {
+    refresh_status_state_from_app(state, app);
+    tapp.set_status_line(build_status_line(w, h, state));
+}
+
+fn refresh_status_state_from_app(state: &mut StatusState, app: &Arc<Mutex<App>>) {
     // Non-blocking workspace refresh. If the worker holds the mutex
     // this tick, reuse the cached value — skipping one frame of
     // updates is preferable to blocking the UI.
@@ -2398,7 +2379,6 @@ fn refresh_status_line(
             }
         }
     }
-    tapp.set_status_line(build_status_line(w, h, state));
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2463,6 +2443,7 @@ fn run_event_loop(
         // *before* redrawing, so new tokens are visible this frame.
         // Also lets the status-state timer observe `Finished` frames
         // inline with the rest of the UI update.
+        refresh_status_state_from_app(status_state, shared_app);
         let error_frame = drain_stream_events(
             event_rx,
             &chat_lines,
@@ -5132,6 +5113,79 @@ mod tests {
     }
 
     #[test]
+    fn post_switch_timeout_fence_uses_refreshed_workspace_key() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+
+        let app = Arc::new(Mutex::new(App {
+            workspaces: vec![
+                crate::cli::workspace::Workspace {
+                    id: 0,
+                    config: crate::cli::workspace::WorkspaceConfig {
+                        id: Some("ws-alpha".to_string()),
+                        name: "alpha".to_string(),
+                        backend: crate::cli::workspace::Backend::Zeroclaw,
+                        url: "http://alpha.example".to_string(),
+                        token_env: None,
+                        token: None,
+                        label: None,
+                        namespace_aliases: Vec::new(),
+                    },
+                    client: None,
+                    cron: None,
+                },
+                crate::cli::workspace::Workspace {
+                    id: 1,
+                    config: crate::cli::workspace::WorkspaceConfig {
+                        id: Some("ws-beta".to_string()),
+                        name: "beta".to_string(),
+                        backend: crate::cli::workspace::Backend::Zeroclaw,
+                        url: "http://beta.example".to_string(),
+                        token_env: None,
+                        token: None,
+                        label: None,
+                        namespace_aliases: Vec::new(),
+                    },
+                    client: None,
+                    cron: None,
+                },
+            ],
+            active: 1,
+            shared_mnemos: None,
+            config_path: std::path::PathBuf::from("test-config.toml"),
+        }));
+        let mut state = StatusState::new(
+            "alpha".to_string(),
+            "model".to_string(),
+            "borland".to_string(),
+            false,
+        );
+        state.workspace_id = Some("ws-alpha".to_string());
+
+        refresh_status_state_from_app(&mut state, &app);
+        set_local_and_persisted_mutation_fence(
+            &mut state,
+            "slash command outcome unknown for `/workspace switch beta` after 30s",
+        );
+
+        assert_eq!(state.workspace, "beta");
+        assert_eq!(state.workspace_id.as_deref(), Some("ws-beta"));
+        assert!(delighters::mutation_fence_for_workspace("id:ws-beta")
+            .unwrap()
+            .is_some());
+        assert!(delighters::mutation_fence_for_workspace("id:ws-alpha")
+            .unwrap()
+            .is_none());
+
+        match old_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    #[test]
     fn force_clear_mutation_fence_removes_persisted_marker() {
         let _env = crate::cli::test_env_lock().lock().unwrap();
         let home = tempfile::tempdir().unwrap();
@@ -5515,34 +5569,6 @@ mod tests {
         assert!(!command_output_indicates_error(
             "✅ Active model key: primary\n"
         ));
-    }
-
-    #[test]
-    fn mutating_rendered_transport_error_requires_fence() {
-        let timeout_text =
-            "❌ Failed to create cron job: Request timed out. Check your connection.\n";
-        assert!(command_failure_requires_mutation_fence(
-            "/cron add '0 9 * * *' 'standup'",
-            timeout_text
-        ));
-        assert!(command_failure_requires_mutation_fence(
-            "/memory delete mem_1",
-            "❌ Delete failed: request failed: connection closed\n"
-        ));
-        assert!(!command_failure_requires_mutation_fence(
-            "/cron list",
-            timeout_text
-        ));
-        assert!(!command_failure_requires_mutation_fence(
-            "/cron add '0 9 * * *' 'standup'",
-            "❌ Failed to create cron job: HTTP 400\n"
-        ));
-
-        let message = mutating_command_unknown_outcome_message(
-            "/cron add '0 9 * * *' 'standup'",
-            timeout_text,
-        );
-        assert!(mutation_timeout_requires_fence(&message));
     }
 
     #[test]

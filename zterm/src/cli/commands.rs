@@ -22,6 +22,28 @@ type AgentClientHandle = Arc<Mutex<Box<dyn AgentClient + Send + Sync>>>;
 type WorkspaceActivationFuture = Pin<Box<dyn Future<Output = Result<AgentClientHandle>> + Send>>;
 type WorkspaceActivator = Arc<dyn Fn(WorkspaceConfig) -> WorkspaceActivationFuture + Send + Sync>;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandHandlerOutput {
+    pub output: Option<String>,
+    pub mutation_outcome_unknown: bool,
+}
+
+impl CommandHandlerOutput {
+    fn known(output: Option<String>) -> Self {
+        Self {
+            output,
+            mutation_outcome_unknown: false,
+        }
+    }
+
+    fn new(output: Option<String>, mutation_outcome_unknown: bool) -> Self {
+        Self {
+            output,
+            mutation_outcome_unknown,
+        }
+    }
+}
+
 /// Command handler.
 ///
 /// Holds a shared Arc<Mutex<App>>. Every per-command helper
@@ -94,14 +116,28 @@ impl CommandHandler {
 
     /// Handle a slash command (maps to zeroclaw CLI)
     pub async fn handle(&self, input: &str, session_id: &str) -> Result<Option<String>> {
+        Ok(self.handle_with_outcome(input, session_id).await?.output)
+    }
+
+    /// Handle a slash command and include whether a mutating backend action
+    /// may already have been applied despite an error response.
+    pub async fn handle_with_outcome(
+        &self,
+        input: &str,
+        session_id: &str,
+    ) -> Result<CommandHandlerOutput> {
         let parts_owned = match tokenize_slash_command(input) {
             Ok(parts) => parts,
-            Err(e) => return Ok(Some(format!("❌ Could not parse command: {e}\n"))),
+            Err(e) => {
+                return Ok(CommandHandlerOutput::known(Some(format!(
+                    "❌ Could not parse command: {e}\n"
+                ))));
+            }
         };
         let parts: Vec<&str> = parts_owned.iter().map(String::as_str).collect();
 
         if parts.is_empty() {
-            return Ok(None);
+            return Ok(CommandHandlerOutput::known(None));
         }
 
         let command = parts[0];
@@ -112,7 +148,7 @@ impl CommandHandler {
             &[] as &[&str]
         };
 
-        match command {
+        let output = match command {
             // Core
             "/help" => self.handle_help().await,
             "/info" | "/status" => self.handle_info(session_id).await,
@@ -130,9 +166,9 @@ impl CommandHandler {
             "/doctor" => self.handle_doctor(subcommand).await,
 
             // Memory, Cron, Skills
-            "/memory" => self.handle_memory(subcommand, args).await,
+            "/memory" => return self.handle_memory(subcommand, args).await,
             "/workspace" | "/workspaces" => self.handle_workspace(subcommand, args).await,
-            "/cron" => self.handle_cron(subcommand, args).await,
+            "/cron" => return self.handle_cron(subcommand, args).await,
             "/skill" | "/skills" => self.handle_skill(subcommand, args).await,
 
             // Provider & Model Management
@@ -155,7 +191,7 @@ impl CommandHandler {
             },
             "/history" => self.handle_history().await,
             "/config" => self.handle_config().await,
-            "/session" => self.handle_session(session_id, subcommand, args).await,
+            "/session" => return self.handle_session(session_id, subcommand, args).await,
             "/mcp" => self.handle_mcp(subcommand).await,
 
             // Completion
@@ -164,7 +200,8 @@ impl CommandHandler {
             _ => Ok(Some(format!(
                 "❌ Unknown command: {command}\n   Type /help for available commands\n"
             ))),
-        }
+        }?;
+        Ok(CommandHandlerOutput::known(output))
     }
 
     /// Handle /help command.
@@ -260,14 +297,15 @@ impl CommandHandler {
         session_id: &str,
         subcommand: Option<&str>,
         args: &[&str],
-    ) -> Result<Option<String>> {
+    ) -> Result<CommandHandlerOutput> {
         let mut out = String::new();
+        let mut mutation_outcome_unknown = false;
         match subcommand {
             Some("list") => {
                 let Some(client) = self.current_agent_client().await else {
                     out.push_str("❌ Could not list sessions: no active workspace client\n");
                     out.push('\n');
-                    return Ok(Some(out));
+                    return Ok(CommandHandlerOutput::known(Some(out)));
                 };
 
                 let list_result = {
@@ -295,7 +333,7 @@ impl CommandHandler {
                     let Some(client) = self.current_agent_client().await else {
                         out.push_str("❌ Failed to delete session: no active workspace client\n");
                         out.push('\n');
-                        return Ok(Some(out));
+                        return Ok(CommandHandlerOutput::known(Some(out)));
                     };
 
                     let scope = self.current_storage_scope().await;
@@ -334,6 +372,7 @@ impl CommandHandler {
                                 }
                             }
                             Err(e) => {
+                                mutation_outcome_unknown = true;
                                 out.push_str(&format!(
                                     "❌ Backend failed to delete session '{}': {e}\n",
                                     target.display_name()
@@ -352,7 +391,7 @@ impl CommandHandler {
                         "❌ Failed to load active backend session: no active workspace client\n",
                     );
                     out.push('\n');
-                    return Ok(Some(out));
+                    return Ok(CommandHandlerOutput::known(Some(out)));
                 };
 
                 let load_result = {
@@ -410,7 +449,10 @@ impl CommandHandler {
             }
         }
         out.push('\n');
-        Ok(Some(out))
+        Ok(CommandHandlerOutput::new(
+            Some(out),
+            mutation_outcome_unknown,
+        ))
     }
 
     /// Handle /history command
@@ -565,7 +607,7 @@ impl CommandHandler {
         &self,
         subcommand: Option<&str>,
         args: &[&str],
-    ) -> Result<Option<String>> {
+    ) -> Result<CommandHandlerOutput> {
         // Backwards-compatible: "/memory <query>" (no subcommand) runs a search.
         let implicit: Vec<&str>;
         let (sub, rest): (&str, &[&str]) = match subcommand {
@@ -594,11 +636,14 @@ impl CommandHandler {
         };
 
         let mut out = String::new();
+        let mut mutation_outcome_unknown = false;
         match sub {
             "search" => {
                 let (query, limit) = parse_search_args(rest);
                 if query.is_empty() {
-                    return Ok(Some("Usage: /memory search <query> [limit]\n".to_string()));
+                    return Ok(CommandHandlerOutput::known(Some(
+                        "Usage: /memory search <query> [limit]\n".to_string(),
+                    )));
                 }
                 out.push_str(&format!("\n🔎 MNEMOS search: {query}\n"));
                 let res = match self.current_mnemos().await {
@@ -637,7 +682,9 @@ impl CommandHandler {
             "get" => {
                 let id = rest.join(" ");
                 if id.is_empty() {
-                    return Ok(Some("Usage: /memory get <id>\n".to_string()));
+                    return Ok(CommandHandlerOutput::known(Some(
+                        "Usage: /memory get <id>\n".to_string(),
+                    )));
                 }
                 let res = match self.current_mnemos().await {
                     Some(m) => m.get(&id).await,
@@ -664,14 +711,20 @@ impl CommandHandler {
             "post" | "add" => {
                 let (content, category) = parse_post_args(rest);
                 if content.is_empty() {
-                    return Ok(Some(
+                    return Ok(CommandHandlerOutput::known(Some(
                         "Usage: /memory post <content> [--category <cat>]\n\
                          Example: /memory post \"shipped zterm CI cleanup\" --category work\n"
                             .to_string(),
-                    ));
+                    )));
                 }
                 let res = match self.current_mnemos().await {
-                    Some(m) => m.create(&content, category.as_deref()).await,
+                    Some(m) => {
+                        let result = m.create(&content, category.as_deref()).await;
+                        if result.is_err() {
+                            mutation_outcome_unknown = true;
+                        }
+                        result
+                    }
                     None => Err(anyhow::anyhow!(
                         "MNEMOS not configured (set MNEMOS_URL + MNEMOS_TOKEN)"
                     )),
@@ -691,10 +744,18 @@ impl CommandHandler {
             "delete" | "rm" => {
                 let id = rest.join(" ");
                 if id.is_empty() {
-                    return Ok(Some("Usage: /memory delete <id>\n".to_string()));
+                    return Ok(CommandHandlerOutput::known(Some(
+                        "Usage: /memory delete <id>\n".to_string(),
+                    )));
                 }
                 let res = match self.current_mnemos().await {
-                    Some(m) => m.delete(&id).await,
+                    Some(m) => {
+                        let result = m.delete(&id).await;
+                        if result.is_err() {
+                            mutation_outcome_unknown = true;
+                        }
+                        result
+                    }
                     None => Err(anyhow::anyhow!(
                         "MNEMOS not configured (set MNEMOS_URL + MNEMOS_TOKEN)"
                     )),
@@ -740,11 +801,19 @@ impl CommandHandler {
             }
         }
         out.push('\n');
-        Ok(Some(out))
+        Ok(CommandHandlerOutput::new(
+            Some(out),
+            mutation_outcome_unknown,
+        ))
     }
 
-    async fn handle_cron(&self, subcommand: Option<&str>, args: &[&str]) -> Result<Option<String>> {
+    async fn handle_cron(
+        &self,
+        subcommand: Option<&str>,
+        args: &[&str],
+    ) -> Result<CommandHandlerOutput> {
         let mut out = String::new();
+        let mut mutation_outcome_unknown = false;
         match subcommand {
             Some("list") => {
                 out.push_str("\n⏰ Scheduled Tasks:\n");
@@ -779,7 +848,13 @@ impl CommandHandler {
                 Err(message) => out.push_str(&message),
                 Ok((expr, prompt)) => {
                     let res = match self.current_cron().await {
-                        Some(c) => c.create_cron_job(expr, &prompt).await,
+                        Some(c) => {
+                            let result = c.create_cron_job(expr, &prompt).await;
+                            if result.is_err() {
+                                mutation_outcome_unknown = true;
+                            }
+                            result
+                        }
                         None => Err(anyhow::anyhow!("cron not available on this backend")),
                     };
                     match res {
@@ -798,7 +873,13 @@ impl CommandHandler {
                 Err(message) => out.push_str(&message),
                 Ok((datetime, prompt)) => {
                     let res = match self.current_cron().await {
-                        Some(c) => c.create_cron_at(datetime, &prompt).await,
+                        Some(c) => {
+                            let result = c.create_cron_at(datetime, &prompt).await;
+                            if result.is_err() {
+                                mutation_outcome_unknown = true;
+                            }
+                            result
+                        }
                         None => Err(anyhow::anyhow!("cron not available on this backend")),
                     };
                     match res {
@@ -814,7 +895,13 @@ impl CommandHandler {
                 Err(message) => out.push_str(&message),
                 Ok(id) => {
                     let res = match self.current_cron().await {
-                        Some(c) => c.pause_cron(id).await,
+                        Some(c) => {
+                            let result = c.pause_cron(id).await;
+                            if result.is_err() {
+                                mutation_outcome_unknown = true;
+                            }
+                            result
+                        }
                         None => Err(anyhow::anyhow!("cron not available on this backend")),
                     };
                     match res {
@@ -827,7 +914,13 @@ impl CommandHandler {
                 Err(message) => out.push_str(&message),
                 Ok(id) => {
                     let res = match self.current_cron().await {
-                        Some(c) => c.resume_cron(id).await,
+                        Some(c) => {
+                            let result = c.resume_cron(id).await;
+                            if result.is_err() {
+                                mutation_outcome_unknown = true;
+                            }
+                            result
+                        }
                         None => Err(anyhow::anyhow!("cron not available on this backend")),
                     };
                     match res {
@@ -840,7 +933,13 @@ impl CommandHandler {
                 Err(message) => out.push_str(&message),
                 Ok(id) => {
                     let res = match self.current_cron().await {
-                        Some(c) => c.delete_cron(id).await,
+                        Some(c) => {
+                            let result = c.delete_cron(id).await;
+                            if result.is_err() {
+                                mutation_outcome_unknown = true;
+                            }
+                            result
+                        }
                         None => Err(anyhow::anyhow!("cron not available on this backend")),
                     };
                     match res {
@@ -857,7 +956,10 @@ impl CommandHandler {
             }
         }
         out.push('\n');
-        Ok(Some(out))
+        Ok(CommandHandlerOutput::new(
+            Some(out),
+            mutation_outcome_unknown,
+        ))
     }
 
     /// Handle /skill command with zeroclaw integration
@@ -2199,7 +2301,7 @@ fn format_memory_list(memories: &[serde_json::Value]) -> String {
 mod tests {
     use crate::cli::agent::{AgentClient, StreamSink};
     use crate::cli::client::Config;
-    use crate::cli::client::{Model, Provider, Session};
+    use crate::cli::client::{Model, Provider, Session, ZeroclawClient};
     use crate::cli::storage::{self, SessionMetadata};
     use crate::cli::workspace::{App, Backend, Workspace, WorkspaceConfig};
     use std::path::PathBuf;
@@ -2313,6 +2415,30 @@ mod tests {
         let err = super::parse_cron_add_args(&args).unwrap_err();
 
         assert!(err.contains("exactly 5 fields"));
+    }
+
+    #[tokio::test]
+    async fn cron_add_success_status_with_invalid_body_marks_unknown_outcome() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/api/cron/add")
+            .with_status(201)
+            .with_body("{not-json")
+            .create_async()
+            .await;
+        let cron = ZeroclawClient::new(server.url(), "test_token".to_string());
+        let handler = super::CommandHandler::new(app_with_fake_client_and_cron(cron).await);
+
+        let result = handler
+            .handle_with_outcome("/cron add '0 9 * * *' 'standup'", "main")
+            .await
+            .unwrap();
+
+        assert!(result.mutation_outcome_unknown);
+        assert!(result
+            .output
+            .unwrap()
+            .contains("Failed to create cron job: Failed to parse response"));
     }
 
     #[test]
@@ -2642,6 +2768,12 @@ mod tests {
             shared_mnemos: None,
             config_path: PathBuf::from("test-config.toml"),
         }))
+    }
+
+    async fn app_with_fake_client_and_cron(cron: ZeroclawClient) -> Arc<Mutex<App>> {
+        let app = app_with_fake_client(FakeAgentClient::default());
+        app.lock().await.workspaces[0].cron = Some(cron);
+        app
     }
 
     fn app_with_two_fake_clients(
