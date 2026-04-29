@@ -5,7 +5,7 @@ use std::future::Future;
 use std::io;
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -16,7 +16,7 @@ use crate::cli::client::ZeroclawClient;
 use crate::cli::client::{Model, Provider, Session};
 use crate::cli::input::InputHistory;
 use crate::cli::storage;
-use crate::cli::workspace::{Workspace, WorkspaceConfig};
+use crate::cli::workspace::{Backend, Workspace, WorkspaceConfig};
 
 type AgentClientHandle = Arc<Mutex<Box<dyn AgentClient + Send + Sync>>>;
 type WorkspaceActivationFuture = Pin<Box<dyn Future<Output = Result<AgentClientHandle>> + Send>>;
@@ -1233,7 +1233,20 @@ impl CommandHandler {
 
     /// Handle /config command
     async fn handle_config(&self) -> Result<Option<String>> {
-        Ok(Some(format_config_output(storage::load_config())))
+        let (path, source) = self.active_config_source().await?;
+        Ok(Some(format_config_output_for_path(
+            load_config_at(&path),
+            &path,
+            source,
+        )))
+    }
+
+    async fn active_config_source(&self) -> Result<(PathBuf, &'static str)> {
+        let app = self.app.lock().await;
+        if app_uses_legacy_synthetic_config(&app) {
+            return Ok(active_config_source_for_app(&app, storage::config_file()?));
+        }
+        Ok((app.config_path.clone(), "ZTerm workspace config"))
     }
 
     /// Handle /clear command
@@ -1479,8 +1492,55 @@ const CONFIG_SECRET_KEY_FRAGMENTS: &[&str] = &[
     "privatekey",
 ];
 
+fn load_config_at(path: &Path) -> Result<String> {
+    fs::read_to_string(path).map_err(|e| anyhow!("Failed to read config {}: {}", path.display(), e))
+}
+
+fn app_uses_legacy_synthetic_config(app: &crate::cli::workspace::App) -> bool {
+    app.workspaces.len() == 1
+        && app.workspaces[0].config.name == "default"
+        && app.workspaces[0].config.backend == Backend::Zeroclaw
+        && !config_file_declares_workspaces(&app.config_path)
+}
+
+fn active_config_source_for_app(
+    app: &crate::cli::workspace::App,
+    legacy_config_path: PathBuf,
+) -> (PathBuf, &'static str) {
+    if app_uses_legacy_synthetic_config(app) {
+        return (legacy_config_path, "Legacy single-workspace config");
+    }
+    (app.config_path.clone(), "ZTerm workspace config")
+}
+
+fn config_file_declares_workspaces(path: &Path) -> bool {
+    let Ok(content) = fs::read_to_string(path) else {
+        return false;
+    };
+    toml::from_str::<toml::Value>(&content)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("workspaces")
+                .and_then(toml::Value::as_array)
+                .map(|workspaces| !workspaces.is_empty())
+        })
+        .unwrap_or(false)
+}
+
 fn format_config_output(config: Result<String>) -> String {
+    format_config_output_inner(config, None)
+}
+
+fn format_config_output_for_path(config: Result<String>, path: &Path, source: &str) -> String {
+    format_config_output_inner(config, Some((source, path)))
+}
+
+fn format_config_output_inner(config: Result<String>, source: Option<(&str, &Path)>) -> String {
     let mut out = "\n⚙️  Configuration:\n".to_string();
+    if let Some((source, path)) = source {
+        out.push_str(&format!("Source: {source} ({})\n\n", path.display()));
+    }
     match config {
         Ok(content) => {
             out.push_str(&redact_config_secrets(&content));
@@ -3024,6 +3084,98 @@ mod tests {
                 "{cmdline} should not complete silently"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn config_command_reads_active_zterm_config_not_legacy_file() {
+        let home = tempfile::tempdir().unwrap();
+        let legacy_dir = home.path().join(".zeroclaw");
+        let zterm_dir = home.path().join(".zterm");
+        std::fs::create_dir_all(&legacy_dir).unwrap();
+        std::fs::create_dir_all(&zterm_dir).unwrap();
+        std::fs::write(
+            legacy_dir.join("config.toml"),
+            r#"[gateway]
+url = "http://legacy.example"
+token = "legacy-secret"
+"#,
+        )
+        .unwrap();
+        let zterm_config_path = zterm_dir.join("config.toml");
+        std::fs::write(
+            &zterm_config_path,
+            r#"active = "prod"
+
+[[workspaces]]
+name = "prod"
+backend = "zeroclaw"
+url = "http://zterm.example"
+token = "zterm-secret"
+"#,
+        )
+        .unwrap();
+
+        let app = app_with_fake_client(FakeAgentClient::default());
+        app.lock().await.config_path = zterm_config_path.clone();
+        let handler = super::CommandHandler::new(app);
+
+        let out = handler.handle("/config", "session").await.unwrap().unwrap();
+
+        assert!(out.contains("Source: ZTerm workspace config"));
+        assert!(out.contains(&zterm_config_path.display().to_string()));
+        assert!(out.contains("http://zterm.example"));
+        assert!(out.contains("token = \"***REDACTED***\""));
+        assert!(!out.contains("zterm-secret"));
+        assert!(!out.contains("http://legacy.example"));
+        assert!(!out.contains("legacy-secret"));
+    }
+
+    #[test]
+    fn config_command_labels_legacy_source_for_synthetic_singleton() {
+        let home = tempfile::tempdir().unwrap();
+        let legacy_dir = home.path().join(".zeroclaw");
+        let zterm_dir = home.path().join(".zterm");
+        std::fs::create_dir_all(&legacy_dir).unwrap();
+        std::fs::create_dir_all(&zterm_dir).unwrap();
+        let legacy_path = legacy_dir.join("config.toml");
+        std::fs::write(
+            &legacy_path,
+            r#"[gateway]
+url = "http://legacy.example"
+token = "legacy-secret"
+"#,
+        )
+        .unwrap();
+
+        let app = App {
+            workspaces: vec![Workspace {
+                id: 0,
+                config: WorkspaceConfig {
+                    id: None,
+                    name: "default".to_string(),
+                    backend: Backend::Zeroclaw,
+                    url: "http://cli.example".to_string(),
+                    token_env: None,
+                    token: None,
+                    label: None,
+                    namespace_aliases: Vec::new(),
+                },
+                client: None,
+                cron: None,
+            }],
+            active: 0,
+            shared_mnemos: None,
+            config_path: zterm_dir.join("config.toml"),
+        };
+
+        let (path, source) = super::active_config_source_for_app(&app, legacy_path.clone());
+        let out = super::format_config_output_for_path(super::load_config_at(&path), &path, source);
+
+        assert!(out.contains("Source: Legacy single-workspace config"));
+        assert_eq!(path, legacy_path);
+        assert!(out.contains("http://legacy.example"));
+        assert!(out.contains("token = \"***REDACTED***\""));
+        assert!(!out.contains("legacy-secret"));
     }
 
     #[tokio::test]
