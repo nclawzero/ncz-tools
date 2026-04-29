@@ -935,7 +935,14 @@ impl CommandHandler {
                     }
                 }
             },
-            Some("remove") => match parse_single_cron_target(args, "/cron remove <id>") {
+            Some("delete" | "remove") => match parse_single_cron_target(
+                args,
+                if subcommand == Some("delete") {
+                    "/cron delete <id>"
+                } else {
+                    "/cron remove <id>"
+                },
+            ) {
                 Err(message) => out.push_str(&message),
                 Ok(id) => {
                     let res = match self.current_cron().await {
@@ -958,7 +965,7 @@ impl CommandHandler {
                 out.push_str("Usage: /cron list\n");
                 out.push_str("       /cron add '<expr>' '<prompt>'\n");
                 out.push_str("       /cron add-at '<datetime>' '<prompt>'\n");
-                out.push_str("       /cron pause|resume|remove <id>\n");
+                out.push_str("       /cron pause|resume|delete|remove <id>\n");
             }
         }
         out.push('\n');
@@ -2586,6 +2593,28 @@ mod tests {
         assert!(resume_err.contains("extra tokens were not ignored"));
         assert!(remove_err.contains("extra tokens were not ignored"));
         assert!(empty_err.contains("/cron remove <id>"));
+    }
+
+    #[tokio::test]
+    async fn cron_delete_alias_dispatches_to_delete_cron() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("DELETE", "/api/cron/remove/job-a")
+            .with_status(200)
+            .with_body("{}")
+            .create_async()
+            .await;
+        let cron = ZeroclawClient::new(server.url(), "test_token".to_string());
+        let handler = super::CommandHandler::new(app_with_fake_client_and_cron(cron).await);
+
+        let result = handler
+            .handle_with_outcome("/cron delete job-a", "main")
+            .await
+            .unwrap();
+
+        mock.assert_async().await;
+        assert!(!result.mutation_outcome_unknown);
+        assert!(result.output.unwrap().contains("Deleted job: job-a"));
     }
 
     #[test]
