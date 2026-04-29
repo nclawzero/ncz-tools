@@ -30,6 +30,9 @@
 use anyhow::{anyhow, Result};
 use reqwest::Client;
 use serde_json::json;
+use std::time::Duration;
+
+const MNEMOS_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// MNEMOS v3.0 REST client. Cheap to clone — wraps a reqwest
 /// client + a base URL + a bearer token.
@@ -74,6 +77,7 @@ impl MnemosClient {
             .post(&url)
             .bearer_auth(&self.token)
             .json(&payload)
+            .timeout(MNEMOS_REQUEST_TIMEOUT)
             .send()
             .await;
         match res {
@@ -90,7 +94,13 @@ impl MnemosClient {
     /// can show a friendly "offline" without bubbling the error.
     pub async fn stats(&self) -> Result<serde_json::Value> {
         let url = format!("{}/stats", self.base_url);
-        let res = self.http.get(&url).bearer_auth(&self.token).send().await;
+        let res = self
+            .http
+            .get(&url)
+            .bearer_auth(&self.token)
+            .timeout(MNEMOS_REQUEST_TIMEOUT)
+            .send()
+            .await;
         match res {
             Ok(r) => r
                 .json::<serde_json::Value>()
@@ -103,7 +113,13 @@ impl MnemosClient {
     /// `GET /memories?limit=N` — recent memories.
     pub async fn list(&self, limit: usize) -> Result<Vec<serde_json::Value>> {
         let url = format!("{}/memories?limit={}", self.base_url, limit);
-        let res = self.http.get(&url).bearer_auth(&self.token).send().await;
+        let res = self
+            .http
+            .get(&url)
+            .bearer_auth(&self.token)
+            .timeout(MNEMOS_REQUEST_TIMEOUT)
+            .send()
+            .await;
         match res {
             Ok(r) if r.status().is_success() => {
                 let data: serde_json::Value = r.json().await.unwrap_or(json!({}));
@@ -117,7 +133,13 @@ impl MnemosClient {
     /// transport failure.
     pub async fn get(&self, id: &str) -> Result<Option<serde_json::Value>> {
         let url = format!("{}/memories/{}", self.base_url, id);
-        let res = self.http.get(&url).bearer_auth(&self.token).send().await;
+        let res = self
+            .http
+            .get(&url)
+            .bearer_auth(&self.token)
+            .timeout(MNEMOS_REQUEST_TIMEOUT)
+            .send()
+            .await;
         match res {
             Ok(r) if r.status().is_success() => Ok(r.json::<serde_json::Value>().await.ok()),
             _ => Ok(None),
@@ -136,6 +158,7 @@ impl MnemosClient {
             .post(&url)
             .bearer_auth(&self.token)
             .json(&payload)
+            .timeout(MNEMOS_REQUEST_TIMEOUT)
             .send()
             .await?;
         if r.status().is_success() {
@@ -152,6 +175,7 @@ impl MnemosClient {
             .http
             .delete(&url)
             .bearer_auth(&self.token)
+            .timeout(MNEMOS_REQUEST_TIMEOUT)
             .send()
             .await?;
         if r.status().is_success() {
