@@ -60,6 +60,7 @@ pub struct BackupRestoreReport {
     pub restored_count: usize,
     pub actions: Vec<RestoreAction>,
     pub skipped_redacted_agent_env_keys: Vec<String>,
+    pub skipped_redacted_provider_files: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -110,6 +111,9 @@ impl Render for BackupRestoreReport {
         }
         for key in &self.skipped_redacted_agent_env_keys {
             writeln!(w, "skipped redacted credential: {key}")?;
+        }
+        for path in &self.skipped_redacted_provider_files {
+            writeln!(w, "skipped redacted provider/MCP source: {path}")?;
         }
         writeln!(
             w,
@@ -269,6 +273,7 @@ pub fn restore(
 
     let mut actions = Vec::new();
     let mut skipped_redacted_agent_env_keys = Vec::new();
+    let mut skipped_redacted_provider_files = Vec::new();
     let mut restored_count = 0;
     for source in &manifest.sources {
         if !backup_state::is_supported_source_path(&source.path) {
@@ -280,12 +285,20 @@ pub fn restore(
         let entry = backup_state::archive_entry(&entries, &source.path).ok_or_else(|| {
             NczError::Inconsistent(format!("backup archive missing {}", source.path))
         })?;
-        if source.path == backup_state::AGENT_ENV_PATH && source.redacted {
-            skipped_redacted_agent_env_keys
-                .extend(backup_state::redacted_agent_env_keys(&entry.contents));
+        if source.redacted {
+            if source.path == backup_state::AGENT_ENV_PATH {
+                skipped_redacted_agent_env_keys
+                    .extend(backup_state::redacted_agent_env_keys(&entry.contents));
+            } else {
+                skipped_redacted_provider_files.push(source.path.clone());
+            }
             actions.push(RestoreAction {
                 path: source.path.clone(),
-                action: "skip-redacted".to_string(),
+                action: if dry_run {
+                    "would_skip_redacted".to_string()
+                } else {
+                    "skip-redacted".to_string()
+                },
             });
             continue;
         }
@@ -342,6 +355,7 @@ pub fn restore(
         restored_count,
         actions,
         skipped_redacted_agent_env_keys,
+        skipped_redacted_provider_files,
     })
 }
 
@@ -461,7 +475,7 @@ fn restore_collisions(
                 source.path
             )));
         }
-        if source.path == backup_state::AGENT_ENV_PATH && source.redacted {
+        if source.redacted {
             continue;
         }
         if let Some(volume) = backup_state::source_is_volume(&source.path) {
@@ -1022,6 +1036,93 @@ mod tests {
             vec!["OPENAI_API_KEY".to_string()]
         );
         assert!(!paths.agent_env().exists());
+    }
+
+    #[test]
+    fn restore_skips_redacted_provider_json_does_not_overwrite_existing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        fs::create_dir_all(paths.providers_dir()).unwrap();
+        fs::write(
+            paths.providers_dir().join("legacy.json"),
+            br#"{"name":"legacy","api_key":"sk-live"}"#,
+        )
+        .unwrap();
+        let archive = tmp.path().join("backup.tar.gz");
+        write_archive(
+            &archive,
+            "/etc/nclawzero/providers.d/legacy.json",
+            br#"{"name":"legacy","api_key":"REDACTED:api_key"}"#,
+            true,
+        );
+        let runner = FakeRunner::new();
+
+        let report = restore(&ctx(&runner), &paths, &archive, false, false).unwrap();
+
+        assert_eq!(report.restored_count, 0);
+        assert_eq!(
+            report.skipped_redacted_provider_files,
+            vec!["/etc/nclawzero/providers.d/legacy.json".to_string()]
+        );
+        assert_eq!(
+            fs::read(paths.providers_dir().join("legacy.json")).unwrap(),
+            br#"{"name":"legacy","api_key":"sk-live"}"#
+        );
+        runner.assert_done();
+    }
+
+    #[test]
+    fn restore_force_does_not_overwrite_with_redacted_provider_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        fs::create_dir_all(paths.providers_dir()).unwrap();
+        fs::write(
+            paths.providers_dir().join("legacy.json"),
+            br#"{"name":"legacy","api_key":"sk-live"}"#,
+        )
+        .unwrap();
+        let archive = tmp.path().join("backup.tar.gz");
+        write_archive(
+            &archive,
+            "/etc/nclawzero/providers.d/legacy.json",
+            br#"{"name":"legacy","api_key":"REDACTED:api_key"}"#,
+            true,
+        );
+        let runner = FakeRunner::new();
+
+        let report = restore(&ctx(&runner), &paths, &archive, false, true).unwrap();
+
+        assert_eq!(report.restored_count, 0);
+        assert_eq!(
+            fs::read(paths.providers_dir().join("legacy.json")).unwrap(),
+            br#"{"name":"legacy","api_key":"sk-live"}"#
+        );
+        runner.assert_done();
+    }
+
+    #[test]
+    fn restore_dry_run_reports_redacted_skip_for_provider_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        let archive = tmp.path().join("backup.tar.gz");
+        write_archive(
+            &archive,
+            "/etc/nclawzero/providers.d/legacy.json",
+            br#"{"name":"legacy","api_key":"REDACTED:api_key"}"#,
+            true,
+        );
+        let runner = FakeRunner::new();
+
+        let report = restore(&ctx(&runner), &paths, &archive, true, false).unwrap();
+
+        assert_eq!(report.restored_count, 0);
+        assert_eq!(report.actions[0].action, "would_skip_redacted");
+        assert_eq!(
+            report.skipped_redacted_provider_files,
+            vec!["/etc/nclawzero/providers.d/legacy.json".to_string()]
+        );
+        assert!(!paths.providers_dir().join("legacy.json").exists());
+        runner.assert_done();
     }
 
     #[test]
