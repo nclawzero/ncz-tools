@@ -11,6 +11,9 @@ use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, Web
 
 use crate::cli::agent::{StreamSink, TurnChunk, TurnUsage};
 
+const ZEROCLAW_WS_TURN_TIMEOUT: Duration = Duration::from_secs(120);
+const ZEROCLAW_WS_RESPONSE_MAX_BYTES: usize = 2 * 1024 * 1024;
+
 /// One row from the daemon's `[providers.models.<key>]` config table.
 ///
 /// `key` is the provider-key the daemon resolves at request time
@@ -566,10 +569,30 @@ impl ZeroclawClient {
 
     async fn submit_turn_ws_connected(
         &self,
+        ws_stream: WebSocketStream<MaybeTlsStream<TcpStream>>,
+        session_id: &str,
+        message: &str,
+        model: &str,
+    ) -> Result<String> {
+        self.submit_turn_ws_connected_with_limits(
+            ws_stream,
+            session_id,
+            message,
+            model,
+            ZEROCLAW_WS_TURN_TIMEOUT,
+            ZEROCLAW_WS_RESPONSE_MAX_BYTES,
+        )
+        .await
+    }
+
+    async fn submit_turn_ws_connected_with_limits(
+        &self,
         mut ws_stream: WebSocketStream<MaybeTlsStream<TcpStream>>,
         session_id: &str,
         message: &str,
         model: &str,
+        timeout: Duration,
+        max_response_bytes: usize,
     ) -> Result<String> {
         let request_id = uuid::Uuid::new_v4().to_string();
         let payload = json!({
@@ -588,8 +611,33 @@ impl ZeroclawClient {
 
         let mut response = String::new();
         let mut streamed = false;
+        let deadline = tokio::time::Instant::now() + timeout;
 
-        while let Some(frame) = ws_stream.next().await {
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                let wrapped = anyhow!(
+                    "WebSocket turn timed out after {}s before a response completed",
+                    timeout.as_secs()
+                );
+                let _ = ws_stream.close(None).await;
+                self.emit_failure(&wrapped);
+                return Err(wrapped);
+            }
+
+            let frame = match tokio::time::timeout(remaining, ws_stream.next()).await {
+                Ok(Some(frame)) => frame,
+                Ok(None) => break,
+                Err(_) => {
+                    let wrapped = anyhow!(
+                        "WebSocket turn timed out after {}s before a response completed",
+                        timeout.as_secs()
+                    );
+                    let _ = ws_stream.close(None).await;
+                    self.emit_failure(&wrapped);
+                    return Err(wrapped);
+                }
+            };
             let frame = match frame {
                 Ok(frame) => frame,
                 Err(e) => {
@@ -604,6 +652,15 @@ impl ZeroclawClient {
                 Message::Close(_) => break,
                 _ => continue,
             };
+            if text.len() > max_response_bytes.saturating_add(4096) {
+                let wrapped = anyhow!(
+                    "WebSocket response frame exceeded {} byte limit",
+                    max_response_bytes
+                );
+                let _ = ws_stream.close(None).await;
+                self.emit_failure(&wrapped);
+                return Err(wrapped);
+            }
 
             let event: serde_json::Value = match serde_json::from_str(&text) {
                 Ok(event) => event,
@@ -613,6 +670,15 @@ impl ZeroclawClient {
             match event.get("type").and_then(|v| v.as_str()) {
                 Some("chunk") => {
                     if let Some(delta) = event.get("content").and_then(|v| v.as_str()) {
+                        if response.len().saturating_add(delta.len()) > max_response_bytes {
+                            let wrapped = anyhow!(
+                                "WebSocket response exceeded {} byte limit",
+                                max_response_bytes
+                            );
+                            let _ = ws_stream.close(None).await;
+                            self.emit_failure(&wrapped);
+                            return Err(wrapped);
+                        }
                         response.push_str(delta);
                         self.emit_token(delta)?;
                         streamed = true;
@@ -621,6 +687,15 @@ impl ZeroclawClient {
                 // Compatibility with the older helper in `websocket.rs`.
                 Some("stream") => {
                     if let Some(delta) = event.get("data").and_then(|v| v.as_str()) {
+                        if response.len().saturating_add(delta.len()) > max_response_bytes {
+                            let wrapped = anyhow!(
+                                "WebSocket response exceeded {} byte limit",
+                                max_response_bytes
+                            );
+                            let _ = ws_stream.close(None).await;
+                            self.emit_failure(&wrapped);
+                            return Err(wrapped);
+                        }
                         response.push_str(delta);
                         self.emit_token(delta)?;
                         streamed = true;
@@ -633,6 +708,15 @@ impl ZeroclawClient {
                         .and_then(|v| v.as_str())
                         .unwrap_or(response.as_str())
                         .to_string();
+                    if full_response.len() > max_response_bytes {
+                        let wrapped = anyhow!(
+                            "WebSocket response exceeded {} byte limit",
+                            max_response_bytes
+                        );
+                        let _ = ws_stream.close(None).await;
+                        self.emit_failure(&wrapped);
+                        return Err(wrapped);
+                    }
                     if !streamed && !full_response.is_empty() {
                         self.emit_token(&full_response)?;
                         streamed = true;
@@ -1300,6 +1384,78 @@ fallback = "gemini"
         assert_eq!(parsed.scheme(), "wss");
         assert_eq!(parsed.path(), "/ws/chat");
         assert!(parsed.query_pairs().all(|(key, _)| key.as_ref() != "token"));
+    }
+
+    async fn test_ws_stream(
+        frames: Vec<serde_json::Value>,
+        hold_open: Option<Duration>,
+    ) -> WebSocketStream<MaybeTlsStream<TcpStream>> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut server_ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _ = server_ws.next().await;
+            for frame in frames {
+                let _ = server_ws.send(Message::Text(frame.to_string())).await;
+            }
+            if let Some(duration) = hold_open {
+                tokio::time::sleep(duration).await;
+            }
+        });
+        let (client_ws, _) = connect_async(format!("ws://{addr}")).await.unwrap();
+        client_ws
+    }
+
+    #[tokio::test]
+    async fn ws_submit_caps_accumulated_chunk_bytes() {
+        let ws = test_ws_stream(
+            vec![
+                json!({ "type": "chunk", "content": "1234567890" }),
+                json!({ "type": "chunk", "content": "abcdefghi" }),
+            ],
+            None,
+        )
+        .await;
+        let client = ZeroclawClient::new("http://localhost:8888".to_string(), String::new());
+
+        let err = client
+            .submit_turn_ws_connected_with_limits(
+                ws,
+                "main",
+                "hello",
+                "primary",
+                Duration::from_secs(5),
+                16,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("WebSocket response exceeded"));
+    }
+
+    #[tokio::test]
+    async fn ws_submit_times_out_without_done_or_close() {
+        let ws = test_ws_stream(
+            vec![json!({ "type": "thinking", "content": "still working" })],
+            Some(Duration::from_millis(100)),
+        )
+        .await;
+        let client = ZeroclawClient::new("http://localhost:8888".to_string(), String::new());
+
+        let err = client
+            .submit_turn_ws_connected_with_limits(
+                ws,
+                "main",
+                "hello",
+                "primary",
+                Duration::from_millis(10),
+                1024,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("WebSocket turn timed out"));
     }
 
     #[test]

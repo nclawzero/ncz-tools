@@ -340,7 +340,7 @@ impl ReplLoop {
                             &append_error,
                         );
                     }
-                    if repl_turn_collection_failure_requires_incomplete_transcript(&error_text) {
+                    if repl_submit_error_requires_incomplete_transcript(&error_text) {
                         surface_repl_transcript_incomplete_reason(
                             &transcript_scope,
                             &session_id,
@@ -749,6 +749,10 @@ fn repl_turn_collection_failure_requires_incomplete_transcript(message: &str) ->
         || message.contains("buffered runId-less assistant messages exceeded cap")
 }
 
+fn repl_submit_error_requires_incomplete_transcript(message: &str) -> bool {
+    repl_turn_collection_failure_requires_incomplete_transcript(message) || !message.is_empty()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -940,6 +944,24 @@ mod tests {
         assert!(repl_turn_collection_failure_requires_incomplete_transcript(
             &reason
         ));
+        surface_repl_transcript_incomplete_reason(&scope, "main", &reason);
+
+        assert!(storage::scoped_session_history_is_incomplete(&scope, "main").unwrap());
+    }
+
+    #[test]
+    fn legacy_repl_submit_error_marks_history_incomplete() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let scope = storage::workspace_scope(
+            "zeroclaw",
+            &format!("legacy-submit-error-transcript-{}", uuid::Uuid::new_v4()),
+            None,
+        )
+        .unwrap();
+        storage::append_scoped_session_history(&scope, "main", "user", "hello").unwrap();
+        let reason = "WebSocket read failed: reset".to_string();
+
+        assert!(repl_submit_error_requires_incomplete_transcript(&reason));
         surface_repl_transcript_incomplete_reason(&scope, "main", &reason);
 
         assert!(storage::scoped_session_history_is_incomplete(&scope, "main").unwrap());

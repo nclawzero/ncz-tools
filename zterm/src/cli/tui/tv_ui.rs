@@ -631,6 +631,8 @@ pub async fn run(
                             let submit_result = client.submit_turn(&worker_session_id, &text).await;
                             client.set_stream_sink(Some(worker_sink.clone()));
                             drop(client);
+                            let submit_error_text =
+                                submit_result.as_ref().err().map(|e| e.to_string());
 
                             match &submit_result {
                                 Ok(response) if !response.is_empty() => {
@@ -665,15 +667,6 @@ pub async fn run(
                                             );
                                         send_worker_finished(&worker_sink, Err(message)).await;
                                     }
-                                    if turn_collection_failure_requires_incomplete_transcript(
-                                        &error_text,
-                                    ) {
-                                        let _ = mark_turn_transcript_incomplete_reason(
-                                            &transcript_scope,
-                                            &worker_session_id,
-                                            &error_text,
-                                        );
-                                    }
                                 }
                                 _ => {}
                             }
@@ -703,12 +696,25 @@ pub async fn run(
                                     }
                                 }
                             };
+                            let forwarded_any = forwarded_token.load(Ordering::Acquire);
+                            if let Some(error_text) = submit_error_text.as_deref() {
+                                if submit_error_requires_incomplete_transcript(
+                                    error_text,
+                                    forwarded_any,
+                                ) {
+                                    let _ = mark_turn_transcript_incomplete_reason(
+                                        &transcript_scope,
+                                        &worker_session_id,
+                                        error_text,
+                                    );
+                                }
+                            }
                             send_worker_chunks_reliably(
                                 &worker_sink,
                                 submit_turn_fallback_chunks(
                                     &submit_result,
                                     saw_finished,
-                                    forwarded_token.load(Ordering::Acquire),
+                                    forwarded_any,
                                 ),
                             )
                             .await;
@@ -1582,6 +1588,10 @@ fn mark_turn_transcript_incomplete_reason(
 fn turn_collection_failure_requires_incomplete_transcript(message: &str) -> bool {
     message.contains("accepted assistant turn exceeded cap")
         || message.contains("buffered runId-less assistant messages exceeded cap")
+}
+
+fn submit_error_requires_incomplete_transcript(message: &str, forwarded_token: bool) -> bool {
+    forwarded_token || turn_collection_failure_requires_incomplete_transcript(message)
 }
 
 #[derive(Debug)]
@@ -4920,6 +4930,25 @@ mod tests {
         assert!(turn_collection_failure_requires_incomplete_transcript(
             &reason
         ));
+        let message = mark_turn_transcript_incomplete_reason(&scope, "main", &reason);
+
+        assert!(message.contains("transcript marked incomplete"));
+        assert!(storage::scoped_session_history_is_incomplete(&scope, "main").unwrap());
+    }
+
+    #[test]
+    fn post_token_submit_error_marks_history_incomplete() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let scope = storage::workspace_scope(
+            "zeroclaw",
+            &format!("partial-error-transcript-{}", uuid::Uuid::new_v4()),
+            None,
+        )
+        .unwrap();
+        storage::append_scoped_session_history(&scope, "main", "user", "hello").unwrap();
+        let reason = "WebSocket read failed: reset".to_string();
+
+        assert!(submit_error_requires_incomplete_transcript(&reason, true));
         let message = mark_turn_transcript_incomplete_reason(&scope, "main", &reason);
 
         assert!(message.contains("transcript marked incomplete"));
