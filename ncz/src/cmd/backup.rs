@@ -458,8 +458,9 @@ mod tests {
             archive_path: backup_state::archive_path_for_source(path),
             contents: contents.to_vec(),
         };
-        let manifest = backup_state::manifest("test-host".to_string(), &[source.clone()]);
-        backup_state::write_archive(archive, &manifest, &[source]).unwrap();
+        let sources = std::slice::from_ref(&source);
+        let manifest = backup_state::manifest("test-host".to_string(), sources);
+        backup_state::write_archive(archive, &manifest, sources).unwrap();
         manifest
     }
 
