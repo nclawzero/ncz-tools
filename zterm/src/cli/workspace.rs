@@ -176,7 +176,7 @@ impl AppConfig {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading zterm config from {}", path.display()))?;
         let mut cfg = Self::parse(&text)?;
-        apply_openclaw_workspace_state(path, &mut cfg)?;
+        apply_workspace_state(path, &mut cfg)?;
         cfg.validate()?;
         Ok(cfg)
     }
@@ -474,7 +474,20 @@ fn openclaw_primary_and_alias_namespaces(config: &WorkspaceConfig) -> Vec<String
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct WorkspaceState {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    zeroclaw_workspaces: Vec<StableWorkspaceState>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     openclaw_workspaces: Vec<OpenClawWorkspaceState>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StableWorkspaceState {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    index: Option<usize>,
+    name: String,
+    url: String,
+    id: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    identity_aliases: Vec<OpenClawWorkspaceIdentity>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -770,12 +783,21 @@ fn save_workspace_state(path: &Path, state: &WorkspaceState) -> Result<()> {
     Ok(())
 }
 
-fn apply_openclaw_workspace_state(config_path: &Path, cfg: &mut AppConfig) -> Result<()> {
-    if !cfg
+fn apply_workspace_state(config_path: &Path, cfg: &mut AppConfig) -> Result<()> {
+    let has_openclaw = cfg
         .workspaces
         .iter()
-        .any(|workspace| workspace.backend == Backend::Openclaw)
-    {
+        .any(|workspace| workspace.backend == Backend::Openclaw);
+    let has_idless_zeroclaw = cfg.workspaces.iter().any(|workspace| {
+        workspace.backend == Backend::Zeroclaw
+            && workspace
+                .id
+                .as_deref()
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .is_none()
+    });
+    if !has_openclaw && !has_idless_zeroclaw {
         return Ok(());
     }
 
@@ -783,6 +805,101 @@ fn apply_openclaw_workspace_state(config_path: &Path, cfg: &mut AppConfig) -> Re
     let _state_lock = lock_workspace_state(&state_path)?;
     let mut state = load_workspace_state(&state_path)?;
     let mut state_changed = false;
+    let mut claimed_zeroclaw_entries = std::collections::HashSet::new();
+    let mut zeroclaw_index = 0usize;
+
+    for workspace in &mut cfg.workspaces {
+        if workspace.backend != Backend::Zeroclaw {
+            continue;
+        }
+        let workspace_index = zeroclaw_index;
+        zeroclaw_index += 1;
+
+        if workspace
+            .id
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .is_some()
+        {
+            continue;
+        }
+
+        if let Some(entry_idx) = find_stable_workspace_state_entry(
+            &state.zeroclaw_workspaces,
+            workspace,
+            workspace_index,
+            &claimed_zeroclaw_entries,
+        )? {
+            if !claimed_zeroclaw_entries.insert(entry_idx) {
+                return Err(anyhow!(
+                    "zeroclaw workspace state entry {} matched more than one workspace",
+                    entry_idx
+                ));
+            }
+            let entry = &mut state.zeroclaw_workspaces[entry_idx];
+            workspace.id = Some(entry.id.clone());
+            state_changed |= refresh_stable_workspace_state_entry(
+                entry,
+                workspace_index,
+                &workspace.name,
+                &workspace.url,
+            );
+            continue;
+        }
+
+        let generated_id = format!("ws_{}", uuid::Uuid::new_v4().simple());
+        let entry = StableWorkspaceState {
+            index: Some(workspace_index),
+            name: workspace.name.clone(),
+            url: workspace.url.clone(),
+            id: generated_id,
+            identity_aliases: Vec::new(),
+        };
+        let mut next_state = state.clone();
+        next_state.zeroclaw_workspaces.push(entry.clone());
+        save_workspace_state(&state_path, &next_state).with_context(|| {
+            format!(
+                "could not persist generated zeroclaw workspace id for '{}' to {}; refusing to use an in-memory-only id",
+                workspace.name,
+                state_path.display()
+            )
+        })?;
+
+        let verified_state = load_workspace_state(&state_path).with_context(|| {
+            format!(
+                "could not verify generated zeroclaw workspace id for '{}' in {}; refusing to use an in-memory-only id",
+                workspace.name,
+                state_path.display()
+            )
+        })?;
+        let entry_idx = verified_state
+            .zeroclaw_workspaces
+            .iter()
+            .position(|persisted| {
+                persisted.id == entry.id
+                    && workspace_identity_values_match(
+                        &persisted.name,
+                        &persisted.url,
+                        &entry.name,
+                        &entry.url,
+                    )
+            })
+            .ok_or_else(|| {
+                anyhow!(
+                    "generated zeroclaw workspace id for '{}' was not present after persisting {}; refusing to use an in-memory-only id",
+                    workspace.name,
+                    state_path.display()
+                )
+            })?;
+
+        let persisted = &verified_state.zeroclaw_workspaces[entry_idx];
+        let persisted_id = persisted.id.clone();
+        state = verified_state;
+        claimed_zeroclaw_entries.insert(entry_idx);
+        workspace.id = Some(persisted_id);
+    }
+
     let mut claimed_state_entries = std::collections::HashSet::new();
     let configured_openclaw_identities = configured_openclaw_workspace_identities(cfg);
     let mut openclaw_index = 0usize;
@@ -926,7 +1043,7 @@ fn apply_openclaw_workspace_state(config_path: &Path, cfg: &mut AppConfig) -> Re
     cfg.validate()?;
     if state_changed {
         if let Err(e) = save_workspace_state(&state_path, &state) {
-            tracing::warn!("could not persist updated openclaw workspace state aliases: {e}");
+            tracing::warn!("could not persist updated workspace state aliases: {e}");
         }
     }
     Ok(())
@@ -942,6 +1059,45 @@ fn configured_openclaw_workspace_identities(cfg: &AppConfig) -> Vec<(String, Str
 
 fn normalize_workspace_url(url: &str) -> String {
     url.trim().trim_end_matches('/').to_string()
+}
+
+fn find_stable_workspace_state_entry(
+    entries: &[StableWorkspaceState],
+    workspace: &WorkspaceConfig,
+    workspace_index: usize,
+    claimed_entries: &std::collections::HashSet<usize>,
+) -> Result<Option<usize>> {
+    let identity_matches: Vec<usize> = entries
+        .iter()
+        .enumerate()
+        .filter(|(idx, entry)| {
+            !claimed_entries.contains(idx)
+                && stable_workspace_state_identity_matches(entry, workspace, workspace_index)
+        })
+        .map(|(idx, _)| idx)
+        .collect();
+    if identity_matches.len() > 1 {
+        return Err(anyhow!(
+            "zeroclaw workspace '{}' matches multiple persisted workspace-state entries",
+            workspace.name
+        ));
+    }
+    Ok(identity_matches.into_iter().next())
+}
+
+fn stable_workspace_state_identity_matches(
+    entry: &StableWorkspaceState,
+    workspace: &WorkspaceConfig,
+    workspace_index: usize,
+) -> bool {
+    workspace_identity_matches(&entry.name, &entry.url, workspace)
+        || entry
+            .identity_aliases
+            .iter()
+            .any(|identity| workspace_identity_matches(&identity.name, &identity.url, workspace))
+        || (entry.index == Some(workspace_index)
+            && normalize_workspace_url(&entry.url) == normalize_workspace_url(&workspace.url))
+        || (entry.index == Some(workspace_index) && entry.name == workspace.name)
 }
 
 fn find_openclaw_workspace_state_entry(
@@ -1016,8 +1172,55 @@ fn openclaw_workspace_state_identity_matches(
 }
 
 fn openclaw_workspace_identity_matches(name: &str, url: &str, workspace: &WorkspaceConfig) -> bool {
+    workspace_identity_matches(name, url, workspace)
+}
+
+fn workspace_identity_matches(name: &str, url: &str, workspace: &WorkspaceConfig) -> bool {
     name == workspace.name
         && normalize_workspace_url(url) == normalize_workspace_url(&workspace.url)
+}
+
+fn refresh_stable_workspace_state_entry(
+    entry: &mut StableWorkspaceState,
+    workspace_index: usize,
+    workspace_name: &str,
+    workspace_url: &str,
+) -> bool {
+    let mut changed = false;
+    if entry.index != Some(workspace_index) {
+        entry.index = Some(workspace_index);
+        changed = true;
+    }
+    if !workspace_identity_values_match(&entry.name, &entry.url, workspace_name, workspace_url) {
+        let previous = OpenClawWorkspaceIdentity {
+            name: entry.name.clone(),
+            url: entry.url.clone(),
+        };
+        if !entry.identity_aliases.iter().any(|identity| {
+            workspace_identity_values_match(
+                &identity.name,
+                &identity.url,
+                &previous.name,
+                &previous.url,
+            )
+        }) {
+            entry.identity_aliases.push(previous);
+        }
+        entry.name = workspace_name.to_string();
+        entry.url = workspace_url.to_string();
+        changed = true;
+    }
+    changed
+}
+
+fn workspace_identity_values_match(
+    left_name: &str,
+    left_url: &str,
+    right_name: &str,
+    right_url: &str,
+) -> bool {
+    left_name == right_name
+        && normalize_workspace_url(left_url) == normalize_workspace_url(right_url)
 }
 
 fn refresh_openclaw_workspace_state_entry(
@@ -1209,6 +1412,8 @@ impl App {
         token: Option<String>,
     ) -> Result<Self> {
         let token = Some(token.unwrap_or_default());
+        let config_path = AppConfig::default_path()
+            .unwrap_or_else(|_| std::path::PathBuf::from("./.zterm-synthetic.toml"));
         let cfg = WorkspaceConfig {
             id: None,
             name: "default".to_string(),
@@ -1219,9 +1424,17 @@ impl App {
             label: None,
             namespace_aliases: Vec::new(),
         };
+        let mut app_cfg = AppConfig {
+            active: Some("default".to_string()),
+            workspaces: vec![cfg],
+        };
+        apply_workspace_state(&config_path, &mut app_cfg)?;
+        let cfg = app_cfg
+            .workspaces
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("synthetic zeroclaw workspace config disappeared"))?;
         let ws = Workspace::instantiate(0, cfg)?;
-        let config_path = AppConfig::default_path()
-            .unwrap_or_else(|_| std::path::PathBuf::from("./.zterm-synthetic.toml"));
         Ok(Self {
             workspaces: vec![ws],
             active: 0,
@@ -1640,7 +1853,7 @@ url = "ws://old.example"
     }
 
     #[test]
-    fn load_without_openclaw_workspaces_does_not_touch_workspace_state_lock() {
+    fn zeroclaw_load_assigns_sidecar_id_without_openclaw() {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("config.toml");
         let original = r#"
@@ -1648,23 +1861,19 @@ url = "ws://old.example"
 name = "alpha"
 backend = "zeroclaw"
 url = "http://localhost:8080"
+token = ""
 "#;
         std::fs::write(&path, original).unwrap();
 
         let lock_path = workspace_state_lock_path(&workspace_state_path_for_config(&path));
-        std::fs::write(
-            &lock_path,
-            format!(
-                "pid = {}\ncreated_unix_ms = 1\ntoken = \"live\"\n",
-                std::process::id()
-            ),
-        )
-        .unwrap();
 
         let cfg = AppConfig::load(&path).unwrap();
+        let state = load_workspace_state(&workspace_state_path_for_config(&path)).unwrap();
 
         assert_eq!(cfg.workspaces[0].backend, Backend::Zeroclaw);
-        assert!(lock_path.exists());
+        assert!(cfg.workspaces[0].id.as_deref().unwrap().starts_with("ws_"));
+        assert_eq!(state.zeroclaw_workspaces.len(), 1);
+        assert!(!lock_path.exists());
     }
 
     #[test]
@@ -1806,6 +2015,52 @@ url = "ws://a.example"
             .namespace_aliases
             .iter()
             .any(|alias| alias == "backend=openclaw;workspace=beta;url=ws://b.example"));
+    }
+
+    #[test]
+    fn zeroclaw_workspace_id_survives_rename_and_preserves_incomplete_marker() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let prior = std::env::var("ZTERM_CONFIG_DIR").ok();
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::env::set_var("ZTERM_CONFIG_DIR", tmp.path());
+        let path = tmp.path().join("config.toml");
+        let original = r#"
+[[workspaces]]
+name = "alpha"
+backend = "zeroclaw"
+url = "http://127.0.0.1:42617"
+token = ""
+"#;
+        std::fs::write(&path, original).unwrap();
+
+        let cfg = AppConfig::load(&path).unwrap();
+        let id = cfg.workspaces[0].id.clone().unwrap();
+        let before = crate::cli::storage::workspace_scope("zeroclaw", "alpha", Some(&id)).unwrap();
+        crate::cli::storage::mark_scoped_session_history_incomplete(
+            &before,
+            "main",
+            "unknown turn outcome",
+        )
+        .unwrap();
+
+        let renamed = r#"
+[[workspaces]]
+name = "renamed"
+backend = "zeroclaw"
+url = "http://127.0.0.1:42617"
+token = ""
+"#;
+        std::fs::write(&path, renamed).unwrap();
+
+        let reloaded = AppConfig::load(&path).unwrap();
+        assert_eq!(reloaded.workspaces[0].id.as_deref(), Some(id.as_str()));
+        let after = crate::cli::storage::workspace_scope("zeroclaw", "renamed", Some(&id)).unwrap();
+        assert!(crate::cli::storage::scoped_session_history_is_incomplete(&after, "main").unwrap());
+
+        match prior {
+            Some(value) => std::env::set_var("ZTERM_CONFIG_DIR", value),
+            None => std::env::remove_var("ZTERM_CONFIG_DIR"),
+        }
     }
 
     #[test]
@@ -2152,6 +2407,13 @@ token = ""
             App::boot_or_synthesize("http://127.0.0.1:42617", Some("tok".to_string())).unwrap();
         assert_eq!(app.workspaces.len(), 1);
         assert_eq!(app.active_workspace().unwrap().config.name, "default");
+        assert!(app
+            .active_workspace()
+            .unwrap()
+            .config
+            .id
+            .as_deref()
+            .is_some_and(|id| id.starts_with("ws_")));
         match prior {
             Some(v) => std::env::set_var("ZTERM_CONFIG_DIR", v),
             None => std::env::remove_var("ZTERM_CONFIG_DIR"),

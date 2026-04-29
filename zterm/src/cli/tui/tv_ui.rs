@@ -5871,6 +5871,35 @@ mod tests {
     }
 
     #[test]
+    fn mutation_fence_with_stable_id_survives_workspace_rename() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let prior = std::env::var_os("HOME");
+        std::env::set_var("HOME", tmp.path());
+        let fence = delighters::MutationFenceState {
+            command: "/memory post x".to_string(),
+            reason: "unknown outcome".to_string(),
+            created_at_unix: 1,
+        };
+        delighters::set_mutation_fence_for_workspace("id:ws-stable", fence).unwrap();
+        let mut status = StatusState::new(
+            "renamed".to_string(),
+            "primary".to_string(),
+            "borland".to_string(),
+            false,
+        );
+        status.workspace_id = Some("ws-stable".to_string());
+
+        let loaded = load_persisted_mutation_fence_for_status(&status).unwrap();
+
+        assert_eq!(loaded.reason, "unknown outcome");
+        match prior {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    #[test]
     fn post_switch_timeout_fence_uses_refreshed_workspace_key() {
         let _env = crate::cli::test_env_lock().lock().unwrap();
         let home = tempfile::tempdir().unwrap();
