@@ -49,7 +49,7 @@ use tokio::sync::Mutex;
 
 use crate::cli::agent::AgentClient;
 use crate::cli::client::ZeroclawClient;
-use crate::cli::url_safety::is_sensitive_url_query_key;
+use crate::cli::url_safety::{is_sensitive_url_query_key, redact_url_secrets_lossy_for_display};
 
 /// Backend identifier as written in `~/.zterm/config.toml`.
 /// Lower-case string enum for TOML ergonomics.
@@ -1672,9 +1672,12 @@ fn validate_workspace_urls(cfg: &AppConfig) -> Result<()> {
 }
 
 fn validate_workspace_url_safety(config: &WorkspaceConfig) -> Result<()> {
-    let Ok(url) = reqwest::Url::parse(config.url.trim()) else {
-        return Ok(());
-    };
+    let url = reqwest::Url::parse(config.url.trim()).map_err(|_| {
+        anyhow!(
+            "workspace `{}` url is invalid; fix the url before use",
+            config.name
+        )
+    })?;
     if !url.username().is_empty() || url.password().is_some() {
         return Err(anyhow!(
             "workspace `{}` url must not embed username/password credentials; use token_env or token instead",
@@ -1713,7 +1716,7 @@ fn missing_zeroclaw_token_error(config: &WorkspaceConfig) -> anyhow::Error {
     let source = match config.resolved_token() {
         Some(token) if token.trim().is_empty() => format!(
             "resolved token is blank and url `{}` is not localhost/loopback",
-            config.url
+            redact_url_secrets_lossy_for_display(&config.url)
         ),
         Some(_) => "resolved token is unusable".to_string(),
         None => match config.token_env.as_deref().filter(|name| !name.is_empty()) {
@@ -2624,6 +2627,35 @@ url = "ws://127.0.0.1:18789/ws#access_token=fragment-secret"
         assert!(!msg.contains("fragment-secret"));
     }
 
+    #[test]
+    fn app_from_config_rejects_malformed_workspace_url_without_leaking_secrets() {
+        let cfg = AppConfig::parse(
+            r#"
+[[workspaces]]
+name = "oc"
+backend = "openclaw"
+url = "ws://operator:embedded-password@[gateway/ws?api_token=query-secret#access_token=fragment-secret"
+"#,
+        )
+        .unwrap();
+
+        let err = match App::from_config(cfg, PathBuf::from("/dev/null")) {
+            Ok(_) => panic!("malformed workspace URL should fail closed"),
+            Err(err) => err,
+        };
+
+        let msg = err.to_string();
+        assert!(msg.contains("url is invalid"));
+        for leaked in [
+            "operator",
+            "embedded-password",
+            "query-secret",
+            "fragment-secret",
+        ] {
+            assert!(!msg.contains(leaked), "{leaked} leaked in {msg}");
+        }
+    }
+
     #[tokio::test]
     async fn activate_zeroclaw_is_noop_returns_ok() {
         let cfg = WorkspaceConfig {
@@ -2844,6 +2876,28 @@ url = "ws://c"
         let fragment_msg = fragment_err.to_string();
         assert!(fragment_msg.contains("url must not contain a fragment"));
         assert!(!fragment_msg.contains("fragment-secret"));
+
+        let malformed_err = match App::synthesize_single_zeroclaw(
+            "https://operator:embedded-password@[example/ws?api_token=query-secret#token=fragment-secret",
+            Some(String::new()),
+        ) {
+            Ok(_) => panic!("malformed synthetic zeroclaw URL should fail closed"),
+            Err(err) => err,
+        };
+        let malformed_msg = malformed_err.to_string();
+        assert!(malformed_msg.contains("url is invalid"));
+        assert!(!malformed_msg.contains("resolved token is blank"));
+        for leaked in [
+            "operator",
+            "embedded-password",
+            "query-secret",
+            "fragment-secret",
+        ] {
+            assert!(
+                !malformed_msg.contains(leaked),
+                "{leaked} leaked in {malformed_msg}"
+            );
+        }
     }
 
     #[test]

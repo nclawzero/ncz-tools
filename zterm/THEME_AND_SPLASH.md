@@ -10,11 +10,11 @@
 > runtime palette presets, `~/.zterm/theme.toml`, cached
 > connect-splash text at `~/.zterm/cache/connect-splash/`, and
 > `~/.zterm/state.toml` for launch count plus `beep_on_error`. The
-> v0.3.1 connect splash is local-only in production and renders a
-> period modem sequence. The guarded backend generator remains
-> test-covered for future side-effect-free clients, but there is no
-> user-facing backend opt-in flag in v0.3.1. Setting
-> `[ui].splash_screen = false`
+> v0.3.1 connect splash defaults to a period modem sequence.
+> `[ui].connect_splash_backend = true` opts into the guarded backend
+> generator when the active backend advertises side-effect-free and
+> cancellable splash generation; unsupported or failed attempts fall
+> back to the local sequence. Setting `[ui].splash_screen = false`
 > disables both the legacy ANSI splash and the TV connect-splash path.
 > State writes use a
 > bounded lock wait, and the TV path persists a mutation fence after
@@ -99,6 +99,19 @@ splash_screen = false
 ```
 
 Default is `true` (splash enabled).
+
+Backend-generated connect splashes are opt-in:
+
+```toml
+[ui]
+connect_splash_backend = true
+```
+
+Default is `false`. When enabled, zterm still requires the active
+backend to pass the side-effect-free and cancellable generation guards.
+Generated text is cached per workspace for 24 hours; unsupported
+backends fall back to the local modem/BBS sequence without writing a
+cache entry.
 
 ---
 

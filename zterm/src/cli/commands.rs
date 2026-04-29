@@ -17,7 +17,9 @@ use crate::cli::client::ZeroclawClient;
 use crate::cli::client::{Model, Provider, Session};
 use crate::cli::input::InputHistory;
 use crate::cli::storage;
-use crate::cli::url_safety::redact_url_secrets_for_display;
+use crate::cli::url_safety::{
+    redact_url_secrets_lossy_for_display, redact_url_secrets_lossy_if_needed,
+};
 use crate::cli::workspace::{Backend, Workspace, WorkspaceConfig};
 
 type AgentClientHandle = Arc<Mutex<Box<dyn AgentClient + Send + Sync>>>;
@@ -1724,11 +1726,11 @@ fn redact_toml_value(value: &mut toml::Value) {
 }
 
 fn redact_url_string_value(value: &str) -> Option<String> {
-    redact_url_secrets_for_display(value)
+    redact_url_secrets_lossy_if_needed(value)
 }
 
 fn display_workspace_url_for_output(url: &str) -> String {
-    redact_url_secrets_for_display(url).unwrap_or_else(|| url.to_string())
+    redact_url_secrets_lossy_for_display(url)
 }
 
 fn split_line_ending(raw_line: &str) -> (&str, &str) {
@@ -3556,7 +3558,7 @@ token = "legacy-secret"
             app.workspaces[0].config.url =
                 "wss://alpha.example/ws#access_token=alpha-fragment-secret".to_string();
             app.workspaces[1].config.url =
-                "wss://beta.example/ws?client_secret=beta-query-secret#token=beta-fragment-secret"
+                "wss://operator:embedded-password@[beta/ws?client_secret=beta-query-secret#token=beta-fragment-secret"
                     .to_string();
         }
         let handler = super::CommandHandler::new(app);
@@ -3575,9 +3577,11 @@ token = "legacy-secret"
             .unwrap()
             .unwrap();
         assert!(list.contains("wss://alpha.example/ws#REDACTED"));
-        assert!(list.contains("wss://beta.example/ws?client_secret=REDACTED#REDACTED"));
+        assert!(list.contains("wss://redacted:redacted@[beta/ws?client_secret=REDACTED#REDACTED"));
         for leaked in [
             "alpha-fragment-secret",
+            "operator",
+            "embedded-password",
             "beta-query-secret",
             "beta-fragment-secret",
         ] {
@@ -3704,6 +3708,25 @@ openai = { model = "gpt", api_key = "inline-api-key" }
             "ZEROCLAW_URL = \"wss://redacted:redacted@gateway.example/ws?access_token=REDACTED&model=gpt\""
         ));
         for leaked in ["legacy:legacy-password", "legacy-token"] {
+            assert!(!out.contains(leaked), "{leaked} leaked in {out}");
+        }
+    }
+
+    #[test]
+    fn config_output_redacts_malformed_url_like_secret_values() {
+        let out = super::format_config_output(Ok(r#"
+	[gateway]
+		url = "wss://operator:embedded-password@[gateway/ws?access_token=url-token&room=alpha#token=fragment-token"
+		"#
+        .to_string()));
+
+        assert!(out.contains("url = \"wss://redacted:redacted@[gateway/ws?access_token=REDACTED&room=alpha#REDACTED\""));
+        for leaked in [
+            "operator",
+            "embedded-password",
+            "url-token",
+            "fragment-token",
+        ] {
             assert!(!out.contains(leaked), "{leaked} leaked in {out}");
         }
     }

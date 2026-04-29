@@ -7,6 +7,7 @@ use crate::cli::client::Session;
 use crate::cli::commands::tokenize_slash_command;
 use crate::cli::pairing::PairingManager;
 use crate::cli::storage::{self, SessionMetadata};
+use crate::cli::url_safety::redact_url_secrets_lossy_for_display;
 use crate::cli::workspace::{App, AppConfig, WorkspaceConfig};
 
 pub mod delighters;
@@ -208,7 +209,8 @@ pub async fn run(
         .active_workspace()
         .expect("active workspace just activated");
     let active_gateway_url = active_gateway_url_for_app(&app)?;
-    info!("Gateway URL: {}", active_gateway_url);
+    let display_gateway_url = redact_url_secrets_lossy_for_display(&active_gateway_url);
+    info!("Gateway URL: {}", display_gateway_url);
     let active_backend = active_ws.config.backend.as_str().to_string();
     let active_client = active_ws
         .client
@@ -221,7 +223,7 @@ pub async fn run(
     {
         let healthy = active_client.lock().await.health().await?;
         if !healthy {
-            eprintln!("❌ Could not connect to gateway at {}", active_gateway_url);
+            eprintln!("❌ Could not connect to gateway at {}", display_gateway_url);
             eprintln!("   Make sure the agent backend is running.");
             return Err(anyhow!("Gateway connection failed"));
         }
@@ -282,14 +284,10 @@ pub async fn run(
         .and_then(|v| v.get("splash_screen"))
         .and_then(|v| v.as_bool())
         .unwrap_or(true); // Default: show splash
-                          // v0.3.1 production connect splashes are local-only. The guarded
-                          // backend generator remains test-covered in tv_ui for a future
-                          // side-effect-free AgentClient capability, but there is no user-facing
-                          // opt-in flag in this release.
-    let backend_connect_splash = false;
+    let backend_connect_splash = backend_connect_splash_enabled(&config);
 
     if show_splash {
-        splash::display_splash(&session_name, &active_gateway_url, &model, &provider);
+        splash::display_splash(&session_name, &display_gateway_url, &model, &provider);
     }
 
     let shared_app = std::sync::Arc::new(tokio::sync::Mutex::new(app));
@@ -354,6 +352,14 @@ fn active_gateway_url_for_app(app: &App) -> Result<String> {
     app.active_workspace()
         .map(|workspace| workspace.config.url.clone())
         .ok_or_else(|| anyhow!("no active workspace after boot"))
+}
+
+fn backend_connect_splash_enabled(config: &toml::Value) -> bool {
+    config
+        .get("ui")
+        .and_then(|v| v.get("connect_splash_backend"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
 }
 
 fn read_toml_value_or_empty(path: &std::path::Path) -> Result<toml::Value> {
@@ -702,6 +708,16 @@ mod tests {
             active_gateway_url_for_app(&app).unwrap(),
             "http://beta.example"
         );
+    }
+
+    #[test]
+    fn backend_connect_splash_config_is_opt_in() {
+        let default_config: toml::Value = toml::from_str("[ui]\nsplash_screen = true\n").unwrap();
+        assert!(!backend_connect_splash_enabled(&default_config));
+
+        let enabled_config: toml::Value =
+            toml::from_str("[ui]\nconnect_splash_backend = true\n").unwrap();
+        assert!(backend_connect_splash_enabled(&enabled_config));
     }
 
     #[tokio::test]
