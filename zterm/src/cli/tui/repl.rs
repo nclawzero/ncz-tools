@@ -48,6 +48,15 @@ struct ReplSessionBinding {
     name: String,
 }
 
+impl ReplSessionBinding {
+    fn from_session(session: &Session) -> Self {
+        Self {
+            id: session.id.clone(),
+            name: session.name.clone(),
+        }
+    }
+}
+
 impl ReplLoop {
     /// Create a new REPL loop around a shared Arc<Mutex<App>>.
     /// Active workspace client is resolved on every submit_turn.
@@ -61,11 +70,24 @@ impl ReplLoop {
         let command_handler = CommandHandler::new(app.clone());
         let status_bar = StatusBar::new(model.clone(), provider.clone(), session.name.clone());
         let fallback_session_name = session.name.clone();
+        let workspace_sessions = {
+            let app_guard = app
+                .try_lock()
+                .map_err(|_| anyhow::anyhow!("could not seed active workspace session binding"))?;
+            let mut sessions = HashMap::new();
+            if let Some(workspace) = app_guard.active_workspace() {
+                sessions.insert(
+                    workspace.config.name.clone(),
+                    ReplSessionBinding::from_session(&session),
+                );
+            }
+            sessions
+        };
 
         Ok(Self {
             app,
             session,
-            workspace_sessions: HashMap::new(),
+            workspace_sessions,
             fallback_session_name,
             reader: io::BufReader::new(io::stdin()),
             model,
@@ -222,13 +244,8 @@ impl ReplLoop {
     }
 
     fn remember_active_workspace_session(&mut self, workspace_name: String, session: &Session) {
-        self.workspace_sessions.insert(
-            workspace_name,
-            ReplSessionBinding {
-                id: session.id.clone(),
-                name: session.name.clone(),
-            },
-        );
+        self.workspace_sessions
+            .insert(workspace_name, ReplSessionBinding::from_session(session));
     }
 
     async fn load_active_workspace_session(&self, session_id: &str) -> Result<Session> {
@@ -1977,6 +1994,60 @@ mod tests {
         assert_eq!(
             beta_submitted.lock().unwrap().as_slice(),
             &[("beta-session".to_string(), "hello beta".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_repl_boot_binding_serves_info_and_first_turn_without_create() {
+        let submitted = Arc::new(StdMutex::new(Vec::new()));
+        let deleted = Arc::new(StdMutex::new(Vec::new()));
+        let created = Arc::new(StdMutex::new(Vec::new()));
+        let boot = session("boot-session", "chat");
+        let app = Arc::new(Mutex::new(App {
+            workspaces: vec![workspace_with_session_client_options(
+                0,
+                "alpha",
+                vec![boot.clone()],
+                Arc::clone(&submitted),
+                Arc::clone(&deleted),
+                None,
+                Vec::new(),
+                Arc::clone(&created),
+            )],
+            active: 0,
+            shared_mnemos: None,
+            config_path: PathBuf::from("test-config.toml"),
+        }));
+        let mut repl = ReplLoop::new(
+            Arc::clone(&app),
+            boot,
+            "model".to_string(),
+            "provider".to_string(),
+        )
+        .unwrap();
+
+        let info = repl
+            .handle_slash_command("/info")
+            .await
+            .unwrap()
+            .expect("/info should render against boot session");
+        assert!(info.contains("Session"));
+        assert!(created.lock().unwrap().is_empty());
+
+        let session_id = repl.turn_session_id_for_active_workspace().await.unwrap();
+        let active_client = repl.resolve_active_client().await.unwrap();
+        active_client
+            .lock()
+            .await
+            .submit_turn(&session_id, "hello")
+            .await
+            .unwrap();
+
+        assert_eq!(session_id, "boot-session");
+        assert!(created.lock().unwrap().is_empty());
+        assert_eq!(
+            submitted.lock().unwrap().as_slice(),
+            &[("boot-session".to_string(), "hello".to_string())]
         );
     }
 
