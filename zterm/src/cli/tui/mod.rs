@@ -1,12 +1,13 @@
 use anyhow::{anyhow, Result};
 use chrono::Utc;
 use std::io::{self, Write};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::cli::client::Session;
 use crate::cli::pairing::PairingManager;
 use crate::cli::storage::{self, SessionMetadata};
 
+pub mod delighters;
 pub mod onboarding;
 pub mod repl;
 pub mod rusty_repl;
@@ -70,11 +71,18 @@ pub async fn run(
     // pairing block below are irrelevant and would spuriously fail
     // against port 8888 defaults. Synthesized (single-workspace) mode
     // keeps pairing as-is.
-    let has_multi_workspace = crate::cli::workspace::AppConfig::default_path()
-        .ok()
-        .and_then(|p| crate::cli::workspace::AppConfig::load(&p).ok())
-        .map(|cfg| !cfg.workspaces.is_empty())
-        .unwrap_or(false);
+    let has_multi_workspace = match crate::cli::workspace::AppConfig::default_path() {
+        Ok(path) => {
+            let cfg = crate::cli::workspace::AppConfig::load(&path).map_err(|e| {
+                anyhow!(
+                    "failed to load zterm workspace config from {}: {e:#}",
+                    path.display()
+                )
+            })?;
+            !cfg.workspaces.is_empty()
+        }
+        Err(_) => false,
+    };
 
     // If no token, consult the gateway's `require_pairing` flag before
     // attempting the interactive pairing flow. Zeroclaw gateways with
@@ -281,15 +289,51 @@ async fn load_or_create_session(
     >,
     session_name: &str,
 ) -> Result<Session> {
-    // Try to load existing session metadata
-    if let Ok(metadata) = storage::load_session_metadata(session_name) {
-        info!("Found existing session: {}", session_name);
-        return Ok(Session {
-            id: metadata.id.clone(),
-            name: metadata.name.clone(),
-            model: metadata.model.clone(),
-            provider: metadata.provider.clone(),
-        });
+    let local_metadata = storage::load_session_metadata(session_name).ok();
+    load_or_create_session_with_metadata(client, session_name, local_metadata).await
+}
+
+async fn load_or_create_session_with_metadata(
+    client: &std::sync::Arc<
+        tokio::sync::Mutex<Box<dyn crate::cli::agent::AgentClient + Send + Sync>>,
+    >,
+    session_name: &str,
+    local_metadata: Option<SessionMetadata>,
+) -> Result<Session> {
+    match client.lock().await.list_sessions().await {
+        Ok(sessions) => {
+            if let Some(session) = choose_boot_session_by_id_or_name(&sessions, session_name)? {
+                info!("Found existing backend session: {}", session.id);
+                return Ok(session.clone());
+            }
+        }
+        Err(e) => {
+            warn!("could not list backend sessions while booting '{session_name}': {e}");
+        }
+    }
+
+    if let Some(metadata) = local_metadata {
+        match client.lock().await.load_session(&metadata.id).await {
+            Ok(session) if session.id == metadata.id => {
+                info!(
+                    "Validated cached session metadata against backend: {}",
+                    session.id
+                );
+                return Ok(session);
+            }
+            Ok(session) => {
+                warn!(
+                    "ignoring cached session metadata for '{}': backend returned mismatched id '{}'",
+                    metadata.id, session.id
+                );
+            }
+            Err(e) => {
+                warn!(
+                    "ignoring stale cached session metadata for '{}': {e}",
+                    metadata.id
+                );
+            }
+        }
     }
 
     // Create new session
@@ -306,7 +350,263 @@ async fn load_or_create_session(
         message_count: 0,
         last_active: Utc::now().to_rfc3339(),
     };
-    storage::save_session_metadata(&metadata)?;
+    if storage::is_safe_session_id(&metadata.id) {
+        storage::save_session_metadata(&metadata)?;
+    } else {
+        warn!(
+            "not saving local metadata for unsafe session id: {}",
+            metadata.id
+        );
+    }
 
     Ok(session)
+}
+
+fn choose_boot_session_by_id_or_name<'a>(
+    sessions: &'a [Session],
+    requested: &str,
+) -> Result<Option<&'a Session>> {
+    let id_matches: Vec<&Session> = sessions
+        .iter()
+        .filter(|session| session.id == requested)
+        .collect();
+    match id_matches.as_slice() {
+        [session] => return Ok(Some(*session)),
+        [] => {}
+        _ => {
+            return Err(anyhow!(
+                "ambiguous backend session id '{requested}' while booting"
+            ));
+        }
+    }
+
+    let name_matches: Vec<&Session> = sessions
+        .iter()
+        .filter(|session| session.name == requested)
+        .collect();
+    match name_matches.as_slice() {
+        [session] => Ok(Some(*session)),
+        [] => Ok(None),
+        _ => Err(anyhow!(
+            "ambiguous backend session name '{requested}' while booting"
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::agent::{AgentClient, StreamSink};
+    use crate::cli::client::{Config, Model, Provider};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex as StdMutex};
+    use tokio::sync::Mutex;
+
+    #[derive(Clone)]
+    struct BootFakeClient {
+        list_sessions: Vec<Session>,
+        load_sessions: Vec<Session>,
+        create_session: Session,
+        loaded: Arc<StdMutex<Vec<String>>>,
+        created: Arc<StdMutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentClient for BootFakeClient {
+        async fn health(&self) -> Result<bool> {
+            Ok(true)
+        }
+
+        async fn get_config(&self) -> Result<Config> {
+            Ok(Config {
+                agent: Default::default(),
+            })
+        }
+
+        async fn put_config(&self, _config: &Config) -> Result<()> {
+            Ok(())
+        }
+
+        async fn list_providers(&self) -> Result<Vec<Provider>> {
+            Ok(Vec::new())
+        }
+
+        async fn get_models(&self, _provider: &str) -> Result<Vec<Model>> {
+            Ok(Vec::new())
+        }
+
+        async fn list_provider_models(&self, _provider: &str) -> Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+
+        async fn list_sessions(&self) -> Result<Vec<Session>> {
+            Ok(self.list_sessions.clone())
+        }
+
+        async fn create_session(&self, name: &str) -> Result<Session> {
+            self.created.lock().unwrap().push(name.to_string());
+            Ok(self.create_session.clone())
+        }
+
+        async fn load_session(&self, session_id: &str) -> Result<Session> {
+            self.loaded.lock().unwrap().push(session_id.to_string());
+            self.load_sessions
+                .iter()
+                .find(|session| session.id == session_id)
+                .cloned()
+                .ok_or_else(|| anyhow!("session not found"))
+        }
+
+        async fn delete_session(&self, _session_id: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn submit_turn(&mut self, _session_id: &str, _message: &str) -> Result<String> {
+            Ok(String::new())
+        }
+
+        fn set_stream_sink(&mut self, _sink: Option<StreamSink>) {}
+    }
+
+    fn session(id: &str, name: &str) -> Session {
+        Session {
+            id: id.to_string(),
+            name: name.to_string(),
+            model: "m".to_string(),
+            provider: "p".to_string(),
+        }
+    }
+
+    fn metadata(id: &str, name: &str) -> SessionMetadata {
+        SessionMetadata {
+            id: id.to_string(),
+            name: name.to_string(),
+            model: "m".to_string(),
+            provider: "p".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            message_count: 0,
+            last_active: "2026-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    fn boxed_client(fake: BootFakeClient) -> Arc<Mutex<Box<dyn AgentClient + Send + Sync>>> {
+        Arc::new(Mutex::new(Box::new(fake)))
+    }
+
+    #[tokio::test]
+    async fn test_workspace_probe_does_not_pair_on_load_error() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::time::{sleep, timeout, Duration};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let server_hits = Arc::clone(&hits);
+        let server = tokio::spawn(async move {
+            while let Ok(Ok((mut stream, _))) =
+                timeout(Duration::from_millis(250), listener.accept()).await
+            {
+                server_hits.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0_u8; 1024];
+                let _ = stream.read(&mut buf).await;
+                let body = r#"{"require_pairing":false}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+
+        let home = tempfile::TempDir::new().unwrap();
+        let legacy_dir = home.path().join(".zeroclaw");
+        std::fs::create_dir_all(&legacy_dir).unwrap();
+        let legacy_config = format!("[gateway]\nurl = \"http://{addr}\"\n");
+        let legacy_config_path = legacy_dir.join("config.toml");
+        std::fs::write(&legacy_config_path, &legacy_config).unwrap();
+
+        let workspace_dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            workspace_dir.path().join("config.toml"),
+            "[[workspaces]]\nname =",
+        )
+        .unwrap();
+
+        let prior_home = std::env::var_os("HOME");
+        let prior_zterm_config_dir = std::env::var_os("ZTERM_CONFIG_DIR");
+        std::env::set_var("HOME", home.path());
+        std::env::set_var("ZTERM_CONFIG_DIR", workspace_dir.path());
+
+        let result = run(None, None, None, None, true).await;
+
+        match prior_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+        match prior_zterm_config_dir {
+            Some(value) => std::env::set_var("ZTERM_CONFIG_DIR", value),
+            None => std::env::remove_var("ZTERM_CONFIG_DIR"),
+        }
+
+        let err = result.unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("failed to load zterm workspace config"));
+        let saved_config = std::fs::read_to_string(&legacy_config_path).unwrap();
+        assert!(!saved_config.contains("token"));
+        sleep(Duration::from_millis(50)).await;
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn boot_prefers_active_backend_session_over_stale_cached_main() {
+        let loaded = Arc::new(StdMutex::new(Vec::new()));
+        let created = Arc::new(StdMutex::new(Vec::new()));
+        let fake = BootFakeClient {
+            list_sessions: vec![session("active-main", "main")],
+            load_sessions: Vec::new(),
+            create_session: session("created/main", "main"),
+            loaded: Arc::clone(&loaded),
+            created: Arc::clone(&created),
+        };
+
+        let selected = load_or_create_session_with_metadata(
+            &boxed_client(fake),
+            "main",
+            Some(metadata("foreign-main", "main")),
+        )
+        .await
+        .expect("active backend main should resolve");
+
+        assert_eq!(selected.id, "active-main");
+        assert!(loaded.lock().unwrap().is_empty());
+        assert!(created.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn boot_does_not_return_stale_cross_workspace_cached_metadata() {
+        let loaded = Arc::new(StdMutex::new(Vec::new()));
+        let created = Arc::new(StdMutex::new(Vec::new()));
+        let fake = BootFakeClient {
+            list_sessions: Vec::new(),
+            load_sessions: Vec::new(),
+            create_session: session("created/main", "main"),
+            loaded: Arc::clone(&loaded),
+            created: Arc::clone(&created),
+        };
+
+        let selected = load_or_create_session_with_metadata(
+            &boxed_client(fake),
+            "main",
+            Some(metadata("foreign-main", "main")),
+        )
+        .await
+        .expect("stale local metadata should fall through to create");
+
+        assert_eq!(selected.id, "created/main");
+        assert_eq!(loaded.lock().unwrap().as_slice(), ["foreign-main"]);
+        assert_eq!(created.lock().unwrap().as_slice(), ["main"]);
+    }
 }

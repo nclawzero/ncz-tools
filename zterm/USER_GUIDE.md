@@ -331,12 +331,18 @@ shortcuts before they ever reach the remote shell.
 | `Ctrl-Z` / `Ctrl-Y` | Undo / redo on the input line |
 | `Alt-X` | Quit |
 | `↩` (Enter) | Submit the input line as a turn (or a `/slash` command) |
-| `/` on an empty line | Open the slash-command popup |
+| `/` on an empty line / `Ctrl-K` | Open the slash-command popup |
 | `Esc` | Close the active modal |
 
 Mac-on-SSH demo path: every shortcut above also works as the
 listed `Ctrl-…` combo, so you don't have to fight your terminal
 emulator's F-key intercepts.
+
+The status line shows `workspace · model · ctx used/total (%) · elapsed`;
+when token usage includes a context window, zterm also renders a compact
+budget bar. Theme presets live at `~/.zterm/theme.toml`; launch count and
+the opt-in error bell live at `~/.zterm/state.toml`. Toggle the bell with
+`/theme beep on` or `/theme beep off`.
 
 ### Legacy REPL (`zterm tui --legacy-repl`)
 

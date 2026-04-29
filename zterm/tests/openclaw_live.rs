@@ -307,12 +307,14 @@ async fn openclaw_live_workspace_activate_against_typhon_gateway() {
     std::env::set_var("ZTERM_CONFIG_DIR", tmp.path());
 
     let cfg = WorkspaceConfig {
+        id: None,
         name: "live-activate-test".to_string(),
         backend: Backend::Openclaw,
         url,
         token_env: None,
         token: std::env::var("OPENCLAW_TOKEN").ok(),
         label: None,
+        namespace_aliases: Vec::new(),
     };
 
     let mut ws = Workspace::instantiate(0, cfg).expect("instantiate");

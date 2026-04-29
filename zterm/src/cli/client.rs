@@ -9,7 +9,7 @@ use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
 
-use crate::cli::agent::{StreamSink, TurnChunk};
+use crate::cli::agent::{StreamSink, TurnChunk, TurnUsage};
 
 /// One row from the daemon's `[providers.models.<key>]` config table.
 ///
@@ -149,6 +149,21 @@ impl ZeroclawClient {
     /// configured either through the trait object or directly.
     pub fn set_stream_sink(&mut self, sink: Option<StreamSink>) {
         self.stream_sink = sink;
+    }
+
+    fn session_url(&self, session_id: &str) -> Result<Url> {
+        Self::session_url_for_base(&self.base_url, session_id)
+    }
+
+    fn session_url_for_base(base_url: &str, session_id: &str) -> Result<Url> {
+        let mut url = Url::parse(base_url)
+            .map_err(|e| anyhow!("Failed to parse zeroclaw base URL: {}", e))?;
+        url.set_query(None);
+        url.set_fragment(None);
+        url.path_segments_mut()
+            .map_err(|_| anyhow!("zeroclaw base URL cannot be used as a base URL"))?
+            .extend(["api", "sessions", session_id]);
+        Ok(url)
     }
 
     /// Fetch `[providers.models.*]` from the daemon's `/api/config`
@@ -607,8 +622,12 @@ impl ZeroclawClient {
                         self.emit_token(&full_response)?;
                         streamed = true;
                     }
+                    self.emit_usage(TurnUsage::from_json_candidates(&event));
                     self.emit_finished_ok(full_response.clone(), streamed);
                     return Ok(full_response);
+                }
+                Some("usage") => {
+                    self.emit_usage(TurnUsage::from_json_candidates(&event));
                 }
                 Some("error") => {
                     let msg = event
@@ -681,6 +700,9 @@ impl ZeroclawClient {
 
         match &self.stream_sink {
             Some(sink) => {
+                if let Some(usage) = TurnUsage::from_json_candidates(&json) {
+                    let _ = sink.send(TurnChunk::Usage(usage));
+                }
                 let _ = sink.send(TurnChunk::Token(text.clone()));
                 let _ = sink.send(TurnChunk::Finished(Ok(text.clone())));
             }
@@ -711,6 +733,12 @@ impl ZeroclawClient {
             let _ = sink.send(TurnChunk::Finished(Ok(text)));
         } else if printed_to_stdout {
             println!();
+        }
+    }
+
+    fn emit_usage(&self, usage: Option<TurnUsage>) {
+        if let (Some(sink), Some(usage)) = (&self.stream_sink, usage) {
+            let _ = sink.send(TurnChunk::Usage(usage));
         }
     }
 
@@ -754,10 +782,10 @@ impl ZeroclawClient {
 
     /// Load specific session
     pub async fn load_session(&self, session_id: &str) -> Result<Session> {
-        let url = format!("{}/api/sessions/{}", self.base_url, session_id);
+        let url = self.session_url(session_id)?;
         let res = self
             .http_client
-            .get(&url)
+            .get(url)
             .bearer_auth(&self.token)
             .send()
             .await
@@ -775,15 +803,20 @@ impl ZeroclawClient {
 
     /// Delete a session
     pub async fn delete_session(&self, session_id: &str) -> Result<()> {
-        let url = format!("{}/api/sessions/{}", self.base_url, session_id);
-        self.http_client
-            .delete(&url)
+        let url = self.session_url(session_id)?;
+        let res = self
+            .http_client
+            .delete(url)
             .bearer_auth(&self.token)
             .send()
             .await
             .map_err(|e| anyhow!("Failed to delete session: {}", e))?;
 
-        Ok(())
+        if res.status().is_success() {
+            Ok(())
+        } else {
+            Err(anyhow!("Failed to delete session: {}", res.status()))
+        }
     }
 
     // ===== CRON & AUTOMATION =====
@@ -966,6 +999,10 @@ impl crate::cli::agent::AgentClient for ZeroclawClient {
         ZeroclawClient::list_provider_models(self, provider).await
     }
 
+    fn current_model_label(&self) -> String {
+        self.current_model_key()
+    }
+
     async fn list_sessions(&self) -> Result<Vec<Session>> {
         ZeroclawClient::list_sessions(self).await
     }
@@ -1113,6 +1150,28 @@ fallback = "gemini"
         assert_eq!(parsed.scheme(), "wss");
         assert_eq!(parsed.path(), "/ws/chat");
         assert!(parsed.query_pairs().all(|(key, _)| key.as_ref() != "token"));
+    }
+
+    #[test]
+    fn session_url_encodes_session_id_as_one_path_segment() {
+        assert_eq!(
+            ZeroclawClient::session_url_for_base("https://example.test", "../owned")
+                .unwrap()
+                .as_str(),
+            "https://example.test/api/sessions/..%2Fowned"
+        );
+        assert_eq!(
+            ZeroclawClient::session_url_for_base("https://example.test", "a/b")
+                .unwrap()
+                .as_str(),
+            "https://example.test/api/sessions/a%2Fb"
+        );
+        assert_eq!(
+            ZeroclawClient::session_url_for_base("https://example.test", "x?y")
+                .unwrap()
+                .as_str(),
+            "https://example.test/api/sessions/x%3Fy"
+        );
     }
 
     #[test]

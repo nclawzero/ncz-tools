@@ -826,6 +826,8 @@ fn parse_one_part(value: &serde_json::Value) -> AssistantContentPart {
 /// - `run_id` — gateway-assigned runId for this turn, echoed
 ///   back from the initial sessions.send ack. Needed for
 ///   sessions.abort and for correlating retroactive events.
+/// - `usage` — token accounting when the gateway/provider includes
+///   it on the session message or event payload.
 #[derive(Debug, Clone, Default)]
 pub struct TurnResult {
     pub text: String,
@@ -833,6 +835,7 @@ pub struct TurnResult {
     pub tool_results: Vec<serde_json::Value>,
     pub thinking: String,
     pub run_id: Option<String>,
+    pub usage: Option<crate::cli::agent::TurnUsage>,
 }
 
 impl TurnResult {

@@ -16,12 +16,17 @@
 //! the E-slice sequence.
 
 use std::cell::RefCell;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use chrono::{DateTime, Utc};
+use tokio::runtime::Handle;
 use tokio::sync::{mpsc, Mutex};
 use tracing::{info, warn};
 
@@ -51,9 +56,11 @@ use turbo_vision::views::status_line::{StatusItem, StatusLine};
 use turbo_vision::views::view::{write_line_to_terminal, View};
 use turbo_vision::views::window::WindowBuilder;
 
-use crate::cli::agent::TurnChunk;
+use crate::cli::agent::{StreamSink, TurnChunk, TurnUsage};
 use crate::cli::client::Session;
 use crate::cli::commands::CommandHandler;
+use crate::cli::storage;
+use crate::cli::tui::delighters;
 use crate::cli::tui::themes;
 use crate::cli::workspace::App;
 
@@ -66,19 +73,22 @@ enum WorkerRequest {
     /// Streaming chunks flow back through the sink installed on the
     /// client at startup.
     Turn(String),
-    /// Dispatch a slash command (e.g. `/help`, `/info`) through the
-    /// shared `CommandHandler`. Any `Ok(Some(text))` return is
-    /// forwarded to the UI as a single `TurnChunk::Token` +
-    /// `Finished(Ok)`; `Ok(None)` maps to a Finished(Ok("")) since
-    /// the handler printed to stdout (TUI-mode output for those
-    /// handlers is not yet hooked up — E-3 covers `/help` and
-    /// `/info` only).
+    /// Dispatch a slash command (e.g. `/help`, `/models list`)
+    /// through the shared `CommandHandler`. Structured
+    /// `Ok(Some(text))` output is forwarded to the chat pane.
     Command(String),
 }
 
-// Custom commands. CMD_HELP and CMD_ABOUT are wired to the real
-// CommandHandler in E-3; the remainder are still stubs that become
-// native modal pickers in E-5.
+#[derive(Debug, PartialEq, Eq)]
+enum SubmissionStatus {
+    Started,
+    Busy,
+    DispatchFailed,
+}
+
+// Custom commands. Menu and slash-popup entries route through the
+// shared `CommandHandler` where a backend action exists; purely
+// visual TUI concerns (theme presets/editing) stay local.
 const CMD_HELP: u16 = 1001;
 const CMD_ABOUT: u16 = 1002;
 const CMD_WORKSPACE_LIST: u16 = 1003;
@@ -87,6 +97,12 @@ const CMD_MODELS_LIST: u16 = 1005;
 const CMD_MEMORY_SEARCH: u16 = 1006;
 const CMD_SESSION_NEW: u16 = 1007;
 const CMD_SESSION_OPEN: u16 = 1008;
+const CMD_PROVIDERS_LIST: u16 = 1009;
+const CMD_MCP_STATUS: u16 = 1010;
+const CMD_WORKSPACE_INFO: u16 = 1011;
+const CMD_MODELS_STATUS: u16 = 1012;
+const CMD_MEMORY_STATS: u16 = 1013;
+const CMD_SESSION_LIST: u16 = 1014;
 /// Slash-popup theme entries occupy `[CMD_THEME_BASE, +PRESETS.len())`.
 /// The selected index is mapped back to `themes::PRESETS[i]` on
 /// return so palette application lives in one place
@@ -103,7 +119,10 @@ const CMD_PALETTE_NEXT: u16 = 1300;
 const CMD_PERSIST_THEME: u16 = 1301;
 
 /// `/` key maps to this KeyCode per `crossterm_to_keycode`: plain
-/// ASCII character with no modifiers, so `c as u16` = 0x2F.
+/// ASCII character with no modifiers, so `c as u16` = 0x2F. Plain
+/// slash is intentionally regular text input; the command popup is
+/// reserved for Ctrl-K/menu paths so arbitrary slash commands remain
+/// typeable.
 const KB_SLASH: u16 = b'/' as u16;
 
 /// Depth of the input-line undo/redo ring. 64 snapshots is more
@@ -116,11 +135,99 @@ const INPUT_UNDO_DEPTH: usize = 64;
 /// legacy rustyline REPL's `cli::streaming::SPINNER_FRAMES` without
 /// taking a cross-module dependency.
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const SPINNER_INTERVAL: Duration = Duration::from_millis(80);
+const TURN_FORWARD_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
+const RESPONSE_BUSY_TOAST: &str = "Busy: response in progress";
 
 /// How long a status-line toast (e.g. palette confirmation after
 /// Ctrl-P) remains visible. ~1s is long enough to read but short
 /// enough that mashing Ctrl-P repeatedly still feels live.
 const TOAST_DURATION: Duration = Duration::from_millis(1000);
+const TYPEWRITER_INTERVAL: Duration = Duration::from_millis(30);
+
+struct TypewriterState {
+    chars: Vec<char>,
+    pos: usize,
+    last_emit: Instant,
+    after_lines: Vec<String>,
+    current_line: usize,
+    completed: bool,
+}
+
+impl TypewriterState {
+    fn new(text: impl Into<String>, after_lines: Vec<String>, current_line: usize) -> Self {
+        Self {
+            chars: text.into().chars().collect(),
+            pos: 0,
+            last_emit: Instant::now(),
+            after_lines,
+            current_line,
+            completed: false,
+        }
+    }
+
+    fn tick(&mut self, lines: &Rc<RefCell<Vec<String>>>) {
+        if self.completed {
+            return;
+        }
+
+        let due = typewriter_chars_due(self.last_emit.elapsed(), TYPEWRITER_INTERVAL);
+        if due == 0 {
+            return;
+        }
+
+        let mut lines = lines.borrow_mut();
+        if self.current_line > lines.len() {
+            self.current_line = lines.len();
+        }
+        if self.current_line == lines.len() {
+            lines.push(String::new());
+        }
+
+        for _ in 0..due {
+            let Some(ch) = self.chars.get(self.pos).copied() else {
+                self.completed = true;
+                self.current_line += 1;
+                lines.insert(self.current_line, String::new());
+                for line in self.after_lines.drain(..) {
+                    self.current_line += 1;
+                    lines.insert(self.current_line, line);
+                }
+                return;
+            };
+            self.pos += 1;
+            self.last_emit += TYPEWRITER_INTERVAL;
+            if ch == '\n' {
+                self.current_line += 1;
+                lines.insert(self.current_line, String::new());
+            } else if let Some(line) = lines.get_mut(self.current_line) {
+                line.push(ch);
+            }
+        }
+    }
+}
+
+fn start_typewriter(
+    state: &mut Option<TypewriterState>,
+    lines: &Rc<RefCell<Vec<String>>>,
+    text: String,
+    after_lines: Vec<String>,
+) {
+    let current_line = {
+        let mut lines = lines.borrow_mut();
+        let current_line = lines.len();
+        lines.push(String::new());
+        current_line
+    };
+    *state = Some(TypewriterState::new(text, after_lines, current_line));
+}
+
+fn typewriter_chars_due(elapsed: Duration, interval: Duration) -> usize {
+    if interval.is_zero() {
+        return usize::MAX;
+    }
+    (elapsed.as_millis() / interval.as_millis()) as usize
+}
 
 /// Live state feeding the status line. Mutated on each event-loop
 /// tick from the TV thread.
@@ -129,9 +236,9 @@ struct StatusState {
     /// try-locking the shared `App`; falls back to this cached
     /// value when the worker is holding the mutex.
     workspace: String,
-    /// Model name as snapshotted at boot. Updating in real time
-    /// would require the agent client to surface the `model`
-    /// field from turn responses — plumbed in a later slice.
+    /// Last known active model label. Refreshed through lightweight
+    /// `TurnChunk::Status` frames after command-driven context
+    /// changes.
     model: String,
     /// Instant the most recent turn was submitted. While `Some`
     /// the elapsed counter is live; cleared on `Finished` and the
@@ -160,10 +267,15 @@ struct StatusState {
     /// re-reading `~/.zterm/theme.toml`. Defaults to whatever
     /// `themes::load_persisted` returned at boot.
     current_theme: String,
+    /// Token usage from the latest turn that reported it. Rendered
+    /// as the `ctx used/total (%)` segment in the status line.
+    usage: Option<TurnUsage>,
+    /// Whether terminal bell should ring on error frames.
+    beep_on_error: bool,
 }
 
 impl StatusState {
-    fn new(workspace: String, model: String, current_theme: String) -> Self {
+    fn new(workspace: String, model: String, current_theme: String, beep_on_error: bool) -> Self {
         Self {
             workspace,
             model,
@@ -173,6 +285,8 @@ impl StatusState {
             last_spinner_tick: Instant::now(),
             toast: None,
             current_theme,
+            usage: None,
+            beep_on_error,
         }
     }
 
@@ -200,8 +314,8 @@ impl StatusState {
         if self.turn_start.is_none() {
             return;
         }
-        if self.last_spinner_tick.elapsed() >= Duration::from_millis(80) {
-            self.spinner_frame = (self.spinner_frame + 1) % SPINNER_FRAMES.len();
+        if should_advance_spinner(self.last_spinner_tick.elapsed()) {
+            self.spinner_frame = next_spinner_frame(self.spinner_frame, SPINNER_FRAMES.len());
             self.last_spinner_tick = Instant::now();
         }
     }
@@ -217,11 +331,35 @@ impl StatusState {
     fn begin_turn(&mut self) {
         self.turn_start = Some(Instant::now());
         self.frozen_elapsed = None;
+        self.clear_usage();
     }
 
     fn end_turn(&mut self) {
         if let Some(start) = self.turn_start.take() {
             self.frozen_elapsed = Some(start.elapsed());
+        }
+    }
+
+    fn clear_usage(&mut self) {
+        self.usage = None;
+    }
+
+    fn apply_status(&mut self, workspace: Option<String>, model: Option<String>) {
+        let mut changed = false;
+        if let Some(workspace) = workspace {
+            if self.workspace != workspace {
+                self.workspace = workspace;
+                changed = true;
+            }
+        }
+        if let Some(model) = model {
+            if self.model != model {
+                self.model = model;
+                changed = true;
+            }
+        }
+        if changed {
+            self.clear_usage();
         }
     }
 
@@ -240,9 +378,9 @@ impl StatusState {
     }
 
     /// Build the status-line content string for the right-most
-    /// segment. `ctx --/--` is a placeholder until an agent client
-    /// surfaces `TurnResult.usage`. The spinner prefix only renders
-    /// while a turn is in flight.
+    /// segment. The spinner prefix only renders while a turn is in
+    /// flight; token usage reflects the latest `TurnChunk::Usage`
+    /// observed from the active backend.
     ///
     /// While a toast is active (set via `set_toast`, e.g. on a
     /// Ctrl-P palette cycle), its text replaces the workspace/model
@@ -256,12 +394,60 @@ impl StatusState {
             None => String::new(),
         };
         format!(
-            "{}{} · {} · ctx --/-- · {} elapsed",
+            "{}{} · {} · {} · {} elapsed",
             lead,
             self.workspace,
             self.model,
+            render_ctx_usage(self.usage),
             self.elapsed_mmss()
         )
+    }
+}
+
+fn should_advance_spinner(elapsed: Duration) -> bool {
+    elapsed >= SPINNER_INTERVAL
+}
+
+fn next_spinner_frame(current: usize, frame_count: usize) -> usize {
+    if frame_count == 0 {
+        return 0;
+    }
+    (current + 1) % frame_count
+}
+
+fn render_ctx_usage(usage: Option<TurnUsage>) -> String {
+    let Some(usage) = usage else {
+        return "ctx --/--".to_string();
+    };
+    let Some(used) = usage.used_tokens() else {
+        return "ctx --/--".to_string();
+    };
+    match usage.context_window {
+        Some(total) if total > 0 => {
+            let pct = usage.budget_pct().unwrap_or(0);
+            format!("ctx {used}/{total} ({pct}%) {}", token_budget_bar(pct, 10))
+        }
+        _ => format!("ctx {used}/--"),
+    }
+}
+
+fn token_budget_bar(pct: u8, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let filled = (pct.min(100) as usize * width).div_ceil(100);
+    format!(
+        "[{}{}]",
+        "#".repeat(filled),
+        "-".repeat(width.saturating_sub(filled))
+    )
+}
+
+fn parse_beep_toggle(arg: &str) -> Option<bool> {
+    match arg.trim().to_ascii_lowercase().as_str() {
+        "beep on" | "beep true" | "beep 1" => Some(true),
+        "beep off" | "beep false" | "beep 0" => Some(false),
+        _ => None,
     }
 }
 
@@ -298,19 +484,14 @@ pub async fn run(
     let (req_tx, mut req_rx) = mpsc::channel::<WorkerRequest>(32);
     let (event_tx, event_rx) = mpsc::unbounded_channel::<TurnChunk>();
 
-    // Install the streaming sink on the active workspace's client
-    // once, up front. Turn dispatch in the worker reuses this sink
-    // for every `submit_turn` — no per-turn reinstall.
-    {
-        let app_guard = app.lock().await;
-        if let Some(ws) = app_guard.active_workspace() {
-            if let Some(client_arc) = ws.client.clone() {
-                let mut client = client_arc.lock().await;
-                client.set_stream_sink(Some(event_tx.clone()));
-            } else {
-                warn!("tv_ui: active workspace has no client; turn submits will fail cleanly");
-            }
-        }
+    let connect_splash = Some(connect_splash_for_workspace(&workspace_name));
+
+    // Install the streaming sink on the boot workspace. The worker
+    // also reinstalls before every submitted turn and after every
+    // workspace switch, so cached splash reads cannot leave the
+    // newly-active client detached from the TUI stream.
+    if !install_stream_sink_on_active_client(&app, event_tx.clone()).await {
+        warn!("tv_ui: active workspace has no client; turn submits will fail cleanly");
     }
 
     // Worker task: owns the shared App reference and processes one
@@ -318,13 +499,32 @@ pub async fn run(
     // `TurnChunk::Finished(Err(_))`; the worker itself never panics
     // the whole process.
     let worker_app = Arc::clone(&app);
-    let worker_session_id = session.id.clone();
+    let mut worker_sessions = HashMap::from([(
+        workspace_name.clone(),
+        WorkerSessionBinding::from_session(&session),
+    )]);
+    let fallback_session_name = session.name.clone();
     let worker_sink = event_tx.clone();
     let worker_cmd_handler = CommandHandler::new(Arc::clone(&app));
     tokio::spawn(async move {
         while let Some(req) = req_rx.recv().await {
             match req {
                 WorkerRequest::Turn(text) => {
+                    let worker_session_id = match ensure_session_for_active_workspace(
+                        &worker_app,
+                        &mut worker_sessions,
+                        &fallback_session_name,
+                    )
+                    .await
+                    {
+                        Ok(session_id) => session_id,
+                        Err(e) => {
+                            let _ = worker_sink.send(TurnChunk::Finished(Err(format!(
+                                "could not prepare session for active workspace: {e}"
+                            ))));
+                            continue;
+                        }
+                    };
                     let client_opt = {
                         let guard = worker_app.lock().await;
                         guard.active_workspace().and_then(|w| w.client.clone())
@@ -332,14 +532,48 @@ pub async fn run(
                     match client_opt {
                         Some(client_arc) => {
                             let mut client = client_arc.lock().await;
-                            // `submit_turn` is responsible for
-                            // emitting exactly one `Finished(_)`
-                            // through the installed sink on both
-                            // success and failure. The worker
-                            // swallows the Err return (already
-                            // reflected on the sink) and waits for
-                            // the next request.
-                            let _ = client.submit_turn(&worker_session_id, &text).await;
+                            let (turn_sink, turn_rx) = mpsc::unbounded_channel::<TurnChunk>();
+                            let observed_finished = Arc::new(AtomicBool::new(false));
+                            let forwarded_token = Arc::new(AtomicBool::new(false));
+                            let mut forward_task = tokio::spawn(forward_turn_chunks(
+                                turn_rx,
+                                worker_sink.clone(),
+                                Arc::clone(&observed_finished),
+                                Arc::clone(&forwarded_token),
+                            ));
+                            client.set_stream_sink(Some(turn_sink));
+                            let submit_result = client.submit_turn(&worker_session_id, &text).await;
+                            client.set_stream_sink(Some(worker_sink.clone()));
+                            drop(client);
+
+                            let saw_finished = match tokio::time::timeout(
+                                TURN_FORWARD_DRAIN_TIMEOUT,
+                                &mut forward_task,
+                            )
+                            .await
+                            {
+                                Ok(Ok(saw_finished)) => saw_finished,
+                                Ok(Err(e)) => {
+                                    warn!("tv_ui: turn stream forwarder failed: {e}");
+                                    observed_finished.load(Ordering::Acquire)
+                                }
+                                Err(_) => {
+                                    forward_task.abort();
+                                    let _ = forward_task.await;
+                                    warn!(
+                                        "tv_ui: turn stream forwarder did not drain after \
+                                         submit_turn returned"
+                                    );
+                                    observed_finished.load(Ordering::Acquire)
+                                }
+                            };
+                            for chunk in submit_turn_fallback_chunks(
+                                &submit_result,
+                                saw_finished,
+                                forwarded_token.load(Ordering::Acquire),
+                            ) {
+                                let _ = worker_sink.send(chunk);
+                            }
                         }
                         None => {
                             // Only branch where `submit_turn` was
@@ -354,28 +588,165 @@ pub async fn run(
                 }
                 WorkerRequest::Command(cmdline) => {
                     // Route slash commands through the shared
-                    // `CommandHandler`. In E-3 only `/help` and
-                    // `/info` are refactored to return their
-                    // output as a `String`; the others still
-                    // println! to stdout (invisible under the TUI
-                    // alt-screen). For those we emit an advisory
-                    // Finished with a placeholder note — E-5
-                    // replaces those handlers with native modal
-                    // pickers.
+                    // `CommandHandler`. Advertised commands return
+                    // structured strings so side effects are visible
+                    // inside the full-screen TUI.
+                    if let Some(message) = stdout_only_slash_command_block_message(&cmdline) {
+                        let _ = worker_sink.send(TurnChunk::Token(message));
+                        let _ = worker_sink.send(TurnChunk::Finished(Ok(String::new())));
+                        continue;
+                    }
+                    if let Some(target) = active_worker_session_delete_target(
+                        &cmdline,
+                        &worker_app,
+                        &mut worker_sessions,
+                    )
+                    .await
+                    {
+                        let _ = worker_sink.send(TurnChunk::Finished(Err(format!(
+                            "cannot delete active session `{target}`; switch to another session before deleting it"
+                        ))));
+                        continue;
+                    }
+                    let preflight = command_session_preflight(&cmdline);
+                    let workspace_before_dispatch =
+                        if preflight == CommandSessionPreflight::AfterWorkspaceSwitch {
+                            current_workspace_name(&worker_app).await.ok()
+                        } else {
+                            None
+                        };
+                    let mut command_session_id = remembered_session_id_for_active_workspace(
+                        &worker_app,
+                        &worker_sessions,
+                        &fallback_session_name,
+                    )
+                    .await;
+                    if preflight == CommandSessionPreflight::BeforeDispatch {
+                        command_session_id = match ensure_session_for_active_workspace(
+                            &worker_app,
+                            &mut worker_sessions,
+                            &fallback_session_name,
+                        )
+                        .await
+                        {
+                            Ok(session_id) => session_id,
+                            Err(e) => {
+                                let _ = worker_sink.send(TurnChunk::Finished(Err(format!(
+                                    "could not prepare session for active workspace: {e}"
+                                ))));
+                                continue;
+                            }
+                        };
+                    }
+                    let mut session_switched = false;
+                    if let Some(session_action) = session_action(&cmdline) {
+                        let target_session = session_action.target();
+                        let action_label = match session_action {
+                            SessionAction::Switch { .. } => "switch session to",
+                            SessionAction::Create { .. } => "create session",
+                        };
+                        let session_result = match session_action {
+                            SessionAction::Switch { target } => {
+                                resolve_or_create_session_for_worker(&worker_app, target).await
+                            }
+                            SessionAction::Create { target } => {
+                                create_new_session_for_worker(&worker_app, target).await
+                            }
+                        };
+                        match session_result {
+                            Ok(session) => {
+                                command_session_id = session.id.clone();
+                                match current_workspace_name(&worker_app).await {
+                                    Ok(workspace_name) => {
+                                        remember_worker_session(
+                                            &mut worker_sessions,
+                                            workspace_name,
+                                            &session,
+                                        );
+                                        session_switched = true;
+                                    }
+                                    Err(e) => {
+                                        let _ = worker_sink.send(TurnChunk::Finished(Err(format!(
+                                            "could not bind session `{target_session}` to workspace: {e}"
+                                        ))));
+                                        continue;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                let _ = worker_sink.send(TurnChunk::Finished(Err(format!(
+                                    "could not {action_label} `{target_session}`: {e}"
+                                ))));
+                                continue;
+                            }
+                        }
+                    }
                     match worker_cmd_handler
-                        .handle(&cmdline, &worker_session_id)
+                        .handle(&cmdline, &command_session_id)
                         .await
                     {
                         Ok(Some(text)) => {
+                            let model_switched = successful_model_switch_command(&cmdline, &text);
                             let _ = worker_sink.send(TurnChunk::Token(text));
+                            let mut workspace_switched = false;
+                            if preflight == CommandSessionPreflight::AfterWorkspaceSwitch {
+                                let switched_workspace = {
+                                    let guard = worker_app.lock().await;
+                                    guard.active_workspace().map(|w| w.config.name.clone())
+                                };
+                                if switched_workspace != workspace_before_dispatch {
+                                    workspace_switched = true;
+                                    install_stream_sink_on_active_client(
+                                        &worker_app,
+                                        worker_sink.clone(),
+                                    )
+                                    .await;
+                                    if let Err(e) = ensure_session_for_active_workspace(
+                                        &worker_app,
+                                        &mut worker_sessions,
+                                        &fallback_session_name,
+                                    )
+                                    .await
+                                    {
+                                        let _ = worker_sink.send(TurnChunk::ClearUsage);
+                                        let _ =
+                                            worker_sink.send(TurnChunk::Finished(Err(format!(
+                                                "workspace switched, but session setup failed: {e}"
+                                            ))));
+                                        continue;
+                                    }
+                                    if let Some(name) = switched_workspace {
+                                        let splash = connect_splash_for_workspace(&name);
+                                        let _ = worker_sink.send(TurnChunk::Typewriter(splash));
+                                    }
+                                }
+                            }
+                            if should_clear_usage_after_command(
+                                workspace_switched,
+                                session_switched,
+                                model_switched,
+                            ) {
+                                let _ = worker_sink.send(TurnChunk::ClearUsage);
+                            }
+                            if workspace_switched || model_switched {
+                                if let Some((workspace, model)) =
+                                    status_snapshot_for_worker(&worker_app).await
+                                {
+                                    let _ = worker_sink.send(TurnChunk::Status {
+                                        workspace: Some(workspace),
+                                        model: Some(model),
+                                    });
+                                }
+                            }
                             let _ = worker_sink.send(TurnChunk::Finished(Ok(String::new())));
                         }
                         Ok(None) => {
                             let _ = worker_sink.send(TurnChunk::Token(format!(
-                                "(command `{cmdline}` — stdout renderer lands \
-                                 in a later slice; structured output not yet \
-                                 available)"
+                                "Command `{cmdline}` completed without structured TUI output."
                             )));
+                            if should_clear_usage_after_command(false, session_switched, false) {
+                                let _ = worker_sink.send(TurnChunk::ClearUsage);
+                            }
                             let _ = worker_sink.send(TurnChunk::Finished(Ok(String::new())));
                         }
                         Err(e) if e.to_string() == "EXIT" => {
@@ -394,6 +765,9 @@ pub async fn run(
                             let _ = worker_sink.send(TurnChunk::Finished(Ok(String::new())));
                         }
                         Err(e) => {
+                            if should_clear_usage_after_command(false, session_switched, false) {
+                                let _ = worker_sink.send(TurnChunk::ClearUsage);
+                            }
                             let _ = worker_sink.send(TurnChunk::Finished(Err(e.to_string())));
                         }
                     }
@@ -403,6 +777,7 @@ pub async fn run(
     });
 
     let blocking_app = Arc::clone(&app);
+    let runtime_handle = Handle::current();
     tokio::task::spawn_blocking(move || {
         run_blocking(
             blocking_app,
@@ -410,22 +785,565 @@ pub async fn run(
             model,
             provider,
             workspace_name,
+            connect_splash,
             req_tx,
             event_rx,
+            runtime_handle,
         )
     })
     .await
     .map_err(|e| anyhow::anyhow!("tv_ui join error: {e}"))?
 }
 
+fn connect_splash_for_workspace(workspace_name: &str) -> String {
+    let cache_path = delighters::default_connect_splash_cache_path(workspace_name);
+    if let Some(path) = &cache_path {
+        if let Some(cached) = delighters::read_cached_connect_splash(
+            path,
+            std::time::SystemTime::now(),
+            delighters::CONNECT_SPLASH_TTL,
+        ) {
+            return cached;
+        }
+    }
+
+    let fallback = delighters::local_connect_splash(workspace_name);
+    if let Some(path) = cache_path {
+        let fallback_for_cache = fallback.clone();
+        let _ = std::thread::spawn(move || {
+            if let Err(e) = delighters::write_connect_splash_cache(&path, &fallback_for_cache) {
+                warn!("connect-splash cache write failed: {e}");
+            }
+        });
+    }
+    fallback
+}
+
+async fn forward_turn_chunks(
+    mut turn_rx: mpsc::UnboundedReceiver<TurnChunk>,
+    ui_sink: StreamSink,
+    observed_finished: Arc<AtomicBool>,
+    forwarded_token: Arc<AtomicBool>,
+) -> bool {
+    let mut saw_finished = false;
+    while let Some(chunk) = turn_rx.recv().await {
+        let is_finished = matches!(&chunk, TurnChunk::Finished(_));
+        if is_finished {
+            if saw_finished {
+                continue;
+            }
+            if ui_sink.send(chunk).is_ok() {
+                saw_finished = true;
+                observed_finished.store(true, Ordering::Release);
+            }
+            continue;
+        }
+        let is_token = matches!(&chunk, TurnChunk::Token(_));
+        if ui_sink.send(chunk).is_ok() && is_token {
+            forwarded_token.store(true, Ordering::Release);
+        }
+    }
+    saw_finished
+}
+
+fn submit_turn_fallback_chunks(
+    submit_result: &Result<String>,
+    saw_finished: bool,
+    forwarded_token: bool,
+) -> Vec<TurnChunk> {
+    if saw_finished {
+        return Vec::new();
+    }
+
+    match submit_result {
+        Ok(_) if forwarded_token => vec![TurnChunk::Finished(Err(
+            "partial response incomplete; backend stream ended without a finished frame"
+                .to_string(),
+        ))],
+        Ok(text) => {
+            let mut chunks = Vec::new();
+            if !text.is_empty() {
+                chunks.push(TurnChunk::Token(text.clone()));
+            }
+            chunks.push(TurnChunk::Finished(Ok(String::new())));
+            chunks
+        }
+        Err(e) => vec![TurnChunk::Finished(Err(e.to_string()))],
+    }
+}
+
+fn successful_model_switch_command(cmdline: &str, output: &str) -> bool {
+    model_switch_target(cmdline).is_some() && command_output_indicates_success(output)
+}
+
+fn should_clear_usage_after_command(
+    workspace_switched: bool,
+    session_switched: bool,
+    model_switched: bool,
+) -> bool {
+    workspace_switched || session_switched || model_switched
+}
+
+fn model_switch_target(cmdline: &str) -> Option<&str> {
+    let mut parts = cmdline.split_whitespace();
+    let command = parts.next()?;
+    if !matches!(command, "/model" | "/models") {
+        return None;
+    }
+    if parts.next()? != "set" {
+        return None;
+    }
+    parts.next()
+}
+
+fn command_output_indicates_success(output: &str) -> bool {
+    let trimmed = output.trim_start();
+    !trimmed.is_empty() && !trimmed.starts_with("Usage:") && !trimmed.starts_with("❌")
+}
+
+async fn install_stream_sink_on_active_client(app: &Arc<Mutex<App>>, sink: StreamSink) -> bool {
+    let client = {
+        let guard = app.lock().await;
+        guard.active_workspace().and_then(|w| w.client.clone())
+    };
+    let Some(client) = client else {
+        return false;
+    };
+    client.lock().await.set_stream_sink(Some(sink));
+    true
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorkerSessionBinding {
+    id: String,
+    name: String,
+}
+
+impl WorkerSessionBinding {
+    fn from_session(session: &Session) -> Self {
+        Self {
+            id: session.id.clone(),
+            name: session.name.clone(),
+        }
+    }
+}
+
+fn remember_worker_session(
+    sessions: &mut HashMap<String, WorkerSessionBinding>,
+    workspace_name: String,
+    session: &Session,
+) {
+    sessions.insert(workspace_name, WorkerSessionBinding::from_session(session));
+}
+
+async fn current_workspace_name(app: &Arc<Mutex<App>>) -> Result<String> {
+    let guard = app.lock().await;
+    guard
+        .active_workspace()
+        .map(|w| w.config.name.clone())
+        .ok_or_else(|| anyhow::anyhow!("no active workspace"))
+}
+
+async fn status_snapshot_for_worker(app: &Arc<Mutex<App>>) -> Option<(String, String)> {
+    let (workspace, client) = {
+        let guard = app.lock().await;
+        let workspace = guard.active_workspace()?;
+        (workspace.config.name.clone(), workspace.client.clone()?)
+    };
+
+    let model = client.lock().await.current_model_label();
+    Some((workspace, model))
+}
+
+async fn remembered_session_id_for_active_workspace(
+    app: &Arc<Mutex<App>>,
+    sessions: &HashMap<String, WorkerSessionBinding>,
+    fallback_session_name: &str,
+) -> String {
+    match current_workspace_name(app).await {
+        Ok(workspace_name) => sessions
+            .get(&workspace_name)
+            .map(|binding| binding.id.clone())
+            .unwrap_or_else(|| fallback_session_name.to_string()),
+        Err(_) => fallback_session_name.to_string(),
+    }
+}
+
+async fn active_worker_session_delete_target(
+    cmdline: &str,
+    app: &Arc<Mutex<App>>,
+    sessions: &mut HashMap<String, WorkerSessionBinding>,
+) -> Option<String> {
+    let target = session_delete_target(cmdline)?.to_string();
+    let (workspace_name, client) = {
+        let guard = app.lock().await;
+        let workspace = guard.active_workspace()?;
+        (workspace.config.name.clone(), workspace.client.clone())
+    };
+    let backend_sessions = match client {
+        Some(client) => client.lock().await.list_sessions().await.ok(),
+        None => None,
+    };
+
+    active_worker_session_delete_target_for_workspace(
+        &target,
+        &workspace_name,
+        sessions,
+        backend_sessions.as_deref(),
+    )
+}
+
+fn active_worker_session_delete_target_for_workspace(
+    target: &str,
+    workspace_name: &str,
+    sessions: &mut HashMap<String, WorkerSessionBinding>,
+    backend_sessions: Option<&[Session]>,
+) -> Option<String> {
+    let binding = sessions.get(workspace_name)?.clone();
+    let (active_binding, target_id) = if let Some(backend_sessions) = backend_sessions {
+        let active_binding = refreshed_active_worker_session_binding(&binding, backend_sessions)?;
+        let target_id = canonical_session_id_for_delete_target(target, backend_sessions)?;
+        (active_binding, target_id)
+    } else if binding.id == target || binding.name == target {
+        let target_id = binding.id.clone();
+        (binding, target_id)
+    } else {
+        return None;
+    };
+
+    if sessions.get(workspace_name) != Some(&active_binding) {
+        sessions.insert(workspace_name.to_string(), active_binding.clone());
+    }
+
+    if active_binding.id == target_id {
+        return Some(target.to_string());
+    }
+    None
+}
+
+fn refreshed_active_worker_session_binding(
+    binding: &WorkerSessionBinding,
+    backend_sessions: &[Session],
+) -> Option<WorkerSessionBinding> {
+    if let Some(session) = backend_sessions
+        .iter()
+        .find(|session| session.id == binding.id)
+    {
+        return Some(WorkerSessionBinding::from_session(session));
+    }
+
+    let mut name_matches = backend_sessions
+        .iter()
+        .filter(|session| session.name == binding.name);
+    let session = name_matches.next()?;
+    if name_matches.next().is_some() {
+        return None;
+    }
+    Some(WorkerSessionBinding::from_session(session))
+}
+
+fn canonical_session_id_for_delete_target(
+    target: &str,
+    backend_sessions: &[Session],
+) -> Option<String> {
+    if let Some(session) = backend_sessions.iter().find(|session| session.id == target) {
+        return Some(session.id.clone());
+    }
+
+    let mut name_matches = backend_sessions
+        .iter()
+        .filter(|session| session.name == target);
+    let session = name_matches.next()?;
+    if name_matches.next().is_some() {
+        return None;
+    }
+    Some(session.id.clone())
+}
+
+async fn ensure_session_for_active_workspace(
+    app: &Arc<Mutex<App>>,
+    sessions: &mut HashMap<String, WorkerSessionBinding>,
+    fallback_session_name: &str,
+) -> Result<String> {
+    let workspace_name = current_workspace_name(app).await?;
+    if let Some(binding) = sessions.get(&workspace_name).cloned() {
+        if let Ok(session) = load_session_for_worker(app, &binding.id).await {
+            remember_worker_session(sessions, workspace_name, &session);
+            return Ok(session.id);
+        }
+        let session = resolve_or_create_session_for_worker(app, &binding.name).await?;
+        remember_worker_session(sessions, workspace_name, &session);
+        return Ok(session.id);
+    }
+
+    let session = resolve_or_create_session_for_worker(app, fallback_session_name).await?;
+    remember_worker_session(sessions, workspace_name, &session);
+    Ok(session.id)
+}
+
+async fn load_session_for_worker(app: &Arc<Mutex<App>>, session_id: &str) -> Result<Session> {
+    let client = {
+        let guard = app.lock().await;
+        guard.active_workspace().and_then(|w| w.client.clone())
+    }
+    .ok_or_else(|| anyhow::anyhow!("no active workspace client"))?;
+
+    let locked = client.lock().await;
+    locked.load_session(session_id).await
+}
+
+async fn resolve_or_create_session_for_worker(
+    app: &Arc<Mutex<App>>,
+    session_name: &str,
+) -> Result<Session> {
+    let client = {
+        let guard = app.lock().await;
+        guard.active_workspace().and_then(|w| w.client.clone())
+    }
+    .ok_or_else(|| anyhow::anyhow!("no active workspace client"))?;
+
+    let resolution = {
+        let locked = client.lock().await;
+        plan_worker_session_resolution(session_name, locked.list_sessions().await)?
+    };
+
+    if let WorkerSessionResolution::Existing(session) = resolution {
+        return Ok(session);
+    }
+
+    let session = client.lock().await.create_session(session_name).await?;
+    save_worker_session_metadata_best_effort(&session);
+    Ok(session)
+}
+
+async fn create_new_session_for_worker(
+    app: &Arc<Mutex<App>>,
+    session_name: &str,
+) -> Result<Session> {
+    let client = {
+        let guard = app.lock().await;
+        guard.active_workspace().and_then(|w| w.client.clone())
+    }
+    .ok_or_else(|| anyhow::anyhow!("no active workspace client"))?;
+
+    create_session_for_worker_client(&client, session_name).await
+}
+
+async fn create_session_for_worker_client(
+    client: &Arc<Mutex<Box<dyn crate::cli::agent::AgentClient + Send + Sync>>>,
+    session_name: &str,
+) -> Result<Session> {
+    let session = client.lock().await.create_session(session_name).await?;
+    save_worker_session_metadata_best_effort(&session);
+    Ok(session)
+}
+
+fn save_worker_session_metadata_best_effort(session: &Session) -> bool {
+    save_worker_session_metadata_best_effort_with(session, storage::save_session_metadata)
+}
+
+fn save_worker_session_metadata_best_effort_with<F>(session: &Session, save: F) -> bool
+where
+    F: FnOnce(&storage::SessionMetadata) -> Result<()>,
+{
+    let metadata = storage::SessionMetadata {
+        id: session.id.clone(),
+        name: session.name.clone(),
+        model: session.model.clone(),
+        provider: session.provider.clone(),
+        created_at: Utc::now().to_rfc3339(),
+        message_count: 0,
+        last_active: Utc::now().to_rfc3339(),
+    };
+    if storage::is_safe_session_id(&metadata.id) {
+        if let Err(e) = save(&metadata) {
+            warn!(
+                "backend session '{}' was created, but local metadata save failed: {e}",
+                metadata.id
+            );
+            return false;
+        }
+    } else {
+        warn!(
+            "not saving local metadata for unsafe session id: {}",
+            metadata.id
+        );
+        return false;
+    }
+    true
+}
+
+#[derive(Debug)]
+enum WorkerSessionResolution {
+    Existing(Session),
+    Create,
+}
+
+fn plan_worker_session_resolution(
+    requested: &str,
+    list_result: Result<Vec<Session>>,
+) -> Result<WorkerSessionResolution> {
+    let sessions = list_result
+        .map_err(|e| anyhow::anyhow!("could not list sessions from active backend: {e}"))?;
+    match choose_worker_session_by_id_or_name(&sessions, requested)? {
+        Some(session) => Ok(WorkerSessionResolution::Existing(session.clone())),
+        None => Ok(WorkerSessionResolution::Create),
+    }
+}
+
+fn choose_worker_session_by_id_or_name<'a>(
+    sessions: &'a [Session],
+    requested: &str,
+) -> Result<Option<&'a Session>> {
+    let id_matches: Vec<&Session> = sessions
+        .iter()
+        .filter(|session| session.id == requested)
+        .collect();
+    match id_matches.as_slice() {
+        [session] => return Ok(Some(*session)),
+        [] => {}
+        _ => {
+            return Err(ambiguous_worker_session_error(
+                requested,
+                "backend session id",
+                id_matches,
+            ));
+        }
+    }
+
+    let name_matches: Vec<&Session> = sessions
+        .iter()
+        .filter(|session| session.name == requested)
+        .collect();
+    match name_matches.as_slice() {
+        [session] => Ok(Some(*session)),
+        [] => Ok(None),
+        _ => Err(ambiguous_worker_session_error(
+            requested,
+            "session name",
+            name_matches,
+        )),
+    }
+}
+
+fn ambiguous_worker_session_error(
+    requested: &str,
+    label: &str,
+    candidates: Vec<&Session>,
+) -> anyhow::Error {
+    let candidates = candidates
+        .iter()
+        .map(|session| format!("backend id={} name={}", session.id, session.name))
+        .collect::<Vec<_>>()
+        .join("; ");
+
+    anyhow::anyhow!("ambiguous {label} '{requested}'; use an explicit id. Candidates: {candidates}")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommandSessionPreflight {
+    None,
+    BeforeDispatch,
+    AfterWorkspaceSwitch,
+}
+
+fn command_session_preflight(cmdline: &str) -> CommandSessionPreflight {
+    let mut parts = cmdline.split_whitespace();
+    let Some(command) = parts.next() else {
+        return CommandSessionPreflight::None;
+    };
+    let subcommand = parts.next();
+
+    match command {
+        "/info" | "/status" => CommandSessionPreflight::BeforeDispatch,
+        "/session" if matches!(subcommand, Some("info")) => CommandSessionPreflight::BeforeDispatch,
+        "/workspace" | "/workspaces"
+            if matches!(subcommand, Some("switch")) && parts.next().is_some() =>
+        {
+            CommandSessionPreflight::AfterWorkspaceSwitch
+        }
+        _ => CommandSessionPreflight::None,
+    }
+}
+
+fn stdout_only_slash_command_block_message(cmdline: &str) -> Option<String> {
+    cmdline.split_whitespace().next()?;
+    None
+}
+
+fn session_delete_target(cmdline: &str) -> Option<&str> {
+    let mut parts = cmdline.split_whitespace();
+    if parts.next()? != "/session" {
+        return None;
+    }
+    if parts.next()? != "delete" {
+        return None;
+    }
+    single_remaining_session_target(&mut parts)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionAction<'a> {
+    Switch { target: &'a str },
+    Create { target: &'a str },
+}
+
+impl<'a> SessionAction<'a> {
+    fn target(self) -> &'a str {
+        match self {
+            SessionAction::Switch { target } | SessionAction::Create { target } => target,
+        }
+    }
+}
+
+fn session_action(cmdline: &str) -> Option<SessionAction<'_>> {
+    let mut parts = cmdline.split_whitespace();
+    if parts.next()? != "/session" {
+        return None;
+    }
+    match parts.next()? {
+        "list" | "info" | "delete" => None,
+        "switch" => Some(SessionAction::Switch {
+            target: single_remaining_session_target(&mut parts)?,
+        }),
+        "create" => Some(SessionAction::Create {
+            target: single_remaining_session_target(&mut parts)?,
+        }),
+        name if parts.next().is_none() => Some(SessionAction::Switch { target: name }),
+        _ => None,
+    }
+}
+
+fn single_remaining_session_target<'a>(
+    parts: &mut std::str::SplitWhitespace<'a>,
+) -> Option<&'a str> {
+    let target = parts.next()?;
+    if parts.next().is_some() {
+        None
+    } else {
+        Some(target)
+    }
+}
+
+fn new_session_command(now: DateTime<Utc>, nonce: uuid::Uuid) -> String {
+    format!(
+        "/session create session-{}-{}",
+        now.format("%Y%m%d-%H%M%S"),
+        nonce.simple()
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_blocking(
     app: Arc<Mutex<App>>,
     session: Session,
     model: String,
     provider: String,
     workspace_name: String,
+    connect_splash: Option<String>,
     req_tx: mpsc::Sender<WorkerRequest>,
     mut event_rx: mpsc::UnboundedReceiver<TurnChunk>,
+    runtime_handle: Handle,
 ) -> Result<()> {
     let mut tapp =
         Application::new().map_err(|e| anyhow::anyhow!("turbo-vision init failed: {e:?}"))?;
@@ -447,6 +1365,17 @@ fn run_blocking(
     tapp.set_palette(Some(persisted_palette));
     info!("tv_ui: applied persisted theme '{}'", persisted_name);
 
+    let welcome_back = match delighters::record_launch() {
+        Ok((_, quote)) => quote,
+        Err(e) => {
+            warn!("welcome-back state update failed: {e}");
+            None
+        }
+    };
+    let beep_on_error = delighters::default_state_path()
+        .map(|path| delighters::load_state(&path).beep_on_error)
+        .unwrap_or(false);
+
     // Live status state. The status line is rebuilt on every
     // redraw tick by `refresh_status_line` rather than built once
     // here, so the elapsed counter and workspace label stay
@@ -455,6 +1384,7 @@ fn run_blocking(
         workspace_name.clone(),
         model.clone(),
         persisted_name.clone(),
+        beep_on_error,
     );
     let initial_status_line = build_status_line(w, h, &status_state);
     tapp.set_status_line(initial_status_line);
@@ -463,11 +1393,16 @@ fn run_blocking(
     // event loop is single-threaded; the custom ChatPane view reads
     // the buffer during its draw pass, and the event loop writes to
     // it on Enter.
-    let chat_lines: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(initial_chat_lines(
-        &workspace_name,
-        &model,
-        &provider,
-    )));
+    let welcome_lines = initial_chat_lines(&workspace_name, &model, &provider, welcome_back);
+    let mut typewriter_state = None;
+    let initial_lines = if let Some(text) = connect_splash {
+        let state = TypewriterState::new(text, welcome_lines, 0);
+        typewriter_state = Some(state);
+        vec![String::new()]
+    } else {
+        welcome_lines
+    };
+    let chat_lines: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(initial_lines));
 
     // Shared input buffer for the InputLine. Turbo Vision's
     // InputLine is already Rc<RefCell<String>>-backed; we hold an
@@ -570,7 +1505,9 @@ fn run_blocking(
         req_tx,
         &mut event_rx,
         &mut status_state,
+        &mut typewriter_state,
         &app,
+        &runtime_handle,
         w,
         h,
     )?;
@@ -578,15 +1515,24 @@ fn run_blocking(
     Ok(())
 }
 
-fn initial_chat_lines(workspace: &str, model: &str, provider: &str) -> Vec<String> {
-    vec![
+fn initial_chat_lines(
+    workspace: &str,
+    model: &str,
+    provider: &str,
+    welcome_back: Option<String>,
+) -> Vec<String> {
+    let mut lines = vec![
         "zterm — Turbo Vision UI (E-2 async bridge)".to_string(),
         format!("workspace: {workspace}  ·  model: {model}  ·  provider: {provider}"),
         String::new(),
         "Type a message and press Enter to submit a turn to the agent.".to_string(),
         "Press Ctrl-D (or Alt-X, F10→File→Exit, /exit) to quit. Ctrl-L to redraw.".to_string(),
         String::new(),
-    ]
+    ];
+    if let Some(quote) = welcome_back {
+        lines.insert(2, quote);
+    }
+    lines
 }
 
 fn build_menu_bar(w: i16) -> MenuBar {
@@ -595,6 +1541,7 @@ fn build_menu_bar(w: i16) -> MenuBar {
         Menu::from_items(vec![
             MenuItem::with_shortcut("~N~ew session", CMD_SESSION_NEW, 0, "", 0),
             MenuItem::with_shortcut("~O~pen session", CMD_SESSION_OPEN, 0, "", 0),
+            MenuItem::with_shortcut("~L~ist sessions", CMD_SESSION_LIST, 0, "", 0),
             MenuItem::separator(),
             MenuItem::with_shortcut("E~x~it", CM_QUIT, 0, "Alt+X", 0),
         ]),
@@ -609,30 +1556,27 @@ fn build_menu_bar(w: i16) -> MenuBar {
         "~W~orkspace",
         Menu::from_items(vec![
             MenuItem::with_shortcut("~L~ist", CMD_WORKSPACE_LIST, 0, "", 0),
+            MenuItem::with_shortcut("~I~nfo", CMD_WORKSPACE_INFO, 0, "", 0),
             MenuItem::with_shortcut("~S~witch…", CMD_WORKSPACE_SWITCH, 0, "", 0),
         ]),
     );
 
     let model_menu = SubMenu::new(
         "~M~odel",
-        Menu::from_items(vec![MenuItem::with_shortcut(
-            "~L~ist",
-            CMD_MODELS_LIST,
-            0,
-            "",
-            0,
-        )]),
+        Menu::from_items(vec![
+            MenuItem::with_shortcut("~L~ist", CMD_MODELS_LIST, 0, "", 0),
+            MenuItem::with_shortcut("~S~tatus", CMD_MODELS_STATUS, 0, "", 0),
+            MenuItem::with_shortcut("~P~roviders", CMD_PROVIDERS_LIST, 0, "", 0),
+        ]),
     );
 
     let memory_menu = SubMenu::new(
         "Me~m~ory",
-        Menu::from_items(vec![MenuItem::with_shortcut(
-            "~S~earch…",
-            CMD_MEMORY_SEARCH,
-            0,
-            "",
-            0,
-        )]),
+        Menu::from_items(vec![
+            MenuItem::with_shortcut("~R~ecent", CMD_MEMORY_SEARCH, 0, "", 0),
+            MenuItem::with_shortcut("~S~tats", CMD_MEMORY_STATS, 0, "", 0),
+            MenuItem::with_shortcut("~M~CP status", CMD_MCP_STATUS, 0, "", 0),
+        ]),
     );
 
     let help_menu = SubMenu::new(
@@ -707,6 +1651,7 @@ fn refresh_status_line(
         if let Some(ws) = guard.active_workspace() {
             if ws.config.name != state.workspace {
                 state.workspace = ws.config.name.clone();
+                state.clear_usage();
             }
         }
     }
@@ -724,12 +1669,15 @@ fn run_event_loop(
     req_tx: mpsc::Sender<WorkerRequest>,
     event_rx: &mut mpsc::UnboundedReceiver<TurnChunk>,
     status_state: &mut StatusState,
+    typewriter_state: &mut Option<TypewriterState>,
     shared_app: &Arc<Mutex<App>>,
+    runtime_handle: &Handle,
     w: i16,
     h: i16,
 ) -> Result<()> {
     app.running = true;
     let mut last_size = app.terminal.size();
+    let mut response_in_flight = false;
     while app.running {
         // Poll terminal size once per tick. On change, print a
         // user-facing notice and exit so the caller can relaunch
@@ -752,7 +1700,26 @@ fn run_event_loop(
         // *before* redrawing, so new tokens are visible this frame.
         // Also lets the status-state timer observe `Finished` frames
         // inline with the rest of the UI update.
-        drain_stream_events(event_rx, &chat_lines, status_state);
+        let error_frame = drain_stream_events(
+            event_rx,
+            &chat_lines,
+            status_state,
+            typewriter_state,
+            &mut response_in_flight,
+        );
+        if error_frame && status_state.beep_on_error {
+            let _ = app.terminal.beep();
+        }
+        if let Some(writer) = typewriter_state.as_mut() {
+            writer.tick(&chat_lines);
+        }
+        if typewriter_state
+            .as_ref()
+            .map(|writer| writer.completed)
+            .unwrap_or(false)
+        {
+            *typewriter_state = None;
+        }
 
         // Advance the in-flight spinner (no-op while idle).
         status_state.tick_spinner();
@@ -857,14 +1824,12 @@ fn run_event_loop(
             status_line.handle_event(&mut event);
         }
 
-        // Slash typing is plain — `/` inserts a literal slash so
-        // multi-word commands like "/models set together" can be
-        // typed without the popup hijacking keyboard focus. The
-        // popup is still available via Ctrl-K (palette convention)
-        // or F10 → top menu bar for discoverability.
+        // Slash-command popup: reserve Ctrl-K/menu paths for the
+        // picker so plain `/` remains ordinary text input. That keeps
+        // arbitrary slash commands typeable even when the popup is
+        // dismissed.
         if event.what == EventType::Keyboard
-            && event.key_code == KB_CTRL_K
-            && input_data.borrow().is_empty()
+            && should_open_slash_popup(event.key_code, input_data.borrow().is_empty())
         {
             let selected = run_slash_popup(app);
             if selected != 0 {
@@ -883,28 +1848,30 @@ fn run_event_loop(
         if event.what == EventType::Keyboard && event.key_code == KB_ENTER {
             let submitted = input_data.borrow().clone();
             if !submitted.is_empty() {
-                {
-                    let mut lines = chat_lines.borrow_mut();
-                    lines.push(format!("> {submitted}"));
-                    lines.push(String::new());
+                if response_in_flight {
+                    note_response_busy(status_state);
+                    continue;
                 }
-                // `set_text("")` resets `cursor_pos`, selection, and
-                // `first_pos` — safe to use mid-session unlike raw
-                // `data.clear()` which would leave `cursor_pos`
-                // pointing past the end of an empty string and panic
-                // in `String::insert` on the next keystroke.
-                input_line.borrow_mut().set_text(String::new());
                 // `/theme …` is a TUI-only concern — it toggles the
                 // live `TPalette` and has no meaning on the
                 // rustyline path. Intercept before routing to the
                 // CommandHandler so the worker never sees it.
                 if let Some(rest) = submitted.strip_prefix("/theme") {
+                    append_prompt_placeholder(&submitted, &chat_lines);
+                    // `set_text("")` resets `cursor_pos`, selection, and
+                    // `first_pos` — safe to use mid-session unlike raw
+                    // `data.clear()` which would leave `cursor_pos`
+                    // pointing past the end of an empty string and panic
+                    // in `String::insert` on the next keystroke.
+                    input_line.borrow_mut().set_text(String::new());
                     handle_theme_command(
                         rest.trim(),
                         &chat_lines,
                         app,
                         &mut status_state.current_theme,
+                        &mut status_state.beep_on_error,
                     );
+                    status_state.set_toast(format!("Command: {submitted}"));
                     // `continue` skips desktop.handle_event +
                     // command dispatch for this tick; the Enter
                     // was fully consumed.
@@ -914,26 +1881,27 @@ fn run_event_loop(
                 // everything else submits as an agent turn.
                 let is_turn = !submitted.starts_with('/');
                 let request = if is_turn {
-                    WorkerRequest::Turn(submitted)
+                    WorkerRequest::Turn(submitted.clone())
                 } else {
-                    WorkerRequest::Command(submitted)
+                    WorkerRequest::Command(submitted.clone())
                 };
-                // Only agent turns drive the elapsed counter —
-                // slash commands are nearly instantaneous and
-                // jittering the timer on each /help would look
-                // wrong.
-                if is_turn {
-                    status_state.begin_turn();
-                }
-                if let Err(e) = req_tx.blocking_send(request) {
-                    chat_lines
-                        .borrow_mut()
-                        .push(format!("[error] could not dispatch: {e}"));
-                    if is_turn {
-                        // Undo the timer start; the turn never
-                        // made it to the worker.
-                        status_state.turn_start = None;
-                    }
+                let toast = (!is_turn).then(|| format!("Command: {submitted}"));
+                let status = dispatch_worker_backed_submission(
+                    &submitted,
+                    request,
+                    &chat_lines,
+                    &req_tx,
+                    status_state,
+                    &mut response_in_flight,
+                    is_turn,
+                    toast,
+                    "dispatch",
+                );
+                if status != SubmissionStatus::Busy {
+                    // Clear after a non-busy submit attempt. Busy
+                    // submissions keep the typed input intact so the
+                    // user can send it once the active response finishes.
+                    input_line.borrow_mut().set_text(String::new());
                 }
                 // Consume the Enter so the input line itself (which
                 // would otherwise ignore it anyway, but be explicit)
@@ -983,7 +1951,9 @@ fn run_event_loop(
                 &chat_lines,
                 &req_tx,
                 shared_app,
+                runtime_handle,
                 status_state,
+                &mut response_in_flight,
             );
         }
     }
@@ -1013,6 +1983,13 @@ fn run_slash_popup(app: &mut Application) -> u16 {
             0,
         ),
         MenuItem::with_shortcut(
+            "Workspace ~i~nfo",
+            CMD_WORKSPACE_INFO,
+            0,
+            "/workspace info",
+            0,
+        ),
+        MenuItem::with_shortcut(
             "Workspace ~s~witch…",
             CMD_WORKSPACE_SWITCH,
             0,
@@ -1020,15 +1997,14 @@ fn run_slash_popup(app: &mut Application) -> u16 {
             0,
         ),
         MenuItem::with_shortcut("~M~odel list", CMD_MODELS_LIST, 0, "/models list", 0),
-        MenuItem::with_shortcut(
-            "Memor~y~ search…",
-            CMD_MEMORY_SEARCH,
-            0,
-            "/memory search",
-            0,
-        ),
+        MenuItem::with_shortcut("Model s~t~atus", CMD_MODELS_STATUS, 0, "/models status", 0),
+        MenuItem::with_shortcut("~P~roviders list", CMD_PROVIDERS_LIST, 0, "/providers", 0),
+        MenuItem::with_shortcut("Memor~y~ recent", CMD_MEMORY_SEARCH, 0, "/memory list", 0),
+        MenuItem::with_shortcut("Memory s~t~ats", CMD_MEMORY_STATS, 0, "/memory stats", 0),
+        MenuItem::with_shortcut("~M~CP status", CMD_MCP_STATUS, 0, "/mcp status", 0),
         MenuItem::separator(),
-        MenuItem::with_shortcut("Session ~n~ew", CMD_SESSION_NEW, 0, "/session new", 0),
+        MenuItem::with_shortcut("Session ~l~ist", CMD_SESSION_LIST, 0, "/session list", 0),
+        MenuItem::with_shortcut("Session ~n~ew", CMD_SESSION_NEW, 0, "/session <new>", 0),
         MenuItem::with_shortcut("Session ~o~pen", CMD_SESSION_OPEN, 0, "/session open", 0),
         MenuItem::separator(),
     ];
@@ -1056,12 +2032,15 @@ fn run_slash_popup(app: &mut Application) -> u16 {
 
     let menu = turbo_vision::core::menu_data::Menu::from_items(items);
     let mut menu_box = MenuBox::new(position, menu);
-    let result = menu_box.execute(&mut app.terminal);
     // The MenuBox leaves the terminal dirty under its footprint;
     // the outer event loop's next `redraw()` tick will repaint the
     // desktop, chat, input line, menu bar, and status line in the
     // right order, so there's nothing to clean up here.
-    result
+    menu_box.execute(&mut app.terminal)
+}
+
+fn should_open_slash_popup(key_code: u16, input_empty: bool) -> bool {
+    input_empty && key_code == KB_CTRL_K
 }
 
 /// Non-blocking drain of the worker → TUI event channel. Called at
@@ -1073,12 +2052,34 @@ fn drain_stream_events(
     event_rx: &mut mpsc::UnboundedReceiver<TurnChunk>,
     chat_lines: &Rc<RefCell<Vec<String>>>,
     status_state: &mut StatusState,
-) {
+    typewriter_state: &mut Option<TypewriterState>,
+    response_in_flight: &mut bool,
+) -> bool {
+    let mut saw_error = false;
     loop {
         match event_rx.try_recv() {
             Ok(chunk) => {
-                if matches!(chunk, TurnChunk::Finished(_)) {
-                    status_state.end_turn();
+                match &chunk {
+                    TurnChunk::Usage(usage) => {
+                        status_state.usage = Some(*usage);
+                    }
+                    TurnChunk::ClearUsage => {
+                        status_state.clear_usage();
+                    }
+                    TurnChunk::Status { workspace, model } => {
+                        status_state.apply_status(workspace.clone(), model.clone());
+                    }
+                    TurnChunk::Finished(result) => {
+                        if result.is_err() {
+                            saw_error = true;
+                        }
+                        status_state.end_turn();
+                        *response_in_flight = false;
+                    }
+                    TurnChunk::Typewriter(text) => {
+                        start_typewriter(typewriter_state, chat_lines, text.clone(), Vec::new());
+                    }
+                    TurnChunk::Token(_) => {}
                 }
                 apply_chunk(chunk, chat_lines);
             }
@@ -1089,6 +2090,56 @@ fn drain_stream_events(
             Err(mpsc::error::TryRecvError::Disconnected) => break,
         }
     }
+    saw_error
+}
+
+fn note_response_busy(status_state: &mut StatusState) {
+    status_state.set_toast(RESPONSE_BUSY_TOAST);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_worker_backed_submission(
+    label: &str,
+    request: WorkerRequest,
+    chat_lines: &Rc<RefCell<Vec<String>>>,
+    req_tx: &mpsc::Sender<WorkerRequest>,
+    status_state: &mut StatusState,
+    response_in_flight: &mut bool,
+    starts_turn_timer: bool,
+    toast: Option<String>,
+    error_context: &str,
+) -> SubmissionStatus {
+    if *response_in_flight {
+        note_response_busy(status_state);
+        return SubmissionStatus::Busy;
+    }
+
+    if let Some(toast) = toast {
+        status_state.set_toast(toast);
+    }
+    append_prompt_placeholder(label, chat_lines);
+
+    // Only agent turns drive the elapsed counter — slash commands are
+    // nearly instantaneous and jittering the timer on each /help would
+    // look wrong.
+    if starts_turn_timer {
+        status_state.begin_turn();
+    }
+    *response_in_flight = true;
+
+    if let Err(e) = req_tx.blocking_send(request) {
+        *response_in_flight = false;
+        if starts_turn_timer {
+            // Undo the timer start; the turn never made it to the worker.
+            status_state.turn_start = None;
+        }
+        chat_lines
+            .borrow_mut()
+            .push(format!("[error] could not {error_context}: {e}"));
+        return SubmissionStatus::DispatchFailed;
+    }
+
+    SubmissionStatus::Started
 }
 
 /// Apply a single streamed chunk to the chat buffer.
@@ -1113,6 +2164,10 @@ fn apply_chunk(chunk: TurnChunk, chat_lines: &Rc<RefCell<Vec<String>>>) {
                 lines.push(piece.to_string());
             }
         }
+        TurnChunk::Typewriter(_) => {}
+        TurnChunk::Usage(_) => {}
+        TurnChunk::ClearUsage => {}
+        TurnChunk::Status { .. } => {}
         TurnChunk::Finished(Ok(_)) => {
             lines.push(String::new());
         }
@@ -1138,13 +2193,16 @@ fn redraw(app: &mut Application, input_line: &Rc<RefCell<InputLine>>) {
     let _ = app.terminal.flush();
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_command(
     app: &mut Application,
     command: u16,
     chat_lines: &Rc<RefCell<Vec<String>>>,
     req_tx: &mpsc::Sender<WorkerRequest>,
     shared_app: &Arc<Mutex<App>>,
+    runtime_handle: &Handle,
     status_state: &mut StatusState,
+    response_in_flight: &mut bool,
 ) {
     match command {
         CM_QUIT => {
@@ -1184,17 +2242,33 @@ fn handle_command(
                 }
             }
         }
-        // Commands whose CommandHandler implementations already
-        // return `Ok(Some(String))` — they route cleanly through
-        // the worker and their output appends into the chat pane.
-        CMD_HELP | CMD_ABOUT | CMD_WORKSPACE_LIST => {
+        // Commands whose CommandHandler implementations return
+        // `Ok(Some(String))` route cleanly through the worker and
+        // append into the chat pane.
+        CMD_HELP | CMD_ABOUT | CMD_WORKSPACE_LIST | CMD_WORKSPACE_INFO | CMD_MODELS_LIST
+        | CMD_MODELS_STATUS | CMD_PROVIDERS_LIST | CMD_MEMORY_SEARCH | CMD_MEMORY_STATS
+        | CMD_MCP_STATUS | CMD_SESSION_LIST => {
             let cmdline = match command {
                 CMD_HELP => "/help",
                 CMD_ABOUT => "/info",
                 CMD_WORKSPACE_LIST => "/workspace list",
+                CMD_WORKSPACE_INFO => "/workspace info",
+                CMD_MODELS_LIST => "/models list",
+                CMD_MODELS_STATUS => "/models status",
+                CMD_PROVIDERS_LIST => "/providers",
+                CMD_MEMORY_SEARCH => "/memory list",
+                CMD_MEMORY_STATS => "/memory stats",
+                CMD_MCP_STATUS => "/mcp status",
+                CMD_SESSION_LIST => "/session list",
                 _ => return,
             };
-            dispatch_command(cmdline, chat_lines, req_tx);
+            dispatch_command(
+                cmdline,
+                chat_lines,
+                req_tx,
+                status_state,
+                response_in_flight,
+            );
         }
         // E-5: Workspace switch opens a modal picker populated from
         // the current App state. On selection, dispatch
@@ -1214,7 +2288,13 @@ fn handle_command(
             }
             if let Some(selected_name) = run_workspace_picker(app, &workspaces) {
                 let cmdline = format!("/workspace switch {selected_name}");
-                dispatch_command(&cmdline, chat_lines, req_tx);
+                dispatch_command(
+                    &cmdline,
+                    chat_lines,
+                    req_tx,
+                    status_state,
+                    response_in_flight,
+                );
             }
         }
         // Theme preset slots from the slash popup. Map the id back
@@ -1222,27 +2302,70 @@ fn handle_command(
         // `handle_theme_command` so the rendering path stays in
         // one place.
         cmd if (CMD_THEME_BASE..CMD_THEME_BASE + themes::PRESETS.len() as u16).contains(&cmd) => {
+            if *response_in_flight {
+                note_response_busy(status_state);
+                return;
+            }
             let idx = (cmd - CMD_THEME_BASE) as usize;
             if let Some(theme) = themes::PRESETS.get(idx) {
-                handle_theme_command(theme.name, chat_lines, app, &mut status_state.current_theme);
+                handle_theme_command(
+                    theme.name,
+                    chat_lines,
+                    app,
+                    &mut status_state.current_theme,
+                    &mut status_state.beep_on_error,
+                );
+                status_state.set_toast(format!("Command: /theme {}", theme.name));
             }
         }
-        // Still-pending native pickers. Their CommandHandler
-        // implementations are stdout-driven so they'd render as
-        // "(stdout renderer lands in a later slice…)" placeholders
-        // if we routed them through the worker; the explicit menu
-        // feedback here is more useful.
-        CMD_MODELS_LIST | CMD_MEMORY_SEARCH | CMD_SESSION_NEW | CMD_SESSION_OPEN => {
-            let label = match command {
-                CMD_MODELS_LIST => "Model › List",
-                CMD_MEMORY_SEARCH => "Memory › Search…",
-                CMD_SESSION_NEW => "File › New session",
-                CMD_SESSION_OPEN => "File › Open session",
-                _ => "?",
-            };
-            let mut lines = chat_lines.borrow_mut();
-            lines.push(format!("[menu] {label} — native picker still pending"));
-            lines.push(String::new());
+        CMD_SESSION_NEW => {
+            let cmdline = new_session_command(Utc::now(), uuid::Uuid::new_v4());
+            dispatch_command(
+                &cmdline,
+                chat_lines,
+                req_tx,
+                status_state,
+                response_in_flight,
+            );
+        }
+        CMD_SESSION_OPEN => {
+            if *response_in_flight {
+                note_response_busy(status_state);
+                return;
+            }
+            match load_session_picker_entries(shared_app, runtime_handle) {
+                Ok(entries) if entries.is_empty() => {
+                    chat_lines
+                        .borrow_mut()
+                        .push("[session] no backend sessions returned".to_string());
+                    chat_lines.borrow_mut().push(String::new());
+                }
+                Ok(entries) => {
+                    if let Some(entry) = run_session_picker(app, &entries) {
+                        match session_switch_command_for_picker_entry(&entry) {
+                            Ok(cmdline) => dispatch_command(
+                                &cmdline,
+                                chat_lines,
+                                req_tx,
+                                status_state,
+                                response_in_flight,
+                            ),
+                            Err(e) => {
+                                chat_lines
+                                    .borrow_mut()
+                                    .push(format!("[session] cannot switch via picker: {e}"));
+                                chat_lines.borrow_mut().push(String::new());
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    chat_lines
+                        .borrow_mut()
+                        .push(format!("[session] could not load backend sessions: {e}"));
+                    chat_lines.borrow_mut().push(String::new());
+                }
+            }
         }
         _ => {}
     }
@@ -1327,8 +2450,26 @@ fn handle_theme_command(
     chat_lines: &Rc<RefCell<Vec<String>>>,
     app: &mut Application,
     current_theme: &mut String,
+    beep_on_error: &mut bool,
 ) {
     let arg = rest.trim();
+    if let Some(enabled) = parse_beep_toggle(arg) {
+        let mut lines = chat_lines.borrow_mut();
+        match delighters::set_beep_on_error(enabled) {
+            Ok(_) => {
+                *beep_on_error = enabled;
+                lines.push(format!(
+                    "🔔 theme beep: {}",
+                    if enabled { "on" } else { "off" }
+                ));
+            }
+            Err(e) => {
+                lines.push(format!("[theme] beep setting not persisted: {e}"));
+            }
+        }
+        lines.push(String::new());
+        return;
+    }
     match arg {
         "" | "list" => {
             let mut lines = chat_lines.borrow_mut();
@@ -1337,8 +2478,8 @@ fn handle_theme_command(
                 lines.push(format!("  {:<8} {}", theme.name, theme.display_name));
             }
             lines.push(
-                "Apply via `/theme <name>`; edit with `/theme edit`; presets also live in \
-                 the slash popup."
+                "Apply via `/theme <name>`; edit with `/theme edit`; toggle bell with \
+                 `/theme beep on|off`."
                     .to_string(),
             );
             lines.push(String::new());
@@ -1413,17 +2554,26 @@ fn dispatch_command(
     cmdline: &str,
     chat_lines: &Rc<RefCell<Vec<String>>>,
     req_tx: &mpsc::Sender<WorkerRequest>,
+    status_state: &mut StatusState,
+    response_in_flight: &mut bool,
 ) {
-    {
-        let mut lines = chat_lines.borrow_mut();
-        lines.push(format!("> {cmdline}"));
-        lines.push(String::new());
-    }
-    if let Err(e) = req_tx.blocking_send(WorkerRequest::Command(cmdline.to_string())) {
-        chat_lines
-            .borrow_mut()
-            .push(format!("[error] could not dispatch command: {e}"));
-    }
+    let _ = dispatch_worker_backed_submission(
+        cmdline,
+        WorkerRequest::Command(cmdline.to_string()),
+        chat_lines,
+        req_tx,
+        status_state,
+        response_in_flight,
+        false,
+        Some(format!("Command: {cmdline}")),
+        "dispatch command",
+    );
+}
+
+fn append_prompt_placeholder(label: &str, chat_lines: &Rc<RefCell<Vec<String>>>) {
+    let mut lines = chat_lines.borrow_mut();
+    lines.push(format!("> {label}"));
+    lines.push(String::new());
 }
 
 /// Read a snapshot of configured workspaces from the shared App.
@@ -1454,6 +2604,53 @@ struct WorkspacePickerEntry {
     label: String,
     backend: String,
     active: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionPickerEntry {
+    id: String,
+    name: String,
+    model: String,
+    provider: String,
+}
+
+impl From<Session> for SessionPickerEntry {
+    fn from(session: Session) -> Self {
+        Self {
+            id: session.id,
+            name: session.name,
+            model: session.model,
+            provider: session.provider,
+        }
+    }
+}
+
+fn load_session_picker_entries(
+    shared_app: &Arc<Mutex<App>>,
+    runtime_handle: &Handle,
+) -> Result<Vec<SessionPickerEntry>> {
+    let client = {
+        let guard = shared_app.blocking_lock();
+        guard.active_workspace().and_then(|w| w.client.clone())
+    }
+    .ok_or_else(|| anyhow::anyhow!("no active workspace client"))?;
+
+    let sessions = runtime_handle.block_on(async {
+        let locked = client.lock().await;
+        locked.list_sessions().await
+    })?;
+
+    Ok(sessions.into_iter().map(SessionPickerEntry::from).collect())
+}
+
+fn session_switch_command_for_picker_entry(entry: &SessionPickerEntry) -> Result<String> {
+    let id = entry.id.trim();
+    if id.is_empty() || id.split_whitespace().count() != 1 {
+        return Err(anyhow::anyhow!(
+            "backend session id is not a single command token"
+        ));
+    }
+    Ok(format!("/session switch {id}"))
 }
 
 /// Theme color editor modal (E-8b MVP).
@@ -1648,6 +2845,58 @@ fn run_workspace_picker(app: &mut Application, entries: &[WorkspacePickerEntry])
     entries.get(idx).map(|e| e.name.clone())
 }
 
+/// Present a MenuBox-style modal picker of backend sessions.
+///
+/// The selected row maps back to the backend session id; the caller dispatches
+/// `/session switch <id>` through the same worker/CommandHandler path as typed
+/// slash commands so session binding remains centralized.
+fn run_session_picker(
+    app: &mut Application,
+    entries: &[SessionPickerEntry],
+) -> Option<SessionPickerEntry> {
+    use turbo_vision::core::geometry::Point;
+
+    const CMD_SESSION_SELECT_BASE: u16 = 1400;
+
+    let items: Vec<MenuItem> = entries
+        .iter()
+        .enumerate()
+        .map(|(i, e)| {
+            let label = format!(
+                " {}  [{} / {}]  {}",
+                e.name,
+                empty_label(&e.provider),
+                empty_label(&e.model),
+                e.id
+            );
+            MenuItem::with_shortcut(&label, CMD_SESSION_SELECT_BASE + i as u16, 0, "", 0)
+        })
+        .collect();
+
+    let (tw, th) = app.terminal.size();
+    let w = tw;
+    let h = th;
+    let position = Point::new((w / 2) - 28, (h / 3).max(3));
+
+    let menu = turbo_vision::core::menu_data::Menu::from_items(items);
+    let mut menu_box = MenuBox::new(position, menu);
+    let selected = menu_box.execute(&mut app.terminal);
+
+    if selected == 0 {
+        return None;
+    }
+    let idx = selected.checked_sub(CMD_SESSION_SELECT_BASE)? as usize;
+    entries.get(idx).cloned()
+}
+
+fn empty_label(value: &str) -> &str {
+    if value.trim().is_empty() {
+        "-"
+    } else {
+        value
+    }
+}
+
 /// Custom read-only scrolling text view over a shared `Vec<String>`
 /// buffer. Purposely narrow for E-1 — no scrollbars, no selection,
 /// no word wrap beyond hard truncation. E-2 replaces this with a
@@ -1736,5 +2985,838 @@ impl View for ChatPane {
 
     fn get_palette(&self) -> Option<Palette> {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn token_budget_bar_clamps_and_sizes() {
+        assert_eq!(token_budget_bar(0, 10), "[----------]");
+        assert_eq!(token_budget_bar(25, 10), "[###-------]");
+        assert_eq!(token_budget_bar(150, 10), "[##########]");
+    }
+
+    #[test]
+    fn ctx_usage_renders_used_total_pct_and_bar() {
+        let usage = TurnUsage {
+            total_tokens: Some(2_000),
+            context_window: Some(8_000),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            render_ctx_usage(Some(usage)),
+            "ctx 2000/8000 (25%) [###-------]"
+        );
+    }
+
+    #[test]
+    fn begin_turn_clears_stale_usage() {
+        let mut state = StatusState::new(
+            "default".to_string(),
+            "gpt-test".to_string(),
+            "borland".to_string(),
+            false,
+        );
+        state.usage = Some(TurnUsage {
+            total_tokens: Some(2_000),
+            context_window: Some(8_000),
+            ..Default::default()
+        });
+
+        state.begin_turn();
+
+        assert!(state.usage.is_none());
+        assert!(state.turn_start.is_some());
+    }
+
+    #[test]
+    fn clear_usage_chunk_resets_status_without_chat_output() {
+        let mut state = StatusState::new(
+            "default".to_string(),
+            "gpt-test".to_string(),
+            "borland".to_string(),
+            false,
+        );
+        state.usage = Some(TurnUsage {
+            total_tokens: Some(2_000),
+            context_window: Some(8_000),
+            ..Default::default()
+        });
+        let lines = Rc::new(RefCell::new(Vec::new()));
+        let mut typewriter_state = None;
+        let mut response_in_flight = true;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tx.send(TurnChunk::ClearUsage).unwrap();
+
+        assert!(!drain_stream_events(
+            &mut rx,
+            &lines,
+            &mut state,
+            &mut typewriter_state,
+            &mut response_in_flight
+        ));
+
+        assert!(state.usage.is_none());
+        assert!(lines.borrow().is_empty());
+        assert!(response_in_flight);
+    }
+
+    #[test]
+    fn status_chunk_updates_workspace_and_model_without_chat_output() {
+        let mut state = StatusState::new(
+            "old".to_string(),
+            "primary".to_string(),
+            "borland".to_string(),
+            false,
+        );
+        state.usage = Some(TurnUsage {
+            total_tokens: Some(2_000),
+            context_window: Some(8_000),
+            ..Default::default()
+        });
+        let lines = Rc::new(RefCell::new(Vec::new()));
+        let mut typewriter_state = None;
+        let mut response_in_flight = true;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tx.send(TurnChunk::Status {
+            workspace: Some("new".to_string()),
+            model: Some("consult".to_string()),
+        })
+        .unwrap();
+
+        assert!(!drain_stream_events(
+            &mut rx,
+            &lines,
+            &mut state,
+            &mut typewriter_state,
+            &mut response_in_flight
+        ));
+
+        assert_eq!(state.workspace, "new");
+        assert_eq!(state.model, "consult");
+        assert!(state.usage.is_none());
+        assert!(lines.borrow().is_empty());
+        assert!(response_in_flight);
+    }
+
+    #[test]
+    fn submit_turn_result_gets_worker_fallback_chunks_only_without_finished() {
+        let err: Result<String> = Err(anyhow::anyhow!("backend unavailable"));
+        let err_chunks = submit_turn_fallback_chunks(&err, false, false);
+        match err_chunks.as_slice() {
+            [TurnChunk::Finished(Err(message))] => assert_eq!(message, "backend unavailable"),
+            other => panic!("expected synthetic error Finished, got {other:?}"),
+        }
+        assert!(submit_turn_fallback_chunks(&err, true, false).is_empty());
+
+        let ok: Result<String> = Ok("done".to_string());
+        let ok_chunks = submit_turn_fallback_chunks(&ok, false, false);
+        match ok_chunks.as_slice() {
+            [TurnChunk::Token(text), TurnChunk::Finished(Ok(done))] => {
+                assert_eq!(text, "done");
+                assert!(done.is_empty());
+            }
+            other => panic!("expected synthetic success Token + Finished, got {other:?}"),
+        }
+        assert!(submit_turn_fallback_chunks(&ok, true, false).is_empty());
+
+        let empty_ok: Result<String> = Ok(String::new());
+        match submit_turn_fallback_chunks(&empty_ok, false, false).as_slice() {
+            [TurnChunk::Finished(Ok(done))] => assert!(done.is_empty()),
+            other => panic!("expected synthetic empty success Finished, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ok_submit_turn_with_forwarded_tokens_finishes_with_partial_error() {
+        let ok: Result<String> = Ok("complete response".to_string());
+
+        match submit_turn_fallback_chunks(&ok, false, true).as_slice() {
+            [TurnChunk::Finished(Err(message))] => {
+                assert!(message.contains("partial response incomplete"));
+            }
+            other => panic!("expected synthetic partial error Finished, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ok_submit_turn_fallback_renders_returned_text_before_finished() {
+        let lines = Rc::new(RefCell::new(vec!["> hello".to_string(), String::new()]));
+        let ok: Result<String> = Ok("complete response".to_string());
+
+        for chunk in submit_turn_fallback_chunks(&ok, false, false) {
+            apply_chunk(chunk, &lines);
+        }
+
+        assert_eq!(
+            lines.borrow().as_slice(),
+            ["> hello", "complete response", ""]
+        );
+    }
+
+    #[test]
+    fn session_picker_entry_builds_switch_command_from_backend_id() {
+        let entry = SessionPickerEntry {
+            id: "sess-123".to_string(),
+            name: "scratch".to_string(),
+            model: "gpt-test".to_string(),
+            provider: "test".to_string(),
+        };
+
+        assert_eq!(
+            session_switch_command_for_picker_entry(&entry).unwrap(),
+            "/session switch sess-123"
+        );
+    }
+
+    #[test]
+    fn session_picker_entry_rejects_non_token_backend_id() {
+        let entry = SessionPickerEntry {
+            id: "bad id".to_string(),
+            name: "scratch".to_string(),
+            model: String::new(),
+            provider: String::new(),
+        };
+
+        assert!(session_switch_command_for_picker_entry(&entry).is_err());
+    }
+
+    #[test]
+    fn empty_picker_labels_render_as_dash() {
+        assert_eq!(empty_label(""), "-");
+        assert_eq!(empty_label("  "), "-");
+        assert_eq!(empty_label("openai"), "openai");
+    }
+
+    #[test]
+    fn worker_submission_gate_blocks_second_command_placeholder() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let lines = Rc::new(RefCell::new(vec![
+            "> first".to_string(),
+            "partial".to_string(),
+        ]));
+        let mut state = StatusState::new(
+            "default".to_string(),
+            "gpt-test".to_string(),
+            "borland".to_string(),
+            false,
+        );
+        let mut response_in_flight = true;
+
+        dispatch_command("/help", &lines, &tx, &mut state, &mut response_in_flight);
+
+        assert!(response_in_flight);
+        assert!(rx.try_recv().is_err());
+        assert_eq!(
+            lines.borrow().as_slice(),
+            ["> first".to_string(), "partial".to_string()]
+        );
+        assert_eq!(
+            state.toast.as_ref().map(|(msg, _)| msg.as_str()),
+            Some(RESPONSE_BUSY_TOAST)
+        );
+    }
+
+    #[test]
+    fn worker_submission_gate_blocks_second_turn_placeholder() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let lines = Rc::new(RefCell::new(vec![
+            "> first".to_string(),
+            "partial".to_string(),
+        ]));
+        let mut state = StatusState::new(
+            "default".to_string(),
+            "gpt-test".to_string(),
+            "borland".to_string(),
+            false,
+        );
+        let mut response_in_flight = true;
+
+        let status = dispatch_worker_backed_submission(
+            "second",
+            WorkerRequest::Turn("second".to_string()),
+            &lines,
+            &tx,
+            &mut state,
+            &mut response_in_flight,
+            true,
+            None,
+            "dispatch",
+        );
+
+        assert_eq!(status, SubmissionStatus::Busy);
+        assert!(response_in_flight);
+        assert!(rx.try_recv().is_err());
+        assert_eq!(
+            lines.borrow().as_slice(),
+            ["> first".to_string(), "partial".to_string()]
+        );
+        assert!(state.turn_start.is_none());
+        assert_eq!(
+            state.toast.as_ref().map(|(msg, _)| msg.as_str()),
+            Some(RESPONSE_BUSY_TOAST)
+        );
+    }
+
+    #[test]
+    fn finished_chunk_clears_response_in_flight() {
+        let mut state = StatusState::new(
+            "default".to_string(),
+            "gpt-test".to_string(),
+            "borland".to_string(),
+            false,
+        );
+        state.begin_turn();
+        let lines = Rc::new(RefCell::new(vec![
+            "> first".to_string(),
+            "done".to_string(),
+        ]));
+        let mut typewriter_state = None;
+        let mut response_in_flight = true;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tx.send(TurnChunk::Finished(Ok(String::new()))).unwrap();
+
+        assert!(!drain_stream_events(
+            &mut rx,
+            &lines,
+            &mut state,
+            &mut typewriter_state,
+            &mut response_in_flight
+        ));
+
+        assert!(!response_in_flight);
+        assert!(state.turn_start.is_none());
+        assert_eq!(
+            lines.borrow().as_slice(),
+            ["> first".to_string(), "done".to_string(), String::new()]
+        );
+    }
+
+    #[tokio::test]
+    async fn forward_turn_chunks_forwards_only_one_finished() {
+        let (turn_tx, turn_rx) = mpsc::unbounded_channel();
+        let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
+        let observed_finished = Arc::new(AtomicBool::new(false));
+        let forwarded_token = Arc::new(AtomicBool::new(false));
+
+        turn_tx
+            .send(TurnChunk::Finished(Ok("first".to_string())))
+            .unwrap();
+        turn_tx
+            .send(TurnChunk::Finished(Ok("second".to_string())))
+            .unwrap();
+        drop(turn_tx);
+
+        assert!(
+            forward_turn_chunks(
+                turn_rx,
+                ui_tx,
+                Arc::clone(&observed_finished),
+                Arc::clone(&forwarded_token),
+            )
+            .await
+        );
+        assert!(observed_finished.load(Ordering::Acquire));
+        assert!(!forwarded_token.load(Ordering::Acquire));
+
+        match ui_rx.recv().await {
+            Some(TurnChunk::Finished(Ok(text))) => assert_eq!(text, "first"),
+            other => panic!("expected first Finished, got {other:?}"),
+        }
+        assert!(ui_rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn forward_turn_chunks_tracks_forwarded_tokens_without_finished() {
+        let (turn_tx, turn_rx) = mpsc::unbounded_channel();
+        let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
+        let observed_finished = Arc::new(AtomicBool::new(false));
+        let forwarded_token = Arc::new(AtomicBool::new(false));
+
+        turn_tx
+            .send(TurnChunk::Token("partial".to_string()))
+            .unwrap();
+        drop(turn_tx);
+
+        assert!(
+            !forward_turn_chunks(
+                turn_rx,
+                ui_tx,
+                Arc::clone(&observed_finished),
+                Arc::clone(&forwarded_token),
+            )
+            .await
+        );
+        assert!(!observed_finished.load(Ordering::Acquire));
+        assert!(forwarded_token.load(Ordering::Acquire));
+
+        match ui_rx.recv().await {
+            Some(TurnChunk::Token(text)) => assert_eq!(text, "partial"),
+            other => panic!("expected forwarded token, got {other:?}"),
+        }
+        assert!(ui_rx.recv().await.is_none());
+    }
+
+    #[test]
+    fn usage_clear_boundaries_include_session_workspace_and_model_switches() {
+        assert!(should_clear_usage_after_command(true, false, false));
+        assert!(should_clear_usage_after_command(false, true, false));
+        assert!(should_clear_usage_after_command(false, false, true));
+        assert!(!should_clear_usage_after_command(false, false, false));
+
+        assert_eq!(model_switch_target("/models set primary"), Some("primary"));
+        assert_eq!(model_switch_target("/model set fast"), Some("fast"));
+        assert_eq!(model_switch_target("/models list"), None);
+        assert!(successful_model_switch_command(
+            "/models set primary",
+            "✅ Active model key: primary\n"
+        ));
+        assert!(!successful_model_switch_command(
+            "/models set missing",
+            "❌ Failed to set model key: missing\n"
+        ));
+        assert!(!successful_model_switch_command(
+            "/models set",
+            "Usage: /models set <key>\n"
+        ));
+    }
+
+    #[test]
+    fn spinner_advances_only_after_interval_and_wraps() {
+        assert!(!should_advance_spinner(
+            SPINNER_INTERVAL - Duration::from_millis(1)
+        ));
+        assert!(should_advance_spinner(SPINNER_INTERVAL));
+        assert_eq!(next_spinner_frame(0, SPINNER_FRAMES.len()), 1);
+        assert_eq!(
+            next_spinner_frame(SPINNER_FRAMES.len() - 1, SPINNER_FRAMES.len()),
+            0
+        );
+    }
+
+    #[test]
+    fn typewriter_due_uses_thirty_ms_cadence() {
+        assert_eq!(
+            typewriter_chars_due(Duration::from_millis(29), TYPEWRITER_INTERVAL),
+            0
+        );
+        assert_eq!(
+            typewriter_chars_due(Duration::from_millis(30), TYPEWRITER_INTERVAL),
+            1
+        );
+        assert_eq!(
+            typewriter_chars_due(Duration::from_millis(95), TYPEWRITER_INTERVAL),
+            3
+        );
+    }
+
+    #[test]
+    fn typewriter_keeps_splash_lines_before_prompt_appended_mid_stream() {
+        let lines = Rc::new(RefCell::new(vec![String::new()]));
+        let mut writer = TypewriterState::new(
+            "ab\ncd",
+            vec!["workspace: default".to_string(), "model: test".to_string()],
+            0,
+        );
+
+        writer.last_emit = Instant::now() - Duration::from_millis(90);
+        writer.tick(&lines);
+        {
+            let mut lines = lines.borrow_mut();
+            lines.push("> hello".to_string());
+            lines.push(String::new());
+        }
+
+        writer.last_emit = Instant::now() - Duration::from_millis(300);
+        writer.tick(&lines);
+
+        let expected = vec![
+            "ab".to_string(),
+            "cd".to_string(),
+            String::new(),
+            "workspace: default".to_string(),
+            "model: test".to_string(),
+            "> hello".to_string(),
+            String::new(),
+        ];
+
+        assert!(writer.completed);
+        assert_eq!(lines.borrow().clone(), expected);
+    }
+
+    #[test]
+    fn parses_theme_beep_toggle() {
+        assert_eq!(parse_beep_toggle("beep on"), Some(true));
+        assert_eq!(parse_beep_toggle("BEEP OFF"), Some(false));
+        assert_eq!(parse_beep_toggle("amber"), None);
+    }
+
+    #[test]
+    fn slash_popup_ignores_plain_slash() {
+        assert!(should_open_slash_popup(KB_CTRL_K, true));
+        assert!(!should_open_slash_popup(KB_SLASH, true));
+        assert!(!should_open_slash_popup(KB_CTRL_K, false));
+    }
+
+    #[test]
+    fn session_action_carries_switch_and_create_intent() {
+        assert_eq!(
+            session_action("/session research"),
+            Some(SessionAction::Switch { target: "research" })
+        );
+        assert_eq!(
+            session_action("/session switch research"),
+            Some(SessionAction::Switch { target: "research" })
+        );
+        assert_eq!(
+            session_action("/session create scratch"),
+            Some(SessionAction::Create { target: "scratch" })
+        );
+        assert_eq!(session_action("/session research notes"), None);
+        assert_eq!(session_action("/session switch research notes"), None);
+        assert_eq!(session_action("/session create scratch copy"), None);
+        assert_eq!(session_action("/session list"), None);
+        assert_eq!(session_action("/session info"), None);
+        assert_eq!(session_action("/workspace switch prod"), None);
+    }
+
+    #[test]
+    fn new_session_command_uses_explicit_create_and_nonce() {
+        let now = DateTime::parse_from_rfc3339("2026-04-28T12:34:56Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let first = new_session_command(now, uuid::Uuid::from_u128(1));
+        let second = new_session_command(now, uuid::Uuid::from_u128(2));
+
+        assert_eq!(
+            first,
+            "/session create session-20260428-123456-00000000000000000000000000000001"
+        );
+        assert_ne!(first, second);
+        assert!(second.starts_with("/session create session-20260428-123456-"));
+    }
+
+    #[test]
+    fn session_delete_target_parses_only_delete_commands() {
+        assert_eq!(
+            session_delete_target("/session delete sess-123"),
+            Some("sess-123")
+        );
+        assert_eq!(
+            session_delete_target("/session delete Research"),
+            Some("Research")
+        );
+        assert_eq!(
+            session_delete_target("/session delete Research Notes"),
+            None
+        );
+        assert_eq!(session_delete_target("/session switch Research"), None);
+        assert_eq!(session_delete_target("/workspace switch prod"), None);
+        assert_eq!(session_delete_target("/session delete"), None);
+    }
+
+    #[test]
+    fn active_worker_session_delete_target_resolves_backend_alias_before_matching_active() {
+        let mut bindings = HashMap::new();
+        remember_worker_session(
+            &mut bindings,
+            "default".to_string(),
+            &Session {
+                id: "sess-123".to_string(),
+                name: "Research".to_string(),
+                model: "m".to_string(),
+                provider: "p".to_string(),
+            },
+        );
+        let backend_sessions = vec![Session {
+            id: "sess-123".to_string(),
+            name: "Renamed Display".to_string(),
+            model: "m".to_string(),
+            provider: "p".to_string(),
+        }];
+
+        assert_eq!(
+            active_worker_session_delete_target_for_workspace(
+                "sess-123",
+                "default",
+                &mut bindings,
+                Some(&backend_sessions)
+            ),
+            Some("sess-123".to_string())
+        );
+        assert_eq!(
+            active_worker_session_delete_target_for_workspace(
+                "Renamed Display",
+                "default",
+                &mut bindings,
+                Some(&backend_sessions)
+            ),
+            Some("Renamed Display".to_string())
+        );
+        assert_eq!(bindings["default"].name, "Renamed Display");
+        assert_eq!(
+            active_worker_session_delete_target_for_workspace(
+                "Research",
+                "default",
+                &mut bindings,
+                Some(&backend_sessions)
+            ),
+            None
+        );
+        assert_eq!(
+            active_worker_session_delete_target_for_workspace(
+                "sess-123",
+                "other-workspace",
+                &mut bindings,
+                Some(&backend_sessions)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn active_worker_session_delete_target_keeps_cached_fallback_without_backend() {
+        let mut bindings = HashMap::new();
+        remember_worker_session(
+            &mut bindings,
+            "default".to_string(),
+            &Session {
+                id: "sess-123".to_string(),
+                name: "Research".to_string(),
+                model: "m".to_string(),
+                provider: "p".to_string(),
+            },
+        );
+
+        assert_eq!(
+            active_worker_session_delete_target_for_workspace(
+                "Research",
+                "default",
+                &mut bindings,
+                None
+            ),
+            Some("Research".to_string())
+        );
+    }
+
+    #[test]
+    fn workspace_switch_detection_requires_target() {
+        assert_eq!(
+            command_session_preflight("/workspace switch prod"),
+            CommandSessionPreflight::AfterWorkspaceSwitch
+        );
+        assert_eq!(
+            command_session_preflight("/workspaces switch prod"),
+            CommandSessionPreflight::AfterWorkspaceSwitch
+        );
+        assert_eq!(
+            command_session_preflight("/workspace switch"),
+            CommandSessionPreflight::None
+        );
+        assert_eq!(
+            command_session_preflight("/workspace list"),
+            CommandSessionPreflight::None
+        );
+    }
+
+    #[test]
+    fn command_session_preflight_is_limited_to_session_dependent_commands() {
+        for cmdline in [
+            "/help",
+            "/workspace list",
+            "/workspace info",
+            "/session list",
+            "/session switch research",
+            "/session research",
+            "/models list",
+            "/memory stats",
+        ] {
+            assert_eq!(
+                command_session_preflight(cmdline),
+                CommandSessionPreflight::None,
+                "{cmdline}"
+            );
+        }
+
+        assert_eq!(
+            command_session_preflight("/info"),
+            CommandSessionPreflight::BeforeDispatch
+        );
+        assert_eq!(
+            command_session_preflight("/status"),
+            CommandSessionPreflight::BeforeDispatch
+        );
+        assert_eq!(
+            command_session_preflight("/session info"),
+            CommandSessionPreflight::BeforeDispatch
+        );
+        assert_eq!(
+            command_session_preflight("/workspace switch prod"),
+            CommandSessionPreflight::AfterWorkspaceSwitch
+        );
+    }
+
+    #[test]
+    fn stdout_only_slash_blocker_allows_advertised_tui_commands() {
+        for cmdline in [
+            "/help",
+            "/info",
+            "/agent",
+            "/cron list",
+            "/clear",
+            "/save out.txt",
+            "/history",
+            "/config",
+            "/session delete sess-123",
+            "/workspace switch prod",
+            "/models set primary",
+            "/memory list",
+            "/doctor",
+            "/skill list",
+            "/channels list",
+            "/hardware discover",
+            "/peripheral list",
+            "/estop status",
+        ] {
+            assert!(
+                stdout_only_slash_command_block_message(cmdline).is_none(),
+                "{cmdline} should route through CommandHandler instead of the stdout-only blocker"
+            );
+        }
+    }
+
+    #[test]
+    fn worker_session_bindings_are_per_workspace() {
+        let mut bindings = HashMap::new();
+        let alpha = Session {
+            id: "alpha-id".to_string(),
+            name: "main".to_string(),
+            model: "m".to_string(),
+            provider: "p".to_string(),
+        };
+        let beta = Session {
+            id: "beta-id".to_string(),
+            name: "main".to_string(),
+            model: "m".to_string(),
+            provider: "p".to_string(),
+        };
+
+        remember_worker_session(&mut bindings, "alpha".to_string(), &alpha);
+        remember_worker_session(&mut bindings, "beta".to_string(), &beta);
+
+        assert_eq!(bindings["alpha"].id, "alpha-id");
+        assert_eq!(bindings["beta"].id, "beta-id");
+    }
+
+    #[test]
+    fn worker_session_resolution_fails_closed_when_backend_listing_fails() {
+        let err =
+            plan_worker_session_resolution("Research", Err(anyhow::anyhow!("backend unavailable")))
+                .unwrap_err();
+        let msg = err.to_string();
+
+        assert!(msg.contains("could not list sessions from active backend"));
+        assert!(msg.contains("backend unavailable"));
+    }
+
+    #[test]
+    fn worker_session_resolution_creates_only_after_successful_absent_listing() {
+        let resolution = plan_worker_session_resolution("Research", Ok(Vec::new()))
+            .expect("successful empty backend listing should permit create");
+
+        match resolution {
+            WorkerSessionResolution::Create => {}
+            WorkerSessionResolution::Existing(session) => {
+                panic!("expected create plan, got existing session {}", session.id)
+            }
+        }
+    }
+
+    #[test]
+    fn worker_session_resolution_switch_and_bare_prefer_existing_backend_match() {
+        let sessions = vec![Session {
+            id: "sess-123".to_string(),
+            name: "Research".to_string(),
+            model: "m".to_string(),
+            provider: "p".to_string(),
+        }];
+
+        let resolution = plan_worker_session_resolution("Research", Ok(sessions))
+            .expect("successful backend listing should resolve existing session");
+
+        match resolution {
+            WorkerSessionResolution::Existing(session) => assert_eq!(session.id, "sess-123"),
+            WorkerSessionResolution::Create => panic!("expected existing session resolution"),
+        }
+    }
+
+    #[test]
+    fn worker_session_metadata_save_failure_is_best_effort() {
+        let session = Session {
+            id: "sess-123".to_string(),
+            name: "Research".to_string(),
+            model: "m".to_string(),
+            provider: "p".to_string(),
+        };
+
+        let saved = save_worker_session_metadata_best_effort_with(&session, |_| {
+            Err(anyhow::anyhow!("disk full"))
+        });
+
+        assert!(!saved);
+    }
+
+    #[test]
+    fn session_switch_resolver_prefers_exact_backend_id_over_duplicate_names() {
+        let sessions = vec![
+            Session {
+                id: "sess-123".to_string(),
+                name: "Research".to_string(),
+                model: "m".to_string(),
+                provider: "p".to_string(),
+            },
+            Session {
+                id: "sess-456".to_string(),
+                name: "Research".to_string(),
+                model: "m".to_string(),
+                provider: "p".to_string(),
+            },
+        ];
+
+        let resolved = choose_worker_session_by_id_or_name(&sessions, "sess-456")
+            .expect("id lookup should not be ambiguous")
+            .expect("id should resolve");
+
+        assert_eq!(resolved.id, "sess-456");
+    }
+
+    #[test]
+    fn session_switch_resolver_fails_closed_on_duplicate_backend_names() {
+        let sessions = vec![
+            Session {
+                id: "sess-123".to_string(),
+                name: "Research".to_string(),
+                model: "m".to_string(),
+                provider: "p".to_string(),
+            },
+            Session {
+                id: "sess-456".to_string(),
+                name: "Research".to_string(),
+                model: "m".to_string(),
+                provider: "p".to_string(),
+            },
+        ];
+
+        let err = choose_worker_session_by_id_or_name(&sessions, "Research").unwrap_err();
+        let msg = err.to_string();
+
+        assert!(msg.contains("ambiguous session name 'Research'"));
+        assert!(msg.contains("sess-123"));
+        assert!(msg.contains("sess-456"));
+        assert!(msg.contains("explicit id"));
     }
 }

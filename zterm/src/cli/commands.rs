@@ -1,11 +1,14 @@
 use anyhow::{anyhow, Result};
 use chrono::Utc;
 use std::fs;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
+use crate::cli::agent::AgentClient;
 use crate::cli::client::ZeroclawClient;
+use crate::cli::client::{Model, Provider, Session};
 use crate::cli::input::InputHistory;
 use crate::cli::storage;
-use crate::cli::ui;
 
 /// Command handler.
 ///
@@ -39,6 +42,14 @@ impl CommandHandler {
 
     async fn current_inventory(&self) -> crate::cli::workspace::WorkspaceInventory {
         self.app.lock().await.inventory()
+    }
+
+    async fn current_agent_client(&self) -> Option<Arc<Mutex<Box<dyn AgentClient + Send + Sync>>>> {
+        self.app
+            .lock()
+            .await
+            .active_workspace()
+            .and_then(|w| w.client.clone())
     }
 
     /// Handle a slash command (maps to zeroclaw CLI)
@@ -100,18 +111,15 @@ impl CommandHandler {
             }
             "/history" => self.handle_history().await,
             "/config" => self.handle_config().await,
-            "/session" => self.handle_session(subcommand, args).await,
+            "/session" => self.handle_session(session_id, subcommand, args).await,
+            "/mcp" => self.handle_mcp(subcommand).await,
 
             // Completion
             "/completions" => self.handle_completions(subcommand).await,
 
-            _ => {
-                ui::print_error(
-                    &format!("Unknown command: {}", command),
-                    Some("Type /help for available commands"),
-                );
-                Ok(None)
-            }
+            _ => Ok(Some(format!(
+                "❌ Unknown command: {command}\n   Type /help for available commands\n"
+            ))),
         }
     }
 
@@ -161,7 +169,7 @@ impl CommandHandler {
               /peripheral list   List configured devices\n  \
               /estop status      Check emergency stop\n\
             \n\
-            Session (REPL-only):\n  \
+            Local Session:\n  \
               /config            Show configuration\n  \
               /clear             Clear history\n  \
               /save [file]       Export session\n  \
@@ -173,129 +181,194 @@ impl CommandHandler {
 
     /// Handle /info command.
     ///
-    /// Returns the session block as a `String` so the TUI can
-    /// render it in the chat pane. Falls back to an empty-output
-    /// frame when no session metadata is on disk — the rustyline
-    /// REPL treated that as a no-op, so we mirror by returning
-    /// `Some("")`.
+    /// Returns the active backend session block as a `String` so
+    /// the TUI can render it in the chat pane. Local metadata is
+    /// merged only when it exactly matches the backend session id.
     async fn handle_info(&self, session_id: &str) -> Result<Option<String>> {
-        match storage::load_session_metadata(session_id) {
-            Ok(metadata) => Ok(Some(format!(
-                "\n📋 Session Information:\n  \
-                  ID:        {}\n  \
-                  Name:      {}\n  \
-                  Model:     {}\n  \
-                  Provider:  {}\n  \
-                  Created:   {}\n  \
-                  Messages:  {}\n",
-                metadata.id,
-                metadata.name,
-                metadata.model,
-                metadata.provider,
-                metadata.created_at,
-                metadata.message_count,
+        let Some(client) = self.current_agent_client().await else {
+            return Ok(Some(
+                "❌ Failed to load active backend session: no active workspace client\n"
+                    .to_string(),
+            ));
+        };
+
+        let load_result = {
+            let locked = client.lock().await;
+            locked.load_session(session_id).await
+        };
+        match load_result {
+            Ok(session) => {
+                let local_sessions = storage::list_sessions().unwrap_or_default();
+                let local_metadata = exact_local_metadata(&local_sessions, &session.id);
+                Ok(Some(format_backend_session_info(&session, local_metadata)))
+            }
+            Err(e) => Ok(Some(format!(
+                "❌ Failed to load active backend session '{session_id}': {e}\n"
             ))),
-            Err(_) => Ok(Some(String::new())),
         }
     }
 
     /// Handle /session command with full CRUD
     async fn handle_session(
         &self,
+        session_id: &str,
         subcommand: Option<&str>,
         args: &[&str],
     ) -> Result<Option<String>> {
+        let mut out = String::new();
         match subcommand {
-            Some("list") => match storage::list_sessions() {
-                Ok(sessions) => {
-                    if sessions.is_empty() {
-                        println!("\n📋 Sessions: (none yet)");
-                        println!("  Create one with: /session <name>");
-                    } else {
-                        println!("\n📋 Sessions ({}):", sessions.len());
-                        for (i, session) in sessions.iter().enumerate() {
-                            println!("  {}. {} ({})", i + 1, session.name, &session.id[..8]);
-                            println!("     Model: {}/{}", session.provider, session.model);
-                            println!(
-                                "     Messages: {}, Last active: {}",
-                                session.message_count,
-                                &session.last_active[..10]
-                            );
-                        }
+            Some("list") => {
+                let Some(client) = self.current_agent_client().await else {
+                    out.push_str("❌ Could not list sessions: no active workspace client\n");
+                    out.push('\n');
+                    return Ok(Some(out));
+                };
+
+                let list_result = {
+                    let locked = client.lock().await;
+                    locked.list_sessions().await
+                };
+                match list_result {
+                    Ok(sessions) => {
+                        let local_sessions = storage::list_sessions().unwrap_or_default();
+                        out.push_str(&format_backend_session_list(&sessions, &local_sessions));
                     }
-                    println!();
-                }
-                Err(e) => {
-                    ui::print_error("Could not list sessions", Some(&e.to_string()));
-                }
-            },
-            Some("delete") => {
-                let name = args.first().copied().unwrap_or("");
-                if name.is_empty() {
-                    ui::print_error("Usage: /session delete <name>", None);
-                } else {
-                    match storage::delete_session(name) {
-                        Ok(_) => {
-                            ui::print_success(&format!("✅ Deleted session: {}", name));
-                        }
-                        Err(e) => {
-                            ui::print_error("Failed to delete session", Some(&e.to_string()));
-                        }
+                    Err(e) => {
+                        out.push_str(&format!("❌ Could not list active backend sessions: {e}\n"));
                     }
                 }
             }
-            Some("info") => match storage::load_session_metadata("main") {
-                Ok(metadata) => {
-                    println!("\n📊 Current Session:");
-                    println!("  Name:      {}", metadata.name);
-                    println!("  ID:        {}", metadata.id);
-                    println!("  Model:     {}/{}", metadata.provider, metadata.model);
-                    println!("  Messages:  {}", metadata.message_count);
-                    println!("  Created:   {}", &metadata.created_at[..10]);
-                    println!("  Last used: {}", &metadata.last_active[..10]);
-                    println!();
-                }
-                Err(e) => {
-                    ui::print_error("Failed to load session", Some(&e.to_string()));
+            Some("delete") => match parse_single_session_target(args, "/session delete <name>") {
+                Err(message) => out.push_str(&message),
+                Ok(name) => {
+                    let Some(client) = self.current_agent_client().await else {
+                        out.push_str("❌ Failed to delete session: no active workspace client\n");
+                        out.push('\n');
+                        return Ok(Some(out));
+                    };
+
+                    match resolve_delete_session_target(&client, name).await {
+                        Ok(target) if target.id == session_id => {
+                            out.push_str(&format!(
+                                "❌ Cannot delete active session '{}'; switch to another session before deleting it\n",
+                                target.display_name()
+                            ));
+                        }
+                        Ok(target) => match client.lock().await.delete_session(&target.id).await {
+                            Ok(()) => {
+                                let display = target.display_name().to_string();
+                                if let Some(local_id) = target.local_id.as_deref() {
+                                    if let Err(e) = storage::delete_session(local_id) {
+                                        out.push_str(&format!(
+                                            "⚠️ Backend deleted session '{display}', but local metadata cleanup failed: {e}\n"
+                                        ));
+                                    } else {
+                                        out.push_str(&format!(
+                                            "✅ Deleted session: {display} ({})\n",
+                                            target.id
+                                        ));
+                                    }
+                                } else {
+                                    out.push_str(&format!(
+                                        "✅ Deleted session: {display} ({})\n",
+                                        target.id
+                                    ));
+                                }
+                            }
+                            Err(e) => {
+                                out.push_str(&format!(
+                                    "❌ Backend failed to delete session '{}': {e}\n",
+                                    target.display_name()
+                                ));
+                            }
+                        },
+                        Err(e) => {
+                            out.push_str(&format!("❌ Failed to resolve session '{name}': {e}\n"));
+                        }
+                    }
                 }
             },
-            Some(session_name) => {
-                println!("🔄 Switching to session: '{}'", session_name);
-                if let Ok(metadata) = storage::load_session_metadata(session_name) {
-                    println!(
-                        "   Found: {}/{}, {} messages",
-                        metadata.provider, metadata.model, metadata.message_count
+            Some("info") => {
+                let Some(client) = self.current_agent_client().await else {
+                    out.push_str(
+                        "❌ Failed to load active backend session: no active workspace client\n",
                     );
-                } else {
-                    println!("   (New session - will be created on first message)");
+                    out.push('\n');
+                    return Ok(Some(out));
+                };
+
+                let load_result = {
+                    let locked = client.lock().await;
+                    locked.load_session(session_id).await
+                };
+                match load_result {
+                    Ok(session) => {
+                        let local_metadata = storage::load_session_metadata(&session.id)
+                            .ok()
+                            .filter(|metadata| metadata.id == session.id);
+                        out.push_str(&format_backend_session_info(
+                            &session,
+                            local_metadata.as_ref(),
+                        ));
+                    }
+                    Err(e) => {
+                        out.push_str(&format!(
+                            "❌ Failed to load active backend session '{session_id}': {e}\n"
+                        ));
+                    }
                 }
-                println!();
+            }
+            Some("switch") | Some("create") => {
+                let usage = format!("Usage: /session {} <name>", subcommand.unwrap_or("switch"));
+                match parse_single_session_target(args, &usage) {
+                    Ok(session_name) => {
+                        out.push_str(&format!("🔄 Active backend session: '{session_name}'\n"));
+                    }
+                    Err(message) => out.push_str(&message),
+                }
+            }
+            Some(session_name) => {
+                if args.is_empty() {
+                    out.push_str(&format!(
+                        "🔄 Switching to backend session: '{session_name}'\n"
+                    ));
+                } else {
+                    out.push_str(
+                        "Usage: /session <name>\n❌ Session targets must be a single id/name token; extra tokens were not ignored.\n",
+                    );
+                }
             }
             None => {
-                println!("Usage: /session list         (show all sessions)");
-                println!("       /session <name>      (switch or create)");
-                println!("       /session info        (current session details)");
-                println!("       /session delete <n>  (remove session)");
+                out.push_str("Usage: /session list         (show all sessions)\n");
+                out.push_str("       /session <name>      (switch or create)\n");
+                out.push_str("       /session switch <n>  (switch or create)\n");
+                out.push_str("       /session create <n>  (create and switch)\n");
+                out.push_str("       /session info        (current session details)\n");
+                out.push_str("       /session delete <n>  (remove session)\n");
             }
         }
-        Ok(None)
+        out.push('\n');
+        Ok(Some(out))
     }
 
     /// Handle /history command
     async fn handle_history(&self) -> Result<Option<String>> {
-        match InputHistory::load_from_file() {
+        let out = match InputHistory::load_from_file() {
             Ok(history) => {
-                println!("\n📜 Command History:");
-                for (i, entry) in history.entries().iter().enumerate() {
-                    println!("  {}. {}", i + 1, entry);
+                if history.entries().is_empty() {
+                    "No history available yet\n".to_string()
+                } else {
+                    let mut out = "\n📜 Command History:\n".to_string();
+                    for (i, entry) in history.entries().iter().enumerate() {
+                        out.push_str(&format!("  {}. {}\n", i + 1, entry));
+                    }
+                    out.push('\n');
+                    out
                 }
-                println!();
             }
-            Err(_) => {
-                println!("No history available yet");
-            }
-        }
-        Ok(None)
+            Err(_) => "No history available yet\n".to_string(),
+        };
+        Ok(Some(out))
     }
 
     // Zeroclaw Agent & Daemon
@@ -304,19 +377,18 @@ impl CommandHandler {
         subcommand: Option<&str>,
         args: &[&str],
     ) -> Result<Option<String>> {
-        match subcommand {
+        let out = match subcommand {
             Some("-m") | Some("--message") => {
                 let msg = args.join(" ");
-                println!("📤 Sending: {}", msg);
-                println!("   (Via zeroclaw agent -m)");
+                format!("📤 Sending: {msg}\n   (Via zeroclaw agent -m)\n")
             }
             Some("-p") | Some("--provider") => {
                 let provider = args.first().copied().unwrap_or("default");
-                println!("🔄 Using provider: {}", provider);
+                format!("🔄 Using provider: {provider}\n")
             }
-            _ => println!("✓ Agent mode active (already running)"),
-        }
-        Ok(None)
+            _ => "✓ Agent mode active (already running)\n".to_string(),
+        };
+        Ok(Some(out))
     }
 
     async fn handle_daemon(
@@ -324,29 +396,28 @@ impl CommandHandler {
         subcommand: Option<&str>,
         args: &[&str],
     ) -> Result<Option<String>> {
-        println!("\n🔌 Daemon & Gateway:");
+        let mut out = "\n🔌 Daemon & Gateway:\n".to_string();
         match subcommand {
             Some("-p") | Some("--port") => {
                 let port = args.first().copied().unwrap_or("42617");
-                println!("  Starting on port: {}", port);
+                out.push_str(&format!("  Starting on port: {port}\n"));
             }
-            _ => println!("  Listening on: http://127.0.0.1:42617"),
+            _ => out.push_str("  Listening on: http://127.0.0.1:42617\n"),
         }
-        println!("  Channels: Connected");
-        println!("  Scheduler: Active");
-        println!("  (Full daemon features in Phase 7+)");
-        println!();
-        Ok(None)
+        out.push_str("  Channels: Connected\n");
+        out.push_str("  Scheduler: Active\n");
+        out.push_str("  (Full daemon features in Phase 7+)\n\n");
+        Ok(Some(out))
     }
 
     async fn handle_service(&self, subcommand: Option<&str>) -> Result<Option<String>> {
-        match subcommand {
-            Some("install") => println!("📦 Install system service (Phase 7+)"),
-            Some("status") => println!("  Service: Not installed"),
-            Some("start") | Some("stop") | Some("restart") => println!("  (Phase 7+)"),
-            _ => println!("Usage: /service install|status|start|stop|restart"),
-        }
-        Ok(None)
+        let out = match subcommand {
+            Some("install") => "📦 Install system service (Phase 7+)\n",
+            Some("status") => "  Service: Not installed\n",
+            Some("start") | Some("stop") | Some("restart") => "  (Phase 7+)\n",
+            _ => "Usage: /service install|status|start|stop|restart\n",
+        };
+        Ok(Some(out.to_string()))
     }
 
     async fn handle_onboard(
@@ -354,39 +425,38 @@ impl CommandHandler {
         subcommand: Option<&str>,
         args: &[&str],
     ) -> Result<Option<String>> {
-        println!("\n⚙️  Onboarding:");
+        let mut out = "\n⚙️  Onboarding:\n".to_string();
         match subcommand {
             Some("--provider") => {
                 let provider = args.first().copied().unwrap_or("openrouter");
-                println!("  Provider: {}", provider);
+                out.push_str(&format!("  Provider: {provider}\n"));
             }
-            Some("--force") => println!("  Config: Reset"),
-            _ => println!("  Config: ~/.zeroclaw/config.toml"),
+            Some("--force") => out.push_str("  Config: Reset\n"),
+            _ => out.push_str("  Config: ~/.zeroclaw/config.toml\n"),
         }
-        println!("  (Interactive setup in Phase 7+)");
-        println!();
-        Ok(None)
+        out.push_str("  (Interactive setup in Phase 7+)\n\n");
+        Ok(Some(out))
     }
 
     async fn handle_doctor(&self, subcommand: Option<&str>) -> Result<Option<String>> {
-        println!("\n🏥 System Diagnostics:");
+        let mut out = "\n🏥 System Diagnostics:\n".to_string();
         match subcommand {
             Some("models") => {
-                println!("  Probing model connectivity...");
-                println!("  • Groq: ✓");
-                println!("  • OpenAI: ✓");
-                println!("  • Configured providers: ✓");
+                out.push_str("  Probing model connectivity...\n");
+                out.push_str("  • Groq: ✓\n");
+                out.push_str("  • OpenAI: ✓\n");
+                out.push_str("  • Configured providers: ✓\n");
             }
-            Some("traces") => println!("  Execution traces: (Phase 7+)"),
+            Some("traces") => out.push_str("  Execution traces: (Phase 7+)\n"),
             _ => {
-                println!("  Gateway: ✓ Running");
-                println!("  Config: ✓ Valid");
-                println!("  Memory: ✓ SQLite");
-                println!("  Channels: ✓ Connected");
+                out.push_str("  Gateway: ✓ Running\n");
+                out.push_str("  Config: ✓ Valid\n");
+                out.push_str("  Memory: ✓ SQLite\n");
+                out.push_str("  Channels: ✓ Connected\n");
             }
         }
-        println!();
-        Ok(None)
+        out.push('\n');
+        Ok(Some(out))
     }
 
     /// Handle /memory command with MNEMOS integration
@@ -422,54 +492,51 @@ impl CommandHandler {
             None => ("help", &[] as &[&str]),
         };
 
+        let mut out = String::new();
         match sub {
             "search" => {
                 let (query, limit) = parse_search_args(rest);
                 if query.is_empty() {
-                    ui::print_error("Usage: /memory search <query> [limit]", None);
-                    return Ok(None);
+                    return Ok(Some("Usage: /memory search <query> [limit]\n".to_string()));
                 }
-                println!("\n🔎 MNEMOS search: {}", query);
+                out.push_str(&format!("\n🔎 MNEMOS search: {query}\n"));
                 let res = match self.current_mnemos().await {
                     Some(m) => m.search(&query, limit).await,
                     None => Ok(Vec::new()),
                 };
                 match res {
                     Ok(memories) if !memories.is_empty() => {
-                        print_memory_list(&memories);
+                        out.push_str(&format_memory_list(&memories));
                     }
-                    Ok(_) => println!("  (no matches)"),
-                    Err(_) => ui::print_error(
-                        "MNEMOS unavailable",
-                        Some("check MNEMOS_URL / MNEMOS_TOKEN"),
-                    ),
+                    Ok(_) => out.push_str("  (no matches)\n"),
+                    Err(_) => {
+                        out.push_str("❌ MNEMOS unavailable\n");
+                        out.push_str("   check MNEMOS_URL / MNEMOS_TOKEN\n");
+                    }
                 }
-                println!();
             }
             "list" | "recent" => {
                 let limit = rest
                     .first()
                     .and_then(|s| s.parse::<usize>().ok())
                     .unwrap_or(10);
-                println!("\n📚 Recent memories (limit {}):", limit);
+                out.push_str(&format!("\n📚 Recent memories (limit {limit}):\n"));
                 let res = match self.current_mnemos().await {
                     Some(m) => m.list(limit).await,
                     None => Ok(Vec::new()),
                 };
                 match res {
                     Ok(memories) if !memories.is_empty() => {
-                        print_memory_list(&memories);
+                        out.push_str(&format_memory_list(&memories));
                     }
-                    Ok(_) => println!("  (MNEMOS empty or not configured)"),
-                    Err(_) => ui::print_error("MNEMOS unavailable", None),
+                    Ok(_) => out.push_str("  (MNEMOS empty or not configured)\n"),
+                    Err(_) => out.push_str("❌ MNEMOS unavailable\n"),
                 }
-                println!();
             }
             "get" => {
                 let id = rest.join(" ");
                 if id.is_empty() {
-                    ui::print_error("Usage: /memory get <id>", None);
-                    return Ok(None);
+                    return Ok(Some("Usage: /memory get <id>\n".to_string()));
                 }
                 let res = match self.current_mnemos().await {
                     Some(m) => m.get(&id).await,
@@ -477,30 +544,30 @@ impl CommandHandler {
                 };
                 match res {
                     Ok(Some(mem)) => {
-                        println!("\n📖 Memory [{}]", id);
+                        out.push_str(&format!("\n📖 Memory [{id}]\n"));
                         if let Some(cat) = mem.get("category").and_then(|v| v.as_str()) {
-                            println!("  category: {}", cat);
+                            out.push_str(&format!("  category: {cat}\n"));
                         }
                         if let Some(content) = mem.get("content").and_then(|v| v.as_str()) {
-                            println!();
-                            println!("{}", content);
+                            out.push('\n');
+                            out.push_str(content);
+                            out.push('\n');
                         }
-                        println!();
                     }
-                    Ok(None) => ui::print_error("Memory not found", Some(&id)),
+                    Ok(None) => out.push_str(&format!("❌ Memory not found: {id}\n")),
                     Err(_) => {
-                        ui::print_error("MNEMOS unavailable", Some("check MNEMOS connection"))
+                        out.push_str("❌ MNEMOS unavailable\n   check MNEMOS connection\n");
                     }
                 }
             }
             "post" | "add" => {
                 let (content, category) = parse_post_args(rest);
                 if content.is_empty() {
-                    ui::print_error(
-                        "Usage: /memory post <content> [--category <cat>]",
-                        Some("Example: /memory post \"shipped zterm CI cleanup\" --category work"),
-                    );
-                    return Ok(None);
+                    return Ok(Some(
+                        "Usage: /memory post <content> [--category <cat>]\n\
+                         Example: /memory post \"shipped zterm CI cleanup\" --category work\n"
+                            .to_string(),
+                    ));
                 }
                 let res = match self.current_mnemos().await {
                     Some(m) => m.create(&content, category.as_deref()).await,
@@ -515,16 +582,15 @@ impl CommandHandler {
                             .and_then(|v| v.as_str())
                             .map(|s| s.to_string())
                             .unwrap_or_else(|| "(unknown id)".to_string());
-                        ui::print_success(&format!("📝 Memory saved: {}", id));
+                        out.push_str(&format!("📝 Memory saved: {id}\n"));
                     }
-                    Err(e) => ui::print_error("Failed to save memory", Some(&e.to_string())),
+                    Err(e) => out.push_str(&format!("❌ Failed to save memory: {e}\n")),
                 }
             }
             "delete" | "rm" => {
                 let id = rest.join(" ");
                 if id.is_empty() {
-                    ui::print_error("Usage: /memory delete <id>", None);
-                    return Ok(None);
+                    return Ok(Some("Usage: /memory delete <id>\n".to_string()));
                 }
                 let res = match self.current_mnemos().await {
                     Some(m) => m.delete(&id).await,
@@ -533,48 +599,54 @@ impl CommandHandler {
                     )),
                 };
                 match res {
-                    Ok(()) => ui::print_success(&format!("🗑️  Deleted memory {}", id)),
-                    Err(e) => ui::print_error("Delete failed", Some(&e.to_string())),
+                    Ok(()) => out.push_str(&format!("🗑️  Deleted memory {id}\n")),
+                    Err(e) => out.push_str(&format!("❌ Delete failed: {e}\n")),
                 }
             }
             "stats" => {
-                println!("\n📊 Memory Statistics:");
+                out.push_str("\n📊 Memory Statistics:\n");
                 let res = match self.current_mnemos().await {
                     Some(m) => m.stats().await,
                     None => Ok(serde_json::json!({ "status": "not_configured" })),
                 };
                 match res {
                     Ok(stats) => {
-                        println!(
-                            "{}",
-                            serde_json::to_string_pretty(&stats).unwrap_or_default()
-                        );
+                        out.push_str(&serde_json::to_string_pretty(&stats).unwrap_or_default());
+                        out.push('\n');
                     }
-                    Err(_) => println!("  (MNEMOS unavailable)"),
+                    Err(_) => out.push_str("  (MNEMOS unavailable)\n"),
                 }
-                println!();
             }
             _ => {
-                println!("Usage:");
-                println!("  /memory search <query> [limit]    — semantic/full-text search");
-                println!("  /memory list [limit]              — recent memories (alias: recent)");
-                println!("  /memory get <id>                  — fetch one by id");
-                println!("  /memory post <content> [--category <cat>]");
-                println!("                                    — save a new memory (alias: add)");
-                println!("  /memory delete <id>               — remove one by id (alias: rm)");
-                println!("  /memory stats                     — MNEMOS storage / categories");
-                println!();
-                println!("  Tip: '/memory <query>' (no subcommand) runs a search.");
-                println!("  Configure with MNEMOS_URL + MNEMOS_TOKEN in env / .env.");
+                out.push_str("Usage:\n");
+                out.push_str("  /memory search <query> [limit]    — semantic/full-text search\n");
+                out.push_str(
+                    "  /memory list [limit]              — recent memories (alias: recent)\n",
+                );
+                out.push_str("  /memory get <id>                  — fetch one by id\n");
+                out.push_str("  /memory post <content> [--category <cat>]\n");
+                out.push_str(
+                    "                                    — save a new memory (alias: add)\n",
+                );
+                out.push_str(
+                    "  /memory delete <id>               — remove one by id (alias: rm)\n",
+                );
+                out.push_str(
+                    "  /memory stats                     — MNEMOS storage / categories\n\n",
+                );
+                out.push_str("  Tip: '/memory <query>' (no subcommand) runs a search.\n");
+                out.push_str("  Configure with MNEMOS_URL + MNEMOS_TOKEN in env / .env.\n");
             }
         }
-        Ok(None)
+        out.push('\n');
+        Ok(Some(out))
     }
 
     async fn handle_cron(&self, subcommand: Option<&str>, args: &[&str]) -> Result<Option<String>> {
+        let mut out = String::new();
         match subcommand {
             Some("list") => {
-                println!("\n⏰ Scheduled Tasks:");
+                out.push_str("\n⏰ Scheduled Tasks:\n");
                 let res = match self.current_cron().await {
                     Some(c) => c.list_cron_jobs().await,
                     None => Err(anyhow::anyhow!("cron not available on this backend")),
@@ -588,20 +660,24 @@ impl CommandHandler {
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("?");
                             let prompt = job.get("prompt").and_then(|v| v.as_str()).unwrap_or("?");
-                            println!("  {}. [{}] {} → {}", i + 1, &id[..8], expr, prompt);
+                            let short_id: String = id.chars().take(8).collect();
+                            out.push_str(&format!(
+                                "  {}. [{}] {} → {}\n",
+                                i + 1,
+                                short_id,
+                                expr,
+                                prompt
+                            ));
                         }
                     }
-                    Ok(_) => println!("  (No scheduled tasks)"),
-                    Err(_) => println!("  (Gateway unavailable)"),
+                    Ok(_) => out.push_str("  (No scheduled tasks)\n"),
+                    Err(e) => out.push_str(&format!("  (Gateway unavailable: {e})\n")),
                 }
-                println!();
             }
             Some("add") => {
                 if args.len() < 2 {
-                    ui::print_error(
-                        "Usage: /cron add '<expr>' '<prompt>'",
-                        Some("Example: /cron add '0 9 * * *' 'Daily standup'"),
-                    );
+                    out.push_str("Usage: /cron add '<expr>' '<prompt>'\n");
+                    out.push_str("Example: /cron add '0 9 * * *' 'Daily standup'\n");
                 } else {
                     let expr = args[0];
                     let prompt = args[1..].join(" ");
@@ -611,21 +687,20 @@ impl CommandHandler {
                     };
                     match res {
                         Ok(id) => {
-                            ui::print_success(&format!("✅ Created cron job: {}", &id[..16]));
-                            println!("   Expression: {} → {}", expr, prompt);
+                            let short_id: String = id.chars().take(16).collect();
+                            out.push_str(&format!("✅ Created cron job: {short_id}\n"));
+                            out.push_str(&format!("   Expression: {expr} → {prompt}\n"));
                         }
                         Err(e) => {
-                            ui::print_error("Failed to create cron job", Some(&e.to_string()))
+                            out.push_str(&format!("❌ Failed to create cron job: {e}\n"));
                         }
                     }
                 }
             }
             Some("add-at") => {
                 if args.len() < 2 {
-                    ui::print_error(
-                        "Usage: /cron add-at '<datetime>' '<prompt>'",
-                        Some("Example: /cron add-at '2026-04-21T10:00:00Z' 'Meeting'"),
-                    );
+                    out.push_str("Usage: /cron add-at '<datetime>' '<prompt>'\n");
+                    out.push_str("Example: /cron add-at '2026-04-21T10:00:00Z' 'Meeting'\n");
                 } else {
                     let datetime = args[0];
                     let prompt = args[1..].join(" ");
@@ -635,66 +710,67 @@ impl CommandHandler {
                     };
                     match res {
                         Ok(_) => {
-                            ui::print_success(&format!("✅ Scheduled task for {}", datetime));
-                            println!("   Prompt: {}", prompt);
+                            out.push_str(&format!("✅ Scheduled task for {datetime}\n"));
+                            out.push_str(&format!("   Prompt: {prompt}\n"));
                         }
-                        Err(e) => ui::print_error("Failed to schedule task", Some(&e.to_string())),
+                        Err(e) => out.push_str(&format!("❌ Failed to schedule task: {e}\n")),
                     }
                 }
             }
             Some("pause") => {
                 let id = args.first().copied().unwrap_or("");
                 if id.is_empty() {
-                    ui::print_error("Usage: /cron pause <id>", None);
+                    out.push_str("Usage: /cron pause <id>\n");
                 } else {
                     let res = match self.current_cron().await {
                         Some(c) => c.pause_cron(id).await,
                         None => Err(anyhow::anyhow!("cron not available on this backend")),
                     };
                     match res {
-                        Ok(_) => ui::print_success(&format!("⏸️  Paused job: {}", id)),
-                        Err(e) => ui::print_error("Failed to pause job", Some(&e.to_string())),
+                        Ok(_) => out.push_str(&format!("⏸️  Paused job: {id}\n")),
+                        Err(e) => out.push_str(&format!("❌ Failed to pause job: {e}\n")),
                     }
                 }
             }
             Some("resume") => {
                 let id = args.first().copied().unwrap_or("");
                 if id.is_empty() {
-                    ui::print_error("Usage: /cron resume <id>", None);
+                    out.push_str("Usage: /cron resume <id>\n");
                 } else {
                     let res = match self.current_cron().await {
                         Some(c) => c.resume_cron(id).await,
                         None => Err(anyhow::anyhow!("cron not available on this backend")),
                     };
                     match res {
-                        Ok(_) => ui::print_success(&format!("▶️  Resumed job: {}", id)),
-                        Err(e) => ui::print_error("Failed to resume job", Some(&e.to_string())),
+                        Ok(_) => out.push_str(&format!("▶️  Resumed job: {id}\n")),
+                        Err(e) => out.push_str(&format!("❌ Failed to resume job: {e}\n")),
                     }
                 }
             }
             Some("remove") => {
                 let id = args.first().copied().unwrap_or("");
                 if id.is_empty() {
-                    ui::print_error("Usage: /cron remove <id>", None);
+                    out.push_str("Usage: /cron remove <id>\n");
                 } else {
                     let res = match self.current_cron().await {
                         Some(c) => c.delete_cron(id).await,
                         None => Err(anyhow::anyhow!("cron not available on this backend")),
                     };
                     match res {
-                        Ok(_) => ui::print_success(&format!("🗑️  Deleted job: {}", id)),
-                        Err(e) => ui::print_error("Failed to delete job", Some(&e.to_string())),
+                        Ok(_) => out.push_str(&format!("🗑️  Deleted job: {id}\n")),
+                        Err(e) => out.push_str(&format!("❌ Failed to delete job: {e}\n")),
                     }
                 }
             }
             _ => {
-                println!("Usage: /cron list");
-                println!("       /cron add '<expr>' '<prompt>'");
-                println!("       /cron add-at '<datetime>' '<prompt>'");
-                println!("       /cron pause|resume|remove <id>");
+                out.push_str("Usage: /cron list\n");
+                out.push_str("       /cron add '<expr>' '<prompt>'\n");
+                out.push_str("       /cron add-at '<datetime>' '<prompt>'\n");
+                out.push_str("       /cron pause|resume|remove <id>\n");
             }
         }
-        Ok(None)
+        out.push('\n');
+        Ok(Some(out))
     }
 
     /// Handle /skill command with zeroclaw integration
@@ -703,52 +779,46 @@ impl CommandHandler {
         subcommand: Option<&str>,
         _args: &[&str],
     ) -> Result<Option<String>> {
-        match subcommand {
-            Some("list") => println!("⚡ Installed Skills: (none)"),
-            Some("install") => println!("  Installing: (Phase 7+)"),
-            Some("audit") => println!("  Auditing skills: (Phase 7+)"),
-            Some("remove") => println!("  Removing skill: (Phase 7+)"),
-            _ => println!("Usage: /skill list|install <path>|audit|remove"),
-        }
-        println!();
-        Ok(None)
+        let out = match subcommand {
+            Some("list") => "⚡ Installed Skills: (none)\n\n",
+            Some("install") => "  Installing: (Phase 7+)\n\n",
+            Some("audit") => "  Auditing skills: (Phase 7+)\n\n",
+            Some("remove") => "  Removing skill: (Phase 7+)\n\n",
+            _ => "Usage: /skill list|install <path>|audit|remove\n\n",
+        };
+        Ok(Some(out.to_string()))
     }
 
     async fn handle_providers(&self) -> Result<Option<String>> {
-        // List provider backends advertised by the live daemon's
-        // `[providers.models.*]` config (e.g. `gemini`,
-        // `openai_compat`). Static "40+ providers" copy is gone —
-        // it was both factually wrong (the daemon only exposes the
-        // backends configured in its TOML) and contained hardcoded
-        // brand strings. Falls back gracefully when no zeroclaw backend is
-        // active or the fetch fails.
-        let mut out = String::from("\n🤖 Configured Providers:\n");
-        match self.current_cron().await {
-            Some(c) => {
-                if c.model_list().is_empty() {
-                    let _ = c.refresh_models().await;
+        let Some(client) = self.current_agent_client().await else {
+            return Ok(Some(
+                "\n🤖 Configured Providers:\n  (no active workspace client)\n\n".to_string(),
+            ));
+        };
+
+        let rows = {
+            let locked = client.lock().await;
+            let providers = match locked.list_providers().await {
+                Ok(providers) => providers,
+                Err(e) => {
+                    return Ok(Some(format!(
+                        "\n🤖 Configured Providers:\n  ❌ Failed to list providers: {e}\n\n"
+                    )));
                 }
-                let models = c.model_list();
-                if models.is_empty() {
-                    out.push_str(
-                        "  (none — /api/config returned no [providers.models.*] entries)\n",
-                    );
-                } else {
-                    let mut backends: std::collections::BTreeSet<String> = Default::default();
-                    for m in &models {
-                        backends.insert(m.provider.clone());
-                    }
-                    for b in backends {
-                        out.push_str(&format!("    • {}\n", b));
-                    }
-                }
+            };
+
+            let mut rows = Vec::new();
+            for provider in providers {
+                let models = locked
+                    .list_provider_models(&provider.id)
+                    .await
+                    .map_err(|e| e.to_string());
+                rows.push((provider, models));
             }
-            None => {
-                out.push_str("  (no active zeroclaw workspace)\n");
-            }
-        }
-        out.push('\n');
-        Ok(Some(out))
+            rows
+        };
+
+        Ok(Some(format_provider_list(&rows)))
     }
 
     async fn handle_models(
@@ -756,141 +826,149 @@ impl CommandHandler {
         subcommand: Option<&str>,
         args: &[&str],
     ) -> Result<Option<String>> {
-        let cron = self.current_cron().await;
         match subcommand {
             Some("list") | None => {
-                let mut out = String::from("\n📋 Available Models (from /api/config):\n\n");
-                match cron {
-                    Some(c) => {
-                        if c.model_list().is_empty() {
-                            let _ = c.refresh_models().await;
+                let Some(client) = self.current_agent_client().await else {
+                    return Ok(Some(
+                        "\n📋 Available Models:\n\n  (no active workspace client)\n\n"
+                            .to_string(),
+                    ));
+                };
+                let (active, rows) = {
+                    let locked = client.lock().await;
+                    let active = locked.current_model_label();
+                    let providers = match locked.list_providers().await {
+                        Ok(providers) => providers,
+                        Err(e) => {
+                            return Ok(Some(format!(
+                                "\n📋 Available Models:\n\n  ❌ Failed to list providers: {e}\n\n"
+                            )));
                         }
-                        let list = c.model_list();
-                        if list.is_empty() {
-                            out.push_str(
-                                "  (none — /api/config returned no [providers.models.*])\n",
-                            );
-                        } else {
-                            let active = c.current_model_key();
-                            for m in &list {
-                                let marker = if m.key == active { "*" } else { " " };
-                                out.push_str(&format!(
-                                    "  {} {:<10}  ({} → {})\n",
-                                    marker, m.key, m.provider, m.model
-                                ));
-                            }
-                            out.push_str(&format!(
-                                "\n  active: {}\n  use: /models set <key>\n",
-                                active
-                            ));
-                        }
+                    };
+                    let mut rows = Vec::new();
+                    for provider in providers {
+                        let models = locked
+                            .get_models(&provider.id)
+                            .await
+                            .map_err(|e| e.to_string());
+                        rows.push((provider, models));
                     }
-                    None => out.push_str("  (no active zeroclaw workspace)\n"),
-                }
-                out.push('\n');
-                Ok(Some(out))
+                    (active, rows)
+                };
+                Ok(Some(format_model_list(&rows, &active)))
             }
             Some("set") => {
                 let key = args.first().copied().unwrap_or("").trim().to_string();
                 if key.is_empty() {
-                    ui::print_error(
-                        "Usage: /models set <key>",
-                        Some("Run /models list to see available keys"),
-                    );
-                    return Ok(None);
+                    return Ok(Some(
+                        "Usage: /models set <key>\n   Run /models list to see available keys\n"
+                            .to_string(),
+                    ));
                 }
-                match cron {
+                match self.current_cron().await {
                     Some(c) => {
                         if c.model_list().is_empty() {
                             let _ = c.refresh_models().await;
                         }
                         match c.set_current_model(&key) {
-                            Ok(()) => {
-                                ui::print_success(&format!("✅ Active model key: {}", key));
-                                println!("   Future turns will send this key to the daemon.");
-                            }
-                            Err(e) => {
-                                ui::print_error("Failed to set model key", Some(&e.to_string()));
-                            }
+                            Ok(()) => Ok(Some(format!(
+                                "✅ Active model key: {key}\n   Future turns will send this key to the daemon.\n"
+                            ))),
+                            Err(e) => Ok(Some(format!("❌ Failed to set model key: {e}\n"))),
                         }
                     }
-                    None => {
-                        ui::print_error("/models set requires an active zeroclaw workspace", None)
-                    }
+                    None => Ok(Some(
+                        "/models set is only supported for zeroclaw workspaces; the active backend does not expose zterm-side model switching\n".to_string(),
+                    )),
                 }
-                Ok(None)
             }
-            Some("refresh") => {
-                match cron {
-                    Some(c) => match c.refresh_models().await {
-                        Ok(list) => ui::print_success(&format!(
-                            "✅ Refreshed model list ({} entries)",
-                            list.len()
-                        )),
-                        Err(e) => {
-                            ui::print_error("Failed to refresh /api/config", Some(&e.to_string()))
-                        }
-                    },
-                    None => ui::print_error(
-                        "/models refresh requires an active zeroclaw workspace",
-                        None,
-                    ),
-                }
-                Ok(None)
-            }
-            Some("status") => match cron {
-                Some(c) => {
-                    let active = c.current_model_key();
-                    let entry = c.model_list().into_iter().find(|m| m.key == active);
-                    let mut out = String::from("\n📊 Current Model:\n");
-                    out.push_str(&format!("  key:      {}\n", active));
-                    if let Some(m) = entry {
-                        out.push_str(&format!("  provider: {}\n", m.provider));
-                        out.push_str(&format!("  model:    {}\n", m.model));
-                    } else {
-                        out.push_str("  (not in /api/config; daemon may reject this key)\n");
-                    }
-                    out.push('\n');
-                    Ok(Some(out))
-                }
-                None => {
-                    ui::print_error("/models status requires an active zeroclaw workspace", None);
-                    Ok(None)
-                }
+            Some("refresh") => match self.current_cron().await {
+                Some(c) => match c.refresh_models().await {
+                    Ok(list) => Ok(Some(format!(
+                        "✅ Refreshed model list ({} entries)\n",
+                        list.len()
+                    ))),
+                    Err(e) => Ok(Some(format!("❌ Failed to refresh /api/config: {e}\n"))),
+                },
+                None => Ok(Some(
+                    "/models refresh is only supported for zeroclaw workspaces; this backend lists models live\n".to_string(),
+                )),
             },
+            Some("status") => {
+                let Some(client) = self.current_agent_client().await else {
+                    return Ok(Some(
+                        "\n📊 Current Model:\n  (no active workspace client)\n\n".to_string(),
+                    ));
+                };
+                let (active, rows) = {
+                    let locked = client.lock().await;
+                    let active = locked.current_model_label();
+                    let providers = match locked.list_providers().await {
+                        Ok(providers) => providers,
+                        Err(e) => {
+                            return Ok(Some(format!(
+                                "\n📊 Current Model:\n  active: {active}\n  ❌ Failed to list providers: {e}\n\n"
+                            )));
+                        }
+                    };
+                    let mut rows = Vec::new();
+                    for provider in providers {
+                        let models = locked
+                            .get_models(&provider.id)
+                            .await
+                            .map_err(|e| e.to_string());
+                        rows.push((provider, models));
+                    }
+                    (active, rows)
+                };
+                Ok(Some(format_model_status(&rows, &active)))
+            }
+            _ => Ok(Some(
+                "Usage: /models list|set <key>|refresh|status\n".to_string(),
+            )),
+        }
+    }
+
+    async fn handle_mcp(&self, subcommand: Option<&str>) -> Result<Option<String>> {
+        let action = subcommand.unwrap_or("status");
+        let mut out = String::from("\n🔌 MCP\n");
+        match action {
+            "status" | "list" => {
+                out.push_str(
+                    "  MCP endpoints are not exposed by the active claw-family backend yet.\n",
+                );
+                out.push_str(
+                    "  zterm will surface them here when the daemon advertises an MCP inventory.\n",
+                );
+            }
             _ => {
-                println!("Usage: /models list|set <key>|refresh|status");
-                Ok(None)
+                out.push_str("Usage: /mcp status\n");
             }
         }
+        out.push('\n');
+        Ok(Some(out))
     }
 
     async fn handle_channels(&self, subcommand: Option<&str>) -> Result<Option<String>> {
-        match subcommand {
+        let out = match subcommand {
             Some("list") => {
-                println!("\n💬 Channels:");
-                println!("  (None configured)");
-                println!("  Available: Slack, Discord, Telegram, Matrix, Email, IRC");
+                "\n💬 Channels:\n  (None configured)\n  Available: Slack, Discord, Telegram, Matrix, Email, IRC\n\n"
             }
-            Some("doctor") => println!("  Channel health: (Phase 7+)"),
-            _ => println!("Usage: /channel list|doctor"),
-        }
-        println!();
-        Ok(None)
+            Some("doctor") => "  Channel health: (Phase 7+)\n\n",
+            _ => "Usage: /channel list|doctor\n\n",
+        };
+        Ok(Some(out.to_string()))
     }
 
     async fn handle_hardware(&self, subcommand: Option<&str>) -> Result<Option<String>> {
-        match subcommand {
+        let out = match subcommand {
             Some("discover") => {
-                println!("\n🔌 Hardware Discovery:");
-                println!("  (No USB devices found)");
-                println!("  Supports: STM32, Arduino, Raspberry Pi, ESP32");
+                "\n🔌 Hardware Discovery:\n  (No USB devices found)\n  Supports: STM32, Arduino, Raspberry Pi, ESP32\n\n"
             }
-            Some("introspect") => println!("  Probing device... (Phase 7+)"),
-            _ => println!("Usage: /hardware discover|introspect <port>"),
-        }
-        println!();
-        Ok(None)
+            Some("introspect") => "  Probing device... (Phase 7+)\n\n",
+            _ => "Usage: /hardware discover|introspect <port>\n\n",
+        };
+        Ok(Some(out.to_string()))
     }
 
     async fn handle_peripheral(
@@ -898,15 +976,14 @@ impl CommandHandler {
         subcommand: Option<&str>,
         _args: &[&str],
     ) -> Result<Option<String>> {
-        match subcommand {
-            Some("list") => println!("📱 Peripherals: (none)"),
-            Some("add") => println!("  Adding peripheral... (Phase 7+)"),
-            Some("flash-nucleo") => println!("  Flashing STM32... (Phase 7+)"),
-            Some("flash") => println!("  Flashing Arduino... (Phase 7+)"),
-            _ => println!("Usage: /peripheral list|add|flash-nucleo|flash"),
-        }
-        println!();
-        Ok(None)
+        let out = match subcommand {
+            Some("list") => "📱 Peripherals: (none)\n\n",
+            Some("add") => "  Adding peripheral... (Phase 7+)\n\n",
+            Some("flash-nucleo") => "  Flashing STM32... (Phase 7+)\n\n",
+            Some("flash") => "  Flashing Arduino... (Phase 7+)\n\n",
+            _ => "Usage: /peripheral list|add|flash-nucleo|flash\n\n",
+        };
+        Ok(Some(out.to_string()))
     }
 
     async fn handle_estop(
@@ -914,43 +991,60 @@ impl CommandHandler {
         subcommand: Option<&str>,
         args: &[&str],
     ) -> Result<Option<String>> {
-        match subcommand {
-            Some("status") => println!("🛑 Emergency Stop: Disengaged"),
+        let out = match subcommand {
+            Some("status") => {
+                "\
+🛑 Emergency Stop: Unknown
+   Status backend is not implemented; treating E-stop state as unsupported until a real backend is wired.
+
+"
+                .to_string()
+            }
             Some("--level") => {
                 let level = args.first().copied().unwrap_or("<level>");
-                println!("  Level: {} (Phase 7+)", level);
+                format!(
+                    "🛑 Emergency Stop: Unsupported\n   Requested level: {level}\n   No E-stop backend is implemented, so zterm did not change hardware or network state.\n\n"
+                )
             }
-            Some("resume") => println!("  ▶️  Resuming (Phase 7+)"),
-            _ => println!("Usage: /estop status|--level <kill-all|network-kill|...>"),
-        }
-        println!();
-        Ok(None)
+            Some("resume") => {
+                "\
+🛑 Emergency Stop: Unsupported
+   No E-stop backend is implemented, so zterm cannot verify or resume E-stop state.
+
+"
+                .to_string()
+            }
+            _ => "Usage: /estop status|--level <kill-all|network-kill|...>\n\n".to_string(),
+        };
+        Ok(Some(out))
     }
 
     async fn handle_completions(&self, subcommand: Option<&str>) -> Result<Option<String>> {
-        match subcommand {
-            Some("zsh") => println!("📝 Zsh completions: (Phase 7+)"),
-            Some("bash") => println!("📝 Bash completions: (Phase 7+)"),
-            Some("fish") => println!("📝 Fish completions: (Phase 7+)"),
-            _ => println!("Usage: /completions zsh|bash|fish"),
-        }
-        println!();
-        Ok(None)
+        let out = match subcommand {
+            Some("zsh") => "📝 Zsh completions: (Phase 7+)\n\n",
+            Some("bash") => "📝 Bash completions: (Phase 7+)\n\n",
+            Some("fish") => "📝 Fish completions: (Phase 7+)\n\n",
+            _ => "Usage: /completions zsh|bash|fish\n\n",
+        };
+        Ok(Some(out.to_string()))
     }
 
     /// Handle /config command
     async fn handle_config(&self) -> Result<Option<String>> {
-        println!("\n⚙️  Configuration:");
+        let mut out = "\n⚙️  Configuration:\n".to_string();
         match storage::load_config() {
             Ok(content) => {
-                println!("{}", content);
+                out.push_str(&content);
+                if !out.ends_with('\n') {
+                    out.push('\n');
+                }
             }
             Err(e) => {
-                ui::print_error("Could not load config", Some(&e.to_string()));
+                out.push_str(&format!("❌ Could not load config: {e}\n"));
             }
         }
-        println!();
-        Ok(None)
+        out.push('\n');
+        Ok(Some(out))
     }
 
     /// Handle /clear command
@@ -959,9 +1053,11 @@ impl CommandHandler {
             metadata.message_count = 0;
             metadata.last_active = Utc::now().to_rfc3339();
             storage::save_session_metadata(&metadata)?;
-            ui::print_success("✓ Session history cleared");
+            return Ok(Some("✓ Session history cleared\n".to_string()));
         }
-        Ok(None)
+        Ok(Some(
+            "No local session history metadata found to clear\n".to_string(),
+        ))
     }
 
     /// Handle /save command
@@ -976,13 +1072,13 @@ impl CommandHandler {
         if let Ok(history_path) = storage::session_history_file(session_id) {
             if history_path.exists() {
                 fs::copy(&history_path, &filename)?;
-                ui::print_success(&format!("✓ Session saved to {}", filename));
+                return Ok(Some(format!("✓ Session saved to {filename}\n")));
             } else {
-                ui::print_error("No history to save", None);
+                return Ok(Some("No history to save\n".to_string()));
             }
         }
 
-        Ok(None)
+        Ok(Some("No history to save\n".to_string()))
     }
 
     async fn handle_workspace(
@@ -1037,45 +1133,42 @@ impl CommandHandler {
             }
             Some("info") => {
                 if let Some(a) = inventory.active() {
-                    println!();
-                    println!("🗂  Active workspace");
-                    println!("   name:      {}", a.name);
+                    let mut out = String::from("\n🗂  Active workspace\n");
+                    out.push_str(&format!("   name:      {}\n", a.name));
                     if let Some(l) = &a.label {
-                        println!("   label:     {}", l);
+                        out.push_str(&format!("   label:     {l}\n"));
                     }
-                    println!("   backend:   {}", a.backend.as_str());
-                    println!("   url:       {}", a.url);
-                    println!(
-                        "   status:    {}",
+                    out.push_str(&format!("   backend:   {}\n", a.backend.as_str()));
+                    out.push_str(&format!("   url:       {}\n", a.url));
+                    out.push_str(&format!(
+                        "   status:    {}\n",
                         if a.activated {
                             "activated"
                         } else {
                             "not yet activated"
                         }
-                    );
-                    println!();
+                    ));
+                    out.push('\n');
+                    Ok(Some(out))
                 } else {
-                    ui::print_error("no active workspace", None);
+                    Ok(Some("❌ no active workspace\n".to_string()))
                 }
-                Ok(None)
             }
             Some("switch") => {
                 let name = args.join(" ");
                 if name.is_empty() {
-                    ui::print_error(
-                        "Usage: /workspace switch <name>",
-                        Some("/workspace list to see names"),
-                    );
-                    return Ok(None);
+                    return Ok(Some(
+                        "Usage: /workspace switch <name>\n   /workspace list to see names\n"
+                            .to_string(),
+                    ));
                 }
                 self.switch_workspace(&name).await
             }
             _ => {
-                println!("Usage:");
-                println!("  /workspace list         — enumerate configured workspaces");
-                println!("  /workspace info         — details of the active workspace");
-                println!("  /workspace switch <name>— change the active workspace");
-                Ok(None)
+                Ok(Some(
+                    "Usage:\n  /workspace list         — enumerate configured workspaces\n  /workspace info         — details of the active workspace\n  /workspace switch <name>— change the active workspace\n"
+                        .to_string(),
+                ))
             }
         }
     }
@@ -1113,6 +1206,360 @@ impl CommandHandler {
     }
 }
 
+fn parse_single_session_target<'a>(
+    args: &'a [&str],
+    usage: &str,
+) -> std::result::Result<&'a str, String> {
+    match args {
+        [] => Err(format!("{usage}\n")),
+        [target] => {
+            if target.is_empty() {
+                Err(format!("{usage}\n"))
+            } else {
+                Ok(*target)
+            }
+        }
+        [_target, ..] => Err(format!(
+            "{usage}\n❌ Session targets must be a single id/name token; extra tokens were not ignored.\n"
+        )),
+    }
+}
+
+fn format_backend_session_list(
+    sessions: &[Session],
+    local_sessions: &[storage::SessionMetadata],
+) -> String {
+    let mut out = String::new();
+    if sessions.is_empty() {
+        out.push_str("\n📋 Sessions: (none yet)\n");
+        out.push_str("  Create one with: /session <name>\n");
+        return out;
+    }
+
+    out.push_str(&format!("\n📋 Sessions ({}):\n", sessions.len()));
+    for (i, session) in sessions.iter().enumerate() {
+        out.push_str(&format!(
+            "  {}. {} ({})\n",
+            i + 1,
+            session.name,
+            short_session_id(&session.id)
+        ));
+        out.push_str(&format!("     ID:    {}\n", session.id));
+        out.push_str(&format!(
+            "     Model: {}/{}\n",
+            session.provider, session.model
+        ));
+        if let Some(metadata) = exact_local_metadata(local_sessions, &session.id) {
+            out.push_str(&format!(
+                "     Cached metadata: {} messages, last active {}\n",
+                metadata.message_count,
+                short_date(&metadata.last_active)
+            ));
+        }
+    }
+    out
+}
+
+fn format_backend_session_info(
+    session: &Session,
+    local_metadata: Option<&storage::SessionMetadata>,
+) -> String {
+    let mut out = String::new();
+    out.push_str("\n📊 Current Session:\n");
+    out.push_str(&format!("  Name:      {}\n", session.name));
+    out.push_str(&format!("  ID:        {}\n", session.id));
+    out.push_str(&format!(
+        "  Model:     {}/{}\n",
+        session.provider, session.model
+    ));
+
+    if let Some(metadata) = local_metadata.filter(|metadata| metadata.id == session.id) {
+        out.push_str(&format!(
+            "  Cached metadata: {} messages\n",
+            metadata.message_count
+        ));
+        out.push_str(&format!(
+            "  Cached created:  {}\n",
+            short_date(&metadata.created_at)
+        ));
+        out.push_str(&format!(
+            "  Cached last use: {}\n",
+            short_date(&metadata.last_active)
+        ));
+    }
+
+    out
+}
+
+fn format_provider_list(rows: &[(Provider, std::result::Result<Vec<String>, String>)]) -> String {
+    let mut out = String::from("\n🤖 Configured Providers:\n");
+    if rows.is_empty() {
+        out.push_str("  (none advertised by active backend)\n\n");
+        return out;
+    }
+
+    for (provider, models) in rows {
+        out.push_str(&format!("  • {}\n", provider_display(provider)));
+        match models {
+            Ok(models) if models.is_empty() => {
+                out.push_str("    models: (none advertised)\n");
+            }
+            Ok(models) => {
+                out.push_str(&format!("    models: {}\n", models.join(", ")));
+            }
+            Err(e) => {
+                out.push_str(&format!("    models: ❌ failed to list: {e}\n"));
+            }
+        }
+    }
+    out.push('\n');
+    out
+}
+
+fn format_model_list(
+    rows: &[(Provider, std::result::Result<Vec<Model>, String>)],
+    active: &str,
+) -> String {
+    let mut out = String::from("\n📋 Available Models:\n\n");
+    if rows.is_empty() {
+        out.push_str("  (none advertised by active backend)\n\n");
+        return out;
+    }
+
+    for (provider, models) in rows {
+        out.push_str(&format!("  {}\n", provider_display(provider)));
+        match models {
+            Ok(models) if models.is_empty() => {
+                out.push_str("    (none advertised)\n");
+            }
+            Ok(models) => {
+                for model in models {
+                    let marker = if provider.id == active || model.id == active {
+                        "*"
+                    } else {
+                        " "
+                    };
+                    out.push_str(&format!("    {marker} {}\n", model.id));
+                }
+            }
+            Err(e) => {
+                out.push_str(&format!("    ❌ failed to list models: {e}\n"));
+            }
+        }
+    }
+    out.push_str(&format!("\n  active: {active}\n"));
+    out.push_str("  use: /models set <key> (zeroclaw workspaces only)\n\n");
+    out
+}
+
+fn format_model_status(
+    rows: &[(Provider, std::result::Result<Vec<Model>, String>)],
+    active: &str,
+) -> String {
+    let mut out = String::from("\n📊 Current Model:\n");
+    out.push_str(&format!("  active: {active}\n"));
+
+    let mut matched = false;
+    for (provider, models) in rows {
+        if provider.id == active {
+            matched = true;
+            out.push_str(&format!("  provider: {}\n", provider_display(provider)));
+            if let Ok(models) = models {
+                if models.is_empty() {
+                    out.push_str("  models:   (none advertised)\n");
+                } else {
+                    out.push_str(&format!(
+                        "  models:   {}\n",
+                        models
+                            .iter()
+                            .map(|m| m.id.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                }
+            }
+            break;
+        }
+
+        if let Ok(models) = models {
+            if let Some(model) = models.iter().find(|model| model.id == active) {
+                matched = true;
+                out.push_str(&format!("  provider: {}\n", provider_display(provider)));
+                out.push_str(&format!("  model:    {}\n", model.id));
+                break;
+            }
+        }
+    }
+
+    if !matched {
+        out.push_str("  selection: backend-managed or not present in advertised models\n");
+    }
+    out.push('\n');
+    out
+}
+
+fn provider_display(provider: &Provider) -> String {
+    if provider.name == provider.id || provider.name.is_empty() {
+        provider.id.clone()
+    } else {
+        format!("{} ({})", provider.name, provider.id)
+    }
+}
+
+fn exact_local_metadata<'a>(
+    local_sessions: &'a [storage::SessionMetadata],
+    id: &str,
+) -> Option<&'a storage::SessionMetadata> {
+    local_sessions.iter().find(|metadata| metadata.id == id)
+}
+
+fn short_session_id(id: &str) -> String {
+    id.chars().take(8).collect()
+}
+
+fn short_date(value: &str) -> String {
+    value.chars().take(10).collect()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeleteSessionTarget {
+    id: String,
+    name: String,
+    local_id: Option<String>,
+}
+
+impl DeleteSessionTarget {
+    fn display_name(&self) -> &str {
+        if self.name.is_empty() {
+            &self.id
+        } else {
+            &self.name
+        }
+    }
+}
+
+async fn resolve_delete_session_target(
+    client: &Arc<Mutex<Box<dyn AgentClient + Send + Sync>>>,
+    requested: &str,
+) -> Result<DeleteSessionTarget> {
+    let local_sessions = storage::list_sessions().unwrap_or_default();
+    let backend_sessions = client.lock().await.list_sessions().await;
+
+    match backend_sessions {
+        Ok(sessions) => choose_delete_session_target(requested, Some(&sessions), &local_sessions),
+        Err(_) => choose_delete_session_target(requested, None, &local_sessions),
+    }
+}
+
+fn choose_delete_session_target(
+    requested: &str,
+    backend_sessions: Option<&[Session]>,
+    local_sessions: &[storage::SessionMetadata],
+) -> Result<DeleteSessionTarget> {
+    let Some(sessions) = backend_sessions else {
+        return choose_delete_session_target_without_backend(requested, local_sessions);
+    };
+
+    let exact_backend: Vec<&Session> = sessions
+        .iter()
+        .filter(|session| session.id == requested)
+        .collect();
+    match exact_backend.as_slice() {
+        [session] => {
+            return Ok(DeleteSessionTarget {
+                id: session.id.clone(),
+                name: session.name.clone(),
+                local_id: unique_local_id_match(local_sessions, &session.id),
+            });
+        }
+        [] => {}
+        _ => {
+            return Err(ambiguous_delete_target_error(
+                requested,
+                exact_backend,
+                Vec::new(),
+            ));
+        }
+    }
+
+    let backend_name_matches: Vec<&Session> = sessions
+        .iter()
+        .filter(|session| session.name == requested)
+        .collect();
+    if backend_name_matches.len() > 1 {
+        return Err(ambiguous_delete_target_error(
+            requested,
+            backend_name_matches,
+            Vec::new(),
+        ));
+    }
+
+    if let Some(session) = backend_name_matches.first() {
+        return Ok(DeleteSessionTarget {
+            id: session.id.clone(),
+            name: session.name.clone(),
+            local_id: unique_local_id_match(local_sessions, &session.id),
+        });
+    }
+
+    Err(anyhow!("not found in active backend sessions"))
+}
+
+fn choose_delete_session_target_without_backend(
+    requested: &str,
+    local_sessions: &[storage::SessionMetadata],
+) -> Result<DeleteSessionTarget> {
+    let exact_local_count = local_sessions
+        .iter()
+        .filter(|metadata| metadata.id == requested)
+        .count();
+    let hint = if exact_local_count == 0 {
+        "no matching local metadata was trusted"
+    } else {
+        "local metadata is not trusted for backend deletes"
+    };
+    Err(anyhow!(
+        "backend sessions unavailable; refusing backend delete while target cannot be verified against the active backend ({hint})"
+    ))
+}
+
+fn unique_local_id_match(local_sessions: &[storage::SessionMetadata], id: &str) -> Option<String> {
+    let mut matches = local_sessions
+        .iter()
+        .filter(|metadata| metadata.id == id)
+        .filter(|metadata| storage::is_safe_session_id(&metadata.id))
+        .map(|metadata| metadata.id.clone());
+    let first = matches.next()?;
+    if matches.next().is_none() {
+        Some(first)
+    } else {
+        None
+    }
+}
+
+fn ambiguous_delete_target_error(
+    requested: &str,
+    backend: Vec<&Session>,
+    local: Vec<&storage::SessionMetadata>,
+) -> anyhow::Error {
+    let mut candidates = Vec::new();
+    candidates.extend(
+        backend
+            .iter()
+            .map(|session| format!("backend id={} name={}", session.id, session.name)),
+    );
+    candidates.extend(
+        local
+            .iter()
+            .map(|metadata| format!("local id={} name={}", metadata.id, metadata.name)),
+    );
+
+    anyhow!(
+        "ambiguous session name/label '{requested}'; use an explicit id. Candidates: {}",
+        candidates.join("; ")
+    )
+}
+
 fn parse_search_args(rest: &[&str]) -> (String, usize) {
     // Last arg is treated as limit if it parses as usize; otherwise
     // everything is treated as the query.
@@ -1145,7 +1592,8 @@ fn parse_post_args(rest: &[&str]) -> (String, Option<String>) {
     (content_parts.join(" "), category)
 }
 
-fn print_memory_list(memories: &[serde_json::Value]) {
+fn format_memory_list(memories: &[serde_json::Value]) -> String {
+    let mut out = String::new();
     for (i, mem) in memories.iter().enumerate() {
         let id = mem.get("id").and_then(|v| v.as_str()).unwrap_or("?");
         let content = mem.get("content").and_then(|v| v.as_str()).unwrap_or("");
@@ -1158,22 +1606,37 @@ fn print_memory_list(memories: &[serde_json::Value]) {
             ""
         };
         if category.is_empty() {
-            println!("  {}. [{}] {}{}", i + 1, short_id, preview, suffix);
+            out.push_str(&format!(
+                "  {}. [{}] {}{}\n",
+                i + 1,
+                short_id,
+                preview,
+                suffix
+            ));
         } else {
-            println!(
-                "  {}. [{}] ({}) {}{}",
+            out.push_str(&format!(
+                "  {}. [{}] ({}) {}{}\n",
                 i + 1,
                 short_id,
                 category,
                 preview,
                 suffix
-            );
+            ));
         }
     }
+    out
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::cli::agent::{AgentClient, StreamSink};
+    use crate::cli::client::Config;
+    use crate::cli::client::{Model, Provider, Session};
+    use crate::cli::storage::SessionMetadata;
+    use crate::cli::workspace::{App, Backend, Workspace, WorkspaceConfig};
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex as StdMutex};
+    use tokio::sync::Mutex;
 
     /// Mirror the parts→(command, subcommand, args) slicing used by the
     /// real dispatcher, so regression tests can hit every length class
@@ -1234,5 +1697,501 @@ mod tests {
             .collect();
         let (_, _, args) = split_parts(&parts);
         assert_eq!(args, &["hello", "world", "--category", "work"]);
+    }
+
+    #[test]
+    fn session_delete_parser_rejects_multiword_or_extra_tokens() {
+        assert_eq!(
+            super::parse_single_session_target(&["Research"], "/session delete <name>").unwrap(),
+            "Research"
+        );
+
+        let err =
+            super::parse_single_session_target(&["Research", "Notes"], "/session delete <name>")
+                .unwrap_err();
+
+        assert!(err.contains("extra tokens were not ignored"));
+        assert!(err.contains("/session delete <name>"));
+    }
+
+    #[test]
+    fn session_switch_create_parser_rejects_extra_tokens() {
+        assert_eq!(
+            super::parse_single_session_target(&["scratch"], "/session create <name>").unwrap(),
+            "scratch"
+        );
+
+        let err =
+            super::parse_single_session_target(&["scratch", "copy"], "/session create <name>")
+                .unwrap_err();
+
+        assert!(err.contains("extra tokens were not ignored"));
+    }
+
+    #[test]
+    fn memory_list_formatter_is_structured_for_tui() {
+        let memories = vec![serde_json::json!({
+            "id": "memory-abcdef123456",
+            "category": "work",
+            "content": "short note"
+        })];
+
+        let out = super::format_memory_list(&memories);
+
+        assert!(out.contains("[memory-abcde]"));
+        assert!(out.contains("(work) short note"));
+        assert!(out.ends_with('\n'));
+    }
+
+    #[test]
+    fn backend_session_list_formats_backend_rows_with_matching_cached_metadata() {
+        let backend = vec![session("sess-123456789", "Research")];
+        let mut matching = metadata("sess-123456789", "Stale Local Name");
+        matching.message_count = 7;
+        matching.last_active = "2026-04-27T12:34:56Z".to_string();
+        let local_sessions = vec![matching];
+
+        let out = super::format_backend_session_list(&backend, &local_sessions);
+
+        assert!(out.contains("📋 Sessions (1):"));
+        assert!(out.contains("Research (sess-123)"));
+        assert!(out.contains("ID:    sess-123456789"));
+        assert!(out.contains("Model: p/m"));
+        assert!(out.contains("Cached metadata: 7 messages, last active 2026-04-27"));
+        assert!(!out.contains("Stale Local Name"));
+    }
+
+    #[test]
+    fn backend_session_list_truncates_multibyte_ids_on_char_boundaries() {
+        let backend = vec![session("ééééééééé", "Unicode")];
+
+        let out = super::format_backend_session_list(&backend, &[]);
+
+        assert!(out.contains("Unicode (éééééééé)"));
+        assert!(out.contains("ID:    ééééééééé"));
+    }
+
+    #[test]
+    fn backend_session_list_suppresses_local_only_metadata() {
+        let backend = vec![session("sess-backend", "Backend Only")];
+        let local_sessions = vec![metadata("local-only", "Local Only")];
+
+        let out = super::format_backend_session_list(&backend, &local_sessions);
+
+        assert!(out.contains("Backend Only"));
+        assert!(!out.contains("Local Only"));
+        assert!(!out.contains("local-only"));
+        assert!(!out.contains("Cached metadata"));
+    }
+
+    #[test]
+    fn backend_session_info_merges_only_exact_cached_metadata() {
+        let backend = session("sess-info", "Current");
+        let mut matching = metadata("sess-info", "Cached Name");
+        matching.message_count = 3;
+        matching.created_at = "2026-01-02T00:00:00Z".to_string();
+        matching.last_active = "2026-04-28T00:00:00Z".to_string();
+
+        let out = super::format_backend_session_info(&backend, Some(&matching));
+
+        assert!(out.contains("Name:      Current"));
+        assert!(out.contains("ID:        sess-info"));
+        assert!(out.contains("Model:     p/m"));
+        assert!(out.contains("Cached metadata: 3 messages"));
+        assert!(out.contains("Cached created:  2026-01-02"));
+        assert!(out.contains("Cached last use: 2026-04-28"));
+        assert!(!out.contains("Cached Name"));
+    }
+
+    #[test]
+    fn backend_session_info_ignores_mismatched_cached_metadata() {
+        let backend = session("sess-info", "Current");
+        let local_only = metadata("local-only", "Local Only");
+
+        let out = super::format_backend_session_info(&backend, Some(&local_only));
+
+        assert!(out.contains("Name:      Current"));
+        assert!(!out.contains("Cached metadata"));
+        assert!(!out.contains("Local Only"));
+    }
+
+    #[test]
+    fn provider_list_formats_model_ids_and_model_failures() {
+        let rows = vec![
+            (
+                provider("openclaw"),
+                Ok(vec!["fast".to_string(), "deep".to_string()]),
+            ),
+            (provider("broken"), Err("backend unavailable".to_string())),
+        ];
+
+        let out = super::format_provider_list(&rows);
+
+        assert!(out.contains("🤖 Configured Providers:"));
+        assert!(out.contains("• openclaw"));
+        assert!(out.contains("models: fast, deep"));
+        assert!(out.contains("models: ❌ failed to list: backend unavailable"));
+    }
+
+    #[test]
+    fn model_list_marks_active_provider_key() {
+        let rows = vec![(
+            provider("primary"),
+            Ok(vec![model("gemini-flash-latest", "primary")]),
+        )];
+
+        let out = super::format_model_list(&rows, "primary");
+
+        assert!(out.contains("📋 Available Models:"));
+        assert!(out.contains("primary"));
+        assert!(out.contains("* gemini-flash-latest"));
+        assert!(out.contains("active: primary"));
+    }
+
+    #[test]
+    fn model_status_reports_backend_managed_selection_when_not_advertised() {
+        let rows = vec![(provider("openclaw"), Ok(vec![model("fast", "openclaw")]))];
+
+        let out = super::format_model_status(&rows, "openclaw default");
+
+        assert!(out.contains("active: openclaw default"));
+        assert!(out.contains("backend-managed"));
+    }
+
+    fn session(id: &str, name: &str) -> Session {
+        Session {
+            id: id.to_string(),
+            name: name.to_string(),
+            model: "m".to_string(),
+            provider: "p".to_string(),
+        }
+    }
+
+    fn metadata(id: &str, name: &str) -> SessionMetadata {
+        SessionMetadata {
+            id: id.to_string(),
+            name: name.to_string(),
+            model: "m".to_string(),
+            provider: "p".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            message_count: 0,
+            last_active: "2026-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    fn provider(id: &str) -> Provider {
+        Provider {
+            id: id.to_string(),
+            name: id.to_string(),
+            requires_key: false,
+            api_key_env: None,
+        }
+    }
+
+    fn model(id: &str, provider: &str) -> Model {
+        Model {
+            id: id.to_string(),
+            display_name: id.to_string(),
+            provider: provider.to_string(),
+            context_window: None,
+            supports_reasoning: false,
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct FakeAgentClient {
+        sessions: Vec<Session>,
+        deleted: Arc<StdMutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentClient for FakeAgentClient {
+        async fn health(&self) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+
+        async fn get_config(&self) -> anyhow::Result<Config> {
+            Ok(Config {
+                agent: Default::default(),
+            })
+        }
+
+        async fn put_config(&self, _config: &Config) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn list_providers(&self) -> anyhow::Result<Vec<Provider>> {
+            Ok(Vec::new())
+        }
+
+        async fn get_models(&self, _provider: &str) -> anyhow::Result<Vec<Model>> {
+            Ok(Vec::new())
+        }
+
+        async fn list_provider_models(&self, _provider: &str) -> anyhow::Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+
+        async fn list_sessions(&self) -> anyhow::Result<Vec<Session>> {
+            Ok(self.sessions.clone())
+        }
+
+        async fn create_session(&self, name: &str) -> anyhow::Result<Session> {
+            Ok(session(name, name))
+        }
+
+        async fn load_session(&self, session_id: &str) -> anyhow::Result<Session> {
+            self.sessions
+                .iter()
+                .find(|session| session.id == session_id)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("session not found"))
+        }
+
+        async fn delete_session(&self, session_id: &str) -> anyhow::Result<()> {
+            self.deleted.lock().unwrap().push(session_id.to_string());
+            Ok(())
+        }
+
+        async fn submit_turn(
+            &mut self,
+            _session_id: &str,
+            _message: &str,
+        ) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+
+        fn set_stream_sink(&mut self, _sink: Option<StreamSink>) {}
+    }
+
+    fn app_with_fake_client(fake: FakeAgentClient) -> Arc<Mutex<App>> {
+        let boxed: Box<dyn AgentClient + Send + Sync> = Box::new(fake);
+        Arc::new(Mutex::new(App {
+            workspaces: vec![Workspace {
+                id: 0,
+                config: WorkspaceConfig {
+                    id: None,
+                    name: "test".to_string(),
+                    backend: Backend::Zeroclaw,
+                    url: "http://127.0.0.1:8888".to_string(),
+                    token_env: None,
+                    token: None,
+                    label: None,
+                    namespace_aliases: Vec::new(),
+                },
+                client: Some(Arc::new(Mutex::new(boxed))),
+                cron: None,
+            }],
+            active: 0,
+            shared_mnemos: None,
+            config_path: PathBuf::from("test-config.toml"),
+        }))
+    }
+
+    #[tokio::test]
+    async fn advertised_local_commands_return_structured_tui_output() {
+        let handler = super::CommandHandler::new(app_with_fake_client(FakeAgentClient::default()));
+
+        for cmdline in [
+            "/agent",
+            "/cron list",
+            "/clear",
+            "/save",
+            "/history",
+            "/config",
+            "/doctor",
+            "/skill list",
+            "/channels list",
+            "/hardware discover",
+            "/peripheral list",
+            "/estop status",
+        ] {
+            let out = handler
+                .handle(cmdline, "session-for-structured-output-test")
+                .await
+                .expect("command should not fail")
+                .expect("advertised command should return TUI output");
+            assert!(
+                !out.trim().is_empty(),
+                "{cmdline} should not complete silently"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn estop_status_fails_closed_until_backend_exists() {
+        let handler = super::CommandHandler::new(app_with_fake_client(FakeAgentClient::default()));
+
+        let out = handler
+            .handle("/estop status", "session-for-estop-test")
+            .await
+            .expect("command should not fail")
+            .expect("estop status should return TUI output");
+
+        assert!(out.contains("Emergency Stop: Unknown"));
+        assert!(out.contains("not implemented"));
+        assert!(!out.contains("Disengaged"));
+    }
+
+    #[tokio::test]
+    async fn command_handler_refuses_to_delete_active_backend_session() {
+        let deleted = Arc::new(StdMutex::new(Vec::new()));
+        let fake = FakeAgentClient {
+            sessions: vec![session("sess-active", "Research")],
+            deleted: Arc::clone(&deleted),
+        };
+        let handler = super::CommandHandler::new(app_with_fake_client(fake));
+
+        let out = handler
+            .handle("/session delete Research", "sess-active")
+            .await
+            .expect("command should complete")
+            .expect("delete command should return output");
+
+        assert!(out.contains("Cannot delete active session"));
+        assert!(out.contains("switch to another session"));
+        assert!(deleted.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn delete_resolver_prefers_backend_display_name_match() {
+        let backend = vec![session("sess-123", "Research")];
+        let target = super::choose_delete_session_target("Research", Some(&backend), &[]).unwrap();
+
+        assert_eq!(target.id, "sess-123");
+        assert_eq!(target.name, "Research");
+        assert_eq!(target.local_id, None);
+    }
+
+    #[test]
+    fn delete_resolver_fails_on_local_only_display_name_when_backend_list_available() {
+        let local = metadata("local-456", "Planning");
+        let local_sessions = vec![local];
+        let err = super::choose_delete_session_target("Planning", Some(&[]), &local_sessions)
+            .unwrap_err();
+
+        assert!(err.to_string().contains("not found"));
+    }
+
+    #[test]
+    fn delete_resolver_fails_when_backend_list_is_authoritative_and_no_match() {
+        let backend = vec![session("sess-123", "Research")];
+        let err = super::choose_delete_session_target("missing", Some(&backend), &[]).unwrap_err();
+
+        assert!(err.to_string().contains("not found"));
+    }
+
+    #[test]
+    fn delete_resolver_fails_closed_on_exact_local_id_when_backend_list_unavailable() {
+        let local = vec![metadata("local-123", "Planning")];
+        let err = super::choose_delete_session_target("local-123", None, &local).unwrap_err();
+
+        assert!(err.to_string().contains("backend sessions unavailable"));
+        assert!(err
+            .to_string()
+            .contains("local metadata is not trusted for backend deletes"));
+    }
+
+    #[test]
+    fn delete_resolver_fails_closed_on_raw_id_when_backend_list_unavailable() {
+        let err = super::choose_delete_session_target("raw-id", None, &[]).unwrap_err();
+
+        assert!(err.to_string().contains("backend sessions unavailable"));
+    }
+
+    #[test]
+    fn delete_resolver_fails_closed_on_local_name_when_backend_list_unavailable() {
+        let local = vec![metadata("local-123", "Planning")];
+        let err = super::choose_delete_session_target("Planning", None, &local).unwrap_err();
+
+        assert!(err.to_string().contains("backend sessions unavailable"));
+    }
+
+    #[test]
+    fn delete_resolver_fails_on_local_only_exact_id_when_backend_list_available() {
+        let local = vec![metadata("local-123", "Planning")];
+        let err = super::choose_delete_session_target("local-123", Some(&[]), &local).unwrap_err();
+
+        assert!(err.to_string().contains("not found"));
+    }
+
+    #[test]
+    fn delete_resolver_does_not_trust_unsafe_local_id_when_backend_list_available() {
+        let local = vec![metadata("../owned", "Planning")];
+        let err = super::choose_delete_session_target("../owned", Some(&[]), &local).unwrap_err();
+
+        assert!(err.to_string().contains("not found"));
+    }
+
+    #[test]
+    fn delete_resolver_does_not_cleanup_unsafe_backend_id_match() {
+        let backend = vec![session("../owned", "Research")];
+        let local = vec![metadata("../owned", "Research")];
+        let target = super::choose_delete_session_target("../owned", Some(&backend), &local)
+            .expect("backend id can be sent to backend but not used for local cleanup");
+
+        assert_eq!(target.id, "../owned");
+        assert_eq!(target.local_id, None);
+    }
+
+    #[test]
+    fn delete_resolver_prefers_exact_backend_id_over_duplicate_names() {
+        let backend = vec![
+            session("sess-123", "Research"),
+            session("sess-456", "Research"),
+        ];
+        let local = vec![
+            metadata("local-123", "Research"),
+            metadata("local-456", "Research"),
+        ];
+
+        let target =
+            super::choose_delete_session_target("sess-456", Some(&backend), &local).unwrap();
+
+        assert_eq!(target.id, "sess-456");
+        assert_eq!(target.name, "Research");
+        assert_eq!(target.local_id, None);
+    }
+
+    #[test]
+    fn delete_resolver_uses_matching_safe_local_id_only_for_cleanup() {
+        let backend = vec![session("sess-123", "Research")];
+        let local = vec![metadata("sess-123", "Stale Local Name")];
+
+        let target = super::choose_delete_session_target("Research", Some(&backend), &local)
+            .expect("backend display name should select authoritative backend id");
+
+        assert_eq!(target.id, "sess-123");
+        assert_eq!(target.name, "Research");
+        assert_eq!(target.local_id.as_deref(), Some("sess-123"));
+    }
+
+    #[test]
+    fn delete_resolver_fails_closed_on_duplicate_backend_names() {
+        let backend = vec![
+            session("sess-123", "Research"),
+            session("sess-456", "Research"),
+        ];
+
+        let err = super::choose_delete_session_target("Research", Some(&backend), &[]).unwrap_err();
+        let msg = err.to_string();
+
+        assert!(msg.contains("ambiguous session name/label 'Research'"));
+        assert!(msg.contains("sess-123"));
+        assert!(msg.contains("sess-456"));
+        assert!(msg.contains("explicit id"));
+    }
+
+    #[test]
+    fn delete_resolver_ignores_duplicate_local_names_when_backend_list_available() {
+        let local = vec![
+            metadata("local-123", "Planning"),
+            metadata("local-456", "Planning"),
+        ];
+
+        let err = super::choose_delete_session_target("Planning", Some(&[]), &local).unwrap_err();
+        let msg = err.to_string();
+
+        assert!(msg.contains("not found"));
     }
 }
