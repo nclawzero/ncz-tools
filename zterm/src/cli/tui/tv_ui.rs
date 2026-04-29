@@ -161,6 +161,8 @@ const PARTIAL_STREAM_INCOMPLETE_REASON: &str =
 const TURN_TRANSCRIPT_PENDING_REASON: &str =
     "turn submitted to backend; terminal transcript entry pending";
 const MUTATION_FENCE_TOAST: &str = "Mutation state unknown: run /resync";
+const MUTATION_FENCE_COMMAND_MAX_CHARS: usize = 256;
+const MUTATION_FENCE_REASON_MAX_CHARS: usize = 1024;
 const STATUS_LABEL_MAX_CHARS: usize = 48;
 const STATUS_TOAST_MAX_CHARS: usize = 96;
 const WORKSPACE_PICKER_LABEL_MAX_CHARS: usize = 48;
@@ -3030,6 +3032,7 @@ fn drain_stream_events(
                     TurnChunk::Finished(result) => {
                         let was_resync = status_state.resync_in_flight;
                         let in_flight_request = status_state.in_flight_request.take();
+                        let mut terminal_requires_fence = false;
                         if result.is_err() {
                             saw_error = true;
                             if let Err(message) = result {
@@ -3037,6 +3040,7 @@ fn drain_stream_events(
                                     message,
                                     in_flight_request.as_ref(),
                                 ) {
+                                    terminal_requires_fence = true;
                                     set_local_and_persisted_mutation_fence(status_state, &reason);
                                     status_state.set_toast(MUTATION_FENCE_TOAST);
                                 } else if was_resync {
@@ -3052,6 +3056,12 @@ fn drain_stream_events(
                             } else {
                                 status_state.set_toast("Resync complete");
                             }
+                        }
+                        if !terminal_requires_fence {
+                            clear_write_ahead_mutation_fence_after_safe_terminal(
+                                status_state,
+                                in_flight_request.as_ref(),
+                            );
                         }
                         status_state.resync_in_flight = false;
                         status_state.end_turn();
@@ -3160,6 +3170,16 @@ fn dispatch_worker_backed_submission(
         return SubmissionStatus::Busy;
     }
     let in_flight_request = in_flight_request_for_worker_request(label, &request);
+    if in_flight_request.mutating_slash {
+        if let Err(e) = write_ahead_mutation_fence_for_dispatch(status_state, label) {
+            status_state.set_toast("Mutation not dispatched");
+            chat_lines.borrow_mut().push(format!(
+                "[error] could not {error_context}: could not persist mutation fence before dispatch; command not submitted: {e}"
+            ));
+            chat_lines.borrow_mut().push(String::new());
+            return SubmissionStatus::DispatchFailed;
+        }
+    }
 
     if let Some(toast) = toast {
         status_state.set_toast(toast);
@@ -3176,6 +3196,12 @@ fn dispatch_worker_backed_submission(
     if let Err(e) = req_tx.blocking_send(request) {
         *response_in_flight = false;
         status_state.in_flight_request = None;
+        if in_flight_request.mutating_slash {
+            clear_write_ahead_mutation_fence_after_safe_terminal(
+                status_state,
+                Some(&in_flight_request),
+            );
+        }
         // Undo the busy indicator; the request never made it to the worker.
         status_state.turn_start = None;
         chat_lines
@@ -3708,6 +3734,52 @@ fn mutation_fence_key_for_status(status_state: &StatusState) -> String {
     )
 }
 
+fn mutation_fence_now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+fn cap_sanitized_text(input: &str, max_chars: usize) -> String {
+    let safe = sanitize_terminal_text(input);
+    if safe.chars().count() <= max_chars {
+        return safe;
+    }
+    const SUFFIX: &str = "... [truncated]";
+    let take_chars = max_chars.saturating_sub(SUFFIX.chars().count());
+    let mut capped = safe.chars().take(take_chars).collect::<String>();
+    capped.push_str(SUFFIX);
+    capped
+}
+
+fn mutation_fence_state_for_command(command: &str, reason: &str) -> delighters::MutationFenceState {
+    delighters::MutationFenceState {
+        command: cap_sanitized_text(command, MUTATION_FENCE_COMMAND_MAX_CHARS),
+        reason: cap_sanitized_text(reason, MUTATION_FENCE_REASON_MAX_CHARS),
+        created_at_unix: mutation_fence_now_unix(),
+    }
+}
+
+fn write_ahead_mutation_fence_reason(cmdline: &str) -> String {
+    format!(
+        "mutating slash command dispatched for `{}`; backend outcome is pending. Run /resync to inspect state, or /resync --force to clear this fence after manual reconciliation.",
+        sanitize_terminal_text(cmdline).replace('`', "'")
+    )
+}
+
+fn write_ahead_mutation_fence_for_dispatch(
+    status_state: &mut StatusState,
+    cmdline: &str,
+) -> Result<()> {
+    let key = mutation_fence_key_for_status(status_state);
+    let reason = write_ahead_mutation_fence_reason(cmdline);
+    let fence = mutation_fence_state_for_command(cmdline, &reason);
+    delighters::set_mutation_fence_for_workspace(&key, fence.clone())?;
+    status_state.mutation_fence = Some(fence.reason);
+    Ok(())
+}
+
 fn load_persisted_mutation_fence_for_status(
     status_state: &StatusState,
 ) -> Option<delighters::MutationFenceState> {
@@ -3784,18 +3856,15 @@ where
 
 fn set_local_and_persisted_mutation_fence(status_state: &mut StatusState, reason: &str) {
     let key = mutation_fence_key_for_status(status_state);
-    let fence = delighters::MutationFenceState {
-        command: mutation_fence_command_from_reason(reason),
-        reason: reason.to_string(),
-        created_at_unix: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.as_secs())
-            .unwrap_or(0),
-    };
-    if let Err(e) = delighters::set_mutation_fence_for_workspace(&key, fence) {
-        status_state.mutation_fence = Some(format!("{reason}; failed to persist fence: {e}"));
+    let command = mutation_fence_command_from_reason(reason);
+    let fence = mutation_fence_state_for_command(&command, reason);
+    if let Err(e) = delighters::set_mutation_fence_for_workspace(&key, fence.clone()) {
+        status_state.mutation_fence = Some(cap_sanitized_text(
+            &format!("{reason}; failed to persist fence: {e}"),
+            MUTATION_FENCE_REASON_MAX_CHARS,
+        ));
     } else {
-        status_state.mutation_fence = Some(reason.to_string());
+        status_state.mutation_fence = Some(fence.reason);
     }
 }
 
@@ -3808,6 +3877,28 @@ fn mutation_fence_command_from_reason(reason: &str) -> String {
         return String::new();
     };
     rest[..end].to_string()
+}
+
+fn clear_write_ahead_mutation_fence_after_safe_terminal(
+    status_state: &mut StatusState,
+    in_flight_request: Option<&InFlightRequest>,
+) {
+    if !in_flight_request.is_some_and(|request| request.mutating_slash) {
+        return;
+    }
+    let key = mutation_fence_key_for_status(status_state);
+    match delighters::clear_mutation_fence_for_workspace(&key) {
+        Ok(_) => status_state.mutation_fence = None,
+        Err(e) => {
+            status_state.mutation_fence = Some(cap_sanitized_text(
+                &format!(
+                    "mutating slash command completed, but zterm could not clear the durable write-ahead mutation fence: {e}; run /resync --force after manual reconciliation"
+                ),
+                MUTATION_FENCE_REASON_MAX_CHARS,
+            ));
+            status_state.set_toast(MUTATION_FENCE_TOAST);
+        }
+    }
 }
 
 fn force_clear_mutation_fence(
@@ -5380,6 +5471,158 @@ mod tests {
         ));
         assert!(state.mutation_fence.is_some());
         assert!(lines.borrow().is_empty());
+    }
+
+    #[test]
+    fn mutating_dispatch_writes_ahead_fence_before_enqueue() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+
+        let mut state = StatusState::new(
+            "default".to_string(),
+            "gpt-test".to_string(),
+            "borland".to_string(),
+            false,
+        );
+        let lines = Rc::new(RefCell::new(Vec::new()));
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut response_in_flight = false;
+
+        let status = dispatch_worker_backed_submission(
+            "/memory post hello",
+            WorkerRequest::Command("/memory post hello".to_string()),
+            &lines,
+            &tx,
+            &mut state,
+            &mut response_in_flight,
+            false,
+            None,
+            "dispatch",
+        );
+        let persisted =
+            delighters::mutation_fence_for_workspace(&mutation_fence_key_for_status(&state))
+                .unwrap()
+                .unwrap();
+        let queued = rx.try_recv().unwrap();
+
+        match old_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+
+        assert_eq!(status, SubmissionStatus::Started);
+        assert!(response_in_flight);
+        assert_eq!(state.mutation_fence, Some(persisted.reason.clone()));
+        assert!(persisted.reason.contains("backend outcome is pending"));
+        assert_eq!(persisted.command, "/memory post hello");
+        assert!(matches!(queued, WorkerRequest::Command(cmd) if cmd == "/memory post hello"));
+    }
+
+    #[test]
+    fn mutating_dispatch_refuses_when_write_ahead_fence_cannot_persist() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join(".zterm"), "not a directory").unwrap();
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+
+        let mut state = StatusState::new(
+            "default".to_string(),
+            "gpt-test".to_string(),
+            "borland".to_string(),
+            false,
+        );
+        let lines = Rc::new(RefCell::new(Vec::new()));
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut response_in_flight = false;
+
+        let status = dispatch_worker_backed_submission(
+            "/memory post hello",
+            WorkerRequest::Command("/memory post hello".to_string()),
+            &lines,
+            &tx,
+            &mut state,
+            &mut response_in_flight,
+            false,
+            None,
+            "dispatch",
+        );
+
+        match old_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+
+        assert_eq!(status, SubmissionStatus::DispatchFailed);
+        assert!(!response_in_flight);
+        assert!(state.in_flight_request.is_none());
+        assert!(state.mutation_fence.is_none());
+        assert!(rx.try_recv().is_err());
+        assert!(lines.borrow().join("\n").contains("command not submitted"));
+    }
+
+    #[test]
+    fn safe_mutating_terminal_clears_write_ahead_fence() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+
+        let mut state = StatusState::new(
+            "default".to_string(),
+            "gpt-test".to_string(),
+            "borland".to_string(),
+            false,
+        );
+        let lines = Rc::new(RefCell::new(Vec::new()));
+        let (req_tx, mut req_rx) = mpsc::channel(4);
+        let mut response_in_flight = false;
+        assert_eq!(
+            dispatch_worker_backed_submission(
+                "/memory post hello",
+                WorkerRequest::Command("/memory post hello".to_string()),
+                &lines,
+                &req_tx,
+                &mut state,
+                &mut response_in_flight,
+                false,
+                None,
+                "dispatch",
+            ),
+            SubmissionStatus::Started
+        );
+        let key = mutation_fence_key_for_status(&state);
+        assert!(delighters::mutation_fence_for_workspace(&key)
+            .unwrap()
+            .is_some());
+        let _ = req_rx.try_recv();
+
+        let (event_tx, mut event_rx) = mpsc::channel(4);
+        event_tx
+            .try_send(TurnChunk::Finished(Ok(String::new())))
+            .unwrap();
+        let mut typewriter_state = None;
+        let mut session_picker_state = SessionPickerState::default();
+        assert!(!drain_stream_events(
+            &mut event_rx,
+            &lines,
+            &mut state,
+            &mut typewriter_state,
+            &mut response_in_flight,
+            &mut session_picker_state
+        ));
+        let persisted_after = delighters::mutation_fence_for_workspace(&key).unwrap();
+
+        match old_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+
+        assert!(!response_in_flight);
+        assert!(state.mutation_fence.is_none());
+        assert!(persisted_after.is_none());
     }
 
     #[test]

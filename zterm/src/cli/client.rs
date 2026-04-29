@@ -17,6 +17,7 @@ const ZEROCLAW_WS_SEND_TIMEOUT: Duration = Duration::from_secs(30);
 const ZEROCLAW_TURN_RESPONSE_MAX_BYTES: usize = 2 * 1024 * 1024;
 const ZEROCLAW_WEBHOOK_ENVELOPE_MAX_BYTES: usize = 64 * 1024;
 const ZEROCLAW_WEBHOOK_ERROR_BODY_MAX_BYTES: usize = 8 * 1024;
+const ZEROCLAW_CRON_ERROR_BODY_MAX_BYTES: usize = 2 * 1024;
 
 /// One row from the daemon's `[providers.models.<key>]` config table.
 ///
@@ -1175,15 +1176,40 @@ async fn ensure_success_response(res: reqwest::Response, context: &str) -> Resul
         return Ok(());
     }
 
-    let body = res
-        .text()
-        .await
-        .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
+    let body = read_bounded_response_body(res, ZEROCLAW_CRON_ERROR_BODY_MAX_BYTES).await;
     if body.trim().is_empty() {
         Err(anyhow!("{context}: {status}"))
     } else {
         Err(anyhow!("{context}: {status}: {body}"))
     }
+}
+
+async fn read_bounded_response_body(res: reqwest::Response, max_bytes: usize) -> String {
+    let mut body = Vec::new();
+    let mut truncated = false;
+    let mut stream = res.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(e) => return format!("<failed to read response body: {e}>"),
+        };
+        let remaining = max_bytes.saturating_sub(body.len());
+        if chunk.len() > remaining {
+            body.extend_from_slice(&chunk[..remaining]);
+            truncated = true;
+            break;
+        }
+        body.extend_from_slice(&chunk);
+        if body.len() >= max_bytes {
+            truncated = true;
+            break;
+        }
+    }
+    let mut text = String::from_utf8_lossy(&body).into_owned();
+    if truncated {
+        text.push_str(&format!("... <truncated at {max_bytes} bytes>"));
+    }
+    text
 }
 
 fn zeroclaw_ws_frame_requires_ownership(event: &serde_json::Value) -> bool {
@@ -1392,6 +1418,30 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("500"));
         assert!(msg.contains("broken"));
+    }
+
+    #[tokio::test]
+    async fn cron_error_body_is_bounded_before_rendering() {
+        let mut server = mockito::Server::new_async().await;
+        let huge = format!(
+            "{}tail-marker",
+            "x".repeat(ZEROCLAW_CRON_ERROR_BODY_MAX_BYTES + 512)
+        );
+        let _mock = server
+            .mock("POST", "/api/cron/pause/job-1")
+            .with_status(502)
+            .with_body(huge)
+            .create_async()
+            .await;
+        let client = ZeroclawClient::new(server.url(), "test_token".to_string());
+
+        let err = client.pause_cron("job-1").await.unwrap_err();
+
+        let msg = err.to_string();
+        assert!(msg.contains("502"));
+        assert!(msg.contains("truncated"));
+        assert!(!msg.contains("tail-marker"));
+        assert!(msg.len() < ZEROCLAW_CRON_ERROR_BODY_MAX_BYTES + 256);
     }
 
     #[tokio::test]
