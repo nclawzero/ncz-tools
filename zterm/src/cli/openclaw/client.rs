@@ -796,18 +796,27 @@ async fn read_loop(
                     let _delivered = pending.resolve(res).await;
                 }
                 Ok(Frame::Event(ev)) => {
-                    match event_tx.try_send(ev) {
-                        Ok(()) => {}
-                        Err(mpsc::error::TrySendError::Full(ev)) => {
+                    if event_requires_reliable_delivery(&ev) {
+                        let event_name = ev.event.clone();
+                        if event_tx.send(ev).await.is_err() {
                             tracing::debug!(
-                                "openclaw: dropping event {} because event channel is full",
-                                ev.event
+                                "openclaw: event receiver closed while delivering reliable event {event_name}"
                             );
                         }
-                        Err(mpsc::error::TrySendError::Closed(_)) => {
-                            // Receiver dropped — no one cares about events.
-                            // Keep the read loop alive anyway so response
-                            // correlation still works.
+                    } else {
+                        match event_tx.try_send(ev) {
+                            Ok(()) => {}
+                            Err(mpsc::error::TrySendError::Full(ev)) => {
+                                tracing::debug!(
+                                    "openclaw: dropping event {} because event channel is full",
+                                    ev.event
+                                );
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => {
+                                // Receiver dropped — no one cares about events.
+                                // Keep the read loop alive anyway so response
+                                // correlation still works.
+                            }
                         }
                     }
                 }
@@ -839,6 +848,10 @@ async fn read_loop(
     }
     connected.store(false, Ordering::Relaxed);
     pending.abort_all().await;
+}
+
+fn event_requires_reliable_delivery(event: &super::wire::EventFrame) -> bool {
+    event.event == "session.message" || is_terminal_run_event_name(&event.event)
 }
 
 async fn write_loop(
@@ -3953,6 +3966,72 @@ mod tests {
             event_rx.try_recv().is_err(),
             "unsolicited event should have been dropped when channel was full"
         );
+    }
+
+    #[tokio::test]
+    async fn read_loop_backpressures_reliable_turn_events_until_delivered() {
+        let pending = PendingRequests::new();
+        let response_id = "req-response-after-completion".to_string();
+        let mut response_rx = pending.register(response_id.clone()).await;
+        let (event_tx, mut event_rx) = mpsc::channel::<super::super::wire::EventFrame>(1);
+        event_tx
+            .try_send(super::super::wire::EventFrame {
+                event: "already.full".to_string(),
+                payload: None,
+                seq: None,
+                state_version: None,
+            })
+            .expect("test event channel should start full");
+
+        let completion = Frame::Event(run_completed_event("session-a", "current-run"))
+            .to_json()
+            .unwrap();
+        let response = Frame::Res(ResponseFrame {
+            id: response_id.clone(),
+            ok: true,
+            payload: Some(serde_json::json!({ "done": true })),
+            error: None,
+        })
+        .to_json()
+        .unwrap();
+        let stream = futures::stream::iter(vec![
+            Ok(WsMessage::Text(completion)),
+            Ok(WsMessage::Text(response)),
+        ]);
+        let connected = Arc::new(AtomicBool::new(true));
+
+        let read_task = tokio::spawn(read_loop(
+            stream,
+            pending.clone(),
+            event_tx,
+            Arc::clone(&connected),
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut response_rx)
+                .await
+                .is_err(),
+            "response should wait while reliable completion is backpressured"
+        );
+
+        let retained = event_rx
+            .recv()
+            .await
+            .expect("pre-filled event should still be queued first");
+        assert_eq!(retained.event, "already.full");
+        let delivered = tokio::time::timeout(Duration::from_millis(50), event_rx.recv())
+            .await
+            .expect("completion event should be delivered after pressure clears")
+            .expect("event channel should stay open");
+        assert_eq!(delivered.event, "session.run.completed");
+
+        let got = tokio::time::timeout(Duration::from_millis(50), response_rx)
+            .await
+            .expect("response should arrive after reliable event delivery")
+            .expect("response oneshot should deliver");
+        assert_eq!(got.id, response_id);
+        assert_eq!(got.payload.unwrap()["done"], true);
+        read_task.await.expect("read loop should join");
+        assert!(!connected.load(Ordering::Relaxed));
     }
 
     #[tokio::test]
