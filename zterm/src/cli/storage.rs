@@ -383,12 +383,26 @@ pub fn append_scoped_session_history(
     role: &str,
     content: &str,
 ) -> Result<()> {
+    append_scoped_session_history_with_sync(scope, session_id, role, content, sync_parent_dir)
+}
+
+fn append_scoped_session_history_with_sync<F>(
+    scope: &LocalWorkspaceScope,
+    session_id: &str,
+    role: &str,
+    content: &str,
+    mut sync_new_file_parent: F,
+) -> Result<()>
+where
+    F: FnMut(&Path) -> std::io::Result<()>,
+{
     if !is_safe_session_id(session_id) {
         return Err(anyhow!("unsafe session id for local history append"));
     }
 
     ensure_scoped_session_dir(scope, session_id)?;
     let file = scoped_session_history_file(scope, session_id)?;
+    let created = !file.exists();
     let mut out = open_private_append_file(&file)?;
     let entry = serde_json::json!({
         "role": role,
@@ -397,6 +411,14 @@ pub fn append_scoped_session_history(
     writeln!(out, "{entry}").map_err(|e| anyhow!("Failed to append session history: {}", e))?;
     out.sync_all()
         .map_err(|e| anyhow!("Failed to sync session history: {}", e))?;
+    if created {
+        sync_new_file_parent(&file).map_err(|e| {
+            anyhow!(
+                "Failed to sync session history directory after create: {}",
+                e
+            )
+        })?;
+    }
     Ok(())
 }
 
@@ -1162,6 +1184,51 @@ mod tests {
             .unwrap()
             .exists());
         assert!(!clear_scoped_session_history(&scope, "main").unwrap());
+    }
+
+    #[test]
+    fn append_scoped_session_history_requires_parent_sync_after_first_create() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let scope = scope(&format!("history-create-sync-{}", uuid::Uuid::new_v4()));
+        let synced = std::cell::RefCell::new(Vec::new());
+
+        let err =
+            append_scoped_session_history_with_sync(&scope, "main", "user", "hello", |path| {
+                synced.borrow_mut().push(path.to_path_buf());
+                Err(std::io::Error::other("injected parent sync failure"))
+            })
+            .unwrap_err();
+
+        assert!(err.to_string().contains("injected parent sync failure"));
+        assert_eq!(
+            synced.borrow().as_slice(),
+            [scoped_session_history_file(&scope, "main").unwrap()]
+        );
+        assert!(
+            scoped_session_history_file(&scope, "main")
+                .unwrap()
+                .exists(),
+            "the append wrote the file, but the caller must see the parent sync failure"
+        );
+    }
+
+    #[test]
+    fn append_scoped_session_history_skips_parent_sync_for_existing_file() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let scope = scope(&format!("history-existing-sync-{}", uuid::Uuid::new_v4()));
+
+        append_scoped_session_history(&scope, "main", "user", "hello").unwrap();
+        append_scoped_session_history_with_sync(&scope, "main", "assistant", "hi", |_path| {
+            Err(std::io::Error::other(
+                "parent sync should not run for existing history file",
+            ))
+        })
+        .unwrap();
+
+        let history =
+            fs::read_to_string(scoped_session_history_file(&scope, "main").unwrap()).unwrap();
+        assert!(history.contains(r#""content":"hello""#));
+        assert!(history.contains(r#""content":"hi""#));
     }
 
     #[test]
