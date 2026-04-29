@@ -1127,6 +1127,7 @@ impl CommandHandler {
         if let Ok(mut metadata) = storage::load_scoped_session_metadata(&scope, session_id) {
             metadata.message_count = 0;
             metadata.last_active = Utc::now().to_rfc3339();
+            storage::clear_scoped_session_history(&scope, session_id)?;
             storage::save_scoped_session_metadata(&scope, &metadata)?;
             return Ok(Some("✓ Session history cleared\n".to_string()));
         }
@@ -2979,11 +2980,16 @@ provider_settings = { tokens = ["array-token-1", "array-token-2"], name = "kept"
 
         let clear_out = handler.handle("/clear", "main").await.unwrap().unwrap();
         assert!(clear_out.contains("cleared"));
+        let alpha_history = storage::scoped_session_history_file(&alpha_scope, "main").unwrap();
         assert_eq!(
             storage::load_scoped_session_metadata(&alpha_scope, "main")
                 .unwrap()
                 .message_count,
             0
+        );
+        assert!(
+            !alpha_history.exists(),
+            "/clear must remove persisted transcript history"
         );
         assert_eq!(
             storage::load_scoped_session_metadata(&beta_scope, "main")
@@ -2996,10 +3002,15 @@ provider_settings = { tokens = ["array-token-1", "array-token-2"], name = "kept"
         let save_path = tempdir.path().join("main-session.txt");
         let save_cmd = format!("/save {}", save_path.display());
         let save_out = handler.handle(&save_cmd, "main").await.unwrap().unwrap();
+        assert!(save_out.contains("No history to save"));
+        assert!(!save_path.exists());
+
+        std::fs::write(&alpha_history, "alpha after clear\n").unwrap();
+        let save_out = handler.handle(&save_cmd, "main").await.unwrap().unwrap();
         assert!(save_out.contains("Session saved"));
         assert_eq!(
             std::fs::read_to_string(&save_path).unwrap(),
-            "alpha history\n"
+            "alpha after clear\n"
         );
 
         let existing_path = tempdir.path().join("existing.txt");

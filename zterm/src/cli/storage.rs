@@ -332,6 +332,20 @@ pub fn append_scoped_session_history(
     Ok(())
 }
 
+/// Remove workspace-scoped transcript history for a session, leaving metadata intact.
+pub fn clear_scoped_session_history(scope: &LocalWorkspaceScope, session_id: &str) -> Result<bool> {
+    if !is_safe_session_id(session_id) {
+        return Err(anyhow!("unsafe session id for local history clear"));
+    }
+
+    let file = scoped_session_history_file(scope, session_id)?;
+    match fs::remove_file(&file) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(anyhow!("Failed to clear session history: {}", e)),
+    }
+}
+
 /// Load config from file
 pub fn load_config() -> Result<String> {
     let file = config_file()?;
@@ -616,6 +630,12 @@ mod tests {
         assert!(history.contains(r#""content":"hello""#));
         assert!(history.contains(r#""role":"assistant""#));
         assert!(history.contains(r#""content":"hi there""#));
+
+        assert!(clear_scoped_session_history(&scope, "main").unwrap());
+        assert!(!scoped_session_history_file(&scope, "main")
+            .unwrap()
+            .exists());
+        assert!(!clear_scoped_session_history(&scope, "main").unwrap());
     }
 
     #[test]

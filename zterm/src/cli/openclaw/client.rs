@@ -1795,8 +1795,8 @@ impl OpenClawClient {
         &self,
         row: &super::handshake::OpenClawSessionRow,
     ) -> bool {
-        let metadata_strings = row_metadata_strings(row);
-        if metadata_strings.is_empty() {
+        let metadata = row_identity_metadata(row);
+        if metadata.is_empty() {
             return false;
         }
 
@@ -1806,13 +1806,15 @@ impl OpenClawClient {
             .map(SessionNamespaceIdentity::from_namespace)
             .collect();
 
-        identities.iter().any(|identity| {
-            metadata_strings
+        if !metadata.session_namespaces.is_empty() {
+            return identities
                 .iter()
-                .any(|value| identity.matches_metadata_value(value))
-        }) || identities
+                .any(|identity| identity.matches_session_namespace_fields(&metadata));
+        }
+
+        identities
             .iter()
-            .any(|identity| identity.matches_metadata_fields(&metadata_strings))
+            .any(|identity| identity.matches_workspace_identity_fields(&metadata))
     }
 }
 
@@ -1834,31 +1836,52 @@ impl<'a> SessionNamespaceIdentity<'a> {
         }
     }
 
-    fn matches_metadata_value(&self, value: &str) -> bool {
-        let value = value.trim();
-        !value.is_empty()
-            && (value == self.namespace
-                || self
-                    .workspace_id
-                    .map(|workspace_id| value == workspace_id)
-                    .unwrap_or(false))
+    fn matches_session_namespace_fields(&self, metadata: &RowIdentityMetadata) -> bool {
+        metadata
+            .session_namespaces
+            .iter()
+            .any(|value| value.trim() == self.namespace)
     }
 
-    fn matches_metadata_fields(&self, values: &[String]) -> bool {
+    fn matches_workspace_identity_fields(&self, metadata: &RowIdentityMetadata) -> bool {
         if let Some(workspace_id) = self.workspace_id {
-            return values.iter().any(|value| value.trim() == workspace_id);
+            return metadata
+                .workspace_ids
+                .iter()
+                .any(|value| value.trim() == workspace_id);
         }
 
         match (self.workspace_name, self.workspace_url) {
             (Some(name), Some(url)) => {
-                let has_name = values.iter().any(|value| value.trim() == name);
-                let has_url = values
+                let has_name = metadata
+                    .workspace_names
+                    .iter()
+                    .any(|value| value.trim() == name);
+                let has_url = metadata
+                    .workspace_urls
                     .iter()
                     .any(|value| urls_equivalent(value.trim(), url));
                 has_name && has_url
             }
             _ => false,
         }
+    }
+}
+
+#[derive(Debug, Default)]
+struct RowIdentityMetadata {
+    session_namespaces: Vec<String>,
+    workspace_ids: Vec<String>,
+    workspace_names: Vec<String>,
+    workspace_urls: Vec<String>,
+}
+
+impl RowIdentityMetadata {
+    fn is_empty(&self) -> bool {
+        self.session_namespaces.is_empty()
+            && self.workspace_ids.is_empty()
+            && self.workspace_names.is_empty()
+            && self.workspace_urls.is_empty()
     }
 }
 
@@ -1873,42 +1896,38 @@ fn urls_equivalent(actual: &str, expected: &str) -> bool {
     actual.trim_end_matches('/') == expected.trim_end_matches('/')
 }
 
-fn row_metadata_strings(row: &super::handshake::OpenClawSessionRow) -> Vec<String> {
-    let mut out = Vec::new();
+fn row_identity_metadata(row: &super::handshake::OpenClawSessionRow) -> RowIdentityMetadata {
+    let mut out = RowIdentityMetadata::default();
     for (key, value) in &row.extra {
-        collect_metadata_strings_for_key(key, value, false, &mut out);
+        collect_identity_metadata_for_key(key, value, &mut out);
     }
     out
 }
 
-fn collect_metadata_strings_for_key(
+fn collect_identity_metadata_for_key(
     key: &str,
     value: &serde_json::Value,
-    in_identity_container: bool,
-    out: &mut Vec<String>,
+    out: &mut RowIdentityMetadata,
 ) {
     let normalized_key = normalize_metadata_key(key);
-    let is_identity_key = is_session_identity_metadata_key(&normalized_key);
-    let in_identity_container =
-        in_identity_container || is_session_identity_metadata_container(&normalized_key);
 
     match value {
         serde_json::Value::String(s) => {
-            if is_identity_key || in_identity_container {
+            if let Some(target) = identity_metadata_target(&normalized_key, out) {
                 let trimmed = s.trim();
                 if !trimmed.is_empty() {
-                    out.push(trimmed.to_string());
+                    target.push(trimmed.to_string());
                 }
             }
         }
         serde_json::Value::Array(items) => {
             for item in items {
-                collect_metadata_strings_for_key(key, item, in_identity_container, out);
+                collect_identity_metadata_for_key(key, item, out);
             }
         }
         serde_json::Value::Object(map) => {
             for (child_key, value) in map {
-                collect_metadata_strings_for_key(child_key, value, in_identity_container, out);
+                collect_identity_metadata_for_key(child_key, value, out);
             }
         }
         _ => {}
@@ -1922,27 +1941,19 @@ fn normalize_metadata_key(key: &str) -> String {
         .collect()
 }
 
-fn is_session_identity_metadata_key(key: &str) -> bool {
-    matches!(
-        key,
-        "sessionnamespace"
-            | "ztermsessionnamespace"
-            | "namespace"
-            | "workspacenamespace"
-            | "workspaceid"
-            | "ztermworkspaceid"
-            | "workspacename"
-            | "workspaceurl"
-            | "workspace"
-            | "url"
-    )
-}
-
-fn is_session_identity_metadata_container(key: &str) -> bool {
-    matches!(
-        key,
-        "metadata" | "zterm" | "session" | "workspace" | "workspaceidentity"
-    )
+fn identity_metadata_target<'a>(
+    key: &str,
+    metadata: &'a mut RowIdentityMetadata,
+) -> Option<&'a mut Vec<String>> {
+    match key {
+        "sessionnamespace" | "ztermsessionnamespace" | "workspacenamespace" => {
+            Some(&mut metadata.session_namespaces)
+        }
+        "workspaceid" | "ztermworkspaceid" => Some(&mut metadata.workspace_ids),
+        "workspacename" => Some(&mut metadata.workspace_names),
+        "workspaceurl" => Some(&mut metadata.workspace_urls),
+        _ => None,
+    }
 }
 
 fn ensure_targeted_session_list_not_truncated(
@@ -2178,6 +2189,105 @@ mod tests {
         };
 
         assert!(client.row_belongs_to_session_namespace(&row));
+    }
+
+    #[test]
+    fn legacy_metadata_matching_only_trusts_exact_identity_fields() {
+        let mut client = tests_support_new_fake(PendingRequests::new(), None, true);
+        let active_namespace =
+            "backend=openclaw;workspace_id=ws_active;workspace=alpha;url=ws://shared";
+        let foreign_namespace =
+            "backend=openclaw;workspace_id=ws_foreign;workspace=beta;url=ws://shared";
+        client.set_session_namespace(active_namespace);
+
+        let exact_namespace_row = test_session_row_with_extra(
+            "oc-server-exact-namespace",
+            serde_json::json!({
+                "metadata": {
+                    "zterm": { "sessionNamespace": active_namespace }
+                }
+            }),
+        );
+        assert!(client.legacy_server_key_row_belongs_to_session_namespace(&exact_namespace_row));
+
+        let exact_workspace_id_row = test_session_row_with_extra(
+            "oc-server-exact-workspace-id",
+            serde_json::json!({
+                "metadata": {
+                    "zterm": { "workspaceId": "ws_active" }
+                }
+            }),
+        );
+        assert!(client.legacy_server_key_row_belongs_to_session_namespace(&exact_workspace_id_row));
+
+        let spoofed_container_row = test_session_row_with_extra(
+            "oc-server-spoofed-container",
+            serde_json::json!({
+                "metadata": {
+                    "zterm": {
+                        "notes": format!("mentions {active_namespace} and ws_active"),
+                        "workspace": {
+                            "title": "ws_active"
+                        }
+                    }
+                }
+            }),
+        );
+        assert!(!client.legacy_server_key_row_belongs_to_session_namespace(&spoofed_container_row));
+
+        let conflicting_namespace_row = test_session_row_with_extra(
+            "oc-server-conflicting-namespace",
+            serde_json::json!({
+                "metadata": {
+                    "zterm": {
+                        "sessionNamespace": foreign_namespace,
+                        "workspaceId": "ws_active"
+                    }
+                }
+            }),
+        );
+        assert!(
+            !client.legacy_server_key_row_belongs_to_session_namespace(&conflicting_namespace_row)
+        );
+    }
+
+    #[test]
+    fn legacy_metadata_matching_accepts_exact_name_and_url_without_workspace_id() {
+        let mut client = tests_support_new_fake(PendingRequests::new(), None, true);
+        client.set_session_namespace("backend=openclaw;workspace=alpha;url=ws://shared/");
+
+        let row = test_session_row_with_extra(
+            "oc-server-name-url",
+            serde_json::json!({
+                "metadata": {
+                    "zterm": {
+                        "workspaceName": "alpha",
+                        "workspaceUrl": "ws://shared"
+                    }
+                }
+            }),
+        );
+
+        assert!(client.legacy_server_key_row_belongs_to_session_namespace(&row));
+    }
+
+    fn test_session_row_with_extra(
+        key: &str,
+        extra: serde_json::Value,
+    ) -> super::super::handshake::OpenClawSessionRow {
+        super::super::handshake::OpenClawSessionRow {
+            key: key.to_string(),
+            kind: "direct".to_string(),
+            label: Some("Research".to_string()),
+            display_name: None,
+            derived_title: None,
+            updated_at: None,
+            session_id: None,
+            extra: match extra {
+                serde_json::Value::Object(map) => map,
+                _ => serde_json::Map::new(),
+            },
+        }
     }
 
     fn assistant_event(
