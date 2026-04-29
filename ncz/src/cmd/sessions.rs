@@ -310,7 +310,9 @@ pub fn prune(
     let (sessions, skipped_agents) = collect_sessions(ctx, paths, requested_agent)?;
     let mut candidates: Vec<PrunedSession> = sessions
         .into_iter()
-        .filter(|session| !session.last_modified.is_empty() && session.last_modified.as_str() < before)
+        .filter(|session| {
+            !session.last_modified.is_empty() && session.last_modified.as_str() < before
+        })
         .map(|session| PrunedSession {
             id: session.id,
             agent: session.agent,
@@ -457,7 +459,8 @@ fn resolve_session(
         [] => Err(NczError::Usage(format!("session not found: {session_id}"))),
         [session] => Ok(session.clone()),
         many => {
-            let agents: BTreeSet<&str> = many.iter().map(|session| session.agent.as_str()).collect();
+            let agents: BTreeSet<&str> =
+                many.iter().map(|session| session.agent.as_str()).collect();
             Err(NczError::Usage(format!(
                 "session id {session_id} is ambiguous across agents: {}; pass --agent",
                 agents.into_iter().collect::<Vec<_>>().join(",")
@@ -509,13 +512,21 @@ fn content_from_value(value: Value) -> SessionContent {
         .unwrap_or_else(|| value.clone());
     let messages = value
         .get("messages")
-        .or_else(|| value.get("session").and_then(|session| session.get("messages")))
+        .or_else(|| {
+            value
+                .get("session")
+                .and_then(|session| session.get("messages"))
+        })
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
     let metadata = value
         .get("metadata")
-        .or_else(|| value.get("session").and_then(|session| session.get("metadata")))
+        .or_else(|| {
+            value
+                .get("session")
+                .and_then(|session| session.get("metadata"))
+        })
         .cloned()
         .unwrap_or(Value::Null);
     SessionContent {
@@ -618,7 +629,10 @@ fn zeroclaw_gateway_port(paths: &Paths) -> Result<u16, NczError> {
         keys.push(format!("NCZ_{key}_GATEWAY_URL"));
     }
     for key in keys {
-        if let Some(value) = entries.iter().find(|entry| entry.key == key).map(|entry| &entry.value)
+        if let Some(value) = entries
+            .iter()
+            .find(|entry| entry.key == key)
+            .map(|entry| &entry.value)
         {
             if let Some(port) = loopback_port(value) {
                 return Ok(port);
