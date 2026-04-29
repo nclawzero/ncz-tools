@@ -498,9 +498,7 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::time::{sleep, timeout, Duration};
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let hits = Arc::new(AtomicUsize::new(0));
         let server_hits = Arc::clone(&hits);
@@ -529,8 +527,11 @@ mod tests {
         std::fs::write(&legacy_config_path, &legacy_config).unwrap();
 
         let workspace_dir = tempfile::TempDir::new().unwrap();
-        std::fs::write(workspace_dir.path().join("config.toml"), "[[workspaces]]\nname =")
-            .unwrap();
+        std::fs::write(
+            workspace_dir.path().join("config.toml"),
+            "[[workspaces]]\nname =",
+        )
+        .unwrap();
 
         let prior_home = std::env::var_os("HOME");
         let prior_zterm_config_dir = std::env::var_os("ZTERM_CONFIG_DIR");
