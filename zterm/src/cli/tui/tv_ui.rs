@@ -7876,8 +7876,8 @@ mod tests {
             ),
             SubmissionStatus::Started
         );
-        let key = mutation_fence_key_for_status(&state);
-        assert!(delighters::mutation_fence_for_workspace(&key)
+        let key = crate::cli::tui::GLOBAL_MEMORY_MUTATION_FENCE_KEY;
+        assert!(delighters::mutation_fence_for_workspace(key)
             .unwrap()
             .is_some());
         let _ = req_rx.try_recv();
@@ -7896,7 +7896,7 @@ mod tests {
             &mut response_in_flight,
             &mut session_picker_state
         ));
-        let persisted_after = delighters::mutation_fence_for_workspace(&key).unwrap();
+        let persisted_after = delighters::mutation_fence_for_workspace(key).unwrap();
 
         match old_home {
             Some(home) => std::env::set_var("HOME", home),
@@ -9036,11 +9036,12 @@ mod tests {
     fn session_preflight_failure_message_sets_terminal_fence() {
         let message = mutating_command_unknown_outcome_message(
             "/session create scratch",
-            "could not create session `scratch`: request timed out",
+            "request timed out",
         );
 
         assert!(mutation_timeout_requires_fence(&message));
-        assert!(message.contains("/session create scratch"));
+        assert!(message.contains("/session create args#"));
+        assert!(!message.contains("scratch"));
     }
 
     #[test]
