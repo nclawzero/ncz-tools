@@ -341,11 +341,36 @@ async fn load_or_create_session_with_metadata(
     session_name: &str,
     local_metadata: Option<SessionMetadata>,
 ) -> Result<Session> {
-    let list_error = match client.lock().await.list_sessions().await {
+    let list_result = {
+        let locked = client.lock().await;
+        locked.list_sessions().await
+    };
+    let list_error = match list_result {
         Ok(sessions) => {
             if let Some(session) = choose_boot_session_by_id_or_name(&sessions, session_name)? {
-                info!("Found existing backend session: {}", session.id);
-                return Ok(session.clone());
+                let load_result = {
+                    let locked = client.lock().await;
+                    locked.load_session(&session.id).await
+                };
+                match load_result {
+                    Ok(session) => {
+                        info!("Validated listed backend session: {}", session.id);
+                        return Ok(session);
+                    }
+                    Err(e) if boot_listed_session_load_allows_create(&e) => {
+                        warn!(
+                            "listed backend session '{}' could not be validated while booting '{}'; creating scoped replacement: {e}",
+                            session.id, session_name
+                        );
+                    }
+                    Err(e) => {
+                        return Err(anyhow!(
+                            "listed backend session '{}' could not be validated while booting '{}'; refusing to bind or create session without authoritative load result: {e}",
+                            session.id,
+                            session_name
+                        ));
+                    }
+                }
             }
             None
         }
@@ -411,6 +436,13 @@ async fn load_or_create_session_with_metadata(
     Ok(session)
 }
 
+fn boot_listed_session_load_allows_create(error: &anyhow::Error) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("session not found")
+        || message.contains("display-only")
+        || message.contains("not loadable")
+}
+
 fn local_storage_scope_for_workspace(
     workspace: &crate::cli::workspace::Workspace,
 ) -> Result<storage::LocalWorkspaceScope> {
@@ -465,6 +497,7 @@ mod tests {
     struct BootFakeClient {
         list_sessions: Result<Vec<Session>, String>,
         load_sessions: Vec<Session>,
+        load_errors: Vec<(String, String)>,
         create_session: Session,
         loaded: Arc<StdMutex<Vec<String>>>,
         created: Arc<StdMutex<Vec<String>>>,
@@ -511,6 +544,9 @@ mod tests {
 
         async fn load_session(&self, session_id: &str) -> Result<Session> {
             self.loaded.lock().unwrap().push(session_id.to_string());
+            if let Some((_, error)) = self.load_errors.iter().find(|(id, _)| id == session_id) {
+                return Err(anyhow!(error.clone()));
+            }
             self.load_sessions
                 .iter()
                 .find(|session| session.id == session_id)
@@ -710,7 +746,8 @@ url = "ws://example.invalid"
         let created = Arc::new(StdMutex::new(Vec::new()));
         let fake = BootFakeClient {
             list_sessions: Ok(vec![session("active-main", "main")]),
-            load_sessions: Vec::new(),
+            load_sessions: vec![session("active-main", "main")],
+            load_errors: Vec::new(),
             create_session: session("created/main", "main"),
             loaded: Arc::clone(&loaded),
             created: Arc::clone(&created),
@@ -726,7 +763,54 @@ url = "ws://example.invalid"
         .expect("active backend main should resolve");
 
         assert_eq!(selected.id, "active-main");
-        assert!(loaded.lock().unwrap().is_empty());
+        assert_eq!(loaded.lock().unwrap().as_slice(), ["active-main"]);
+        assert!(created.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn boot_creates_replacement_for_unloadable_listed_session() {
+        let loaded = Arc::new(StdMutex::new(Vec::new()));
+        let created = Arc::new(StdMutex::new(Vec::new()));
+        let fake = BootFakeClient {
+            list_sessions: Ok(vec![session("legacy-server-key", "main")]),
+            load_sessions: Vec::new(),
+            load_errors: Vec::new(),
+            create_session: session("created/main", "main"),
+            loaded: Arc::clone(&loaded),
+            created: Arc::clone(&created),
+        };
+
+        let selected =
+            load_or_create_session_with_metadata(&boxed_client(fake), &scope(), "main", None)
+                .await
+                .expect("not-found listed session should fall through to create");
+
+        assert_eq!(selected.id, "created/main");
+        assert_eq!(loaded.lock().unwrap().as_slice(), ["legacy-server-key"]);
+        assert_eq!(created.lock().unwrap().as_slice(), ["main"]);
+    }
+
+    #[tokio::test]
+    async fn boot_fails_closed_when_listed_session_load_is_unauthoritative() {
+        let loaded = Arc::new(StdMutex::new(Vec::new()));
+        let created = Arc::new(StdMutex::new(Vec::new()));
+        let fake = BootFakeClient {
+            list_sessions: Ok(vec![session("active-main", "main")]),
+            load_sessions: Vec::new(),
+            load_errors: vec![("active-main".to_string(), "permission denied".to_string())],
+            create_session: session("created/main", "main"),
+            loaded: Arc::clone(&loaded),
+            created: Arc::clone(&created),
+        };
+
+        let err = load_or_create_session_with_metadata(&boxed_client(fake), &scope(), "main", None)
+            .await
+            .unwrap_err();
+        let msg = format!("{err:#}");
+
+        assert!(msg.contains("refusing to bind or create session"));
+        assert!(msg.contains("permission denied"));
+        assert_eq!(loaded.lock().unwrap().as_slice(), ["active-main"]);
         assert!(created.lock().unwrap().is_empty());
     }
 
@@ -737,6 +821,7 @@ url = "ws://example.invalid"
         let fake = BootFakeClient {
             list_sessions: Ok(Vec::new()),
             load_sessions: Vec::new(),
+            load_errors: Vec::new(),
             create_session: session("created/main", "main"),
             loaded: Arc::clone(&loaded),
             created: Arc::clone(&created),
@@ -763,6 +848,7 @@ url = "ws://example.invalid"
         let fake = BootFakeClient {
             list_sessions: Err("backend list unavailable".to_string()),
             load_sessions: Vec::new(),
+            load_errors: Vec::new(),
             create_session: session("created/main", "main"),
             loaded: Arc::clone(&loaded),
             created: Arc::clone(&created),
@@ -790,6 +876,7 @@ url = "ws://example.invalid"
         let fake = BootFakeClient {
             list_sessions: Err("backend list unavailable".to_string()),
             load_sessions: vec![session("cached-main", "main")],
+            load_errors: Vec::new(),
             create_session: session("created/main", "main"),
             loaded: Arc::clone(&loaded),
             created: Arc::clone(&created),
