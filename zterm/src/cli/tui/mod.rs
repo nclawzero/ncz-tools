@@ -38,6 +38,7 @@ pub async fn run(
     let is_tty = atty::is(atty::Stream::Stdin);
     info!("TTY mode: {}", is_tty);
 
+    let cli_token_override = token.clone();
     let (gateway_url, api_token, config) = if has_multi_workspace {
         info!("Workspace config found; skipping legacy onboarding and pairing.");
         let active_workspace_url = active_workspace_config(&zterm_config)
@@ -46,7 +47,7 @@ pub async fn run(
         let config = read_toml_value_or_empty(&zterm_config_path)?;
         (
             active_workspace_url,
-            token.or_else(|| {
+            token.clone().or_else(|| {
                 active_workspace_config(&zterm_config).and_then(WorkspaceConfig::resolved_token)
             }),
             config,
@@ -75,7 +76,7 @@ pub async fn run(
                 .to_string()
         });
 
-        let api_token = token.or_else(|| {
+        let api_token = token.clone().or_else(|| {
             config
                 .get("gateway")
                 .and_then(|v| v.get("token"))
@@ -142,9 +143,11 @@ pub async fn run(
     // Build a multi-workspace App. If ~/.zterm/config.toml has
     // [[workspaces]], use them. Otherwise synthesize a single
     // zeroclaw workspace from the legacy gateway_url + api_token.
-    let mut app = crate::cli::workspace::App::boot_or_synthesize(
+    let mut app = crate::cli::workspace::App::boot_or_synthesize_with_cli_token_override(
         gateway_url.clone(),
         Some(api_token.clone()),
+        cli_token_override,
+        workspace.as_deref(),
     )?;
 
     // Honor the --workspace override if the user passed one and

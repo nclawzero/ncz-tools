@@ -786,7 +786,14 @@ impl ZeroclawClient {
             "model": model
         });
 
-        let response = match self.http_client.post(&url).json(&payload).send().await {
+        let response = match self
+            .http_client
+            .post(&url)
+            .bearer_auth(&self.token)
+            .json(&payload)
+            .send()
+            .await
+        {
             Ok(r) => r,
             Err(e) => {
                 let wrapped = anyhow!("Webhook request failed: {}", e);
@@ -1350,6 +1357,27 @@ mod tests {
             other => panic!("expected oversized webhook error, got {other:?}"),
         }
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn webhook_submit_sends_bearer_auth() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/webhook")
+            .match_header("authorization", "Bearer test-token")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(serde_json::json!({ "response": "ok" }).to_string())
+            .create_async()
+            .await;
+        let client = ZeroclawClient::new(server.url(), "test-token".to_string());
+
+        let response = client
+            .submit_turn_webhook_with_limit("main", "hello", "primary", 1024)
+            .await
+            .unwrap();
+
+        assert_eq!(response, "ok");
     }
 
     #[tokio::test]

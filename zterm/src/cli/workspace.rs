@@ -1173,6 +1173,16 @@ impl App {
         })
     }
 
+    pub fn from_config_with_cli_token_override(
+        mut cfg: AppConfig,
+        config_path: PathBuf,
+        token_override: Option<String>,
+        workspace_override: Option<&str>,
+    ) -> Result<Self> {
+        apply_cli_token_override(&mut cfg, token_override.as_deref(), workspace_override);
+        Self::from_config(cfg, config_path)
+    }
+
     /// Read `config.toml` from the canonical path, build the `App`.
     pub fn boot() -> Result<Self> {
         let path = AppConfig::default_path()?;
@@ -1248,12 +1258,54 @@ impl App {
     }
 
     pub fn boot_or_synthesize(remote: impl Into<String>, token: Option<String>) -> Result<Self> {
+        Self::boot_or_synthesize_with_cli_token_override(remote, token, None, None)
+    }
+
+    pub fn boot_or_synthesize_with_cli_token_override(
+        remote: impl Into<String>,
+        token: Option<String>,
+        token_override: Option<String>,
+        workspace_override: Option<&str>,
+    ) -> Result<Self> {
         let path = AppConfig::default_path()?;
         let cfg = AppConfig::load(&path)?;
         if !cfg.workspaces.is_empty() {
-            return Self::from_config(cfg, path);
+            return Self::from_config_with_cli_token_override(
+                cfg,
+                path,
+                token_override,
+                workspace_override,
+            );
         }
         Self::synthesize_single_zeroclaw(remote, token)
+    }
+}
+
+fn apply_cli_token_override(
+    cfg: &mut AppConfig,
+    token_override: Option<&str>,
+    workspace_override: Option<&str>,
+) {
+    let Some(token) = token_override.filter(|token| !token.is_empty()) else {
+        return;
+    };
+    let selected = workspace_override
+        .and_then(|name| {
+            cfg.workspaces
+                .iter()
+                .position(|workspace| workspace.name == name)
+        })
+        .or_else(|| {
+            cfg.active.as_deref().and_then(|name| {
+                cfg.workspaces
+                    .iter()
+                    .position(|workspace| workspace.name == name)
+            })
+        })
+        .unwrap_or(0);
+    if let Some(workspace) = cfg.workspaces.get_mut(selected) {
+        workspace.token_env = None;
+        workspace.token = Some(token.to_string());
     }
 }
 
@@ -2049,6 +2101,83 @@ token = "configured-tok"
             None => std::env::remove_var("ZTERM_CONFIG_DIR"),
         }
     }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn boot_or_synthesize_cli_token_override_applies_to_requested_workspace() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("GET", "/api/config")
+            .match_header("authorization", "Bearer cli-token")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "agent": { "model": "m", "provider": "p" }
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cfg_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &cfg_path,
+            format!(
+                r#"
+active = "primary"
+
+[[workspaces]]
+name = "primary"
+backend = "zeroclaw"
+url = "http://primary.invalid"
+token = "primary-token"
+
+[[workspaces]]
+name = "target"
+backend = "zeroclaw"
+url = "{}"
+token_env = "ZTERM_TEST_STALE_TOKEN"
+token = "stale-token"
+"#,
+                server.url()
+            ),
+        )
+        .unwrap();
+        let prior_config = std::env::var("ZTERM_CONFIG_DIR").ok();
+        let prior_stale = std::env::var("ZTERM_TEST_STALE_TOKEN").ok();
+        std::env::set_var("ZTERM_CONFIG_DIR", tmp.path());
+        std::env::set_var("ZTERM_TEST_STALE_TOKEN", "env-stale-token");
+
+        let app = App::boot_or_synthesize_with_cli_token_override(
+            "http://fallback-url",
+            Some("fallback-tok".to_string()),
+            Some("cli-token".to_string()),
+            Some("target"),
+        )
+        .unwrap();
+
+        let target = app
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.config.name == "target")
+            .expect("target workspace should load");
+        assert_eq!(target.config.token.as_deref(), Some("cli-token"));
+        assert!(target.config.token_env.is_none());
+        let client = target.client.clone().expect("zeroclaw target is activated");
+        client.lock().await.get_config().await.unwrap();
+
+        match prior_config {
+            Some(v) => std::env::set_var("ZTERM_CONFIG_DIR", v),
+            None => std::env::remove_var("ZTERM_CONFIG_DIR"),
+        }
+        match prior_stale {
+            Some(v) => std::env::set_var("ZTERM_TEST_STALE_TOKEN", v),
+            None => std::env::remove_var("ZTERM_TEST_STALE_TOKEN"),
+        }
+    }
+
     #[test]
     fn inventory_snapshot_matches_workspaces() {
         let app = App::synthesize_single_zeroclaw("http://a", Some("t".to_string())).unwrap();
