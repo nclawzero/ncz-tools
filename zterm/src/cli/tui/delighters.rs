@@ -1,5 +1,6 @@
 //! Small v0.3 flavor helpers that are testable without a terminal.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, Write};
 #[cfg(unix)]
@@ -33,6 +34,15 @@ pub struct ZtermState {
     pub launches: u64,
     #[serde(default)]
     pub beep_on_error: bool,
+    #[serde(default)]
+    pub mutation_fences: BTreeMap<String, MutationFenceState>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MutationFenceState {
+    pub command: String,
+    pub reason: String,
+    pub created_at_unix: u64,
 }
 
 pub fn sanitize_workspace_name(workspace: &str) -> String {
@@ -352,6 +362,66 @@ pub fn set_beep_on_error_at(path: &Path, enabled: bool) -> std::io::Result<Zterm
     })
 }
 
+pub fn mutation_fence_for_workspace(workspace_key: &str) -> Option<MutationFenceState> {
+    let path = default_state_path()?;
+    mutation_fence_for_workspace_at(&path, workspace_key)
+}
+
+pub fn mutation_fence_for_workspace_at(
+    path: &Path,
+    workspace_key: &str,
+) -> Option<MutationFenceState> {
+    load_state(path).mutation_fences.get(workspace_key).cloned()
+}
+
+pub fn set_mutation_fence_for_workspace(
+    workspace_key: &str,
+    fence: MutationFenceState,
+) -> std::io::Result<ZtermState> {
+    let Some(path) = default_state_path() else {
+        return Err(std::io::Error::other(
+            "no home directory; cannot persist zterm mutation fence",
+        ));
+    };
+    set_mutation_fence_for_workspace_at(&path, workspace_key, fence)
+}
+
+pub fn set_mutation_fence_for_workspace_at(
+    path: &Path,
+    workspace_key: &str,
+    fence: MutationFenceState,
+) -> std::io::Result<ZtermState> {
+    with_state_lock(path, || {
+        let mut state = load_state_unlocked(path);
+        state
+            .mutation_fences
+            .insert(workspace_key.to_string(), fence);
+        save_state_unlocked(path, &state)?;
+        Ok(state)
+    })
+}
+
+pub fn clear_mutation_fence_for_workspace(workspace_key: &str) -> std::io::Result<ZtermState> {
+    let Some(path) = default_state_path() else {
+        return Err(std::io::Error::other(
+            "no home directory; cannot persist zterm mutation fence",
+        ));
+    };
+    clear_mutation_fence_for_workspace_at(&path, workspace_key)
+}
+
+pub fn clear_mutation_fence_for_workspace_at(
+    path: &Path,
+    workspace_key: &str,
+) -> std::io::Result<ZtermState> {
+    with_state_lock(path, || {
+        let mut state = load_state_unlocked(path);
+        state.mutation_fences.remove(workspace_key);
+        save_state_unlocked(path, &state)?;
+        Ok(state)
+    })
+}
+
 pub fn is_welcome_milestone(launches: u64) -> bool {
     launches == 5 || launches == 10 || (launches >= 25 && launches.is_multiple_of(25))
 }
@@ -490,6 +560,28 @@ mod tests {
         assert_eq!(state.launches, 1);
         assert!(state.beep_on_error);
         assert!(load_state(&path).beep_on_error);
+    }
+
+    #[test]
+    fn mutation_fence_persists_per_workspace() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("state.toml");
+        let fence = MutationFenceState {
+            command: "/cron add '0 9 * * *' standup".to_string(),
+            reason: "slash command outcome unknown".to_string(),
+            created_at_unix: 42,
+        };
+
+        set_mutation_fence_for_workspace_at(&path, "id:prod", fence.clone()).unwrap();
+
+        assert_eq!(
+            mutation_fence_for_workspace_at(&path, "id:prod"),
+            Some(fence)
+        );
+        assert_eq!(mutation_fence_for_workspace_at(&path, "id:dev"), None);
+
+        clear_mutation_fence_for_workspace_at(&path, "id:prod").unwrap();
+        assert_eq!(mutation_fence_for_workspace_at(&path, "id:prod"), None);
     }
 
     #[test]

@@ -815,6 +815,7 @@ pub async fn run(
                 }
                 WorkerRequest::Command(cmdline) => {
                     let deadline = slash_command_deadline(&cmdline);
+                    let command_label = cmdline.clone();
                     let command = handle_worker_command_request(
                         cmdline,
                         &worker_app,
@@ -823,7 +824,13 @@ pub async fn run(
                         &worker_sink,
                         &worker_cmd_handler,
                     );
-                    run_worker_command_with_deadline(&worker_sink, deadline, command).await;
+                    run_worker_command_with_deadline(
+                        &worker_sink,
+                        deadline,
+                        Some(&command_label),
+                        command,
+                    )
+                    .await;
                 }
                 WorkerRequest::Resync => {
                     let result = tokio::time::timeout(
@@ -899,15 +906,25 @@ impl SlashCommandDeadline {
         }
     }
 
-    fn timeout_message(self) -> String {
+    fn timeout_message(self, command_label: Option<&str>) -> String {
         match self.kind {
             SlashCommandDeadlineKind::ReadOnly => {
                 format!("slash command timed out after {:?}", self.timeout)
             }
-            SlashCommandDeadlineKind::Mutating => format!(
-                "slash command outcome unknown after {:?}; the backend may still have applied the mutation. Run /resync before retrying.",
-                self.timeout
-            ),
+            SlashCommandDeadlineKind::Mutating => {
+                let command = command_label
+                    .map(|command| {
+                        format!(
+                            " for `{}`",
+                            sanitize_terminal_text(command).replace('`', "'")
+                        )
+                    })
+                    .unwrap_or_default();
+                format!(
+                    "slash command outcome unknown{command} after {:?}; the backend may still have applied the mutation. Run /resync to inspect state, or /resync --force to clear this fence after manual reconciliation.",
+                    self.timeout
+                )
+            }
         }
     }
 }
@@ -915,6 +932,7 @@ impl SlashCommandDeadline {
 async fn run_worker_command_with_deadline<F>(
     worker_sink: &StreamSink,
     deadline: SlashCommandDeadline,
+    command_label: Option<&str>,
     command: F,
 ) where
     F: Future<Output = ()>,
@@ -923,7 +941,7 @@ async fn run_worker_command_with_deadline<F>(
         .await
         .is_err()
     {
-        send_worker_finished(worker_sink, Err(deadline.timeout_message())).await;
+        send_worker_finished(worker_sink, Err(deadline.timeout_message(command_label))).await;
     }
 }
 
@@ -2057,6 +2075,8 @@ fn run_blocking(
         beep_on_error,
     );
     status_state.workspace_id = workspace_id;
+    status_state.mutation_fence =
+        load_persisted_mutation_fence_for_status(&status_state).map(|fence| fence.reason);
     let initial_status_line = build_status_line(w, h, &status_state);
     tapp.set_status_line(initial_status_line);
 
@@ -2323,6 +2343,9 @@ fn refresh_status_line(
                 state.workspace = ws.config.name.clone();
                 state.workspace_id = ws.config.id.clone();
                 state.clear_usage();
+                state.mutation_fence =
+                    load_persisted_mutation_fence_for_status(state).map(|fence| fence.reason);
+                state.resync_in_flight = false;
             }
         }
     }
@@ -2566,6 +2589,11 @@ fn run_event_loop(
                 }
                 if response_in_flight {
                     note_response_busy(status_state);
+                    continue;
+                }
+                if is_resync_force_command(&submitted) {
+                    force_clear_mutation_fence(status_state, &chat_lines);
+                    input_line.borrow_mut().set_text(String::new());
                     continue;
                 }
                 if is_resync_command(&submitted) {
@@ -2846,7 +2874,7 @@ fn drain_stream_events(
                             saw_error = true;
                             if let Err(message) = result {
                                 if mutation_timeout_requires_fence(message) {
-                                    status_state.mutation_fence = Some(message.clone());
+                                    set_local_and_persisted_mutation_fence(status_state, message);
                                     status_state.set_toast(MUTATION_FENCE_TOAST);
                                 } else if was_resync {
                                     status_state
@@ -2854,8 +2882,13 @@ fn drain_stream_events(
                                 }
                             }
                         } else if was_resync {
-                            status_state.mutation_fence = None;
-                            status_state.set_toast("Resync complete: commands re-enabled");
+                            if status_state.mutation_fence.is_some() {
+                                status_state.set_toast(
+                                    "Resync complete: fence remains until /resync --force",
+                                );
+                            } else {
+                                status_state.set_toast("Resync complete");
+                            }
                         }
                         status_state.resync_in_flight = false;
                         status_state.end_turn();
@@ -2910,7 +2943,7 @@ fn note_mutation_fence(status_state: &mut StatusState, chat_lines: &Rc<RefCell<V
         .as_deref()
         .unwrap_or("a mutating slash command timed out with unknown backend outcome");
     chat_lines.borrow_mut().push(format!(
-        "[blocked] mutation outcome is unknown; run /resync before submitting more commands. Last status: {detail}"
+        "[blocked] mutation outcome is unknown; run /resync to inspect state, or /resync --force after manual reconciliation. Last status: {detail}"
     ));
     chat_lines.borrow_mut().push(String::new());
 }
@@ -3438,11 +3471,95 @@ fn is_resync_command(input: &str) -> bool {
     tokens.len() == 1 && matches!(tokens[0].as_str(), "/resync" | "/sync")
 }
 
+fn is_resync_force_command(input: &str) -> bool {
+    let Ok(tokens) = tokenize_slash_command(input) else {
+        return false;
+    };
+    tokens.len() == 2
+        && matches!(tokens[0].as_str(), "/resync" | "/sync")
+        && matches!(tokens[1].as_str(), "--force" | "force")
+}
+
 fn mutation_fence_allows_input(input: &str) -> bool {
     let Ok(tokens) = tokenize_slash_command(input) else {
         return false;
     };
-    tokens.len() == 1 && matches!(tokens[0].as_str(), "/help" | "/resync" | "/sync")
+    (tokens.len() == 1 && matches!(tokens[0].as_str(), "/help" | "/resync" | "/sync"))
+        || (tokens.len() == 2
+            && matches!(tokens[0].as_str(), "/resync" | "/sync")
+            && matches!(tokens[1].as_str(), "--force" | "force"))
+}
+
+fn mutation_fence_workspace_key(workspace: &str, workspace_id: Option<&str>) -> String {
+    match workspace_id {
+        Some(id) if !id.trim().is_empty() => format!("id:{}", id.trim()),
+        _ => format!("name:{workspace}"),
+    }
+}
+
+fn mutation_fence_key_for_status(status_state: &StatusState) -> String {
+    mutation_fence_workspace_key(
+        &status_state.workspace,
+        status_state.workspace_id.as_deref(),
+    )
+}
+
+fn load_persisted_mutation_fence_for_status(
+    status_state: &StatusState,
+) -> Option<delighters::MutationFenceState> {
+    let key = mutation_fence_key_for_status(status_state);
+    delighters::mutation_fence_for_workspace(&key)
+}
+
+fn set_local_and_persisted_mutation_fence(status_state: &mut StatusState, reason: &str) {
+    let key = mutation_fence_key_for_status(status_state);
+    let fence = delighters::MutationFenceState {
+        command: mutation_fence_command_from_reason(reason),
+        reason: reason.to_string(),
+        created_at_unix: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0),
+    };
+    if let Err(e) = delighters::set_mutation_fence_for_workspace(&key, fence) {
+        status_state.mutation_fence = Some(format!("{reason}; failed to persist fence: {e}"));
+    } else {
+        status_state.mutation_fence = Some(reason.to_string());
+    }
+}
+
+fn mutation_fence_command_from_reason(reason: &str) -> String {
+    let Some(start) = reason.find(" for `") else {
+        return String::new();
+    };
+    let rest = &reason[start + " for `".len()..];
+    let Some(end) = rest.find('`') else {
+        return String::new();
+    };
+    rest[..end].to_string()
+}
+
+fn force_clear_mutation_fence(
+    status_state: &mut StatusState,
+    chat_lines: &Rc<RefCell<Vec<String>>>,
+) {
+    let key = mutation_fence_key_for_status(status_state);
+    match delighters::clear_mutation_fence_for_workspace(&key) {
+        Ok(_) => {
+            status_state.mutation_fence = None;
+            status_state.set_toast("Mutation fence cleared");
+            chat_lines
+                .borrow_mut()
+                .push("[sync] mutation fence cleared by explicit /resync --force".to_string());
+        }
+        Err(e) => {
+            status_state.set_toast("Mutation fence clear failed");
+            chat_lines
+                .borrow_mut()
+                .push(format!("[error] could not clear mutation fence: {e}"));
+        }
+    }
+    chat_lines.borrow_mut().push(String::new());
 }
 
 fn append_prompt_placeholder(label: &str, chat_lines: &Rc<RefCell<Vec<String>>>) {
@@ -4829,6 +4946,7 @@ mod tests {
         run_worker_command_with_deadline(
             &sink,
             SlashCommandDeadline::read_only(Duration::from_millis(1)),
+            Some("/help"),
             std::future::pending::<()>(),
         )
         .await;
@@ -4848,10 +4966,15 @@ mod tests {
         run_worker_command_with_deadline(
             &sink,
             SlashCommandDeadline::mutating(Duration::from_millis(1)),
+            Some("/memory post hello"),
             std::future::pending::<()>(),
         )
         .await;
 
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
         let mut state = StatusState::new(
             "default".to_string(),
             "gpt-test".to_string(),
@@ -4876,9 +4999,19 @@ mod tests {
         assert!(!response_in_flight);
         assert!(state.turn_start.is_none());
         assert!(state.mutation_fence.is_some());
+        let key = mutation_fence_key_for_status(&state);
+        assert!(delighters::mutation_fence_for_workspace(&key)
+            .unwrap()
+            .reason
+            .contains("/memory post hello"));
         let rendered = lines.borrow().join("\n");
         assert!(rendered.contains("outcome unknown"));
-        assert!(rendered.contains("Run /resync before retrying"));
+        assert!(rendered.contains("/resync --force"));
+
+        match old_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
     }
 
     #[test]
@@ -4886,6 +5019,8 @@ mod tests {
         assert!(mutation_fence_allows_input("/help"));
         assert!(mutation_fence_allows_input("/resync"));
         assert!(mutation_fence_allows_input("/sync"));
+        assert!(mutation_fence_allows_input("/resync --force"));
+        assert!(mutation_fence_allows_input("/sync force"));
 
         assert!(!mutation_fence_allows_input("hello"));
         assert!(!mutation_fence_allows_input("/session list"));
@@ -4893,7 +5028,7 @@ mod tests {
     }
 
     #[test]
-    fn resync_finished_clears_mutation_fence() {
+    fn resync_finished_keeps_mutation_fence_until_force() {
         let mut state = StatusState::new(
             "default".to_string(),
             "gpt-test".to_string(),
@@ -4920,12 +5055,59 @@ mod tests {
         ));
 
         assert!(!response_in_flight);
-        assert!(state.mutation_fence.is_none());
+        assert!(state.mutation_fence.is_some());
         assert!(!state.resync_in_flight);
         assert_eq!(
             state.toast.as_ref().map(|(message, _)| message.as_str()),
-            Some("Resync complete: commands re-enabled")
+            Some("Resync complete: fence remains until /resync --force")
         );
+    }
+
+    #[test]
+    fn mutation_fence_workspace_key_prefers_stable_id() {
+        assert_eq!(
+            mutation_fence_workspace_key("prod", Some(" ws-123 ")),
+            "id:ws-123"
+        );
+        assert_eq!(mutation_fence_workspace_key("prod", None), "name:prod");
+    }
+
+    #[test]
+    fn force_clear_mutation_fence_removes_persisted_marker() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+        let mut state = StatusState::new(
+            "prod".to_string(),
+            "gpt-test".to_string(),
+            "borland".to_string(),
+            false,
+        );
+        state.workspace_id = Some("ws-123".to_string());
+        state.mutation_fence = Some("slash command outcome unknown".to_string());
+        let key = mutation_fence_key_for_status(&state);
+        delighters::set_mutation_fence_for_workspace(
+            &key,
+            delighters::MutationFenceState {
+                command: "/cron add".to_string(),
+                reason: "slash command outcome unknown".to_string(),
+                created_at_unix: 1,
+            },
+        )
+        .unwrap();
+        let lines = Rc::new(RefCell::new(Vec::new()));
+
+        force_clear_mutation_fence(&mut state, &lines);
+
+        assert!(state.mutation_fence.is_none());
+        assert!(delighters::mutation_fence_for_workspace(&key).is_none());
+        assert!(lines.borrow().join("\n").contains("/resync --force"));
+
+        match old_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
     }
 
     #[test]

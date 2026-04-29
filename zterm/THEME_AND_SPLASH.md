@@ -11,10 +11,11 @@
 > deterministic local connect-splash text at
 > `~/.zterm/cache/connect-splash/`, and `~/.zterm/state.toml` for
 > launch count plus `beep_on_error`. State writes use a bounded
-> lock wait, and the TV path exposes `/resync` after timed-out
-> mutating slash commands. v0.3.1 does not call a backend or LLM to
-> generate connect-splash text; a daemon-backed scratch generation
-> path is deferred until it can run outside user chat sessions.
+> lock wait, and the TV path persists a mutation fence after
+> timed-out mutating slash commands until `/resync --force`.
+> v0.3.1 does not call a backend or LLM to generate connect-splash
+> text; a daemon-backed scratch generation path is deferred until it
+> can run outside user chat sessions.
 
 ---
 
