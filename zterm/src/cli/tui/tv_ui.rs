@@ -2320,6 +2320,10 @@ fn run_event_loop(
         if event.what == EventType::Keyboard && event.key_code == KB_ENTER {
             let submitted = input_data.borrow().clone();
             if !submitted.is_empty() {
+                if quit_is_blocked_by_inflight_turn(response_in_flight) {
+                    note_response_busy(status_state);
+                    continue;
+                }
                 if is_exit_command(&submitted) {
                     append_prompt_placeholder(&submitted, &chat_lines);
                     input_line.borrow_mut().set_text(String::new());
@@ -2625,6 +2629,10 @@ fn note_response_busy(status_state: &mut StatusState) {
     status_state.set_toast(RESPONSE_BUSY_TOAST);
 }
 
+fn quit_is_blocked_by_inflight_turn(response_in_flight: bool) -> bool {
+    response_in_flight
+}
+
 #[allow(clippy::too_many_arguments)]
 fn dispatch_worker_backed_submission(
     label: &str,
@@ -2733,7 +2741,11 @@ fn handle_command(
 ) {
     match command {
         CM_QUIT => {
-            app.running = false;
+            if quit_is_blocked_by_inflight_turn(*response_in_flight) {
+                note_response_busy(status_state);
+            } else {
+                app.running = false;
+            }
         }
         // Ctrl-P: cycle to the next palette preset, apply it
         // live, persist to ~/.zterm/theme.toml, and post a
@@ -4669,6 +4681,12 @@ mod tests {
         assert!(is_exit_command(" /exit"));
         assert!(!is_exit_command("/exitnow"));
         assert!(!is_exit_command("hello /exit"));
+    }
+
+    #[test]
+    fn quit_paths_are_blocked_while_turn_is_in_flight() {
+        assert!(quit_is_blocked_by_inflight_turn(true));
+        assert!(!quit_is_blocked_by_inflight_turn(false));
     }
 
     #[test]
