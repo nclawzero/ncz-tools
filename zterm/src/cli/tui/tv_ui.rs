@@ -4571,13 +4571,22 @@ fn force_clear_mutation_fence(
     chat_lines: &Rc<RefCell<Vec<String>>>,
 ) {
     let key = mutation_fence_key_for_status(status_state);
-    match delighters::clear_mutation_fence_for_workspace(&key) {
-        Ok(_) => {
+    match delighters::force_clear_mutation_fence_for_workspace(&key) {
+        Ok(result) => {
             status_state.mutation_fence = None;
-            status_state.set_toast("Mutation fence cleared");
-            chat_lines
-                .borrow_mut()
-                .push("[sync] mutation fence cleared by explicit /resync --force".to_string());
+            if let Some(path) = result.quarantined_state_path {
+                status_state.set_toast("Mutation state reset");
+                chat_lines.borrow_mut().push(format!(
+                    "[sync] unreadable zterm state moved to {}; mutation fence cleared by explicit /resync --force",
+                    path.display()
+                ));
+            } else {
+                status_state.set_toast("Mutation fence cleared");
+                chat_lines.borrow_mut().push(format!(
+                    "[sync] mutation fence cleared by explicit /resync --force ({} tracked fences remain)",
+                    result.state.mutation_fences.len()
+                ));
+            }
         }
         Err(e) => {
             status_state.set_toast("Mutation fence clear failed");
@@ -7503,6 +7512,49 @@ mod tests {
             .unwrap()
             .is_none());
         assert!(lines.borrow().join("\n").contains("/resync --force"));
+
+        match old_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    #[test]
+    fn force_clear_mutation_fence_recovers_after_corrupt_startup_state() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+        let zterm_dir = home.path().join(".zterm");
+        std::fs::create_dir_all(&zterm_dir).unwrap();
+        let state_path = zterm_dir.join("state.toml");
+        std::fs::write(&state_path, "launches = ???\nmutation_fences = {}\n").unwrap();
+        let mut state = StatusState::new(
+            "prod".to_string(),
+            "gpt-test".to_string(),
+            "borland".to_string(),
+            false,
+        );
+        state.workspace_id = Some("ws-123".to_string());
+        state.mutation_fence =
+            load_persisted_mutation_fence_for_status(&state).map(|fence| fence.reason);
+        let lines = Rc::new(RefCell::new(Vec::new()));
+
+        assert!(state
+            .mutation_fence
+            .as_deref()
+            .unwrap()
+            .contains("could not read zterm mutation-fence state"));
+        force_clear_mutation_fence(&mut state, &lines);
+
+        assert!(state.mutation_fence.is_none());
+        assert!(delighters::load_state_checked(&state_path)
+            .unwrap()
+            .mutation_fences
+            .is_empty());
+        let line_output = lines.borrow().join("\n");
+        assert!(line_output.contains("unreadable zterm state moved to"));
+        assert!(line_output.contains("state.toml.corrupt."));
 
         match old_home {
             Some(home) => std::env::set_var("HOME", home),

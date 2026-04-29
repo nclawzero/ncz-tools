@@ -49,6 +49,12 @@ pub struct MutationFenceState {
     pub dispatch_id: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct ForceClearMutationFenceResult {
+    pub state: ZtermState,
+    pub quarantined_state_path: Option<PathBuf>,
+}
+
 pub fn new_mutation_fence_dispatch_id() -> String {
     let seq = MUTATION_FENCE_DISPATCH_SEQ.fetch_add(1, Ordering::Relaxed);
     let now = SystemTime::now()
@@ -591,6 +597,66 @@ pub fn clear_mutation_fence_for_workspace_at(
     })
 }
 
+pub fn force_clear_mutation_fence_for_workspace(
+    workspace_key: &str,
+) -> std::io::Result<ForceClearMutationFenceResult> {
+    let Some(path) = default_state_path() else {
+        return Err(std::io::Error::other(
+            "no home directory; cannot persist zterm mutation fence",
+        ));
+    };
+    force_clear_mutation_fence_for_workspace_at(&path, workspace_key)
+}
+
+pub fn force_clear_mutation_fence_for_workspace_at(
+    path: &Path,
+    workspace_key: &str,
+) -> std::io::Result<ForceClearMutationFenceResult> {
+    with_state_lock(path, || match load_state_unlocked(path) {
+        Ok(mut state) => {
+            state.mutation_fences.remove(workspace_key);
+            save_state_unlocked(path, &state)?;
+            Ok(ForceClearMutationFenceResult {
+                state,
+                quarantined_state_path: None,
+            })
+        }
+        Err(load_err) => {
+            let quarantined_state_path = quarantine_unreadable_state_file(path, &load_err)?;
+            let state = ZtermState::default();
+            save_state_unlocked(path, &state)?;
+            Ok(ForceClearMutationFenceResult {
+                state,
+                quarantined_state_path: Some(quarantined_state_path),
+            })
+        }
+    })
+}
+
+fn quarantine_unreadable_state_file(path: &Path, load_err: &io::Error) -> io::Result<PathBuf> {
+    if let Some(parent) = path.parent() {
+        create_private_state_dir(parent)?;
+    }
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let filename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("state.toml");
+    let quarantine_path = parent.join(format!("{filename}.corrupt.{}", uuid::Uuid::new_v4()));
+    fs::rename(path, &quarantine_path).map_err(|rename_err| {
+        io::Error::new(
+            rename_err.kind(),
+            format!(
+                "could not quarantine unreadable zterm state {} after load failed: {load_err}; rename failed: {rename_err}",
+                path.display()
+            ),
+        )
+    })?;
+    harden_private_state_file(&quarantine_path)?;
+    sync_state_parent_dir(parent)?;
+    Ok(quarantine_path)
+}
+
 pub fn clear_mutation_fence_for_workspace_if_dispatch(
     workspace_key: &str,
     dispatch_id: &str,
@@ -1023,7 +1089,7 @@ mod tests {
     }
 
     #[test]
-    fn force_clear_malformed_state_fails_closed_without_rewrite() {
+    fn regular_clear_malformed_state_fails_closed_without_rewrite() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("state.toml");
         fs::write(&path, "launches = ???\nmutation_fences = {}\n").unwrap();
@@ -1042,6 +1108,33 @@ mod tests {
         assert!(!quarantined);
         let raw = fs::read_to_string(&path).unwrap();
         assert!(raw.contains("launches = ???"));
+    }
+
+    #[test]
+    fn force_clear_malformed_state_quarantines_and_rewrites() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("state.toml");
+        fs::write(&path, "launches = ???\nmutation_fences = {}\n").unwrap();
+
+        let result = force_clear_mutation_fence_for_workspace_at(&path, "id:prod").unwrap();
+
+        assert!(result.state.mutation_fences.is_empty());
+        let quarantine_path = result.quarantined_state_path.unwrap();
+        assert!(quarantine_path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("state.toml.corrupt."));
+        assert!(fs::read_to_string(&quarantine_path)
+            .unwrap()
+            .contains("launches = ???"));
+        let recovered = load_state_checked(&path).unwrap();
+        assert_eq!(recovered.launches, 0);
+        assert!(!recovered.beep_on_error);
+        assert!(recovered.mutation_fences.is_empty());
+        assert!(mutation_fence_for_workspace_at(&path, "id:prod")
+            .unwrap()
+            .is_none());
     }
 
     #[test]
