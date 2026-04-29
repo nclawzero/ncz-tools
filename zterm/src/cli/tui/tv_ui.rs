@@ -16,10 +16,11 @@
 //! the E-slice sequence.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{hash_map::DefaultHasher, HashMap, VecDeque};
 use std::error::Error as StdError;
 use std::fmt;
 use std::future::Future;
+use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -1013,7 +1014,7 @@ impl SlashCommandDeadline {
                     .map(|command| {
                         format!(
                             " for `{}`",
-                            sanitize_terminal_text(command).replace('`', "'")
+                            mutation_fence_command_descriptor(command).replace('`', "'")
                         )
                     })
                     .unwrap_or_default();
@@ -1740,6 +1741,18 @@ async fn generate_connect_splash_with_named_session_timeout(
     {
         Ok(result) => result,
         Err(_) => {
+            if owned_session {
+                cleanup_owned_connect_splash_session_after_submit_timeout(
+                    client,
+                    &session.id,
+                    timeout,
+                )
+                .await?;
+                anyhow::bail!(
+                    "connect-splash scratch session `{}` turn timed out after submit; scratch session cleaned up; backend outcome unknown",
+                    session.id
+                );
+            }
             return Err(ConnectSplashCleanupFailure::new(format!(
                 "connect-splash scratch session `{}` turn timed out after submit; backend outcome unknown",
                 session.id
@@ -1782,6 +1795,30 @@ async fn generate_connect_splash_with_named_session_timeout(
         anyhow::bail!("connect-splash generation returned empty output");
     }
     Ok(normalized)
+}
+
+async fn cleanup_owned_connect_splash_session_after_submit_timeout(
+    client: &mut (dyn AgentClient + Send + Sync),
+    session_id: &str,
+    timeout: Duration,
+) -> Result<()> {
+    match tokio::time::timeout(timeout, client.delete_session(session_id)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) if session_not_found_error(&e) => {
+            warn!(
+                "connect-splash scratch session `{session_id}` was not found during cleanup after submit timeout: {e}"
+            );
+            Ok(())
+        }
+        Ok(Err(e)) => Err(ConnectSplashCleanupFailure::new(format!(
+            "connect-splash scratch session `{session_id}` cleanup failed after submit timeout: {e}"
+        ))
+        .into()),
+        Err(_) => Err(ConnectSplashCleanupFailure::new(format!(
+            "connect-splash scratch session `{session_id}` cleanup timed out after submit timeout"
+        ))
+        .into()),
+    }
 }
 
 fn connect_splash_generation_failed(generated: &anyhow::Result<String>) -> bool {
@@ -4460,6 +4497,40 @@ fn mutation_fence_state_for_command(command: &str, reason: &str) -> delighters::
     mutation_fence_state_for_command_with_dispatch(command, reason, "")
 }
 
+fn mutation_fence_command_descriptor(cmdline: &str) -> String {
+    let tokens = tokenize_slash_command(cmdline)
+        .unwrap_or_else(|_| cmdline.split_whitespace().map(str::to_string).collect());
+    let Some(command) = tokens.first() else {
+        return String::new();
+    };
+
+    let command = sanitize_terminal_text(command).replace('`', "'");
+    let mut descriptor = command.clone();
+    let args_start = match command.as_str() {
+        "/clear" | "/save" => 1,
+        _ => match tokens.get(1) {
+            Some(subcommand) => {
+                descriptor.push(' ');
+                descriptor.push_str(&sanitize_terminal_text(subcommand).replace('`', "'"));
+                2
+            }
+            None => 1,
+        },
+    };
+
+    if tokens.len() > args_start {
+        descriptor.push_str(" args#");
+        descriptor.push_str(&mutation_fence_args_hash(&tokens[args_start..]));
+    }
+    descriptor
+}
+
+fn mutation_fence_args_hash(args: &[String]) -> String {
+    let mut hasher = DefaultHasher::new();
+    args.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
 fn mutation_fence_state_for_command_with_dispatch(
     command: &str,
     reason: &str,
@@ -4474,9 +4545,9 @@ fn mutation_fence_state_for_command_with_dispatch(
 }
 
 fn write_ahead_mutation_fence_reason(cmdline: &str) -> String {
+    let descriptor = mutation_fence_command_descriptor(cmdline);
     format!(
-        "mutating slash command dispatched for `{}`; backend outcome is pending. Run /resync to inspect state, or /resync --force to clear this fence after manual reconciliation.",
-        sanitize_terminal_text(cmdline).replace('`', "'")
+        "mutating slash command `{descriptor}` dispatched; backend outcome is pending. Run /resync to inspect state, or /resync --force to clear this fence after manual reconciliation."
     )
 }
 
@@ -4487,7 +4558,8 @@ fn write_ahead_mutation_fence_for_dispatch(
     let key = mutation_fence_key_for_command(status_state, cmdline);
     let reason = write_ahead_mutation_fence_reason(cmdline);
     let dispatch_id = delighters::new_mutation_fence_dispatch_id();
-    let fence = mutation_fence_state_for_command_with_dispatch(cmdline, &reason, &dispatch_id);
+    let command = mutation_fence_command_descriptor(cmdline);
+    let fence = mutation_fence_state_for_command_with_dispatch(&command, &reason, &dispatch_id);
     match delighters::acquire_mutation_fence_for_workspace(&key, fence.clone())? {
         Ok(_) => {
             status_state.mutation_fence = Some(fence.reason);
@@ -4593,17 +4665,18 @@ fn set_local_and_persisted_mutation_fence_replacing(
     reason: &str,
     old_owner: Option<&MutationFenceOwner>,
 ) {
+    let safe_reason = mutation_fence_redacted_reason(reason);
     let key = match old_owner {
         Some(owner) if owner.key == crate::cli::tui::GLOBAL_MEMORY_MUTATION_FENCE_KEY => {
             owner.key.clone()
         }
         _ => mutation_fence_key_for_status(status_state),
     };
-    let command = mutation_fence_command_from_reason(reason);
+    let command = mutation_fence_command_from_reason(&safe_reason);
     let dispatch_id = old_owner
         .map(|owner| owner.dispatch_id.as_str())
         .unwrap_or_default();
-    let fence = mutation_fence_state_for_command_with_dispatch(&command, reason, dispatch_id);
+    let fence = mutation_fence_state_for_command_with_dispatch(&command, &safe_reason, dispatch_id);
     let result = match old_owner {
         Some(owner) => delighters::replace_mutation_fence_for_workspace_if_dispatch(
             &owner.key,
@@ -4619,7 +4692,7 @@ fn set_local_and_persisted_mutation_fence_replacing(
         Ok(false) => {
             status_state.mutation_fence = Some(cap_sanitized_text(
                 &format!(
-                    "{reason}; failed to persist fence: durable write-ahead fence is no longer owned by this dispatch"
+                    "{safe_reason}; failed to persist fence: durable write-ahead fence is no longer owned by this dispatch"
                 ),
                 MUTATION_FENCE_REASON_MAX_CHARS,
             ));
@@ -4627,12 +4700,25 @@ fn set_local_and_persisted_mutation_fence_replacing(
         }
         Err(e) => {
             status_state.mutation_fence = Some(cap_sanitized_text(
-                &format!("{reason}; failed to persist fence: {e}"),
+                &format!("{safe_reason}; failed to persist fence: {e}"),
                 MUTATION_FENCE_REASON_MAX_CHARS,
             ));
             status_state.set_toast(MUTATION_FENCE_TOAST);
         }
     }
+}
+
+fn mutation_fence_redacted_reason(reason: &str) -> String {
+    let raw_command = mutation_fence_command_from_reason(reason);
+    if raw_command.is_empty() {
+        return reason.to_string();
+    }
+    let raw_command = raw_command.lines().next().unwrap_or_default().to_string();
+    let descriptor = mutation_fence_command_descriptor(&raw_command);
+    if descriptor.is_empty() || descriptor == raw_command {
+        return reason.to_string();
+    }
+    reason.replacen(&format!("`{raw_command}`"), &format!("`{descriptor}`"), 1)
 }
 
 fn mutation_fence_command_from_reason(reason: &str) -> String {
@@ -6482,7 +6568,7 @@ mod tests {
     }
 
     #[test]
-    fn connect_splash_submit_timeout_does_not_delete_unknown_backend_turn() {
+    fn connect_splash_submit_timeout_cleans_up_owned_scratch_session() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
             let created = Arc::new(StdMutex::new(Vec::new()));
@@ -6515,14 +6601,56 @@ mod tests {
             .await
             .unwrap_err();
 
-            assert!(is_connect_splash_cleanup_failure(&err));
+            assert!(!is_connect_splash_cleanup_failure(&err));
             assert!(err.to_string().contains("backend outcome unknown"));
+            assert!(err.to_string().contains("scratch session cleaned up"));
             assert_eq!(created.lock().unwrap().len(), 1);
             assert_eq!(submitted.lock().unwrap().len(), 1);
-            assert!(
-                deleted.lock().unwrap().is_empty(),
-                "timed-out submitted splash turns must not be treated as safe to delete"
-            );
+            assert_eq!(deleted.lock().unwrap().len(), 1);
+        });
+    }
+
+    #[test]
+    fn connect_splash_submit_timeout_cleanup_failure_surfaces() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let created = Arc::new(StdMutex::new(Vec::new()));
+            let deleted = Arc::new(StdMutex::new(Vec::new()));
+            let submitted = Arc::new(StdMutex::new(Vec::new()));
+            let mut fake = WorkerSessionFakeClient {
+                listed_sessions: Vec::new(),
+                list_sessions_error: None,
+                loadable_sessions: Vec::new(),
+                load_reject_ids: Vec::new(),
+                created: Arc::clone(&created),
+                deleted: Arc::clone(&deleted),
+                submitted: Arc::clone(&submitted),
+                list_calls: Arc::new(StdMutex::new(0)),
+                load_calls: Arc::new(StdMutex::new(Vec::new())),
+                submit_response: "SHOULD NOT BE USED".to_string(),
+                submit_error: None,
+                submit_never: true,
+                cancellation_safe: true,
+                sink_set_states: Arc::new(StdMutex::new(Vec::new())),
+                delete_error: Some("delete failed".to_string()),
+            };
+
+            let err = generate_connect_splash_with_named_session_timeout(
+                &mut fake,
+                "alpha",
+                "zterm connect splash alpha timeout cleanup",
+                Duration::from_millis(1),
+            )
+            .await
+            .unwrap_err();
+
+            assert!(is_connect_splash_cleanup_failure(&err));
+            assert!(err
+                .to_string()
+                .contains("cleanup failed after submit timeout"));
+            assert_eq!(created.lock().unwrap().len(), 1);
+            assert_eq!(submitted.lock().unwrap().len(), 1);
+            assert_eq!(deleted.lock().unwrap().len(), 1);
         });
     }
 
@@ -7228,7 +7356,7 @@ mod tests {
             .unwrap()
             .unwrap()
             .reason
-            .contains("/memory post hello"));
+            .contains("/memory post args#"));
         let rendered = lines.borrow().join("\n");
         assert!(rendered.contains("outcome unknown"));
         assert!(rendered.contains("/resync --force"));
@@ -7485,6 +7613,59 @@ mod tests {
     }
 
     #[test]
+    fn mutation_fence_descriptors_redact_secret_like_arguments() {
+        let memory =
+            mutation_fence_command_descriptor("/memory post api_key=sk-secret remember this");
+        assert!(memory.starts_with("/memory post args#"));
+        assert!(!memory.contains("sk-secret"));
+        assert!(!memory.contains("remember this"));
+
+        let cron = mutation_fence_command_descriptor(
+            "/cron add '* * * * *' 'curl https://example.test?token=secret-token'",
+        );
+        assert!(cron.starts_with("/cron add args#"));
+        assert!(!cron.contains("secret-token"));
+        assert!(!cron.contains("curl"));
+    }
+
+    #[test]
+    fn write_ahead_fence_redacts_secret_like_mutation_arguments() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+
+        for cmdline in [
+            "/memory post api_key=sk-memory-secret remember this",
+            "/cron add '* * * * *' 'curl https://example.test?token=cron-secret'",
+        ] {
+            let mut state = StatusState::new(
+                "default".to_string(),
+                "gpt-test".to_string(),
+                "borland".to_string(),
+                false,
+            );
+            let owner = write_ahead_mutation_fence_for_dispatch(&mut state, cmdline).unwrap();
+            let persisted = delighters::mutation_fence_for_workspace(&owner.key)
+                .unwrap()
+                .unwrap();
+            let persisted_text = format!("{} {}", persisted.command, persisted.reason);
+
+            assert!(!persisted_text.contains("sk-memory-secret"));
+            assert!(!persisted_text.contains("cron-secret"));
+            assert!(!persisted_text.contains("remember this"));
+            assert!(!persisted_text.contains("curl https://example.test"));
+            assert!(persisted.command.contains("args#"));
+            delighters::force_clear_mutation_fence_for_workspace(&owner.key).unwrap();
+        }
+
+        match old_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    #[test]
     fn mutating_dispatch_writes_ahead_fence_before_enqueue() {
         let _env = crate::cli::test_env_lock().lock().unwrap();
         let home = tempfile::tempdir().unwrap();
@@ -7512,10 +7693,11 @@ mod tests {
             None,
             "dispatch",
         );
-        let persisted =
-            delighters::mutation_fence_for_workspace(&mutation_fence_key_for_status(&state))
-                .unwrap()
-                .unwrap();
+        let persisted = delighters::mutation_fence_for_workspace(
+            crate::cli::tui::GLOBAL_MEMORY_MUTATION_FENCE_KEY,
+        )
+        .unwrap()
+        .unwrap();
         let queued = rx.try_recv().unwrap();
 
         match old_home {
@@ -7527,7 +7709,9 @@ mod tests {
         assert!(response_in_flight);
         assert_eq!(state.mutation_fence, Some(persisted.reason.clone()));
         assert!(persisted.reason.contains("backend outcome is pending"));
-        assert_eq!(persisted.command, "/memory post hello");
+        assert!(persisted.command.starts_with("/memory post args#"));
+        assert!(!persisted.command.contains("hello"));
+        assert!(!persisted.reason.contains("hello"));
         assert!(!persisted.dispatch_id.is_empty());
         assert!(matches!(queued, WorkerRequest::Command(cmd) if cmd == "/memory post hello"));
     }
@@ -7770,7 +7954,8 @@ mod tests {
 
         assert!(source_after.is_none());
         assert!(target_after.reason.contains("outcome unknown"));
-        assert!(target_after.reason.contains("/workspace switch beta"));
+        assert!(target_after.reason.contains("/workspace switch args#"));
+        assert!(!target_after.reason.contains("switch beta"));
         assert_eq!(state.mutation_fence, Some(target_after.reason));
     }
 
@@ -7849,7 +8034,8 @@ mod tests {
         assert_eq!(state.workspace_id.as_deref(), Some("ws-beta"));
         assert!(source_after.is_none());
         assert!(target_after.reason.contains("outcome unknown"));
-        assert!(target_after.reason.contains("/workspace switch beta"));
+        assert!(target_after.reason.contains("/workspace switch args#"));
+        assert!(!target_after.reason.contains("switch beta"));
         assert_eq!(state.mutation_fence, Some(target_after.reason));
     }
 
@@ -8251,14 +8437,16 @@ mod tests {
         let fence = local_fence
             .as_deref()
             .expect("mutating disconnect should set a local fence");
-        assert!(fence.contains("/memory post hello"));
+        assert!(fence.contains("/memory post args#"));
+        assert!(!fence.contains("hello"));
         assert!(fence.contains("worker channel disconnected"));
         let persisted = persisted
             .unwrap()
             .expect("mutating disconnect should persist a fence");
-        assert!(persisted.reason.contains("/memory post hello"));
+        assert!(persisted.reason.contains("/memory post args#"));
+        assert!(!persisted.reason.contains("hello"));
         assert!(persisted.reason.contains("worker channel disconnected"));
-        assert_eq!(persisted.command, "/memory post hello");
+        assert!(persisted.command.starts_with("/memory post args#"));
         assert!(rendered.contains("worker channel disconnected"));
         assert!(rendered.contains("/resync --force"));
     }
@@ -8292,7 +8480,8 @@ mod tests {
             Some(&mutating),
         )
         .expect("mutating terminal failure should produce a fence reason");
-        assert!(reason.contains("/workspace switch prod"));
+        assert!(reason.contains("/workspace switch args#"));
+        assert!(!reason.contains("prod"));
         assert!(reason.contains("worker channel disconnected"));
 
         let save = in_flight_request_for_worker_request(
@@ -8303,7 +8492,8 @@ mod tests {
         let reason =
             mutation_fence_reason_for_terminal_failure("failed to create export file", Some(&save))
                 .expect("save export failures should fence ambiguous filesystem state");
-        assert!(reason.contains("/save missing/parent.txt"));
+        assert!(reason.contains("/save args#"));
+        assert!(!reason.contains("missing/parent.txt"));
         assert!(reason.contains("failed to create export file"));
     }
 
