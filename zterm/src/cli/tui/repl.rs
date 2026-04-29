@@ -229,10 +229,19 @@ impl ReplLoop {
             && matches!(tokens.get(1).map(String::as_str), Some("--force" | "force"));
         if force {
             let key = self.current_mutation_fence_key().await?;
-            delighters::clear_mutation_fence_for_workspace(&key)?;
-            return Ok(Some(
-                "[sync] mutation fence cleared by explicit /resync --force\n".to_string(),
-            ));
+            let result = delighters::force_clear_mutation_fence_for_workspace(&key)?;
+            let message = if let Some(path) = result.quarantined_state_path {
+                format!(
+                    "[sync] unreadable zterm state moved to {}; mutation fence cleared by explicit /resync --force\n",
+                    path.display()
+                )
+            } else {
+                format!(
+                    "[sync] mutation fence cleared by explicit /resync --force ({} tracked fences remain)\n",
+                    result.state.mutation_fences.len()
+                )
+            };
+            return Ok(Some(message));
         }
         if tokens.len() > 1 {
             return Ok(Some("[error] usage: /resync [--force]\n".to_string()));
@@ -2031,6 +2040,73 @@ mod tests {
             assert!(delighters::mutation_fence_for_workspace("name:alpha")
                 .unwrap()
                 .is_some());
+            assert!(submitted.lock().unwrap().is_empty());
+        });
+
+        match old_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    #[test]
+    fn legacy_repl_force_resync_recovers_corrupt_state_file() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+        let zterm_dir = home.path().join(".zterm");
+        std::fs::create_dir_all(&zterm_dir).unwrap();
+        let state_path = zterm_dir.join("state.toml");
+        std::fs::write(&state_path, "launches = ???\nmutation_fences = {}\n").unwrap();
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let submitted = Arc::new(StdMutex::new(Vec::new()));
+            let deleted = Arc::new(StdMutex::new(Vec::new()));
+            let alpha = session("alpha-session", "chat");
+            let app = Arc::new(Mutex::new(App {
+                workspaces: vec![workspace(
+                    0,
+                    "alpha",
+                    vec![alpha.clone()],
+                    Arc::clone(&submitted),
+                    Arc::clone(&deleted),
+                )],
+                active: 0,
+                shared_mnemos: None,
+                config_path: PathBuf::from("test-config.toml"),
+            }));
+            let mut repl = ReplLoop::new(
+                Arc::clone(&app),
+                alpha,
+                "model".to_string(),
+                "provider".to_string(),
+            )
+            .unwrap();
+
+            let blocked = repl
+                .mutation_fence_block_output("hello agent")
+                .await
+                .unwrap();
+            assert!(blocked.contains("could not read zterm mutation-fence state"));
+
+            let cleared = repl
+                .handle_legacy_resync("/resync --force")
+                .await
+                .unwrap()
+                .unwrap();
+
+            assert!(cleared.contains("unreadable zterm state moved to"));
+            assert!(cleared.contains("state.toml.corrupt."));
+            assert!(delighters::load_state_checked(&state_path)
+                .unwrap()
+                .mutation_fences
+                .is_empty());
+            assert!(repl
+                .mutation_fence_block_output("hello agent")
+                .await
+                .is_none());
             assert!(submitted.lock().unwrap().is_empty());
         });
 
