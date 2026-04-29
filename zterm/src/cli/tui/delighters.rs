@@ -179,18 +179,99 @@ pub fn local_connect_splash(workspace: &str) -> String {
 }
 
 pub fn load_state(path: &Path) -> ZtermState {
-    let Ok(text) = std::fs::read_to_string(path) else {
+    load_state_unlocked(path)
+}
+
+fn load_state_unlocked(path: &Path) -> ZtermState {
+    let Ok(text) = fs::read_to_string(path) else {
         return ZtermState::default();
     };
     toml::from_str(&text).unwrap_or_default()
 }
 
-pub fn save_state(path: &Path, state: &ZtermState) -> std::io::Result<()> {
+pub fn save_state(path: &Path, state: &ZtermState) -> io::Result<()> {
+    with_state_lock(path, || save_state_unlocked(path, state))
+}
+
+fn save_state_unlocked(path: &Path, state: &ZtermState) -> io::Result<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        create_private_state_dir(parent)?;
     }
     let body = toml::to_string_pretty(state).map_err(std::io::Error::other)?;
-    std::fs::write(path, body)
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let filename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("state.toml");
+    let tmp_path = parent.join(format!(".{filename}.{}.tmp", uuid::Uuid::new_v4()));
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        opts.mode(0o600);
+    }
+    let mut file = opts.open(&tmp_path)?;
+    file.write_all(body.as_bytes())?;
+    drop(file);
+    if let Err(e) = fs::rename(&tmp_path, path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+    harden_private_state_file(path)
+}
+
+fn with_state_lock<T>(path: &Path, update: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
+    if let Some(parent) = path.parent() {
+        create_private_state_dir(parent)?;
+    }
+    let lock_path = state_lock_path(path);
+    let mut opts = fs::OpenOptions::new();
+    opts.read(true).write(true).create(true);
+    #[cfg(unix)]
+    {
+        opts.mode(0o600);
+    }
+    let lock_file = opts.open(&lock_path)?;
+    lock_file.lock()?;
+    let result = update();
+    let unlock_result = lock_file.unlock();
+    match result {
+        Ok(value) => unlock_result.map(|()| value),
+        Err(e) => Err(e),
+    }
+}
+
+fn state_lock_path(path: &Path) -> PathBuf {
+    let filename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("state.toml");
+    path.with_file_name(format!("{filename}.lock"))
+}
+
+fn create_private_state_dir(dir: &Path) -> io::Result<()> {
+    fs::create_dir_all(dir)?;
+    harden_private_state_dir(dir)
+}
+
+#[cfg(unix)]
+fn harden_private_state_dir(dir: &Path) -> io::Result<()> {
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
+}
+
+#[cfg(not(unix))]
+fn harden_private_state_dir(_dir: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn harden_private_state_file(path: &Path) -> io::Result<()> {
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+}
+
+#[cfg(not(unix))]
+fn harden_private_state_file(_path: &Path) -> io::Result<()> {
+    Ok(())
 }
 
 pub fn record_launch() -> std::io::Result<(u64, Option<String>)> {
@@ -203,11 +284,13 @@ pub fn record_launch() -> std::io::Result<(u64, Option<String>)> {
 }
 
 pub fn record_launch_at(path: &Path) -> std::io::Result<(u64, Option<String>)> {
-    let mut state = load_state(path);
-    state.launches = state.launches.saturating_add(1);
-    let launches = state.launches;
-    save_state(path, &state)?;
-    Ok((launches, welcome_quote_for_launch(launches)))
+    with_state_lock(path, || {
+        let mut state = load_state_unlocked(path);
+        state.launches = state.launches.saturating_add(1);
+        let launches = state.launches;
+        save_state_unlocked(path, &state)?;
+        Ok((launches, welcome_quote_for_launch(launches)))
+    })
 }
 
 pub fn set_beep_on_error(enabled: bool) -> std::io::Result<ZtermState> {
@@ -220,10 +303,12 @@ pub fn set_beep_on_error(enabled: bool) -> std::io::Result<ZtermState> {
 }
 
 pub fn set_beep_on_error_at(path: &Path, enabled: bool) -> std::io::Result<ZtermState> {
-    let mut state = load_state(path);
-    state.beep_on_error = enabled;
-    save_state(path, &state)?;
-    Ok(state)
+    with_state_lock(path, || {
+        let mut state = load_state_unlocked(path);
+        state.beep_on_error = enabled;
+        save_state_unlocked(path, &state)?;
+        Ok(state)
+    })
 }
 
 pub fn is_welcome_milestone(launches: u64) -> bool {
@@ -244,6 +329,8 @@ pub fn welcome_quote_for_launch(launches: u64) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
     use tempfile::tempdir;
 
     #[test]
@@ -344,6 +431,43 @@ mod tests {
         assert_eq!(state.launches, 1);
         assert!(state.beep_on_error);
         assert!(load_state(&path).beep_on_error);
+    }
+
+    #[test]
+    fn concurrent_state_updates_do_not_clobber_launches_or_beep() {
+        let dir = tempdir().unwrap();
+        let path = Arc::new(dir.path().join("state.toml"));
+        let barrier = Arc::new(Barrier::new(3));
+        let launches = 64;
+
+        let launch_path = Arc::clone(&path);
+        let launch_barrier = Arc::clone(&barrier);
+        let launch_thread = thread::spawn(move || {
+            launch_barrier.wait();
+            for _ in 0..launches {
+                record_launch_at(&launch_path).unwrap();
+                thread::yield_now();
+            }
+        });
+
+        let beep_path = Arc::clone(&path);
+        let beep_barrier = Arc::clone(&barrier);
+        let beep_thread = thread::spawn(move || {
+            beep_barrier.wait();
+            for idx in 0..launches {
+                set_beep_on_error_at(&beep_path, idx % 2 == 0).unwrap();
+                thread::yield_now();
+            }
+            set_beep_on_error_at(&beep_path, true).unwrap();
+        });
+
+        barrier.wait();
+        launch_thread.join().unwrap();
+        beep_thread.join().unwrap();
+
+        let state = load_state(&path);
+        assert_eq!(state.launches, launches);
+        assert!(state.beep_on_error);
     }
 
     #[test]

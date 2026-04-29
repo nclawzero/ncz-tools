@@ -1800,6 +1800,7 @@ namespace_aliases = ["backend=openclaw;workspace_id=ws_alpha"]
 
     #[test]
     fn resolved_token_prefers_env_var() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
         let cfg = WorkspaceConfig {
             id: None,
             name: "w".into(),
@@ -1997,6 +1998,7 @@ url = "ws://c"
 
     #[test]
     fn boot_or_synthesize_falls_back_when_config_missing() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
         // ZTERM_CONFIG_DIR pointed at a tempdir with no config.toml
         // means AppConfig::load returns an empty config, which
         // triggers the synthesize fallback path.
@@ -2015,6 +2017,7 @@ url = "ws://c"
 
     #[test]
     fn boot_or_synthesize_prefers_config_workspaces() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
         let tmp = tempfile::TempDir::new().unwrap();
         let cfg_path = tmp.path().join("config.toml");
         std::fs::write(
