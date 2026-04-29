@@ -164,8 +164,8 @@ impl WorkspaceConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AppConfig {
     /// Name of the workspace that should be active on boot.
-    /// If absent or doesn't match a defined workspace, the first
-    /// workspace in the list is used.
+    /// If absent, the first successfully-instantiated workspace is used.
+    /// If set, it must match a defined and instantiable workspace.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active: Option<String>,
 
@@ -1496,29 +1496,38 @@ pub struct App {
 impl App {
     /// Build an `App` from an `AppConfig`. Instantiates every
     /// workspace that can be instantiated in a pure-data manner;
-    /// logs (via tracing) and skips any that require async.
-    /// Honors `config.active` when resolvable; falls back to the
-    /// first successfully-instantiated workspace.
+    /// logs (via tracing) and skips inactive entries that require async.
+    /// Honors `config.active` when set; an unloadable active workspace
+    /// fails closed instead of silently selecting another workspace.
     pub fn from_config(cfg: AppConfig, config_path: PathBuf) -> Result<Self> {
         validate_zeroclaw_workspace_tokens(&cfg)?;
 
+        let configured_active = cfg.active.clone();
         let mut workspaces: Vec<Workspace> = Vec::new();
         for (idx, wc) in cfg.workspaces.into_iter().enumerate() {
             match Workspace::instantiate(workspaces.len(), wc.clone()) {
                 Ok(w) => workspaces.push(w),
-                Err(e) => tracing::warn!(
-                    "workspace '{}' (#{}) skipped at D1 instantiation: {e}",
-                    wc.name,
-                    idx
-                ),
+                Err(e) => {
+                    if configured_active.as_deref() == Some(wc.name.as_str()) {
+                        return Err(anyhow!(
+                            "active workspace '{}' failed to instantiate: {e}",
+                            wc.name
+                        ));
+                    }
+                    tracing::warn!(
+                        "workspace '{}' (#{}) skipped at D1 instantiation: {e}",
+                        wc.name,
+                        idx
+                    );
+                }
             }
         }
 
-        let active = match cfg.active {
+        let active = match configured_active {
             Some(name) => workspaces
                 .iter()
                 .position(|w| w.config.name == name)
-                .unwrap_or(0),
+                .ok_or_else(|| anyhow!("active workspace '{name}' could not be instantiated"))?,
             None => 0,
         };
 
@@ -2565,6 +2574,35 @@ url = "ws://nc"
         // But the openclaw workspace is not activated yet — activate()
         // runs async at a later stage.
         assert!(!app.active_workspace().unwrap().is_activated());
+    }
+
+    #[test]
+    fn app_from_config_rejects_unloadable_active_workspace() {
+        let cfg = AppConfig::parse(
+            r#"
+active = "nc"
+
+[[workspaces]]
+name = "z1"
+backend = "zeroclaw"
+url = "http://a"
+token = "t"
+
+[[workspaces]]
+name = "nc"
+backend = "nemoclaw"
+url = "ws://nc"
+"#,
+        )
+        .unwrap();
+
+        let err = match App::from_config(cfg, PathBuf::from("/dev/null")) {
+            Ok(_) => panic!("unloadable active workspace should fail closed"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("active workspace 'nc' failed to instantiate"));
+        assert!(msg.contains("nemoclaw backend is declared in config but not yet implemented"));
     }
 
     #[test]
