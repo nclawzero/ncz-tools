@@ -2,6 +2,7 @@ use anyhow::{anyhow, Result};
 use chrono::Utc;
 use std::fs;
 use std::future::Future;
+use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -144,10 +145,10 @@ impl CommandHandler {
 
             // Session Management (REPL-specific)
             "/clear" => self.handle_clear(session_id).await,
-            "/save" => {
-                self.handle_save(session_id, subcommand.map(|s| s.to_string()))
-                    .await
-            }
+            "/save" => match parse_save_filename(subcommand, args) {
+                Ok(filename) => self.handle_save(session_id, filename).await,
+                Err(message) => Ok(Some(message)),
+            },
             "/history" => self.handle_history().await,
             "/config" => self.handle_config().await,
             "/session" => self.handle_session(session_id, subcommand, args).await,
@@ -500,17 +501,55 @@ impl CommandHandler {
         let mut out = "\n🏥 System Diagnostics:\n".to_string();
         match subcommand {
             Some("models") => {
-                out.push_str("  Probing model connectivity...\n");
-                out.push_str("  • Groq: ✓\n");
-                out.push_str("  • OpenAI: ✓\n");
-                out.push_str("  • Configured providers: ✓\n");
+                let providers = match self.current_agent_client().await {
+                    Some(client) => client.lock().await.list_providers().await,
+                    None => Err(anyhow::anyhow!("no active backend client")),
+                };
+                match providers {
+                    Ok(providers) => {
+                        let model_label = match self.current_agent_client().await {
+                            Some(client) => client.lock().await.current_model_label(),
+                            None => "(no active backend client)".to_string(),
+                        };
+                        out.push_str(&format!(
+                            "  Provider catalog: [ok] {} provider(s) advertised\n",
+                            providers.len()
+                        ));
+                        out.push_str(&format!("  Active model key: [info] {model_label}\n"));
+                        out.push_str("  Provider connectivity: [unknown] not probed by v0.3.1\n");
+                    }
+                    Err(e) => out.push_str(&format!("  Provider catalog: [fail] {e}\n")),
+                }
             }
             Some("traces") => out.push_str("  Execution traces: (Phase 7+)\n"),
             _ => {
-                out.push_str("  Gateway: ✓ Running\n");
-                out.push_str("  Config: ✓ Valid\n");
-                out.push_str("  Memory: ✓ SQLite\n");
-                out.push_str("  Channels: ✓ Connected\n");
+                let health = match self.current_agent_client().await {
+                    Some(client) => client.lock().await.health().await,
+                    None => Err(anyhow::anyhow!("no active backend client")),
+                };
+                match health {
+                    Ok(true) => out.push_str("  Gateway: [ok] reachable\n"),
+                    Ok(false) => out.push_str("  Gateway: [fail] unhealthy\n"),
+                    Err(e) => out.push_str(&format!("  Gateway: [fail] {e}\n")),
+                }
+
+                let config = match self.current_agent_client().await {
+                    Some(client) => client.lock().await.get_config().await,
+                    None => Err(anyhow::anyhow!("no active backend client")),
+                };
+                match config {
+                    Ok(_) => out.push_str("  Config: [ok] backend returned config\n"),
+                    Err(e) => out.push_str(&format!("  Config: [fail] {e}\n")),
+                }
+
+                match self.current_mnemos().await {
+                    Some(mnemos) => match mnemos.stats().await {
+                        Ok(_) => out.push_str("  Memory: [ok] MNEMOS stats reachable\n"),
+                        Err(e) => out.push_str(&format!("  Memory: [fail] {e}\n")),
+                    },
+                    None => out.push_str("  Memory: [unknown] MNEMOS not configured\n"),
+                }
+                out.push_str("  Channels: [unknown] channel doctor not implemented in v0.3.1\n");
             }
         }
         out.push('\n');
@@ -1108,7 +1147,21 @@ impl CommandHandler {
         if let Some(scope) = self.current_storage_scope().await {
             if let Ok(history_path) = storage::scoped_session_history_file(&scope, session_id) {
                 if history_path.exists() {
-                    fs::copy(&history_path, &filename)?;
+                    let mut src = fs::File::open(&history_path)?;
+                    let mut dst = match fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&filename)
+                    {
+                        Ok(file) => file,
+                        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                            return Ok(Some(format!(
+                                "❌ Refusing to overwrite existing file: {filename}\n"
+                            )));
+                        }
+                        Err(e) => return Err(e.into()),
+                    };
+                    io::copy(&mut src, &mut dst)?;
                     return Ok(Some(format!("✓ Session saved to {filename}\n")));
                 } else {
                     return Ok(Some("No history to save\n".to_string()));
@@ -1577,6 +1630,21 @@ fn parse_single_cron_target<'a>(
         [_target, ..] => Err(format!(
             "{usage}\n❌ Cron job targets must be a single id token; extra tokens were not ignored.\n"
         )),
+    }
+}
+
+fn parse_save_filename(
+    filename: Option<&str>,
+    args: &[&str],
+) -> std::result::Result<Option<String>, String> {
+    match (filename, args) {
+        (None, []) => Ok(None),
+        (Some(name), []) if !name.is_empty() => Ok(Some(name.to_string())),
+        (Some(_), [_extra, ..]) => Err(
+            "Usage: /save [file]\n❌ Save path must be a single token; quote paths containing spaces.\n"
+                .to_string(),
+        ),
+        _ => Err("Usage: /save [file]\n".to_string()),
     }
 }
 
@@ -2261,6 +2329,19 @@ mod tests {
     }
 
     #[test]
+    fn save_parser_rejects_extra_path_tokens() {
+        assert_eq!(super::parse_save_filename(None, &[]).unwrap(), None);
+        assert_eq!(
+            super::parse_save_filename(Some("backup.txt"), &[]).unwrap(),
+            Some("backup.txt".to_string())
+        );
+
+        let err = super::parse_save_filename(Some("session"), &["backup.txt"]).unwrap_err();
+        assert!(err.contains("single token"));
+        assert!(err.contains("quote paths containing spaces"));
+    }
+
+    #[test]
     fn memory_list_formatter_is_structured_for_tui() {
         let memories = vec![serde_json::json!({
             "id": "memory-abcdef123456",
@@ -2643,6 +2724,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn doctor_reports_real_or_unknown_status_not_static_green_checks() {
+        let handler = super::CommandHandler::new(app_with_fake_client(FakeAgentClient::default()));
+
+        let out = handler.handle("/doctor", "s").await.unwrap().unwrap();
+        assert!(out.contains("Gateway: [ok]"));
+        assert!(out.contains("Config: [ok]"));
+        assert!(out.contains("Memory: [unknown]"));
+        assert!(out.contains("Channels: [unknown]"));
+        assert!(!out.contains('✓'));
+
+        let models = handler
+            .handle("/doctor models", "s")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(models.contains("Provider catalog: [ok]"));
+        assert!(models.contains("Provider connectivity: [unknown]"));
+        assert!(!models.contains("Groq"));
+    }
+
+    #[tokio::test]
     async fn workspace_switch_releases_app_lock_while_activation_is_in_flight() {
         let app = app_with_pending_openclaw_workspace();
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
@@ -2899,6 +3001,27 @@ provider_settings = { tokens = ["array-token-1", "array-token-2"], name = "kept"
             std::fs::read_to_string(&save_path).unwrap(),
             "alpha history\n"
         );
+
+        let existing_path = tempdir.path().join("existing.txt");
+        std::fs::write(&existing_path, "keep me\n").unwrap();
+        let save_existing_cmd = format!("/save {}", existing_path.display());
+        let save_existing_out = handler
+            .handle(&save_existing_cmd, "main")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(save_existing_out.contains("Refusing to overwrite"));
+        assert_eq!(
+            std::fs::read_to_string(&existing_path).unwrap(),
+            "keep me\n"
+        );
+
+        let save_extra_out = handler
+            .handle("/save session backup.txt", "main")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(save_extra_out.contains("single token"));
 
         let delete_out = handler
             .handle("/session delete main", "active")

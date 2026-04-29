@@ -2272,9 +2272,22 @@ fn drain_stream_events(
             }
             Err(mpsc::error::TryRecvError::Empty) => break,
             // Worker dropped — either shutting down or crashed. Either
-            // way there's nothing productive to do in the UI loop
-            // beyond letting Alt-X exit naturally.
-            Err(mpsc::error::TryRecvError::Disconnected) => break,
+            // way, treat an in-flight request as terminal so the UI
+            // does not stay permanently busy.
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                if *response_in_flight {
+                    saw_error = true;
+                    status_state.end_turn();
+                    *response_in_flight = false;
+                    apply_chunk(
+                        TurnChunk::Finished(Err(
+                            "worker channel disconnected before the request completed".to_string(),
+                        )),
+                        chat_lines,
+                    );
+                }
+                break;
+            }
         }
     }
     saw_error
@@ -3845,6 +3858,39 @@ mod tests {
             lines.borrow().as_slice(),
             ["> first".to_string(), "done".to_string(), String::new()]
         );
+    }
+
+    #[test]
+    fn worker_disconnect_clears_in_flight_turn() {
+        let mut state = StatusState::new(
+            "default".to_string(),
+            "gpt-test".to_string(),
+            "borland".to_string(),
+            false,
+        );
+        state.begin_turn();
+        let lines = Rc::new(RefCell::new(vec!["> prompt".to_string(), String::new()]));
+        let mut typewriter_state = None;
+        let mut response_in_flight = true;
+        let mut session_picker_state = SessionPickerState::default();
+        let (tx, mut rx) = mpsc::unbounded_channel::<TurnChunk>();
+        drop(tx);
+
+        assert!(drain_stream_events(
+            &mut rx,
+            &lines,
+            &mut state,
+            &mut typewriter_state,
+            &mut response_in_flight,
+            &mut session_picker_state
+        ));
+
+        assert!(!response_in_flight);
+        assert!(state.turn_start.is_none());
+        assert!(lines
+            .borrow()
+            .iter()
+            .any(|line| line.contains("worker channel disconnected")));
     }
 
     #[tokio::test]
