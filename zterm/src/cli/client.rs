@@ -21,6 +21,8 @@ const ZEROCLAW_CRON_ERROR_BODY_MAX_BYTES: usize = 2 * 1024;
 const ZEROCLAW_CRON_LIST_BODY_MAX_BYTES: usize = 512 * 1024;
 const ZEROCLAW_CRON_MUTATION_BODY_MAX_BYTES: usize = 16 * 1024;
 const ZEROCLAW_CONFIG_BODY_MAX_BYTES: usize = 512 * 1024;
+const ZEROCLAW_SESSION_LIST_BODY_MAX_BYTES: usize = 512 * 1024;
+const ZEROCLAW_SESSION_LIST_MAX_ROWS: usize = 1_000;
 
 /// One row from the daemon's `[providers.models.<key>]` config table.
 ///
@@ -502,16 +504,24 @@ impl ZeroclawClient {
             .await
             .map_err(|e| anyhow!(ClientError::Network(e.to_string())))?;
 
-        match res.status().as_u16() {
-            200 => {
-                let sessions = res
-                    .json::<Vec<Session>>()
-                    .await
-                    .map_err(|e| anyhow!("Failed to parse sessions: {}", e))?;
-                Ok(sessions)
-            }
-            _ => Err(anyhow!(ClientError::Invalid(res.status().to_string()))),
+        let status = res.status();
+        if status.as_u16() != 200 {
+            return Err(anyhow!(ClientError::Invalid(status.to_string())));
         }
+
+        let body = Self::read_response_body_limited(res, ZEROCLAW_SESSION_LIST_BODY_MAX_BYTES)
+            .await
+            .map_err(|e| anyhow!("Failed to read session list response: {}", e))?;
+        let sessions = serde_json::from_slice::<Vec<Session>>(&body)
+            .map_err(|e| anyhow!("Failed to parse sessions: {}", e))?;
+        if sessions.len() > ZEROCLAW_SESSION_LIST_MAX_ROWS {
+            anyhow::bail!(
+                "session list exceeded {} row limit (got {})",
+                ZEROCLAW_SESSION_LIST_MAX_ROWS,
+                sessions.len()
+            );
+        }
+        Ok(sessions)
     }
 
     /// Create a session (implicit - zeroclaw uses implicit session IDs)
@@ -936,7 +946,7 @@ impl ZeroclawClient {
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|e| anyhow!("Failed to read response body: {}", e))?;
             if body.len().saturating_add(chunk.len()) > max_bytes {
-                anyhow::bail!("Webhook response body exceeded {} byte limit", max_bytes);
+                anyhow::bail!("response body exceeded {} byte limit", max_bytes);
             }
             body.extend_from_slice(&chunk);
         }
@@ -1500,6 +1510,73 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("Failed to parse /api/config envelope"));
         assert!(!msg.contains("tail-marker"));
+    }
+
+    #[tokio::test]
+    async fn list_sessions_success_body_is_bounded_before_parsing() {
+        let mut server = mockito::Server::new_async().await;
+        let huge = format!(
+            "[{{\"id\":\"main\",\"name\":\"{}tail-marker\",\"model\":\"primary\",\"provider\":\"zeroclaw\"}}]",
+            "x".repeat(ZEROCLAW_SESSION_LIST_BODY_MAX_BYTES + 512)
+        );
+        let _mock = server
+            .mock("GET", "/api/sessions")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(huge)
+            .create_async()
+            .await;
+        let client = ZeroclawClient::new(server.url(), "test_token".to_string());
+
+        let err = client.list_sessions().await.unwrap_err();
+
+        let msg = err.to_string();
+        assert!(msg.contains("Failed to read session list response"));
+        assert!(msg.contains("response body exceeded"));
+        assert!(!msg.contains("tail-marker"));
+    }
+
+    #[tokio::test]
+    async fn list_sessions_rejects_too_many_rows() {
+        let mut server = mockito::Server::new_async().await;
+        let sessions: Vec<Session> = (0..=ZEROCLAW_SESSION_LIST_MAX_ROWS)
+            .map(|idx| Session {
+                id: format!("s{idx}"),
+                name: "main".to_string(),
+                model: "primary".to_string(),
+                provider: "zeroclaw".to_string(),
+            })
+            .collect();
+        let _mock = server
+            .mock("GET", "/api/sessions")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(serde_json::to_string(&sessions).unwrap())
+            .create_async()
+            .await;
+        let client = ZeroclawClient::new(server.url(), "test_token".to_string());
+
+        let err = client.list_sessions().await.unwrap_err();
+
+        let msg = err.to_string();
+        assert!(msg.contains("session list exceeded"));
+        assert!(msg.contains(&ZEROCLAW_SESSION_LIST_MAX_ROWS.to_string()));
+    }
+
+    #[tokio::test]
+    async fn list_sessions_rejects_malformed_json() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("GET", "/api/sessions")
+            .with_status(200)
+            .with_body("not-json")
+            .create_async()
+            .await;
+        let client = ZeroclawClient::new(server.url(), "test_token".to_string());
+
+        let err = client.list_sessions().await.unwrap_err();
+
+        assert!(err.to_string().contains("Failed to parse sessions"));
     }
 
     #[tokio::test]
