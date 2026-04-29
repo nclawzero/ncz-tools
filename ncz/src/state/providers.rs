@@ -1101,7 +1101,8 @@ fn env_pairs(body: &str) -> Vec<(String, String)> {
             }
             let line = line.strip_prefix("export ").unwrap_or(line);
             let (key, value) = line.split_once('=')?;
-            Some((key.trim().to_string(), strip_wrapping_quotes(value)))
+            let value = agent_env::parse_environment_file_value(value).ok()?;
+            Some((key.trim().to_string(), value))
         })
         .collect()
 }
@@ -1308,15 +1309,6 @@ fn lookup_with_key(pairs: &[(String, String)], keys: &[&str]) -> Option<(String,
         }
     }
     None
-}
-
-fn strip_wrapping_quotes(value: &str) -> String {
-    let trimmed = value.trim();
-    if trimmed.len() >= 2 && trimmed.starts_with('"') && trimmed.ends_with('"') {
-        trimmed[1..trimmed.len() - 1].to_string()
-    } else {
-        trimmed.to_string()
-    }
 }
 
 fn context_length_from_object(obj: &serde_json::Map<String, Value>) -> Option<u64> {
@@ -1643,6 +1635,85 @@ mod tests {
             fs::read_to_string(paths.agent_env()).unwrap(),
             "LOCAL_API_KEY=secret\nNCZ_PROVIDER_BINDING_6C6F63616C=\"LOCAL_API_KEY http://127.0.0.1:8080\"\n"
         );
+    }
+
+    #[test]
+    fn test_migrate_single_quoted_strips_quotes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        fs::create_dir_all(paths.providers_dir()).unwrap();
+        fs::write(
+            paths.providers_dir().join("local.env"),
+            "PROVIDER_NAME=local\nPROVIDER_URL=http://127.0.0.1:8080\nMODEL=mini\nAPI_KEY='sk-live'\n",
+        )
+        .unwrap();
+
+        migrate_legacy(&paths).unwrap();
+
+        assert_eq!(
+            agent_env::read(&paths)
+                .unwrap()
+                .into_iter()
+                .find(|entry| entry.key == "LOCAL_API_KEY")
+                .map(|entry| entry.value),
+            Some("sk-live".to_string())
+        );
+    }
+
+    #[test]
+    fn test_migrate_double_quoted_processes_escapes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        fs::create_dir_all(paths.providers_dir()).unwrap();
+        fs::write(
+            paths.providers_dir().join("local.env"),
+            "PROVIDER_NAME=local\nPROVIDER_URL=http://127.0.0.1:8080\nMODEL=mini\nAPI_KEY=\"a\\\"b\"\n",
+        )
+        .unwrap();
+
+        migrate_legacy(&paths).unwrap();
+
+        assert_eq!(
+            agent_env::read(&paths)
+                .unwrap()
+                .into_iter()
+                .find(|entry| entry.key == "LOCAL_API_KEY")
+                .map(|entry| entry.value),
+            Some("a\"b".to_string())
+        );
+    }
+
+    #[test]
+    fn test_migrate_unquoted_strips_inline_comment() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path());
+        fs::create_dir_all(paths.providers_dir()).unwrap();
+        fs::write(
+            paths.providers_dir().join("local.env"),
+            "PROVIDER_NAME=local\nPROVIDER_URL=http://127.0.0.1:8080\nMODEL=mini\nAPI_KEY=secret # trailing\n",
+        )
+        .unwrap();
+
+        migrate_legacy(&paths).unwrap();
+
+        assert_eq!(
+            agent_env::read(&paths)
+                .unwrap()
+                .into_iter()
+                .find(|entry| entry.key == "LOCAL_API_KEY")
+                .map(|entry| entry.value),
+            Some("secret".to_string())
+        );
+    }
+
+    #[test]
+    fn test_migrate_double_quoted_backslash_n_becomes_newline() {
+        let parsed = parse_env(
+            "PROVIDER_NAME=local\nPROVIDER_URL=http://127.0.0.1:8080\nMODEL=mini\nAPI_KEY=\"line\\nnext\"\n",
+            "local".to_string(),
+        );
+
+        assert_eq!(parsed.inline_secret.as_deref(), Some("line\nnext"));
     }
 
     #[test]

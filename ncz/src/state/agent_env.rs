@@ -321,6 +321,10 @@ pub fn validate_value(value: &str) -> Result<(), NczError> {
     Ok(())
 }
 
+pub fn parse_environment_file_value(raw: &str) -> Result<String, NczError> {
+    parse_value(raw)
+}
+
 fn is_safe_unquoted_value_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric()
         || matches!(
@@ -366,6 +370,13 @@ fn parse_unquoted(raw: &str) -> String {
             escaped = false;
         } else if ch == '\\' {
             escaped = true;
+        } else if ch == '#'
+            && (out.is_empty() || out.chars().last().is_some_and(char::is_whitespace))
+        {
+            while out.chars().last().is_some_and(char::is_whitespace) {
+                out.pop();
+            }
+            break;
         } else {
             out.push(ch);
         }
@@ -381,7 +392,9 @@ fn parse_double_quoted(raw: &str) -> Result<String, NczError> {
     let mut escaped = false;
     for (idx, ch) in raw.char_indices() {
         if escaped {
-            if matches!(ch, '"' | '\\' | '$' | '`') {
+            if ch == 'n' {
+                out.push('\n');
+            } else if matches!(ch, '"' | '\\' | '$' | '`') {
                 out.push(ch);
             } else {
                 out.push('\\');
