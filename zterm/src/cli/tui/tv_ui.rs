@@ -40,8 +40,9 @@ const KB_CTRL_L: u16 = 0x000C; // FF — force redraw (curses convention)
 
 use turbo_vision::core::draw::DrawBuffer;
 use turbo_vision::core::event::{
-    Event, EventType, KB_ALT_X, KB_CTRL_H, KB_CTRL_O, KB_CTRL_P, KB_CTRL_S, KB_CTRL_T, KB_CTRL_Y,
-    KB_CTRL_Z, KB_DOWN, KB_ENTER, KB_ESC, KB_F1, KB_F10, KB_LEFT, KB_RIGHT, KB_UP,
+    Event, EventType, KB_ALT_F, KB_ALT_H, KB_ALT_M, KB_ALT_S, KB_ALT_W, KB_ALT_X, KB_CTRL_H,
+    KB_CTRL_O, KB_CTRL_P, KB_CTRL_S, KB_CTRL_T, KB_CTRL_Y, KB_CTRL_Z, KB_DOWN, KB_ENTER, KB_ESC,
+    KB_F1, KB_F10, KB_LEFT, KB_RIGHT, KB_UP, MB_LEFT_BUTTON,
 };
 use turbo_vision::core::geometry::Rect;
 use turbo_vision::core::menu_data::{Menu, MenuItem};
@@ -2271,6 +2272,13 @@ fn run_event_loop(
             }
         }
 
+        if response_in_flight
+            && should_block_modal_entry_while_busy(&event, input_data.borrow().is_empty())
+        {
+            note_response_busy(status_state);
+            continue;
+        }
+
         // Menu bar gets first crack at navigation keys (F10, Alt+F,
         // arrow navigation inside open menus).
         if let Some(menu_bar) = app.menu_bar.as_mut() {
@@ -2511,6 +2519,26 @@ fn run_slash_popup(app: &mut Application) -> u16 {
 
 fn should_open_slash_popup(key_code: u16, input_empty: bool) -> bool {
     input_empty && key_code == KB_CTRL_K
+}
+
+fn should_block_modal_entry_while_busy(event: &Event, input_empty: bool) -> bool {
+    match event.what {
+        EventType::Keyboard => {
+            is_menu_activation_key(event.key_code)
+                || should_open_slash_popup(event.key_code, input_empty)
+        }
+        EventType::MouseDown => {
+            event.mouse.pos.y == 0 && (event.mouse.buttons & MB_LEFT_BUTTON) != 0
+        }
+        _ => false,
+    }
+}
+
+fn is_menu_activation_key(key_code: u16) -> bool {
+    matches!(
+        key_code,
+        KB_F10 | KB_ALT_F | KB_ALT_S | KB_ALT_W | KB_ALT_M | KB_ALT_H
+    )
 }
 
 fn is_exit_command(input: &str) -> bool {
@@ -2775,6 +2803,10 @@ fn handle_command(
         // status-line read (E-4) picks up the new workspace on the
         // next tick.
         CMD_WORKSPACE_SWITCH => {
+            if *response_in_flight {
+                note_response_busy(status_state);
+                return;
+            }
             let workspaces = snapshot_workspace_names(shared_app);
             if workspaces.is_empty() {
                 chat_lines.borrow_mut().push(
@@ -4598,6 +4630,36 @@ mod tests {
         assert!(should_open_slash_popup(KB_CTRL_K, true));
         assert!(!should_open_slash_popup(KB_SLASH, true));
         assert!(!should_open_slash_popup(KB_CTRL_K, false));
+    }
+
+    #[test]
+    fn busy_modal_gate_blocks_menu_and_slash_popup_entry() {
+        assert!(should_block_modal_entry_while_busy(
+            &Event::keyboard(KB_F10),
+            true
+        ));
+        assert!(should_block_modal_entry_while_busy(
+            &Event::keyboard(KB_ALT_W),
+            true
+        ));
+        assert!(should_block_modal_entry_while_busy(
+            &Event::keyboard(KB_CTRL_K),
+            true
+        ));
+        assert!(!should_block_modal_entry_while_busy(
+            &Event::keyboard(KB_CTRL_K),
+            false
+        ));
+
+        let mut click_menu_bar = Event::nothing();
+        click_menu_bar.what = EventType::MouseDown;
+        click_menu_bar.mouse.pos = turbo_vision::core::geometry::Point::new(2, 0);
+        click_menu_bar.mouse.buttons = MB_LEFT_BUTTON;
+        assert!(should_block_modal_entry_while_busy(&click_menu_bar, true));
+
+        let mut click_chat = click_menu_bar;
+        click_chat.mouse.pos = turbo_vision::core::geometry::Point::new(2, 3);
+        assert!(!should_block_modal_entry_while_busy(&click_chat, true));
     }
 
     #[test]

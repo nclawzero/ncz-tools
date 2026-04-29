@@ -878,21 +878,7 @@ async fn read_loop(
                 }
                 Ok(Frame::Event(ev)) => {
                     if event_requires_reliable_delivery(&ev) {
-                        match event_tx.try_send(ev) {
-                            Ok(()) => {}
-                            Err(mpsc::error::TrySendError::Full(ev)) => {
-                                tracing::warn!(
-                                    "openclaw: reliable event channel full while delivering {}; closing connection",
-                                    ev.event
-                                );
-                                break;
-                            }
-                            Err(mpsc::error::TrySendError::Closed(_)) => {
-                                // Receiver dropped — no one cares about events.
-                                // Keep the read loop alive anyway so response
-                                // correlation still works.
-                            }
-                        }
+                        deliver_reliable_event(&event_tx, ev);
                     } else {
                         match event_tx.try_send(ev) {
                             Ok(()) => {}
@@ -942,6 +928,31 @@ async fn read_loop(
 
 fn event_requires_reliable_delivery(event: &super::wire::EventFrame) -> bool {
     event.event == "session.message" || is_terminal_run_event_name(&event.event)
+}
+
+fn deliver_reliable_event(
+    event_tx: &mpsc::Sender<super::wire::EventFrame>,
+    event: super::wire::EventFrame,
+) {
+    match event_tx.try_send(event) {
+        Ok(()) => {}
+        Err(mpsc::error::TrySendError::Full(event)) => {
+            let event_name = event.event.clone();
+            let event_tx = event_tx.clone();
+            let handle = tokio::spawn(async move {
+                if event_tx.send(event).await.is_err() {
+                    tracing::debug!(
+                        "openclaw: dropping reliable event {event_name} because receiver closed"
+                    );
+                }
+            });
+            drop(handle);
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            // Receiver dropped — no one cares about events. Keep the
+            // read loop alive anyway so response correlation still works.
+        }
+    }
 }
 
 async fn write_loop(
@@ -4565,7 +4576,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_loop_closes_on_reliable_turn_event_backpressure() {
+    async fn read_loop_delivers_reliable_turn_event_after_best_effort_backlog() {
         let pending = PendingRequests::new();
         let response_id = "req-response-after-completion".to_string();
         let response_rx = pending.register(response_id.clone()).await;
@@ -4604,24 +4615,23 @@ mod tests {
         ));
         let response = tokio::time::timeout(Duration::from_millis(50), response_rx)
             .await
-            .expect("pending response should be aborted when reliable event overflows");
-        assert!(
-            response.is_err(),
-            "overflow must fail the connection instead of parking the reader"
-        );
+            .expect("response should still be read while reliable event waits")
+            .expect("response oneshot should deliver");
+        assert_eq!(response.id, response_id);
+        assert_eq!(response.payload.unwrap()["done"], true);
 
         let retained = event_rx
             .recv()
             .await
             .expect("pre-filled event should still be queued first");
         assert_eq!(retained.event, "already.full");
-        assert!(
-            event_rx.try_recv().is_err(),
-            "overflowed reliable event should not be silently dropped into the queue"
-        );
+        let delivered = tokio::time::timeout(Duration::from_millis(50), event_rx.recv())
+            .await
+            .expect("reliable event should be delivered after backlog drains")
+            .expect("reliable event channel should remain open");
+        assert_eq!(delivered.event, "session.run.completed");
         read_task.await.expect("read loop should join");
         assert!(!connected.load(Ordering::Relaxed));
-        assert!(pending.is_empty().await);
     }
 
     #[tokio::test]
