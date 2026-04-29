@@ -27,7 +27,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use tokio::sync::{mpsc, Mutex};
 use tracing::{info, warn};
@@ -2292,13 +2292,25 @@ async fn ensure_session_for_active_workspace(
 ) -> Result<String> {
     let workspace_key = current_workspace_binding_key(app).await?;
     if let Some(binding) = sessions.get(&workspace_key).cloned() {
-        if let Ok(session) = load_session_for_worker(app, &binding.id).await {
-            remember_worker_session(sessions, workspace_key, &session);
-            return Ok(session.id);
+        match load_session_for_worker(app, &binding.id).await {
+            Ok(session) => {
+                remember_worker_session(sessions, workspace_key, &session);
+                return Ok(session.id);
+            }
+            Err(load_err) => {
+                sessions.remove(&workspace_key);
+                let session = resolve_or_create_session_for_worker(app, &binding.name)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "active backend session `{}` could not be validated ({load_err}); failed to resolve replacement",
+                            binding.id
+                        )
+                    })?;
+                remember_worker_session(sessions, workspace_key, &session);
+                return Ok(session.id);
+            }
         }
-        let session = resolve_or_create_session_for_worker(app, &binding.name).await?;
-        remember_worker_session(sessions, workspace_key, &session);
-        return Ok(session.id);
     }
 
     let session = resolve_or_create_session_for_worker(app, fallback_session_name).await?;
@@ -2311,14 +2323,7 @@ async fn turn_session_id_for_active_workspace(
     sessions: &mut HashMap<String, WorkerSessionBinding>,
     fallback_session_name: &str,
 ) -> Result<String> {
-    let workspace_key = current_workspace_binding_key(app).await?;
-    if let Some(binding) = sessions.get(&workspace_key) {
-        return Ok(binding.id.clone());
-    }
-
-    let session = resolve_or_create_session_for_worker(app, fallback_session_name).await?;
-    remember_worker_session(sessions, workspace_key, &session);
-    Ok(session.id)
+    ensure_session_for_active_workspace(app, sessions, fallback_session_name).await
 }
 
 async fn verify_session_for_active_workspace(
@@ -9304,7 +9309,11 @@ mod tests {
                 .await
                 .unwrap_err();
 
-            let msg = err.to_string();
+            let msg = err
+                .chain()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n");
             assert!(msg.contains("listed session 'legacy-server-key'"));
             assert!(msg.contains("could not be loaded"));
             assert!(msg.contains("refusing to create a replacement session"));
@@ -9323,7 +9332,7 @@ mod tests {
     }
 
     #[test]
-    fn turn_session_uses_remembered_binding_without_inventory() {
+    fn turn_session_fails_closed_when_remembered_binding_cannot_be_validated() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
             let active = Session {
@@ -9377,31 +9386,98 @@ mod tests {
             }));
             let workspace_key = current_workspace_binding_key(&app).await.unwrap();
             let mut bindings = HashMap::new();
-            remember_worker_session(&mut bindings, workspace_key, &active);
+            remember_worker_session(&mut bindings, workspace_key.clone(), &active);
 
-            let turn_session_id =
-                turn_session_id_for_active_workspace(&app, &mut bindings, "fallback")
-                    .await
-                    .unwrap();
-            let client = {
-                let guard = app.lock().await;
-                guard.active_workspace().unwrap().client.clone().unwrap()
-            };
-            client
-                .lock()
+            let err = turn_session_id_for_active_workspace(&app, &mut bindings, "fallback")
                 .await
-                .submit_turn(&turn_session_id, "hello")
+                .unwrap_err();
+
+            let msg = err.to_string();
+            assert!(msg.contains("active backend session `active-id` could not be validated"));
+            assert!(!bindings.contains_key(&workspace_key));
+            assert_eq!(*list_calls.lock().unwrap(), 1);
+            assert_eq!(*load_calls.lock().unwrap(), vec!["active-id".to_string()]);
+            assert!(created.lock().unwrap().is_empty());
+            assert!(submitted.lock().unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn turn_session_rebinds_stale_binding_before_submit() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let stale = Session {
+                id: "stale-id".to_string(),
+                name: "Main".to_string(),
+                model: "model".to_string(),
+                provider: "provider".to_string(),
+            };
+            let replacement = Session {
+                id: "backend-main".to_string(),
+                name: "Main".to_string(),
+                model: "model".to_string(),
+                provider: "provider".to_string(),
+            };
+            let created = Arc::new(StdMutex::new(Vec::new()));
+            let deleted = Arc::new(StdMutex::new(Vec::new()));
+            let submitted = Arc::new(StdMutex::new(Vec::new()));
+            let list_calls = Arc::new(StdMutex::new(0));
+            let load_calls = Arc::new(StdMutex::new(Vec::new()));
+            let fake = WorkerSessionFakeClient {
+                listed_sessions: vec![replacement.clone()],
+                list_sessions_error: None,
+                loadable_sessions: vec![replacement.clone()],
+                load_reject_ids: vec!["stale-id".to_string()],
+                created: Arc::clone(&created),
+                deleted,
+                submitted: Arc::clone(&submitted),
+                list_calls: Arc::clone(&list_calls),
+                load_calls: Arc::clone(&load_calls),
+                submit_response: String::new(),
+                submit_error: None,
+                submit_never: false,
+                cancellation_safe: true,
+                sink_set_states: Arc::new(StdMutex::new(Vec::new())),
+                delete_error: None,
+            };
+            let boxed: Box<dyn crate::cli::agent::AgentClient + Send + Sync> = Box::new(fake);
+            let app = Arc::new(Mutex::new(App {
+                workspaces: vec![crate::cli::workspace::Workspace {
+                    id: 0,
+                    config: crate::cli::workspace::WorkspaceConfig {
+                        id: Some("ws-turn".to_string()),
+                        name: "turn-ws".to_string(),
+                        backend: crate::cli::workspace::Backend::Zeroclaw,
+                        url: "http://gateway.example".to_string(),
+                        token_env: None,
+                        token: None,
+                        label: None,
+                        namespace_aliases: Vec::new(),
+                    },
+                    client: Some(Arc::new(Mutex::new(boxed))),
+                    cron: None,
+                }],
+                active: 0,
+                shared_mnemos: None,
+                config_path: std::path::PathBuf::from("test-config.toml"),
+            }));
+            let workspace_key = current_workspace_binding_key(&app).await.unwrap();
+            let mut bindings = HashMap::new();
+            remember_worker_session(&mut bindings, workspace_key.clone(), &stale);
+
+            let turn_session_id = turn_session_id_for_active_workspace(&app, &mut bindings, "Main")
                 .await
                 .unwrap();
 
-            assert_eq!(turn_session_id, "active-id");
-            assert_eq!(*list_calls.lock().unwrap(), 0);
-            assert!(load_calls.lock().unwrap().is_empty());
-            assert!(created.lock().unwrap().is_empty());
+            assert_eq!(turn_session_id, "backend-main");
+            assert_eq!(bindings[&workspace_key].id, "backend-main");
+            assert_eq!(*list_calls.lock().unwrap(), 1);
             assert_eq!(
-                submitted.lock().unwrap().as_slice(),
-                [("active-id".to_string(), "hello".to_string())]
+                *load_calls.lock().unwrap(),
+                vec!["stale-id".to_string(), "backend-main".to_string()]
             );
+            assert!(created.lock().unwrap().is_empty());
+            assert!(submitted.lock().unwrap().is_empty());
         });
     }
 

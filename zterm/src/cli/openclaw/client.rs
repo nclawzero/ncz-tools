@@ -153,9 +153,12 @@ impl OpenClawClient {
     /// `DeviceIdentity`, and sending a `connect` request before any
     /// other method call succeeds. (Slice 3b packages the handshake.)
     pub async fn connect(url: &str) -> Result<Self> {
-        let (ws_stream, _response) = connect_async(url)
-            .await
-            .with_context(|| format!("openclaw: WebSocket upgrade to {url} failed"))?;
+        let (ws_stream, _response) = connect_async(url).await.with_context(|| {
+            format!(
+                "openclaw: WebSocket upgrade to {} failed",
+                redacted_openclaw_url_for_error(url)
+            )
+        })?;
 
         let (ws_sink, ws_stream) = ws_stream.split();
         let pending = PendingRequests::new();
@@ -281,6 +284,64 @@ impl OpenClawClient {
             let _ = tokio::time::timeout(Duration::from_secs(1), t).await;
         }
     }
+}
+
+pub(crate) fn redacted_openclaw_url_for_error(url: &str) -> String {
+    let Ok(mut parsed) = reqwest::Url::parse(url) else {
+        return "<invalid openclaw url>".to_string();
+    };
+    if !parsed.username().is_empty() {
+        let _ = parsed.set_username("redacted");
+    }
+    if parsed.password().is_some() {
+        let _ = parsed.set_password(Some("redacted"));
+    }
+    if parsed.query().is_some() {
+        let pairs: Vec<(String, String)> = parsed
+            .query_pairs()
+            .map(|(key, value)| {
+                if is_sensitive_url_query_key(&key) {
+                    (key.into_owned(), "REDACTED".to_string())
+                } else {
+                    (key.into_owned(), value.into_owned())
+                }
+            })
+            .collect();
+        parsed.set_query(None);
+        if !pairs.is_empty() {
+            parsed.query_pairs_mut().extend_pairs(
+                pairs
+                    .iter()
+                    .map(|(key, value)| (key.as_str(), value.as_str())),
+            );
+        }
+    }
+    parsed.to_string()
+}
+
+fn is_sensitive_url_query_key(key: &str) -> bool {
+    let normalized: String = key
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect();
+    matches!(
+        normalized.as_str(),
+        "token"
+            | "accesstoken"
+            | "authtoken"
+            | "authorization"
+            | "auth"
+            | "bearer"
+            | "apikey"
+            | "key"
+            | "secret"
+            | "password"
+            | "pass"
+            | "jwt"
+            | "sig"
+            | "signature"
+    )
 }
 
 impl OpenClawClient {
@@ -2317,6 +2378,30 @@ mod tests {
         // ZeroclawClient in cli/client.rs.
         fn assert_agent_client<T: crate::cli::agent::AgentClient>() {}
         assert_agent_client::<OpenClawClient>();
+    }
+
+    #[test]
+    fn openclaw_error_url_redaction_masks_credentials_and_sensitive_query() {
+        let redacted = redacted_openclaw_url_for_error(
+            "wss://operator:secret@gateway.example/ws?token=abc&api_key=def&room=alpha",
+        );
+
+        assert!(redacted.contains("redacted:redacted@gateway.example"));
+        assert!(redacted.contains("token=REDACTED"));
+        assert!(redacted.contains("api_key=REDACTED"));
+        assert!(redacted.contains("room=alpha"));
+        assert!(!redacted.contains("operator"));
+        assert!(!redacted.contains("secret"));
+        assert!(!redacted.contains("abc"));
+        assert!(!redacted.contains("def"));
+    }
+
+    #[test]
+    fn openclaw_error_url_redaction_hides_unparseable_urls() {
+        assert_eq!(
+            redacted_openclaw_url_for_error("not a url?token=abc"),
+            "<invalid openclaw url>"
+        );
     }
 
     #[test]

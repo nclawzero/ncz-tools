@@ -303,6 +303,7 @@ impl Workspace {
     /// Does NOT perform a handshake / live connect — that's a
     /// separate concern the caller owns. Keeps D1 purely data.
     pub fn instantiate(id: usize, config: WorkspaceConfig) -> Result<Self> {
+        validate_workspace_url_safety(&config)?;
         match config.backend {
             Backend::Zeroclaw => {
                 let token = config.resolved_zeroclaw_token()?;
@@ -392,10 +393,11 @@ impl Workspace {
 async fn openclaw_client_for_config(
     config: &WorkspaceConfig,
 ) -> Result<crate::cli::openclaw::client::OpenClawClient> {
-    use crate::cli::openclaw::client::OpenClawClient;
+    use crate::cli::openclaw::client::{redacted_openclaw_url_for_error, OpenClawClient};
     use crate::cli::openclaw::device::DeviceIdentity;
     use crate::cli::openclaw::handshake::{ClientIdentity, HandshakeParams};
 
+    validate_workspace_url_safety(config)?;
     let device_key_path = default_openclaw_device_key_path()?;
     let device = DeviceIdentity::load_or_create(&device_key_path).with_context(|| {
         format!(
@@ -423,7 +425,8 @@ async fn openclaw_client_for_config(
         .with_context(|| {
             format!(
                 "openclaw workspace '{}' connect+handshake to {}",
-                config.name, config.url
+                config.name,
+                redacted_openclaw_url_for_error(&config.url)
             )
         })?;
     client.set_session_namespace(openclaw_session_namespace(config));
@@ -1500,6 +1503,7 @@ impl App {
     /// Honors `config.active` when set; an unloadable active workspace
     /// fails closed instead of silently selecting another workspace.
     pub fn from_config(cfg: AppConfig, config_path: PathBuf) -> Result<Self> {
+        validate_workspace_urls(&cfg)?;
         validate_zeroclaw_workspace_tokens(&cfg)?;
 
         let configured_active = cfg.active.clone();
@@ -1656,6 +1660,61 @@ impl App {
         }
         Self::synthesize_single_zeroclaw(remote, token)
     }
+}
+
+fn validate_workspace_urls(cfg: &AppConfig) -> Result<()> {
+    for workspace in &cfg.workspaces {
+        validate_workspace_url_safety(workspace)?;
+    }
+    Ok(())
+}
+
+fn validate_workspace_url_safety(config: &WorkspaceConfig) -> Result<()> {
+    let Ok(url) = reqwest::Url::parse(config.url.trim()) else {
+        return Ok(());
+    };
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(anyhow!(
+            "workspace `{}` url must not embed username/password credentials; use token_env or token instead",
+            config.name
+        ));
+    }
+    if let Some(key) = url
+        .query_pairs()
+        .map(|(key, _)| key.into_owned())
+        .find(|key| is_sensitive_workspace_url_query_key(key))
+    {
+        return Err(anyhow!(
+            "workspace `{}` url must not contain sensitive query parameter `{key}`; use token_env or token instead",
+            config.name
+        ));
+    }
+    Ok(())
+}
+
+fn is_sensitive_workspace_url_query_key(key: &str) -> bool {
+    let normalized: String = key
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect();
+    matches!(
+        normalized.as_str(),
+        "token"
+            | "accesstoken"
+            | "authtoken"
+            | "authorization"
+            | "auth"
+            | "bearer"
+            | "apikey"
+            | "key"
+            | "secret"
+            | "password"
+            | "pass"
+            | "jwt"
+            | "sig"
+            | "signature"
+    )
 }
 
 fn validate_zeroclaw_workspace_tokens(cfg: &AppConfig) -> Result<()> {
@@ -2516,6 +2575,48 @@ namespace_aliases = ["backend=openclaw;workspace_id=ws_alpha"]
             "openclaw client should be None until activate()"
         );
         assert!(ws.cron.is_none());
+    }
+
+    #[test]
+    fn instantiate_rejects_workspace_url_with_embedded_credentials() {
+        let cfg = WorkspaceConfig {
+            id: None,
+            name: "oc".into(),
+            backend: Backend::Openclaw,
+            url: "ws://operator:secret@127.0.0.1:18789".into(),
+            token_env: None,
+            token: None,
+            label: None,
+            namespace_aliases: Vec::new(),
+        };
+
+        let err = Workspace::instantiate(0, cfg).unwrap_err();
+
+        let msg = err.to_string();
+        assert!(msg.contains("url must not embed username/password credentials"));
+        assert!(!msg.contains("secret"));
+    }
+
+    #[test]
+    fn app_from_config_rejects_workspace_url_with_sensitive_query_key() {
+        let cfg = AppConfig::parse(
+            r#"
+[[workspaces]]
+name = "oc"
+backend = "openclaw"
+url = "ws://127.0.0.1:18789/ws?token=secret&room=alpha"
+"#,
+        )
+        .unwrap();
+
+        let err = match App::from_config(cfg, PathBuf::from("/dev/null")) {
+            Ok(_) => panic!("sensitive query key should fail closed"),
+            Err(err) => err,
+        };
+
+        let msg = err.to_string();
+        assert!(msg.contains("sensitive query parameter `token`"));
+        assert!(!msg.contains("secret"));
     }
 
     #[tokio::test]
