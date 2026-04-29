@@ -120,24 +120,49 @@ impl ReplLoop {
         }
     }
 
-    async fn persist_mutation_fence(&self, reason: &str) -> String {
+    async fn mutation_fence_block_output(&self, input: &str) -> Option<String> {
+        let reason = self.active_mutation_fence_reason().await?;
+        if legacy_mutation_fence_allows_input(input) {
+            return None;
+        }
+        Some(format!(
+            "[blocked] mutation outcome is unknown; run /resync to inspect state, or /resync --force after manual reconciliation. Last status: {reason}\n"
+        ))
+    }
+
+    async fn persist_mutation_fence_replacing(
+        &self,
+        reason: &str,
+        old_key: Option<&str>,
+    ) -> String {
         let key = match self.current_mutation_fence_key().await {
             Ok(key) => key,
             Err(e) => return format!("{reason}; failed to identify active workspace: {e}"),
         };
-        let fence = delighters::MutationFenceState {
-            command: legacy_mutation_fence_command_from_reason(reason),
-            reason: reason.to_string(),
-            created_at_unix: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|duration| duration.as_secs())
-                .unwrap_or(0),
+        let fence =
+            legacy_mutation_fence_state(&legacy_mutation_fence_command_from_reason(reason), reason);
+        let result = if let Some(old_key) = old_key {
+            delighters::replace_mutation_fence_for_workspace(Some(old_key), &key, fence)
+        } else {
+            delighters::set_mutation_fence_for_workspace(&key, fence)
         };
-        if let Err(e) = delighters::set_mutation_fence_for_workspace(&key, fence) {
+        if let Err(e) = result {
             format!("{reason}; failed to persist fence: {e}")
         } else {
             reason.to_string()
         }
+    }
+
+    async fn persist_mutation_fence(&self, reason: &str) -> String {
+        self.persist_mutation_fence_replacing(reason, None).await
+    }
+
+    async fn write_ahead_mutation_fence_for_dispatch(&self, cmdline: &str) -> Result<String> {
+        let key = self.current_mutation_fence_key().await?;
+        let reason = legacy_write_ahead_mutation_fence_message(cmdline);
+        let fence = legacy_mutation_fence_state(cmdline, &reason);
+        delighters::set_mutation_fence_for_workspace(&key, fence)?;
+        Ok(key)
     }
 
     async fn handle_legacy_resync(&mut self, input: &str) -> Result<Option<String>> {
@@ -303,6 +328,11 @@ impl ReplLoop {
 
             // Add to history
             self.history.push(input.clone());
+
+            if let Some(output) = self.mutation_fence_block_output(&input).await {
+                print!("{output}");
+                continue;
+            }
 
             // Handle commands
             if input.starts_with('/') {
@@ -481,30 +511,46 @@ impl ReplLoop {
         if let Some(output) = self.handle_legacy_resync(input).await? {
             return Ok(Some(output));
         }
-        if let Some(reason) = self.active_mutation_fence_reason().await {
-            if !legacy_mutation_fence_allows_input(input) {
-                return Ok(Some(format!(
-                    "[blocked] mutation outcome is unknown; run /resync to inspect state, or /resync --force after manual reconciliation. Last status: {reason}\n"
-                )));
-            }
+        if let Some(output) = self.mutation_fence_block_output(input).await {
+            return Ok(Some(output));
         }
 
         if let Some(action) = legacy_session_action(input) {
+            let mutation_fence_key = match self.write_ahead_mutation_fence_for_dispatch(input).await
+            {
+                Ok(key) => key,
+                Err(e) => {
+                    return Ok(Some(format!(
+                        "[blocked] {}\n",
+                        legacy_write_ahead_persist_failure_message(input, &e)
+                    )));
+                }
+            };
             match tokio::time::timeout(
                 LEGACY_MUTATING_COMMAND_TIMEOUT,
                 self.apply_legacy_session_action(action),
             )
             .await
             {
-                Ok(Ok(())) => {}
+                Ok(Ok(())) => {
+                    if let Some(reason) =
+                        clear_legacy_write_ahead_mutation_fence(&mutation_fence_key)
+                    {
+                        return Ok(Some(format!("[blocked] {reason}\n")));
+                    }
+                }
                 Ok(Err(e)) => {
                     let reason = legacy_mutating_unknown_outcome_message(input, &e.to_string());
-                    let reason = self.persist_mutation_fence(&reason).await;
+                    let reason = self
+                        .persist_mutation_fence_replacing(&reason, Some(&mutation_fence_key))
+                        .await;
                     return Ok(Some(format!("[blocked] {reason}\n")));
                 }
                 Err(_) => {
                     let reason = legacy_mutating_timeout_message(input);
-                    let reason = self.persist_mutation_fence(&reason).await;
+                    let reason = self
+                        .persist_mutation_fence_replacing(&reason, Some(&mutation_fence_key))
+                        .await;
                     return Ok(Some(format!("[blocked] {reason}\n")));
                 }
             }
@@ -529,7 +575,21 @@ impl ReplLoop {
             self.session.id.clone()
         };
 
-        let command_result = if legacy_slash_command_may_mutate_state(input) {
+        let mutation_fence_key = if legacy_slash_command_may_mutate_state(input) {
+            match self.write_ahead_mutation_fence_for_dispatch(input).await {
+                Ok(key) => Some(key),
+                Err(e) => {
+                    return Ok(Some(format!(
+                        "[blocked] {}\n",
+                        legacy_write_ahead_persist_failure_message(input, &e)
+                    )));
+                }
+            }
+        } else {
+            None
+        };
+
+        let command_result = if mutation_fence_key.is_some() {
             match tokio::time::timeout(
                 LEGACY_MUTATING_COMMAND_TIMEOUT,
                 self.command_handler
@@ -537,10 +597,19 @@ impl ReplLoop {
             )
             .await
             {
-                Ok(result) => result?,
+                Ok(Ok(result)) => result,
+                Ok(Err(e)) => {
+                    let reason = legacy_mutating_unknown_outcome_message(input, &e.to_string());
+                    let reason = self
+                        .persist_mutation_fence_replacing(&reason, mutation_fence_key.as_deref())
+                        .await;
+                    return Ok(Some(format!("[blocked] {reason}\n")));
+                }
                 Err(_) => {
                     let reason = legacy_mutating_timeout_message(input);
-                    let reason = self.persist_mutation_fence(&reason).await;
+                    let reason = self
+                        .persist_mutation_fence_replacing(&reason, mutation_fence_key.as_deref())
+                        .await;
                     return Ok(Some(format!("[blocked] {reason}\n")));
                 }
             }
@@ -561,13 +630,13 @@ impl ReplLoop {
             if successful_switch || workspace_after_dispatch != workspace_before_dispatch {
                 if let Err(e) = self.ensure_session_for_active_workspace().await {
                     let reason = legacy_workspace_switch_session_setup_failure_message(input, &e);
-                    let reason = self.persist_mutation_fence(&reason).await;
-                    let mut output = result.clone().unwrap_or_default();
-                    if !output.ends_with('\n') {
-                        output.push('\n');
-                    }
-                    output.push_str(&format!("[blocked] {reason}\n"));
-                    return Ok(Some(output));
+                    let reason = self
+                        .persist_mutation_fence_replacing(&reason, mutation_fence_key.as_deref())
+                        .await;
+                    return Ok(Some(legacy_output_with_blocked(
+                        result.clone().unwrap_or_default(),
+                        &reason,
+                    )));
                 }
             }
         }
@@ -575,13 +644,22 @@ impl ReplLoop {
         if mutation_outcome_unknown {
             let rendered = result.as_deref().unwrap_or_default();
             let reason = legacy_mutating_unknown_outcome_message(input, rendered);
-            let reason = self.persist_mutation_fence(&reason).await;
-            let mut output = result.unwrap_or_default();
-            if !output.ends_with('\n') {
-                output.push('\n');
+            let reason = self
+                .persist_mutation_fence_replacing(&reason, mutation_fence_key.as_deref())
+                .await;
+            return Ok(Some(legacy_output_with_blocked(
+                result.unwrap_or_default(),
+                &reason,
+            )));
+        }
+
+        if let Some(key) = mutation_fence_key {
+            if let Some(reason) = clear_legacy_write_ahead_mutation_fence(&key) {
+                return Ok(Some(legacy_output_with_blocked(
+                    result.unwrap_or_default(),
+                    &reason,
+                )));
             }
-            output.push_str(&format!("[blocked] {reason}\n"));
-            return Ok(Some(output));
         }
 
         Ok(result)
@@ -833,6 +911,52 @@ fn legacy_mutation_fence_workspace_key(workspace: &str, workspace_id: Option<&st
         Some(id) if !id.trim().is_empty() => format!("id:{}", id.trim()),
         _ => format!("name:{workspace}"),
     }
+}
+
+fn legacy_mutation_fence_now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+fn legacy_mutation_fence_state(command: &str, reason: &str) -> delighters::MutationFenceState {
+    delighters::MutationFenceState {
+        command: sanitize_terminal_text(command).replace('`', "'"),
+        reason: reason.to_string(),
+        created_at_unix: legacy_mutation_fence_now_unix(),
+    }
+}
+
+fn legacy_write_ahead_mutation_fence_message(cmdline: &str) -> String {
+    format!(
+        "mutating slash command dispatched for `{}`; backend outcome is pending. Run /resync to inspect state, or /resync --force to clear this fence after manual reconciliation.",
+        sanitize_terminal_text(cmdline).replace('`', "'")
+    )
+}
+
+fn legacy_write_ahead_persist_failure_message(cmdline: &str, error: &anyhow::Error) -> String {
+    format!(
+        "could not persist durable mutation fence for `{}`; command not dispatched: {}",
+        sanitize_terminal_text(cmdline).replace('`', "'"),
+        sanitize_terminal_text(&error.to_string())
+    )
+}
+
+fn clear_legacy_write_ahead_mutation_fence(key: &str) -> Option<String> {
+    delighters::clear_mutation_fence_for_workspace(key).err().map(|e| {
+        format!(
+            "mutating slash command completed, but zterm could not clear the durable write-ahead mutation fence: {e}; run /resync --force after manual reconciliation"
+        )
+    })
+}
+
+fn legacy_output_with_blocked(mut output: String, reason: &str) -> String {
+    if !output.is_empty() && !output.ends_with('\n') {
+        output.push('\n');
+    }
+    output.push_str(&format!("[blocked] {reason}\n"));
+    output
 }
 
 fn legacy_mutating_timeout_message(cmdline: &str) -> String {
@@ -1376,6 +1500,115 @@ mod tests {
             assert!(delighters::mutation_fence_for_workspace("name:alpha")
                 .unwrap()
                 .is_none());
+        });
+
+        match old_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    #[test]
+    fn legacy_repl_write_ahead_fence_persists_before_mutating_dispatch() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let submitted = Arc::new(StdMutex::new(Vec::new()));
+            let deleted = Arc::new(StdMutex::new(Vec::new()));
+            let alpha = session("alpha-session", "chat");
+            let app = Arc::new(Mutex::new(App {
+                workspaces: vec![workspace(
+                    0,
+                    "alpha",
+                    vec![alpha.clone()],
+                    Arc::clone(&submitted),
+                    Arc::clone(&deleted),
+                )],
+                active: 0,
+                shared_mnemos: None,
+                config_path: PathBuf::from("test-config.toml"),
+            }));
+            let repl = ReplLoop::new(
+                Arc::clone(&app),
+                alpha,
+                "model".to_string(),
+                "provider".to_string(),
+            )
+            .unwrap();
+
+            let key = repl
+                .write_ahead_mutation_fence_for_dispatch("/memory post remember this")
+                .await
+                .unwrap();
+
+            assert_eq!(key, "name:alpha");
+            let fence = delighters::mutation_fence_for_workspace("name:alpha")
+                .unwrap()
+                .unwrap();
+            assert_eq!(fence.command, "/memory post remember this");
+            assert!(fence.reason.contains("backend outcome is pending"));
+            assert!(submitted.lock().unwrap().is_empty());
+        });
+
+        match old_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    #[test]
+    fn legacy_repl_mutation_fence_blocks_plain_turn_input() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let submitted = Arc::new(StdMutex::new(Vec::new()));
+            let deleted = Arc::new(StdMutex::new(Vec::new()));
+            let alpha = session("alpha-session", "chat");
+            let app = Arc::new(Mutex::new(App {
+                workspaces: vec![workspace(
+                    0,
+                    "alpha",
+                    vec![alpha.clone()],
+                    Arc::clone(&submitted),
+                    Arc::clone(&deleted),
+                )],
+                active: 0,
+                shared_mnemos: None,
+                config_path: PathBuf::from("test-config.toml"),
+            }));
+            let repl = ReplLoop::new(
+                Arc::clone(&app),
+                alpha,
+                "model".to_string(),
+                "provider".to_string(),
+            )
+            .unwrap();
+            let reason = repl
+                .persist_mutation_fence("slash command outcome unknown for `/cron add job`")
+                .await;
+            assert!(reason.contains("slash command outcome unknown"));
+
+            let blocked = repl
+                .mutation_fence_block_output("hello agent")
+                .await
+                .unwrap();
+
+            assert!(blocked.contains("mutation outcome is unknown"));
+            assert!(blocked.contains("/resync --force"));
+            assert!(repl.mutation_fence_block_output("/help").await.is_none());
+            assert!(repl
+                .mutation_fence_block_output("/resync --force")
+                .await
+                .is_none());
+            assert!(submitted.lock().unwrap().is_empty());
         });
 
         match old_home {
