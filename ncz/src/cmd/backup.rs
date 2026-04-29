@@ -299,7 +299,12 @@ pub fn restore(
                 },
             });
             if !dry_run {
-                restore_volume(ctx, staging.as_ref().unwrap().path(), volume, &entry.contents)?;
+                restore_volume(
+                    ctx,
+                    staging.as_ref().unwrap().path(),
+                    volume,
+                    &entry.contents,
+                )?;
             }
             restored_count += 1;
             continue;
@@ -315,7 +320,11 @@ pub fn restore(
             },
         });
         if !dry_run {
-            write_staging_file(staging.as_ref().unwrap().path(), &source.path, &entry.contents)?;
+            write_staging_file(
+                staging.as_ref().unwrap().path(),
+                &source.path,
+                &entry.contents,
+            )?;
             let mode = if source.path == backup_state::AGENT_ENV_PATH {
                 0o600
             } else {
@@ -727,9 +736,8 @@ mod tests {
 
         let report = create(&ctx(&runner), &paths, &archive, false, true).unwrap();
         let (manifest, entries) = backup_state::read_archive(&archive).unwrap();
-        let entry =
-            backup_state::archive_entry(&entries, "/etc/nclawzero/providers.d/legacy.json")
-                .unwrap();
+        let entry = backup_state::archive_entry(&entries, "/etc/nclawzero/providers.d/legacy.json")
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&entry.contents).unwrap();
 
         assert_eq!(report.redacted_count, 1);
@@ -752,9 +760,8 @@ mod tests {
 
         let report = create(&ctx(&runner), &paths, &archive, true, true).unwrap();
         let (manifest, entries) = backup_state::read_archive(&archive).unwrap();
-        let entry =
-            backup_state::archive_entry(&entries, "/etc/nclawzero/providers.d/legacy.json")
-                .unwrap();
+        let entry = backup_state::archive_entry(&entries, "/etc/nclawzero/providers.d/legacy.json")
+            .unwrap();
 
         assert_eq!(report.redacted_count, 0);
         assert!(!manifest.sources[0].redacted);
@@ -772,7 +779,11 @@ mod tests {
         let _ = fs::remove_file(&export_path);
         fs::write(&export_path, b"volume tar").unwrap();
         let runner = FakeRunner::new();
-        runner.expect("podman", &["volume", "exists", "zeroclaw-data"], out(0, "", ""));
+        runner.expect(
+            "podman",
+            &["volume", "exists", "zeroclaw-data"],
+            out(0, "", ""),
+        );
         runner.expect(
             "systemctl",
             &["is-active", "--quiet", "zeroclaw.service"],
@@ -801,8 +812,16 @@ mod tests {
             &["systemctl", "start", "zeroclaw.service"],
             out(0, "", ""),
         );
-        runner.expect("podman", &["volume", "exists", "openclaw-data"], out(1, "", ""));
-        runner.expect("podman", &["volume", "exists", "hermes-data"], out(1, "", ""));
+        runner.expect(
+            "podman",
+            &["volume", "exists", "openclaw-data"],
+            out(1, "", ""),
+        );
+        runner.expect(
+            "podman",
+            &["volume", "exists", "hermes-data"],
+            out(1, "", ""),
+        );
         expect_hostname(&runner);
 
         let report = create(&ctx(&runner), &paths, &archive, false, false).unwrap();
@@ -822,7 +841,11 @@ mod tests {
         let _ = fs::remove_file(&export_path);
         fs::write(&export_path, b"volume tar").unwrap();
         let runner = FakeRunner::new();
-        runner.expect("podman", &["volume", "exists", "zeroclaw-data"], out(0, "", ""));
+        runner.expect(
+            "podman",
+            &["volume", "exists", "zeroclaw-data"],
+            out(0, "", ""),
+        );
         runner.expect(
             "podman",
             &[
@@ -834,12 +857,20 @@ mod tests {
             ],
             out(0, "", ""),
         );
-        runner.expect("podman", &["volume", "exists", "openclaw-data"], out(1, "", ""));
-        runner.expect("podman", &["volume", "exists", "hermes-data"], out(1, "", ""));
+        runner.expect(
+            "podman",
+            &["volume", "exists", "openclaw-data"],
+            out(1, "", ""),
+        );
+        runner.expect(
+            "podman",
+            &["volume", "exists", "hermes-data"],
+            out(1, "", ""),
+        );
         expect_hostname(&runner);
 
-        let report = create_with_options(&ctx(&runner), &paths, &archive, false, false, true)
-            .unwrap();
+        let report =
+            create_with_options(&ctx(&runner), &paths, &archive, false, false, true).unwrap();
 
         assert_eq!(report.source_count, 1);
         assert!(!export_path.exists());
@@ -865,7 +896,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let paths = test_paths(tmp.path());
         fs::create_dir_all(paths.providers_dir()).unwrap();
-        fs::write(paths.providers_dir().join("legacy.json"), br#"{"name":"old"}"#).unwrap();
+        fs::write(
+            paths.providers_dir().join("legacy.json"),
+            br#"{"name":"old"}"#,
+        )
+        .unwrap();
         let archive = tmp.path().join("backup.tar.gz");
         write_archive(
             &archive,
@@ -900,7 +935,11 @@ mod tests {
             false,
         );
         let runner = FakeRunner::new();
-        runner.expect("podman", &["volume", "exists", "zeroclaw-data"], out(0, "", ""));
+        runner.expect(
+            "podman",
+            &["volume", "exists", "zeroclaw-data"],
+            out(0, "", ""),
+        );
         runner.expect(
             "podman",
             &[
@@ -924,7 +963,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let paths = test_paths(tmp.path());
         fs::create_dir_all(paths.providers_dir()).unwrap();
-        fs::write(paths.providers_dir().join("legacy.json"), br#"{"name":"old"}"#).unwrap();
+        fs::write(
+            paths.providers_dir().join("legacy.json"),
+            br#"{"name":"old"}"#,
+        )
+        .unwrap();
         let archive = tmp.path().join("backup.tar.gz");
         write_archive(
             &archive,
@@ -1005,7 +1048,10 @@ mod tests {
         .unwrap();
 
         let path = tmp.path().join("etc/nclawzero/agent-env");
-        assert_eq!(fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[test]
