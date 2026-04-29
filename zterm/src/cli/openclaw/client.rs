@@ -58,7 +58,7 @@ use tokio_tungstenite::{
     tungstenite::{Error as WsError, Message as WsMessage},
 };
 
-use crate::cli::url_safety::is_sensitive_url_query_key;
+use crate::cli::url_safety::redact_url_secrets_for_display;
 
 use super::wire::{Frame, PendingRequests, RequestFrame, ResponseFrame};
 
@@ -289,36 +289,13 @@ impl OpenClawClient {
 }
 
 pub(crate) fn redacted_openclaw_url_for_error(url: &str) -> String {
-    let Ok(mut parsed) = reqwest::Url::parse(url) else {
-        return "<invalid openclaw url>".to_string();
-    };
-    if !parsed.username().is_empty() {
-        let _ = parsed.set_username("redacted");
+    if let Some(redacted) = redact_url_secrets_for_display(url) {
+        return redacted;
     }
-    if parsed.password().is_some() {
-        let _ = parsed.set_password(Some("redacted"));
+    match reqwest::Url::parse(url) {
+        Ok(parsed) => parsed.to_string(),
+        Err(_) => "<invalid openclaw url>".to_string(),
     }
-    if parsed.query().is_some() {
-        let pairs: Vec<(String, String)> = parsed
-            .query_pairs()
-            .map(|(key, value)| {
-                if is_sensitive_url_query_key(&key) {
-                    (key.into_owned(), "REDACTED".to_string())
-                } else {
-                    (key.into_owned(), value.into_owned())
-                }
-            })
-            .collect();
-        parsed.set_query(None);
-        if !pairs.is_empty() {
-            parsed.query_pairs_mut().extend_pairs(
-                pairs
-                    .iter()
-                    .map(|(key, value)| (key.as_str(), value.as_str())),
-            );
-        }
-    }
-    parsed.to_string()
 }
 
 impl OpenClawClient {
@@ -2360,7 +2337,7 @@ mod tests {
     #[test]
     fn openclaw_error_url_redaction_masks_credentials_and_sensitive_query() {
         let redacted = redacted_openclaw_url_for_error(
-            "wss://operator:embedded-password@gateway.example/ws?api_token=abc&refresh_token=def&client_secret=ghi&session_token=jkl&room=alpha",
+            "wss://operator:embedded-password@gateway.example/ws?api_token=abc&refresh_token=def&client_secret=ghi&session_token=jkl&room=alpha#access_token=fragment-secret",
         );
 
         assert!(redacted.contains("redacted:redacted@gateway.example"));
@@ -2369,12 +2346,14 @@ mod tests {
         assert!(redacted.contains("client_secret=REDACTED"));
         assert!(redacted.contains("session_token=REDACTED"));
         assert!(redacted.contains("room=alpha"));
+        assert!(redacted.contains("#REDACTED"));
         assert!(!redacted.contains("operator"));
         assert!(!redacted.contains("embedded-password"));
         assert!(!redacted.contains("abc"));
         assert!(!redacted.contains("def"));
         assert!(!redacted.contains("ghi"));
         assert!(!redacted.contains("jkl"));
+        assert!(!redacted.contains("fragment-secret"));
     }
 
     #[test]

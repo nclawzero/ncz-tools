@@ -1691,6 +1691,12 @@ fn validate_workspace_url_safety(config: &WorkspaceConfig) -> Result<()> {
             config.name
         ));
     }
+    if url.fragment().is_some() {
+        return Err(anyhow!(
+            "workspace `{}` url must not contain a fragment; use token_env or token instead",
+            config.name
+        ));
+    }
     Ok(())
 }
 
@@ -2596,6 +2602,28 @@ url = "ws://127.0.0.1:18789/ws?client_secret=credential-value&room=alpha"
         assert!(!msg.contains("credential-value"));
     }
 
+    #[test]
+    fn app_from_config_rejects_workspace_url_with_fragment() {
+        let cfg = AppConfig::parse(
+            r#"
+[[workspaces]]
+name = "oc"
+backend = "openclaw"
+url = "ws://127.0.0.1:18789/ws#access_token=fragment-secret"
+"#,
+        )
+        .unwrap();
+
+        let err = match App::from_config(cfg, PathBuf::from("/dev/null")) {
+            Ok(_) => panic!("fragment-bearing workspace URL should fail closed"),
+            Err(err) => err,
+        };
+
+        let msg = err.to_string();
+        assert!(msg.contains("url must not contain a fragment"));
+        assert!(!msg.contains("fragment-secret"));
+    }
+
     #[tokio::test]
     async fn activate_zeroclaw_is_noop_returns_ok() {
         let cfg = WorkspaceConfig {
@@ -2805,6 +2833,17 @@ url = "ws://c"
         let query_msg = query_err.to_string();
         assert!(query_msg.contains("sensitive query parameter `refresh_token`"));
         assert!(!query_msg.contains("url-token"));
+
+        let fragment_err = match App::synthesize_single_zeroclaw(
+            "https://example.com/ws#access_token=fragment-secret",
+            Some("bearer-token".to_string()),
+        ) {
+            Ok(_) => panic!("fragment synthetic zeroclaw URL should fail closed"),
+            Err(err) => err,
+        };
+        let fragment_msg = fragment_err.to_string();
+        assert!(fragment_msg.contains("url must not contain a fragment"));
+        assert!(!fragment_msg.contains("fragment-secret"));
     }
 
     #[test]

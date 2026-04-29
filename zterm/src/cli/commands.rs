@@ -17,7 +17,7 @@ use crate::cli::client::ZeroclawClient;
 use crate::cli::client::{Model, Provider, Session};
 use crate::cli::input::InputHistory;
 use crate::cli::storage;
-use crate::cli::url_safety::is_sensitive_url_query_key;
+use crate::cli::url_safety::redact_url_secrets_for_display;
 use crate::cli::workspace::{Backend, Workspace, WorkspaceConfig};
 
 type AgentClientHandle = Arc<Mutex<Box<dyn AgentClient + Send + Sync>>>;
@@ -1382,7 +1382,7 @@ impl CommandHandler {
                         i + 1,
                         label,
                         w.backend.as_str(),
-                        w.url,
+                        display_workspace_url_for_output(&w.url),
                         status
                     ));
                 }
@@ -1396,7 +1396,10 @@ impl CommandHandler {
                         out.push_str(&format!("   label:     {l}\n"));
                     }
                     out.push_str(&format!("   backend:   {}\n", a.backend.as_str()));
-                    out.push_str(&format!("   url:       {}\n", a.url));
+                    out.push_str(&format!(
+                        "   url:       {}\n",
+                        display_workspace_url_for_output(&a.url)
+                    ));
                     out.push_str(&format!(
                         "   status:    {}\n",
                         if a.activated {
@@ -1721,38 +1724,11 @@ fn redact_toml_value(value: &mut toml::Value) {
 }
 
 fn redact_url_string_value(value: &str) -> Option<String> {
-    let mut url = reqwest::Url::parse(value).ok()?;
-    let mut changed = false;
-    if !url.username().is_empty() {
-        let _ = url.set_username("redacted");
-        changed = true;
-    }
-    if url.password().is_some() {
-        let _ = url.set_password(Some("redacted"));
-        changed = true;
-    }
-    if url.query().is_some() {
-        let pairs: Vec<(String, String)> = url
-            .query_pairs()
-            .map(|(key, value)| {
-                if is_sensitive_url_query_key(&key) {
-                    changed = true;
-                    (key.into_owned(), "REDACTED".to_string())
-                } else {
-                    (key.into_owned(), value.into_owned())
-                }
-            })
-            .collect();
-        url.set_query(None);
-        if !pairs.is_empty() {
-            url.query_pairs_mut().extend_pairs(
-                pairs
-                    .iter()
-                    .map(|(key, value)| (key.as_str(), value.as_str())),
-            );
-        }
-    }
-    changed.then(|| url.to_string())
+    redact_url_secrets_for_display(value)
+}
+
+fn display_workspace_url_for_output(url: &str) -> String {
+    redact_url_secrets_for_display(url).unwrap_or_else(|| url.to_string())
 }
 
 fn split_line_ending(raw_line: &str) -> (&str, &str) {
@@ -3568,6 +3544,48 @@ token = "legacy-secret"
     }
 
     #[tokio::test]
+    async fn workspace_commands_redact_url_fragment_secrets() {
+        let app = app_with_two_fake_clients(
+            "alpha",
+            FakeAgentClient::default(),
+            "beta",
+            FakeAgentClient::default(),
+        );
+        {
+            let mut app = app.lock().await;
+            app.workspaces[0].config.url =
+                "wss://alpha.example/ws#access_token=alpha-fragment-secret".to_string();
+            app.workspaces[1].config.url =
+                "wss://beta.example/ws?client_secret=beta-query-secret#token=beta-fragment-secret"
+                    .to_string();
+        }
+        let handler = super::CommandHandler::new(app);
+
+        let info = handler
+            .handle("/workspace info", "s")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(info.contains("url:       wss://alpha.example/ws#REDACTED"));
+        assert!(!info.contains("alpha-fragment-secret"));
+
+        let list = handler
+            .handle("/workspace list", "s")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(list.contains("wss://alpha.example/ws#REDACTED"));
+        assert!(list.contains("wss://beta.example/ws?client_secret=REDACTED#REDACTED"));
+        for leaked in [
+            "alpha-fragment-secret",
+            "beta-query-secret",
+            "beta-fragment-secret",
+        ] {
+            assert!(!list.contains(leaked), "{leaked} leaked in {list}");
+        }
+    }
+
+    #[tokio::test]
     async fn workspace_switch_releases_app_lock_while_activation_is_in_flight() {
         let app = app_with_pending_openclaw_workspace();
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
@@ -3657,11 +3675,11 @@ openai = { model = "gpt", api_key = "inline-api-key" }
     fn config_output_redacts_url_embedded_credentials_in_valid_toml() {
         let out = super::format_config_output(Ok(r#"
 	[gateway]
-		url = "wss://operator:embedded-password@gateway.example/ws?api_token=url-api-token&refresh_token=url-refresh-token&client_secret=url-client-secret&session_token=url-session-token&room=alpha"
+		url = "wss://operator:embedded-password@gateway.example/ws?api_token=url-api-token&refresh_token=url-refresh-token&client_secret=url-client-secret&session_token=url-session-token&room=alpha#access_token=url-fragment-token"
 		"#
         .to_string()));
 
-        assert!(out.contains("url = \"wss://redacted:redacted@gateway.example/ws?api_token=REDACTED&refresh_token=REDACTED&client_secret=REDACTED&session_token=REDACTED&room=alpha\""));
+        assert!(out.contains("url = \"wss://redacted:redacted@gateway.example/ws?api_token=REDACTED&refresh_token=REDACTED&client_secret=REDACTED&session_token=REDACTED&room=alpha#REDACTED\""));
         for leaked in [
             "operator",
             "embedded-password",
@@ -3669,6 +3687,7 @@ openai = { model = "gpt", api_key = "inline-api-key" }
             "url-refresh-token",
             "url-client-secret",
             "url-session-token",
+            "url-fragment-token",
         ] {
             assert!(!out.contains(leaked), "{leaked} leaked in {out}");
         }
@@ -3767,11 +3786,11 @@ provider_settings = { tokens = ["array-token-1", "array-token-2"], name = "kept"
         let out = super::redact_config_secrets(
             r#"
 	[unterminated
-		url = "wss://operator:embedded-password@gateway.example/ws?api_token=url-api-token&refresh_token=url-refresh-token&client_secret=url-client-secret&session_token=url-session-token&room=alpha"
+		url = "wss://operator:embedded-password@gateway.example/ws?api_token=url-api-token&refresh_token=url-refresh-token&client_secret=url-client-secret&session_token=url-session-token&room=alpha#access_token=url-fragment-token"
 		"#,
         );
 
-        assert!(out.contains("url = \"wss://redacted:redacted@gateway.example/ws?api_token=REDACTED&refresh_token=REDACTED&client_secret=REDACTED&session_token=REDACTED&room=alpha\""));
+        assert!(out.contains("url = \"wss://redacted:redacted@gateway.example/ws?api_token=REDACTED&refresh_token=REDACTED&client_secret=REDACTED&session_token=REDACTED&room=alpha#REDACTED\""));
         for leaked in [
             "operator",
             "embedded-password",
@@ -3779,6 +3798,7 @@ provider_settings = { tokens = ["array-token-1", "array-token-2"], name = "kept"
             "url-refresh-token",
             "url-client-secret",
             "url-session-token",
+            "url-fragment-token",
         ] {
             assert!(!out.contains(leaked), "{leaked} leaked in {out}");
         }
