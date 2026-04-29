@@ -33,6 +33,7 @@ impl Render for BackupReport {
 }
 
 #[derive(Debug, Serialize)]
+#[non_exhaustive]
 pub struct BackupCreateReport {
     pub schema_version: u32,
     pub archive: String,
@@ -44,6 +45,7 @@ pub struct BackupCreateReport {
 }
 
 #[derive(Debug, Serialize)]
+#[non_exhaustive]
 pub struct BackupVerifyReport {
     pub schema_version: u32,
     pub archive: String,
@@ -55,6 +57,7 @@ pub struct BackupVerifyReport {
 }
 
 #[derive(Debug, Serialize)]
+#[non_exhaustive]
 pub struct BackupRestoreReport {
     pub schema_version: u32,
     pub archive: String,

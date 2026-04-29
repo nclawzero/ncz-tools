@@ -299,6 +299,7 @@ pub enum McpAction {
 #[derive(Subcommand, Debug)]
 pub enum BackupAction {
     /// Create a tar.gz backup archive.
+    #[non_exhaustive]
     Create {
         /// Archive path to write.
         #[arg(long)]
