@@ -486,9 +486,12 @@ fn parse_entries(stdout: &str, json_mode: bool) -> Result<Option<Vec<CronEntryRe
     let value: Value = match serde_json::from_str(trimmed) {
         Ok(value) => value,
         Err(err) => {
-            return Err(NczError::Inconsistent(format!(
-                "zeroclaw cron list returned non-parseable JSON: {err}"
-            )));
+            let message = format!("zeroclaw cron list returned non-parseable JSON: {err}");
+            return if json_mode {
+                Err(NczError::Precondition(message))
+            } else {
+                Err(NczError::Inconsistent(message))
+            };
         }
     };
     let entries = match &value {
@@ -689,12 +692,13 @@ mod tests {
 
         let err = list(&ctx(&runner), &paths, None).unwrap_err();
         assert!(matches!(err, NczError::Inconsistent(_)));
+        assert_eq!(err.exit_code(), 3);
         assert!(err.to_string().contains("non-parseable JSON"));
         runner.assert_done();
     }
 
     #[test]
-    fn cron_list_json_mode_still_fails_on_invalid_json_unchanged() {
+    fn cron_list_json_mode_returns_precondition_on_invalid_json() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = paths_with_agent(tmp.path(), "zeroclaw");
         let runner = FakeRunner::new();
@@ -706,7 +710,8 @@ mod tests {
         );
 
         let err = list(&json_ctx(&runner), &paths, None).unwrap_err();
-        assert!(matches!(err, NczError::Inconsistent(_)));
+        assert!(matches!(err, NczError::Precondition(_)));
+        assert_eq!(err.exit_code(), 2);
         assert!(err.to_string().contains("non-parseable JSON"));
         runner.assert_done();
     }
