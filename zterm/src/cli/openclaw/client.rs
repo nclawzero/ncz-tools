@@ -1066,6 +1066,7 @@ async fn collect_turn_result(
 ) -> anyhow::Result<()> {
     let deadline = tokio::time::Instant::now() + timeout;
     let mut saw_terminal_completion = false;
+    let mut saw_expected_assistant_message = false;
     let mut expected_message_id: Option<String> = expected_ack_message_id.map(str::to_string);
     let mut pending_runless_messages: Vec<BufferedAssistantMessage> = Vec::new();
     let mut pending_runless_bytes = 0usize;
@@ -1073,7 +1074,12 @@ async fn collect_turn_result(
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
-            return finish_completed_or_timeout(timeout, turn, saw_terminal_completion);
+            return finish_completed_or_timeout(
+                timeout,
+                turn,
+                saw_terminal_completion,
+                saw_expected_assistant_message,
+            );
         }
 
         let rx_res = tokio::time::timeout(remaining, event_rx.recv()).await;
@@ -1081,7 +1087,12 @@ async fn collect_turn_result(
             Ok(Some(ev)) => ev,
             Ok(None) => anyhow::bail!("openclaw: event channel closed mid-stream"),
             Err(_) => {
-                return finish_completed_or_timeout(timeout, turn, saw_terminal_completion);
+                return finish_completed_or_timeout(
+                    timeout,
+                    turn,
+                    saw_terminal_completion,
+                    saw_expected_assistant_message,
+                );
             }
         };
 
@@ -1096,13 +1107,15 @@ async fn collect_turn_result(
                 if expected_message_id.is_none() {
                     expected_message_id = completion.message_id.clone();
                 }
-                merge_buffered_runless_messages(
+                if merge_buffered_runless_messages(
                     turn,
                     &mut pending_runless_messages,
                     &mut pending_runless_bytes,
                     expected_message_id.as_deref(),
-                )?;
-                if turn_completion_can_finish(turn) {
+                )? {
+                    saw_expected_assistant_message = true;
+                }
+                if turn_completion_can_finish(turn) || saw_expected_assistant_message {
                     return Ok(());
                 }
             }
@@ -1129,7 +1142,7 @@ async fn collect_turn_result(
                 if expected_message_id.is_none() {
                     expected_message_id = message_id.clone();
                 }
-                merge_buffered_runless_messages(
+                let _ = merge_buffered_runless_messages(
                     turn,
                     &mut pending_runless_messages,
                     &mut pending_runless_bytes,
@@ -1182,6 +1195,7 @@ async fn collect_turn_result(
         }
 
         merge_assistant_message_into_turn(turn, payload, message)?;
+        saw_expected_assistant_message = true;
 
         let message_completed =
             message_marks_run_completed(payload, message) || saw_terminal_completion;
@@ -1189,7 +1203,8 @@ async fn collect_turn_result(
         // Text-bearing events can be deltas or intermediate snapshots;
         // success still requires the expected run/message completion
         // marker so we do not truncate a streaming reply.
-        if message_completed && turn_completion_can_finish(turn) {
+        if message_completed && (turn_completion_can_finish(turn) || saw_expected_assistant_message)
+        {
             return Ok(());
         }
         tracing::debug!(
@@ -1212,21 +1227,23 @@ fn merge_buffered_runless_messages(
     pending: &mut Vec<BufferedAssistantMessage>,
     pending_bytes: &mut usize,
     expected_message_id: Option<&str>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     let Some(expected_message_id) = expected_message_id else {
-        return Ok(());
+        return Ok(false);
     };
     let mut idx = 0;
+    let mut merged = false;
     while idx < pending.len() {
         if pending[idx].message_id == expected_message_id {
             let buffered = pending.remove(idx);
             *pending_bytes = pending_bytes.saturating_sub(buffered.byte_len);
             merge_assistant_message_into_turn(turn, &buffered.payload, &buffered.message)?;
+            merged = true;
         } else {
             idx += 1;
         }
     }
-    Ok(())
+    Ok(merged)
 }
 
 fn merge_assistant_message_into_turn(
@@ -1532,8 +1549,11 @@ fn finish_completed_or_timeout(
     timeout: std::time::Duration,
     turn: &super::handshake::TurnResult,
     saw_terminal_completion: bool,
+    saw_expected_assistant_message: bool,
 ) -> anyhow::Result<()> {
-    if saw_terminal_completion && turn_completion_can_finish(turn) {
+    if saw_terminal_completion
+        && (turn_completion_can_finish(turn) || saw_expected_assistant_message)
+    {
         return Ok(());
     }
     anyhow::bail!(
@@ -2666,6 +2686,31 @@ mod tests {
         }
     }
 
+    fn assistant_empty_completed_event(
+        session_key: &str,
+        run_id: &str,
+        message_id: &str,
+    ) -> super::super::wire::EventFrame {
+        super::super::wire::EventFrame {
+            event: "session.message".to_string(),
+            payload: Some(serde_json::json!({
+                "sessionKey": session_key,
+                "runId": run_id,
+                "messageId": message_id,
+                "status": "completed",
+                "message": {
+                    "id": message_id,
+                    "role": "assistant",
+                    "runId": run_id,
+                    "status": "completed",
+                    "content": []
+                }
+            })),
+            seq: None,
+            state_version: None,
+        }
+    }
+
     fn assistant_delta_event(
         session_key: &str,
         run_id: &str,
@@ -2970,6 +3015,40 @@ mod tests {
         .expect_err("completion-only run should fail closed instead of persisting a blank turn");
 
         assert!(err.to_string().contains("timed out"));
+        assert_eq!(turn.run_id.as_deref(), Some("current-run"));
+        assert!(turn.text.is_empty());
+        assert!(turn.tool_calls.is_empty());
+        assert!(turn.tool_results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn collect_turn_result_accepts_observed_empty_completed_message() {
+        let (event_tx, mut event_rx) = mpsc::channel::<super::super::wire::EventFrame>(1);
+        event_tx
+            .send(assistant_empty_completed_event(
+                "session-a",
+                "current-run",
+                "message-1",
+            ))
+            .await
+            .unwrap();
+
+        let mut turn = super::super::handshake::TurnResult {
+            run_id: Some("current-run".to_string()),
+            ..Default::default()
+        };
+        collect_turn_result(
+            &mut event_rx,
+            "session-a",
+            "current-run",
+            None,
+            None,
+            Duration::from_millis(50),
+            &mut turn,
+        )
+        .await
+        .expect("observed empty assistant completion should collect");
+
         assert_eq!(turn.run_id.as_deref(), Some("current-run"));
         assert!(turn.text.is_empty());
         assert!(turn.tool_calls.is_empty());
