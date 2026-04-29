@@ -365,9 +365,15 @@ impl StatusState {
     }
 
     fn begin_turn(&mut self) {
+        self.begin_busy(true);
+    }
+
+    fn begin_busy(&mut self, clear_usage: bool) {
         self.turn_start = Some(Instant::now());
         self.frozen_elapsed = None;
-        self.clear_usage();
+        if clear_usage {
+            self.clear_usage();
+        }
     }
 
     fn end_turn(&mut self) {
@@ -2588,20 +2594,17 @@ fn dispatch_worker_backed_submission(
     }
     append_prompt_placeholder(label, chat_lines);
 
-    // Only agent turns drive the elapsed counter — slash commands are
-    // nearly instantaneous and jittering the timer on each /help would
-    // look wrong.
     if starts_turn_timer {
         status_state.begin_turn();
+    } else {
+        status_state.begin_busy(false);
     }
     *response_in_flight = true;
 
     if let Err(e) = req_tx.blocking_send(request) {
         *response_in_flight = false;
-        if starts_turn_timer {
-            // Undo the timer start; the turn never made it to the worker.
-            status_state.turn_start = None;
-        }
+        // Undo the busy indicator; the request never made it to the worker.
+        status_state.turn_start = None;
         chat_lines
             .borrow_mut()
             .push(format!("[error] could not {error_context}: {e}"));
@@ -4079,6 +4082,34 @@ mod tests {
             state.toast.as_ref().map(|(msg, _)| msg.as_str()),
             Some(RESPONSE_BUSY_TOAST)
         );
+    }
+
+    #[test]
+    fn worker_backed_command_starts_busy_spinner_without_clearing_usage() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let lines = Rc::new(RefCell::new(Vec::new()));
+        let mut state = StatusState::new(
+            "default".to_string(),
+            "gpt-test".to_string(),
+            "borland".to_string(),
+            false,
+        );
+        state.usage = Some(TurnUsage {
+            total_tokens: Some(100),
+            context_window: Some(1_000),
+            ..Default::default()
+        });
+        let mut response_in_flight = false;
+
+        dispatch_command("/help", &lines, &tx, &mut state, &mut response_in_flight);
+
+        assert!(response_in_flight);
+        assert!(state.spinner_char().is_some());
+        assert!(state.usage.is_some());
+        let WorkerRequest::Command(cmdline) = rx.try_recv().unwrap() else {
+            panic!("expected command request");
+        };
+        assert_eq!(cmdline, "/help");
     }
 
     #[test]

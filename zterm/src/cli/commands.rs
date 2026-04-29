@@ -185,7 +185,6 @@ impl CommandHandler {
             \n\
             Agent & Daemon:\n  \
               /agent             Interactive agent (current mode)\n  \
-              /agent -m 'text'   Send single message\n  \
               /daemon            Start gateway + channels + scheduler\n  \
               /service           Manage system service\n\
             \n\
@@ -442,8 +441,9 @@ impl CommandHandler {
     ) -> Result<Option<String>> {
         let out = match subcommand {
             Some("-m") | Some("--message") => {
-                let msg = args.join(" ");
-                format!("📤 Sending: {msg}\n   (Via zeroclaw agent -m)\n")
+                anyhow::bail!(
+                    "/agent -m is not supported in zterm; type the message directly at the prompt"
+                );
             }
             Some("-p") | Some("--provider") => {
                 let provider = args.first().copied().unwrap_or("default");
@@ -2764,6 +2764,15 @@ mod tests {
                 "{cmdline} should not complete silently"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn agent_message_command_fails_closed_until_wired_to_submit_path() {
+        let handler = super::CommandHandler::new(app_with_fake_client(FakeAgentClient::default()));
+
+        let err = handler.handle("/agent -m hello", "s").await.unwrap_err();
+
+        assert!(err.to_string().contains("/agent -m is not supported"));
     }
 
     #[tokio::test]
