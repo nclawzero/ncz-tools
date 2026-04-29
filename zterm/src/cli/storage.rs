@@ -676,7 +676,7 @@ pub(crate) fn write_stale_scoped_session_history_turn_lock_owner_for_tests(
     write_session_turn_lock_owner(
         &lock_dir,
         &SessionTurnLockOwner {
-            pid: u32::MAX,
+            pid: 999_999_999,
             created_at_unix: 0,
         },
     )
