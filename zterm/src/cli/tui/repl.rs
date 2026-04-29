@@ -298,6 +298,12 @@ impl ReplLoop {
                 }
             };
             if let Err(e) =
+                storage::ensure_scoped_session_history_complete(&transcript_scope, &session_id)
+            {
+                ui::print_error("turn not submitted", Some(&e.to_string()));
+                continue;
+            }
+            if let Err(e) =
                 append_repl_transcript_entry(&transcript_scope, &session_id, "user", &input)
             {
                 ui::print_error(

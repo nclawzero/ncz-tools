@@ -615,6 +615,17 @@ pub async fn run(
                                     continue;
                                 }
                             };
+                            if let Err(e) = storage::ensure_scoped_session_history_complete(
+                                &transcript_scope,
+                                &worker_session_id,
+                            ) {
+                                send_worker_finished(
+                                    &worker_sink,
+                                    Err(format!("{e}; turn not submitted")),
+                                )
+                                .await;
+                                continue;
+                            }
                             if let Err(e) = append_turn_transcript_entry(
                                 &transcript_scope,
                                 &worker_session_id,

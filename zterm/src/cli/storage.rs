@@ -430,6 +430,19 @@ pub fn scoped_session_history_is_incomplete(
     Ok(scoped_session_history_incomplete_file(scope, session_id)?.exists())
 }
 
+/// Refuse new turns while the local transcript is known incomplete.
+pub fn ensure_scoped_session_history_complete(
+    scope: &LocalWorkspaceScope,
+    session_id: &str,
+) -> Result<()> {
+    if scoped_session_history_is_incomplete(scope, session_id)? {
+        return Err(anyhow!(
+            "session `{session_id}` has an incomplete transcript; run /clear before submitting another turn"
+        ));
+    }
+    Ok(())
+}
+
 /// Remove workspace-scoped transcript history for a session, leaving metadata intact.
 pub fn clear_scoped_session_history(scope: &LocalWorkspaceScope, session_id: &str) -> Result<bool> {
     if !is_safe_session_id(session_id) {
@@ -800,6 +813,21 @@ mod tests {
             .unwrap()
             .exists());
         assert!(!scoped_session_history_is_incomplete(&scope, "main").unwrap());
+    }
+
+    #[test]
+    fn incomplete_history_blocks_new_turns_until_clear() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let scope = scope(&format!("blocked-{}", uuid::Uuid::new_v4()));
+
+        append_scoped_session_history(&scope, "main", "user", "hello").unwrap();
+        mark_scoped_session_history_incomplete(&scope, "main", "run state unresolved").unwrap();
+
+        let err = ensure_scoped_session_history_complete(&scope, "main").unwrap_err();
+        assert!(err.to_string().contains("run /clear"));
+
+        clear_scoped_session_history(&scope, "main").unwrap();
+        ensure_scoped_session_history_complete(&scope, "main").unwrap();
     }
 
     #[test]
