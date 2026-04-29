@@ -148,6 +148,7 @@ const UI_EVENT_CAPACITY: usize = 512;
 const TURN_STREAM_CAPACITY: usize = 128;
 const TURN_TOKEN_COALESCE_BYTES: usize = 4096;
 const TURN_STREAM_MAX_BYTES: usize = 2 * 1024 * 1024;
+const COMMAND_ERROR_ALREADY_RENDERED: &str = "__zterm_command_error_already_rendered__";
 
 /// How long a status-line toast (e.g. palette confirmation after
 /// Ctrl-P) remains visible. ~1s is long enough to read but short
@@ -891,6 +892,7 @@ pub async fn run(
                     {
                         Ok(Some(text)) => {
                             let model_switched = successful_model_switch_command(&cmdline, &text);
+                            let command_failed = command_output_indicates_error(&text);
                             let _ = worker_sink.send(TurnChunk::Token(text));
                             let mut workspace_switched = false;
                             if preflight == CommandSessionPreflight::AfterWorkspaceSwitch {
@@ -945,7 +947,15 @@ pub async fn run(
                                     });
                                 }
                             }
-                            send_worker_finished(&worker_sink, Ok(String::new())).await;
+                            if command_failed {
+                                send_worker_finished(
+                                    &worker_sink,
+                                    Err(COMMAND_ERROR_ALREADY_RENDERED.to_string()),
+                                )
+                                .await;
+                            } else {
+                                send_worker_finished(&worker_sink, Ok(String::new())).await;
+                            }
                         }
                         Ok(None) => {
                             let _ = worker_sink.send(TurnChunk::Token(format!(
@@ -1195,6 +1205,14 @@ fn model_switch_target(cmdline: &str) -> Option<&str> {
 fn command_output_indicates_success(output: &str) -> bool {
     let trimmed = output.trim_start();
     !trimmed.is_empty() && !trimmed.starts_with("Usage:") && !trimmed.starts_with("❌")
+}
+
+fn command_output_indicates_error(output: &str) -> bool {
+    let trimmed = output.trim_start();
+    trimmed.starts_with("Usage:")
+        || output
+            .lines()
+            .any(|line| line.trim_start().starts_with("❌"))
 }
 
 async fn install_stream_sink_on_active_client(app: &Arc<Mutex<App>>, sink: StreamSink) -> bool {
@@ -2738,7 +2756,9 @@ fn apply_chunk(chunk: TurnChunk, chat_lines: &Rc<RefCell<Vec<String>>>) {
             lines.push(String::new());
         }
         TurnChunk::Finished(Err(e)) => {
-            lines.push(format!("[error] {}", sanitize_terminal_text(&e)));
+            if e != COMMAND_ERROR_ALREADY_RENDERED {
+                lines.push(format!("[error] {}", sanitize_terminal_text(&e)));
+            }
             lines.push(String::new());
         }
     }
@@ -4290,6 +4310,45 @@ mod tests {
     }
 
     #[test]
+    fn rendered_command_error_uses_error_path_without_duplicate_chat_line() {
+        let mut state = StatusState::new(
+            "default".to_string(),
+            "gpt-test".to_string(),
+            "borland".to_string(),
+            true,
+        );
+        state.begin_turn();
+        let lines = Rc::new(RefCell::new(vec!["> /bad".to_string(), String::new()]));
+        let mut typewriter_state = None;
+        let mut response_in_flight = true;
+        let mut session_picker_state = SessionPickerState::default();
+        let (tx, mut rx) = mpsc::channel(8);
+        tx.try_send(TurnChunk::Token(
+            "❌ Unknown command: /bad\n   Type /help for available commands\n".to_string(),
+        ))
+        .unwrap();
+        tx.try_send(TurnChunk::Finished(Err(
+            COMMAND_ERROR_ALREADY_RENDERED.to_string()
+        )))
+        .unwrap();
+
+        assert!(drain_stream_events(
+            &mut rx,
+            &lines,
+            &mut state,
+            &mut typewriter_state,
+            &mut response_in_flight,
+            &mut session_picker_state
+        ));
+
+        assert!(!response_in_flight);
+        assert!(state.turn_start.is_none());
+        let rendered = lines.borrow().join("\n");
+        assert!(rendered.contains("Unknown command"));
+        assert!(!rendered.contains("[error]"));
+    }
+
+    #[test]
     fn worker_disconnect_clears_in_flight_turn() {
         let mut state = StatusState::new(
             "default".to_string(),
@@ -4595,6 +4654,15 @@ mod tests {
         assert!(!successful_model_switch_command(
             "/models set",
             "Usage: /models set <key>\n"
+        ));
+        assert!(command_output_indicates_error(
+            "❌ Failed to set model key: missing\n"
+        ));
+        assert!(command_output_indicates_error(
+            "Usage: /models set <key>\n   Run /models list to see available keys\n"
+        ));
+        assert!(!command_output_indicates_error(
+            "✅ Active model key: primary\n"
         ));
     }
 

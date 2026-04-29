@@ -6,6 +6,7 @@ use tracing::{info, warn};
 use crate::cli::client::Session;
 use crate::cli::pairing::PairingManager;
 use crate::cli::storage::{self, SessionMetadata};
+use crate::cli::workspace::{AppConfig, WorkspaceConfig};
 
 pub mod delighters;
 pub mod onboarding;
@@ -25,6 +26,10 @@ pub async fn run(
 ) -> Result<()> {
     info!("Starting ZTerm");
 
+    let zterm_config_path = AppConfig::default_path()?;
+    let zterm_config = AppConfig::load(&zterm_config_path)?;
+    let has_multi_workspace = !zterm_config.workspaces.is_empty();
+
     // Ensure config directories exist
     storage::ensure_config_dir()?;
     storage::ensure_sessions_dir()?;
@@ -33,45 +38,53 @@ pub async fn run(
     let is_tty = atty::is(atty::Stream::Stdin);
     info!("TTY mode: {}", is_tty);
 
-    // Check if config exists
-    let config_exists = storage::config_exists()?;
-    info!("Config exists: {}", config_exists);
+    let (gateway_url, api_token, config) = if has_multi_workspace {
+        info!("Workspace config found; skipping legacy onboarding and pairing.");
+        let active_workspace_url = active_workspace_config(&zterm_config)
+            .map(|workspace| workspace.url.clone())
+            .unwrap_or_else(|| "http://localhost:8888".to_string());
+        let config = read_toml_value_or_empty(&zterm_config_path)?;
+        (
+            active_workspace_url,
+            token.or_else(|| {
+                active_workspace_config(&zterm_config).and_then(WorkspaceConfig::resolved_token)
+            }),
+            config,
+        )
+    } else {
+        // Check if legacy config exists only when no ~/.zterm
+        // [[workspaces]] are configured. Workspace mode carries its own
+        // endpoint/auth and must not be forced through old onboarding.
+        let config_exists = storage::config_exists()?;
+        info!("Legacy config exists: {}", config_exists);
 
-    // If no config, run onboarding
-    if !config_exists {
-        info!("No config found. Running onboarding...");
-        onboarding::run_onboarding().await?;
-    }
+        if !config_exists {
+            info!("No legacy config found. Running onboarding...");
+            onboarding::run_onboarding().await?;
+        }
 
-    // Load config
-    let config_content = storage::load_config()?;
-    let config: toml::Value = toml::from_str(&config_content)?;
+        let config_content = storage::load_config()?;
+        let config: toml::Value = toml::from_str(&config_content)?;
 
-    // Extract API endpoint and token
-    let gateway_url = remote.unwrap_or_else(|| {
-        config
-            .get("gateway")
-            .and_then(|v| v.get("url"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("http://localhost:8888")
-            .to_string()
-    });
+        let gateway_url = remote.unwrap_or_else(|| {
+            config
+                .get("gateway")
+                .and_then(|v| v.get("url"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("http://localhost:8888")
+                .to_string()
+        });
 
-    let api_token = token.or_else(|| {
-        config
-            .get("gateway")
-            .and_then(|v| v.get("token"))
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-    });
+        let api_token = token.or_else(|| {
+            config
+                .get("gateway")
+                .and_then(|v| v.get("token"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        });
 
-    // Peek at ~/.zterm/config.toml's [[workspaces]] before the legacy
-    // pairing flow. If multi-workspace mode is configured, each
-    // workspace carries its own token/auth — the --remote URL + legacy
-    // pairing block below are irrelevant and would spuriously fail
-    // against port 8888 defaults. Synthesized (single-workspace) mode
-    // keeps pairing as-is.
-    let has_multi_workspace = has_configured_workspaces()?;
+        (gateway_url, api_token, config)
+    };
 
     // If no token, consult the gateway's `require_pairing` flag before
     // attempting the interactive pairing flow. Zeroclaw gateways with
@@ -178,6 +191,7 @@ pub async fn run(
     let active_ws = app
         .active_workspace()
         .expect("active workspace just activated");
+    let active_backend = active_ws.config.backend.as_str().to_string();
     let active_client = active_ws
         .client
         .clone()
@@ -209,9 +223,6 @@ pub async fn run(
     // line until `refresh_models` lands the live `/api/config` data.
     // Defaults are neutral config-key strings so fallbacks do not
     // pin a vendor or upstream model name.
-    let config_content = storage::load_config()?;
-    let config: toml::Value = toml::from_str(&config_content)?;
-
     let local_default_model = config
         .get("agent")
         .and_then(|v| v.get("model"))
@@ -223,8 +234,8 @@ pub async fn run(
         .get("agent")
         .and_then(|v| v.get("provider"))
         .and_then(|v| v.as_str())
-        .unwrap_or("zeroclaw")
-        .to_string();
+        .map(str::to_string)
+        .unwrap_or(active_backend);
 
     // Refresh the model list from /api/config once at boot. If the
     // active workspace is zeroclaw, this populates the cached
@@ -271,10 +282,25 @@ pub async fn run(
     Ok(())
 }
 
-fn has_configured_workspaces() -> Result<bool> {
-    let path = crate::cli::workspace::AppConfig::default_path()?;
-    let cfg = crate::cli::workspace::AppConfig::load(&path)?;
-    Ok(!cfg.workspaces.is_empty())
+fn active_workspace_config(config: &AppConfig) -> Option<&WorkspaceConfig> {
+    config
+        .active
+        .as_deref()
+        .and_then(|active| {
+            config
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.name == active)
+        })
+        .or_else(|| config.workspaces.first())
+}
+
+fn read_toml_value_or_empty(path: &std::path::Path) -> Result<toml::Value> {
+    if !path.exists() {
+        return Ok(toml::Value::Table(toml::map::Map::new()));
+    }
+    let text = std::fs::read_to_string(path)?;
+    Ok(toml::from_str(&text)?)
 }
 
 /// Load existing session or create new one. Goes through
@@ -572,6 +598,40 @@ url = "ws://example.invalid"
         assert!(!std::fs::read_to_string(&legacy_config_path)
             .unwrap()
             .contains("token"));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn boot_with_only_zterm_workspaces_skips_legacy_onboarding() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let home = tempfile::TempDir::new().unwrap();
+        let zterm_config_dir = tempfile::TempDir::new().unwrap();
+        let _home_guard = EnvGuard::set_path("HOME", home.path());
+        let _zterm_config_guard = EnvGuard::set_path("ZTERM_CONFIG_DIR", zterm_config_dir.path());
+
+        std::fs::write(
+            zterm_config_dir.path().join("config.toml"),
+            r#"
+[[workspaces]]
+name = "oc"
+backend = "openclaw"
+url = "ws://example.invalid"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            zterm_config_dir.path().join("workspace-state.toml"),
+            "openclaw_workspaces = [",
+        )
+        .unwrap();
+
+        let err = run(Some("main".to_string()), None, None, None, true)
+            .await
+            .unwrap_err();
+        let msg = format!("{err:#}");
+
+        assert!(msg.contains("parsing zterm workspace state"));
+        assert!(!home.path().join(".zeroclaw").join("config.toml").exists());
     }
 
     #[tokio::test]
