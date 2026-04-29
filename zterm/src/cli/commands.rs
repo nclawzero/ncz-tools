@@ -4209,6 +4209,8 @@ provider_settings = { tokens = ["array-token-1", "array-token-2"], name = "kept"
             )
             .unwrap();
             std::mem::forget(lock);
+            storage::write_stale_scoped_session_history_turn_lock_owner_for_tests(&scope, "main")
+                .unwrap();
 
             let history = storage::scoped_session_history_file(&scope, "main").unwrap();
             let marker = storage::scoped_session_history_incomplete_file(&scope, "main").unwrap();

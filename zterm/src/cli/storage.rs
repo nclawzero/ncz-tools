@@ -5,6 +5,7 @@ use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Configuration directory: ~/.zeroclaw
 pub fn config_dir() -> Result<PathBuf> {
@@ -237,6 +238,12 @@ impl ScopedSessionTurnLock {
     pub fn release(&self) -> Result<bool> {
         release_scoped_session_turn_lock_path(&self.lock_dir)
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SessionTurnLockOwner {
+    pid: u32,
+    created_at_unix: u64,
 }
 
 /// Ensure config directory exists
@@ -547,6 +554,10 @@ pub fn acquire_scoped_session_history_turn_lock(
             "session `{session_id}` already has a turn in progress; wait for it to finish or run /clear --force if another zterm exited mid-turn"
         ),
     )?;
+    if let Err(e) = write_session_turn_lock_owner(&lock_dir, &current_session_turn_lock_owner()) {
+        let _ = release_scoped_session_turn_lock_path(&lock_dir);
+        return Err(e);
+    }
 
     if let Err(e) = ensure_scoped_session_history_complete(scope, session_id) {
         let _ = release_scoped_session_turn_lock_path(&lock_dir);
@@ -584,6 +595,91 @@ fn acquire_scoped_session_history_lock_dir(
             "Failed to acquire session history {operation} lock: {e}"
         )),
     }
+}
+
+fn current_session_turn_lock_owner() -> SessionTurnLockOwner {
+    SessionTurnLockOwner {
+        pid: std::process::id(),
+        created_at_unix: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0),
+    }
+}
+
+fn session_turn_lock_owner_file(lock_dir: &Path) -> PathBuf {
+    lock_dir.join("owner.json")
+}
+
+fn write_session_turn_lock_owner(lock_dir: &Path, owner: &SessionTurnLockOwner) -> Result<()> {
+    let file = session_turn_lock_owner_file(lock_dir);
+    let mut out = open_private_write_file(&file)?;
+    let content = serde_json::to_string(owner)
+        .map_err(|e| anyhow!("Failed to serialize session history turn lock owner: {e}"))?;
+    writeln!(out, "{content}")
+        .map_err(|e| anyhow!("Failed to write session history turn lock owner: {e}"))?;
+    out.sync_all()
+        .map_err(|e| anyhow!("Failed to sync session history turn lock owner: {e}"))?;
+    sync_parent_dir(&file)
+        .map_err(|e| anyhow!("Failed to sync session history turn lock owner directory: {e}"))?;
+    Ok(())
+}
+
+fn read_session_turn_lock_owner(lock_dir: &Path) -> Result<SessionTurnLockOwner> {
+    let file = session_turn_lock_owner_file(lock_dir);
+    let content = fs::read_to_string(&file)
+        .map_err(|e| anyhow!("Failed to read session history turn lock owner: {e}"))?;
+    serde_json::from_str(&content)
+        .map_err(|e| anyhow!("Failed to parse session history turn lock owner: {e}"))
+}
+
+fn session_turn_lock_owner_is_live(lock_dir: &Path) -> Result<bool> {
+    let owner = read_session_turn_lock_owner(lock_dir)?;
+    process_id_is_live(owner.pid)
+}
+
+#[cfg(unix)]
+fn process_id_is_live(pid: u32) -> Result<bool> {
+    if pid == 0 {
+        return Ok(false);
+    }
+    if pid == std::process::id() {
+        return Ok(true);
+    }
+    let status = std::process::Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_err(|e| anyhow!("Failed to check session history turn lock owner process: {e}"))?;
+    Ok(status.success())
+}
+
+#[cfg(not(unix))]
+fn process_id_is_live(pid: u32) -> Result<bool> {
+    if pid == std::process::id() {
+        Ok(true)
+    } else {
+        Err(anyhow!(
+            "cannot prove session history turn lock owner process is stale on this platform"
+        ))
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn write_stale_scoped_session_history_turn_lock_owner_for_tests(
+    scope: &LocalWorkspaceScope,
+    session_id: &str,
+) -> Result<()> {
+    let lock_dir = scoped_session_history_turn_lock_dir(scope, session_id)?;
+    write_session_turn_lock_owner(
+        &lock_dir,
+        &SessionTurnLockOwner {
+            pid: u32::MAX,
+            created_at_unix: 0,
+        },
+    )
 }
 
 /// True when `/save` should refuse to export this scoped transcript.
@@ -724,6 +820,24 @@ pub fn clear_scoped_session_history_pending_turn_marker(
 }
 
 fn release_scoped_session_turn_lock_path(lock_dir: &Path) -> Result<bool> {
+    let owner_file = session_turn_lock_owner_file(lock_dir);
+    match fs::remove_file(&owner_file) {
+        Ok(()) => {
+            sync_parent_dir(&owner_file).map_err(|e| {
+                anyhow!(
+                    "Failed to sync session history turn lock owner parent after release: {}",
+                    e
+                )
+            })?;
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(anyhow!(
+                "Failed to release session history turn lock owner: {}",
+                e
+            ))
+        }
+    }
     match fs::remove_dir(lock_dir) {
         Ok(()) => {
             sync_parent_dir(lock_dir).map_err(|e| {
@@ -756,33 +870,41 @@ pub fn force_clear_scoped_session_history(
     }
 
     let lock_dir = scoped_session_history_turn_lock_dir(scope, session_id)?;
-    let removed_lock = match fs::remove_dir(&lock_dir) {
-        Ok(()) => {
-            sync_parent_dir(&lock_dir).map_err(|e| {
-                anyhow!(
-                    "Failed to sync session history turn lock parent after force clear: {}",
-                    e
-                )
-            })?;
-            true
+    match fs::metadata(&lock_dir) {
+        Ok(metadata) => {
+            if !metadata.is_dir() {
+                return Err(anyhow!(
+                    "session history turn lock path is not a directory; refusing force clear"
+                ));
+            }
+            if session_turn_lock_owner_is_live(&lock_dir)? {
+                return Err(anyhow!(
+                    "session `{session_id}` has a live turn lock; refusing /clear --force"
+                ));
+            }
+            let clear_result =
+                clear_scoped_session_history_files_with_sync(scope, session_id, sync_parent_dir);
+            let release_result = release_scoped_session_turn_lock_path(&lock_dir);
+            match (clear_result, release_result) {
+                (Ok(_), Ok(_)) => Ok(true),
+                (Ok(_), Err(release_err)) => Err(release_err),
+                (Err(clear_err), Ok(_)) => Err(clear_err),
+                (Err(clear_err), Err(release_err)) => Err(anyhow!(
+                    "{clear_err}; additionally failed to release stale session history turn lock: {release_err}"
+                )),
+            }
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-        Err(e) => {
-            return Err(anyhow!(
-                "Failed to remove stale session history turn lock: {}",
-                e
-            ))
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            clear_scoped_session_history(scope, session_id)
         }
-    };
-
-    clear_scoped_session_history(scope, session_id)
-        .map(|removed_history| removed_lock || removed_history)
+        Err(e) => Err(anyhow!("Failed to inspect session history turn lock: {e}")),
+    }
 }
 
 fn clear_scoped_session_history_with_sync<F>(
     scope: &LocalWorkspaceScope,
     session_id: &str,
-    mut sync_removed_path_parent: F,
+    sync_removed_path_parent: F,
 ) -> Result<bool>
 where
     F: FnMut(&Path) -> std::io::Result<()>,
@@ -800,75 +922,8 @@ where
         ),
     )?;
 
-    let clear_result = (|| {
-        let mut removed = false;
-        for file in [
-            scoped_session_history_file(scope, session_id)?,
-            scoped_session_history_incomplete_file(scope, session_id)?,
-        ] {
-            match fs::remove_file(&file) {
-                Ok(()) => {
-                    removed = true;
-                    sync_removed_path_parent(&file).map_err(|e| {
-                        anyhow!(
-                            "Failed to sync session history directory after clear: {}",
-                            e
-                        )
-                    })?;
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(anyhow!("Failed to clear session history: {}", e)),
-            }
-        }
-        let pending_dir = scoped_session_history_pending_dir(scope, session_id)?;
-        match fs::read_dir(&pending_dir) {
-            Ok(entries) => {
-                for entry in entries {
-                    let entry = entry.map_err(|e| {
-                        anyhow!("Failed to read session history pending marker: {}", e)
-                    })?;
-                    let path = entry.path();
-                    let file_type = entry.file_type().map_err(|e| {
-                        anyhow!("Failed to inspect session history pending marker: {}", e)
-                    })?;
-                    if file_type.is_dir() {
-                        return Err(anyhow!(
-                            "Failed to clear session history: unexpected nested pending marker directory"
-                        ));
-                    }
-                    match fs::remove_file(&path) {
-                        Ok(()) => {
-                            removed = true;
-                            sync_removed_path_parent(&path).map_err(|e| {
-                                anyhow!(
-                                    "Failed to sync session history pending marker directory after clear: {}",
-                                    e
-                                )
-                            })?;
-                        }
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(e) => return Err(anyhow!("Failed to clear session history: {}", e)),
-                    }
-                }
-                match fs::remove_dir(&pending_dir) {
-                    Ok(()) => {
-                        removed = true;
-                        sync_removed_path_parent(&pending_dir).map_err(|e| {
-                            anyhow!(
-                                "Failed to sync session history pending marker parent after clear: {}",
-                                e
-                            )
-                        })?;
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => return Err(anyhow!("Failed to clear session history: {}", e)),
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(anyhow!("Failed to clear session history: {}", e)),
-        }
-        Ok(removed)
-    })();
+    let clear_result =
+        clear_scoped_session_history_files_with_sync(scope, session_id, sync_removed_path_parent);
 
     let release_result = release_scoped_session_turn_lock_path(&lock_dir);
     match (clear_result, release_result) {
@@ -879,6 +934,83 @@ where
             "{clear_err}; additionally failed to release session history clear lock: {release_err}"
         )),
     }
+}
+
+fn clear_scoped_session_history_files_with_sync<F>(
+    scope: &LocalWorkspaceScope,
+    session_id: &str,
+    sync_removed_path_parent: F,
+) -> Result<bool>
+where
+    F: FnMut(&Path) -> std::io::Result<()>,
+{
+    let mut sync_removed_path_parent = sync_removed_path_parent;
+    let mut removed = false;
+    for file in [
+        scoped_session_history_file(scope, session_id)?,
+        scoped_session_history_incomplete_file(scope, session_id)?,
+    ] {
+        match fs::remove_file(&file) {
+            Ok(()) => {
+                removed = true;
+                sync_removed_path_parent(&file).map_err(|e| {
+                    anyhow!(
+                        "Failed to sync session history directory after clear: {}",
+                        e
+                    )
+                })?;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(anyhow!("Failed to clear session history: {}", e)),
+        }
+    }
+    let pending_dir = scoped_session_history_pending_dir(scope, session_id)?;
+    match fs::read_dir(&pending_dir) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry = entry
+                    .map_err(|e| anyhow!("Failed to read session history pending marker: {}", e))?;
+                let path = entry.path();
+                let file_type = entry.file_type().map_err(|e| {
+                    anyhow!("Failed to inspect session history pending marker: {}", e)
+                })?;
+                if file_type.is_dir() {
+                    return Err(anyhow!(
+                        "Failed to clear session history: unexpected nested pending marker directory"
+                    ));
+                }
+                match fs::remove_file(&path) {
+                    Ok(()) => {
+                        removed = true;
+                        sync_removed_path_parent(&path).map_err(|e| {
+                            anyhow!(
+                                "Failed to sync session history pending marker directory after clear: {}",
+                                e
+                            )
+                        })?;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(anyhow!("Failed to clear session history: {}", e)),
+                }
+            }
+            match fs::remove_dir(&pending_dir) {
+                Ok(()) => {
+                    removed = true;
+                    sync_removed_path_parent(&pending_dir).map_err(|e| {
+                        anyhow!(
+                            "Failed to sync session history pending marker parent after clear: {}",
+                            e
+                        )
+                    })?;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(anyhow!("Failed to clear session history: {}", e)),
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(anyhow!("Failed to clear session history: {}", e)),
+    }
+    Ok(removed)
 }
 
 #[cfg(unix)]
@@ -1518,6 +1650,7 @@ mod tests {
                 .unwrap();
         mark_scoped_session_history_incomplete(&scope, "main", "incomplete").unwrap();
         std::mem::forget(lock);
+        write_stale_scoped_session_history_turn_lock_owner_for_tests(&scope, "main").unwrap();
 
         assert!(scoped_session_history_turn_lock_dir(&scope, "main")
             .unwrap()
@@ -1536,6 +1669,34 @@ mod tests {
         assert!(!scoped_session_history_pending_dir(&scope, "main")
             .unwrap()
             .exists());
+    }
+
+    #[test]
+    fn force_clear_scoped_history_refuses_live_turn_lock() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let scope = scope(&format!(
+            "force-clear-live-turn-lock-{}",
+            uuid::Uuid::new_v4()
+        ));
+        append_scoped_session_history(&scope, "main", "user", "line").unwrap();
+        let lock =
+            acquire_scoped_session_history_turn_lock(&scope, "main", "turn-a", "turn A pending")
+                .unwrap();
+        mark_scoped_session_history_incomplete(&scope, "main", "incomplete").unwrap();
+
+        let err = force_clear_scoped_session_history(&scope, "main").unwrap_err();
+
+        assert!(err.to_string().contains("live turn lock"));
+        assert!(scoped_session_history_turn_lock_dir(&scope, "main")
+            .unwrap()
+            .exists());
+        assert!(scoped_session_history_file(&scope, "main")
+            .unwrap()
+            .exists());
+        assert!(scoped_session_history_incomplete_file(&scope, "main")
+            .unwrap()
+            .exists());
+        lock.release().unwrap();
     }
 
     #[test]
