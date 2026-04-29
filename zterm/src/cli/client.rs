@@ -640,6 +640,7 @@ impl ZeroclawClient {
 
         let mut response = String::new();
         let mut streamed = false;
+        let mut ws_frame_ownership_required = false;
         let deadline = tokio::time::Instant::now() + timeout;
 
         loop {
@@ -696,9 +697,21 @@ impl ZeroclawClient {
                 Err(_) => continue,
             };
             if zeroclaw_ws_frame_requires_ownership(&event) {
-                match zeroclaw_ws_frame_matches_turn(&event, &request_id, session_id) {
-                    Ok(true) => {}
-                    Ok(false) => continue,
+                match zeroclaw_ws_frame_ownership(&event, &request_id, session_id) {
+                    Ok(ZeroclawWsFrameOwnership::MatchesTurn) => {
+                        ws_frame_ownership_required = true;
+                    }
+                    Ok(ZeroclawWsFrameOwnership::ForeignTurn) => continue,
+                    Ok(ZeroclawWsFrameOwnership::LegacyOwnerless)
+                        if !ws_frame_ownership_required => {}
+                    Ok(ZeroclawWsFrameOwnership::LegacyOwnerless) => {
+                        let wrapped = anyhow!(
+                            "WebSocket frame ownership check failed: missing ownership after owned frame"
+                        );
+                        let _ = ws_stream.close(None).await;
+                        self.emit_failure(&wrapped);
+                        return Err(wrapped);
+                    }
                     Err(e) => {
                         let wrapped = anyhow!("WebSocket frame ownership check failed: {e}");
                         let _ = ws_stream.close(None).await;
@@ -1219,16 +1232,32 @@ fn zeroclaw_ws_frame_requires_ownership(event: &serde_json::Value) -> bool {
     )
 }
 
-fn zeroclaw_ws_frame_matches_turn(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ZeroclawWsFrameOwnership {
+    LegacyOwnerless,
+    MatchesTurn,
+    ForeignTurn,
+}
+
+fn zeroclaw_ws_frame_ownership(
     event: &serde_json::Value,
     request_id: &str,
     session_id: &str,
-) -> Result<bool> {
-    let frame_request_id = zeroclaw_ws_string_field(event, "request_id", "requestId")
-        .ok_or_else(|| anyhow!("missing request_id"))?;
-    let frame_session_id = zeroclaw_ws_string_field(event, "session_id", "sessionId")
-        .ok_or_else(|| anyhow!("missing session_id"))?;
-    Ok(frame_request_id == request_id && frame_session_id == session_id)
+) -> Result<ZeroclawWsFrameOwnership> {
+    let frame_request_id = zeroclaw_ws_string_field(event, "request_id", "requestId");
+    let frame_session_id = zeroclaw_ws_string_field(event, "session_id", "sessionId");
+
+    match (frame_request_id, frame_session_id) {
+        (None, None) => Ok(ZeroclawWsFrameOwnership::LegacyOwnerless),
+        (Some(frame_request_id), Some(frame_session_id))
+            if frame_request_id == request_id && frame_session_id == session_id =>
+        {
+            Ok(ZeroclawWsFrameOwnership::MatchesTurn)
+        }
+        (Some(_), Some(_)) => Ok(ZeroclawWsFrameOwnership::ForeignTurn),
+        (None, Some(_)) => Err(anyhow!("missing request_id")),
+        (Some(_), None) => Err(anyhow!("missing session_id")),
+    }
 }
 
 fn zeroclaw_ws_string_field<'a>(
@@ -1871,6 +1900,13 @@ fallback = "gemini"
             return;
         }
         if let Some(object) = frame.as_object_mut() {
+            if object
+                .remove("__zterm_test_ownerless")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false)
+            {
+                return;
+            }
             object
                 .entry("request_id")
                 .or_insert_with(|| serde_json::Value::String(request_id.to_string()));
@@ -1993,11 +2029,45 @@ fallback = "gemini"
     }
 
     #[tokio::test]
-    async fn ws_submit_rejects_missing_frame_ownership() {
+    async fn ws_submit_accepts_legacy_ownerless_frames() {
         let ws = test_ws_stream_with_ownership(
-            vec![json!({ "type": "chunk", "content": "ownerless" })],
+            vec![
+                json!({ "type": "chunk", "content": "ownerless" }),
+                json!({ "type": "done", "full_response": "ownerless" }),
+            ],
             None,
             false,
+        )
+        .await;
+        let client = ZeroclawClient::new("http://localhost:8888".to_string(), String::new());
+
+        let response = client
+            .submit_turn_ws_connected_with_limits(
+                ws,
+                "main",
+                "hello",
+                "primary",
+                Duration::from_secs(5),
+                1024,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response, "ownerless");
+    }
+
+    #[tokio::test]
+    async fn ws_submit_rejects_ownerless_frames_after_owned_frames() {
+        let ws = test_ws_stream(
+            vec![
+                json!({ "type": "chunk", "content": "owned" }),
+                json!({
+                    "type": "done",
+                    "full_response": "ownerless",
+                    "__zterm_test_ownerless": true
+                }),
+            ],
+            None,
         )
         .await;
         let client = ZeroclawClient::new("http://localhost:8888".to_string(), String::new());
@@ -2014,7 +2084,9 @@ fallback = "gemini"
             .await
             .unwrap_err();
 
-        assert!(err.to_string().contains("missing request_id"));
+        assert!(err
+            .to_string()
+            .contains("missing ownership after owned frame"));
     }
 
     #[test]
