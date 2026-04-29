@@ -286,10 +286,22 @@ fn harden_private_dirs(dir: &Path) -> Result<()> {
     dirs.reverse();
 
     for path in dirs {
-        if path.is_dir() {
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
-                .map_err(|e| anyhow!("Failed to set private directory permissions: {}", e))?;
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|e| anyhow!("Failed to inspect private directory: {}", e))?;
+        if metadata.file_type().is_symlink() {
+            return Err(anyhow!(
+                "Refusing to use symlinked private directory: {}",
+                path.display()
+            ));
         }
+        if !metadata.is_dir() {
+            return Err(anyhow!(
+                "Refusing to use non-directory private path: {}",
+                path.display()
+            ));
+        }
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+            .map_err(|e| anyhow!("Failed to set private directory permissions: {}", e))?;
     }
 
     Ok(())
@@ -363,7 +375,7 @@ pub fn save_session_metadata(metadata: &SessionMetadata) -> Result<()> {
     ensure_session_dir(&metadata.id)?;
     let file = session_metadata_file(&metadata.id)?;
     let content = serde_json::to_string_pretty(&metadata)?;
-    fs::write(&file, content).map_err(|e| anyhow!("Failed to write session metadata: {}", e))?;
+    write_private_storage_file(&file, &content, "session metadata")?;
     Ok(())
 }
 
@@ -379,7 +391,7 @@ pub fn save_scoped_session_metadata(
     ensure_scoped_session_dir(scope, &metadata.id)?;
     let file = scoped_session_metadata_file(scope, &metadata.id)?;
     let content = serde_json::to_string_pretty(&metadata)?;
-    fs::write(&file, content).map_err(|e| anyhow!("Failed to write session metadata: {}", e))?;
+    write_private_storage_file(&file, &content, "session metadata")?;
     Ok(())
 }
 
@@ -430,46 +442,92 @@ where
 }
 
 fn open_private_append_file(file: &Path) -> Result<fs::File> {
+    ensure_private_file_leaf_safe(file, "append")?;
     let mut opts = fs::OpenOptions::new();
     opts.create(true).append(true);
     #[cfg(unix)]
     {
         opts.mode(0o600);
+        opts.custom_flags(libc::O_NOFOLLOW);
     }
 
     let out = opts
         .open(file)
         .map_err(|e| anyhow!("Failed to open session history: {}", e))?;
-    harden_private_file(file)?;
+    harden_private_open_file(file, &out)?;
     Ok(out)
 }
 
 fn open_private_write_file(file: &Path) -> Result<fs::File> {
+    ensure_private_file_leaf_safe(file, "write")?;
     let mut opts = fs::OpenOptions::new();
     opts.create(true).truncate(true).write(true);
     #[cfg(unix)]
     {
         opts.mode(0o600);
+        opts.custom_flags(libc::O_NOFOLLOW);
     }
 
     let out = opts
         .open(file)
         .map_err(|e| anyhow!("Failed to open private storage file: {}", e))?;
-    harden_private_file(file)?;
+    harden_private_open_file(file, &out)?;
     Ok(out)
 }
 
-#[cfg(unix)]
-fn harden_private_file(file: &Path) -> Result<()> {
-    if file.exists() {
-        fs::set_permissions(file, fs::Permissions::from_mode(0o600))
-            .map_err(|e| anyhow!("Failed to set private file permissions: {}", e))?;
+fn write_private_storage_file(file: &Path, content: &str, label: &str) -> Result<()> {
+    let mut out = open_private_write_file(file)?;
+    out.write_all(content.as_bytes())
+        .map_err(|e| anyhow!("Failed to write {label}: {}", e))?;
+    out.sync_all()
+        .map_err(|e| anyhow!("Failed to sync {label}: {}", e))?;
+    Ok(())
+}
+
+fn ensure_private_file_leaf_safe(file: &Path, operation: &str) -> Result<()> {
+    if let Some(parent) = file.parent() {
+        harden_private_dirs(parent)?;
     }
+    match fs::symlink_metadata(file) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(anyhow!(
+            "Refusing to {operation} private storage symlink: {}",
+            file.display()
+        )),
+        Ok(metadata) if metadata.is_dir() => Err(anyhow!(
+            "Refusing to {operation} private storage directory as file: {}",
+            file.display()
+        )),
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(anyhow!("Failed to inspect private storage file: {}", e)),
+    }
+}
+
+#[cfg(unix)]
+fn harden_private_open_file(file: &Path, out: &fs::File) -> Result<()> {
+    match fs::symlink_metadata(file) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(anyhow!(
+                "Refusing to harden private storage symlink: {}",
+                file.display()
+            ));
+        }
+        Ok(metadata) if metadata.is_dir() => {
+            return Err(anyhow!(
+                "Refusing to harden private storage directory as file: {}",
+                file.display()
+            ));
+        }
+        Ok(_) => {}
+        Err(e) => return Err(anyhow!("Failed to inspect private storage file: {}", e)),
+    }
+    out.set_permissions(fs::Permissions::from_mode(0o600))
+        .map_err(|e| anyhow!("Failed to set private file permissions: {}", e))?;
     Ok(())
 }
 
 #[cfg(not(unix))]
-fn harden_private_file(_file: &Path) -> Result<()> {
+fn harden_private_open_file(_file: &Path, _out: &fs::File) -> Result<()> {
     Ok(())
 }
 
@@ -1036,7 +1094,7 @@ pub fn load_config() -> Result<String> {
 pub fn save_config(content: &str) -> Result<()> {
     ensure_config_dir()?;
     let file = config_file()?;
-    fs::write(&file, content).map_err(|e| anyhow!("Failed to write config: {}", e))?;
+    write_private_storage_file(&file, content, "config")?;
     Ok(())
 }
 
@@ -1178,7 +1236,7 @@ pub fn update_config_model(provider: &str, model: &str) -> Result<()> {
         content.push_str(&format!("model = \"{}\"\n", model));
     }
 
-    fs::write(&file, content).map_err(|e| anyhow!("Failed to update config: {}", e))?;
+    write_private_storage_file(&file, &content, "config")?;
 
     Ok(())
 }
@@ -1316,6 +1374,87 @@ mod tests {
             .unwrap()
             .exists());
         assert!(!clear_scoped_session_history(&scope, "main").unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn append_scoped_session_history_refuses_symlink_leaf() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+        let scope = scope(&format!("history-symlink-{}", uuid::Uuid::new_v4()));
+        let target = home.path().join("outside-history.jsonl");
+        fs::write(&target, "original\n").unwrap();
+
+        ensure_scoped_session_dir(&scope, "main").unwrap();
+        let history = scoped_session_history_file(&scope, "main").unwrap();
+        std::os::unix::fs::symlink(&target, &history).unwrap();
+
+        let err =
+            append_scoped_session_history(&scope, "main", "user", "must not write").unwrap_err();
+
+        match old_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+
+        assert!(err.to_string().contains("symlink"));
+        assert_eq!(fs::read_to_string(&target).unwrap(), "original\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pending_turn_marker_refuses_symlink_leaf() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+        let scope = scope(&format!("pending-symlink-{}", uuid::Uuid::new_v4()));
+        let target = home.path().join("outside-pending-marker");
+        fs::write(&target, "original\n").unwrap();
+
+        let pending_dir = scoped_session_history_pending_dir(&scope, "main").unwrap();
+        fs::create_dir_all(&pending_dir).unwrap();
+        let marker = scoped_session_history_pending_marker_file(&scope, "main", "turn-a").unwrap();
+        std::os::unix::fs::symlink(&target, &marker).unwrap();
+
+        let err = mark_scoped_session_history_pending_turn(&scope, "main", "turn-a", "pending")
+            .unwrap_err();
+
+        match old_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+
+        assert!(err.to_string().contains("symlink"));
+        assert_eq!(fs::read_to_string(&target).unwrap(), "original\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_scoped_session_metadata_refuses_symlink_leaf() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+        let scope = scope(&format!("metadata-symlink-{}", uuid::Uuid::new_v4()));
+        let target = home.path().join("outside-metadata.json");
+        fs::write(&target, "original\n").unwrap();
+
+        ensure_scoped_session_dir(&scope, "main").unwrap();
+        let metadata_file = scoped_session_metadata_file(&scope, "main").unwrap();
+        std::os::unix::fs::symlink(&target, &metadata_file).unwrap();
+
+        let err = save_scoped_session_metadata(&scope, &metadata("main")).unwrap_err();
+
+        match old_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+
+        assert!(err.to_string().contains("symlink"));
+        assert_eq!(fs::read_to_string(&target).unwrap(), "original\n");
     }
 
     #[test]
