@@ -3910,6 +3910,27 @@ fn mutation_fence_allows_input(input: &str) -> bool {
         || (tokens.len() == 2
             && matches!(tokens[0].as_str(), "/resync" | "/sync")
             && matches!(tokens[1].as_str(), "--force" | "force"))
+        || mutation_fence_allows_read_only_inspection(&tokens)
+}
+
+fn mutation_fence_allows_read_only_inspection(tokens: &[String]) -> bool {
+    let command = tokens.first().map(String::as_str);
+    let subcommand = tokens.get(1).map(String::as_str);
+    match (command, subcommand) {
+        (Some("/session"), Some("list" | "info")) => true,
+        (Some("/workspace" | "/workspaces"), None | Some("list" | "info")) => true,
+        (Some("/memory"), None | Some("search" | "list" | "recent" | "get" | "stats" | "help")) => {
+            true
+        }
+        (Some("/memory"), Some("post" | "add" | "delete" | "rm")) => false,
+        (Some("/memory"), Some(_)) => true,
+        (Some("/cron"), None | Some("list")) => true,
+        (Some("/models" | "/model"), None | Some("list" | "status")) => true,
+        (Some("/providers"), None | Some("list")) => true,
+        (Some("/mcp"), None | Some("status")) => true,
+        (Some("/config"), _) => true,
+        _ => false,
+    }
 }
 
 fn mutation_fence_workspace_key(workspace: &str, workspace_id: Option<&str>) -> String {
@@ -5677,16 +5698,37 @@ mod tests {
     }
 
     #[test]
-    fn mutation_fence_only_allows_help_and_resync_input() {
+    fn mutation_fence_allows_read_only_reconciliation_input() {
         assert!(mutation_fence_allows_input("/help"));
         assert!(mutation_fence_allows_input("/resync"));
         assert!(mutation_fence_allows_input("/sync"));
         assert!(mutation_fence_allows_input("/resync --force"));
         assert!(mutation_fence_allows_input("/sync force"));
+        assert!(mutation_fence_allows_input("/cron list"));
+        assert!(mutation_fence_allows_input("/memory list"));
+        assert!(mutation_fence_allows_input("/memory search deploy"));
+        assert!(mutation_fence_allows_input("/memory deploy"));
+        assert!(mutation_fence_allows_input("/memory get mem-1"));
+        assert!(mutation_fence_allows_input("/memory stats"));
+        assert!(mutation_fence_allows_input("/session list"));
+        assert!(mutation_fence_allows_input("/session info"));
+        assert!(mutation_fence_allows_input("/workspace info"));
+        assert!(mutation_fence_allows_input("/workspaces"));
+        assert!(mutation_fence_allows_input("/config"));
+        assert!(mutation_fence_allows_input("/models list"));
+        assert!(mutation_fence_allows_input("/models status"));
+        assert!(mutation_fence_allows_input("/providers list"));
+        assert!(mutation_fence_allows_input("/mcp status"));
 
         assert!(!mutation_fence_allows_input("hello"));
-        assert!(!mutation_fence_allows_input("/session list"));
         assert!(!mutation_fence_allows_input("/memory post hello"));
+        assert!(!mutation_fence_allows_input("/memory delete mem-1"));
+        assert!(!mutation_fence_allows_input("/cron add * * * * * run"));
+        assert!(!mutation_fence_allows_input("/workspace switch prod"));
+        assert!(!mutation_fence_allows_input("/session create scratch"));
+        assert!(!mutation_fence_allows_input("/models set primary"));
+        assert!(!mutation_fence_allows_input("/clear"));
+        assert!(!mutation_fence_allows_input("/save out.txt"));
     }
 
     #[test]
