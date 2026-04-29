@@ -485,12 +485,11 @@ fn parse_entries(stdout: &str, json_mode: bool) -> Result<Option<Vec<CronEntryRe
 
     let value: Value = match serde_json::from_str(trimmed) {
         Ok(value) => value,
-        Err(err) if json_mode => {
-            return Err(NczError::Precondition(format!(
+        Err(err) => {
+            return Err(NczError::Inconsistent(format!(
                 "zeroclaw cron list returned non-parseable JSON: {err}"
             )));
         }
-        Err(_) => return Ok(None),
     };
     let entries = match &value {
         Value::Array(items) => items,
@@ -677,7 +676,25 @@ mod tests {
     }
 
     #[test]
-    fn cron_list_json_fails_on_nonparsable_stdout_with_content() {
+    fn cron_list_text_mode_fails_on_truncated_json_starting_with_brace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_with_agent(tmp.path(), "zeroclaw");
+        let runner = FakeRunner::new();
+        expect_podman(&runner);
+        runner.expect(
+            "podman",
+            &["exec", "zeroclaw", "zeroclaw", "cron", "list"],
+            out(0, r#"{"id":"x","schedule":"#, ""),
+        );
+
+        let err = list(&ctx(&runner), &paths, None).unwrap_err();
+        assert!(matches!(err, NczError::Inconsistent(_)));
+        assert!(err.to_string().contains("non-parseable JSON"));
+        runner.assert_done();
+    }
+
+    #[test]
+    fn cron_list_json_mode_still_fails_on_invalid_json_unchanged() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = paths_with_agent(tmp.path(), "zeroclaw");
         let runner = FakeRunner::new();
@@ -689,7 +706,7 @@ mod tests {
         );
 
         let err = list(&json_ctx(&runner), &paths, None).unwrap_err();
-        assert!(matches!(err, NczError::Precondition(_)));
+        assert!(matches!(err, NczError::Inconsistent(_)));
         assert!(err.to_string().contains("non-parseable JSON"));
         runner.assert_done();
     }
@@ -713,7 +730,7 @@ mod tests {
     }
 
     #[test]
-    fn cron_list_text_mode_passes_raw_when_unparsable() {
+    fn cron_list_text_mode_passes_through_human_table_starting_with_id() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = paths_with_agent(tmp.path(), "zeroclaw");
         let runner = FakeRunner::new();
