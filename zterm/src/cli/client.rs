@@ -24,6 +24,7 @@ const ZEROCLAW_WS_TURN_TIMEOUT: Duration = Duration::from_secs(120);
 const ZEROCLAW_WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const ZEROCLAW_WS_SEND_TIMEOUT: Duration = Duration::from_secs(30);
 const ZEROCLAW_TURN_RESPONSE_MAX_BYTES: usize = 2 * 1024 * 1024;
+const ZEROCLAW_SPLASH_RESPONSE_MAX_BYTES: usize = 8 * 1024;
 const ZEROCLAW_WEBHOOK_ENVELOPE_MAX_BYTES: usize = 64 * 1024;
 const ZEROCLAW_WEBHOOK_ERROR_BODY_MAX_BYTES: usize = 8 * 1024;
 const ZEROCLAW_CRON_ERROR_BODY_MAX_BYTES: usize = 2 * 1024;
@@ -863,13 +864,40 @@ impl ZeroclawClient {
         model: &str,
         max_response_bytes: usize,
     ) -> Result<String> {
-        let url = format!("{}/webhook", self.base_url);
         let payload = serde_json::json!({
             "message": message,
             "session": session_id,
             "model": model
         });
+        self.submit_webhook_payload_with_limit(payload, max_response_bytes)
+            .await
+    }
 
+    pub(crate) async fn submit_side_effect_free_splash_turn(
+        &self,
+        session_id: &str,
+        message: &str,
+    ) -> Result<String> {
+        let payload = serde_json::json!({
+            "message": message,
+            "session": session_id,
+            "model": self.current_model_key(),
+            "tools": [],
+            "tool_choice": "none",
+            "allow_tools": false,
+            "side_effect_free": true,
+            "purpose": "zterm_connect_splash"
+        });
+        self.submit_webhook_payload_with_limit(payload, ZEROCLAW_SPLASH_RESPONSE_MAX_BYTES)
+            .await
+    }
+
+    async fn submit_webhook_payload_with_limit(
+        &self,
+        payload: serde_json::Value,
+        max_response_bytes: usize,
+    ) -> Result<String> {
+        let url = format!("{}/webhook", self.base_url);
         let response = match self
             .http_client
             .post(&url)
@@ -1393,6 +1421,18 @@ impl crate::cli::agent::AgentClient for ZeroclawClient {
         ZeroclawClient::submit_turn(self, session_id, message).await
     }
 
+    fn supports_side_effect_free_splash_generation(&self) -> bool {
+        true
+    }
+
+    async fn submit_side_effect_free_splash(
+        &mut self,
+        session_id: &str,
+        message: &str,
+    ) -> Result<String> {
+        ZeroclawClient::submit_side_effect_free_splash_turn(self, session_id, message).await
+    }
+
     fn set_stream_sink(&mut self, sink: Option<StreamSink>) {
         ZeroclawClient::set_stream_sink(self, sink)
     }
@@ -1863,6 +1903,43 @@ mod tests {
             .unwrap();
 
         assert_eq!(response, "ok");
+    }
+
+    #[tokio::test]
+    async fn zeroclaw_side_effect_free_splash_uses_no_tools_webhook_payload() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/webhook")
+            .match_body(mockito::Matcher::PartialJson(json!({
+                "message": "splash prompt",
+                "session": "zterm connect splash test",
+                "model": "primary",
+                "tools": [],
+                "tool_choice": "none",
+                "allow_tools": false,
+                "side_effect_free": true,
+                "purpose": "zterm_connect_splash"
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(serde_json::json!({ "response": "generated splash" }).to_string())
+            .create_async()
+            .await;
+        let mut client = ZeroclawClient::new(server.url(), "test-token".to_string());
+
+        assert!(
+            crate::cli::agent::AgentClient::supports_side_effect_free_splash_generation(&client)
+        );
+        let response = crate::cli::agent::AgentClient::submit_side_effect_free_splash(
+            &mut client,
+            "zterm connect splash test",
+            "splash prompt",
+        )
+        .await
+        .unwrap();
+
+        mock.assert_async().await;
+        assert_eq!(response, "generated splash");
     }
 
     #[tokio::test]

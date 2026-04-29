@@ -1651,8 +1651,11 @@ async fn generate_connect_splash_with_named_session_timeout(
     }
 
     let prompt = connect_splash_prompt(workspace_name);
-    let generated = match tokio::time::timeout(timeout, client.submit_turn(&session.id, &prompt))
-        .await
+    let generated = match tokio::time::timeout(
+        timeout,
+        client.submit_side_effect_free_splash(&session.id, &prompt),
+    )
+    .await
     {
         Ok(result) => result,
         Err(_) => {
@@ -3662,7 +3665,14 @@ fn drain_stream_events(
                         *response_in_flight = false;
                     }
                     TurnChunk::Typewriter(text) => {
-                        start_typewriter(typewriter_state, chat_lines, text.clone(), Vec::new());
+                        if !*response_in_flight {
+                            start_typewriter(
+                                typewriter_state,
+                                chat_lines,
+                                text.clone(),
+                                Vec::new(),
+                            );
+                        }
                     }
                     TurnChunk::Token(_) => {}
                 }
@@ -6691,6 +6701,43 @@ mod tests {
     }
 
     #[test]
+    fn typewriter_chunk_during_inflight_turn_is_dropped_before_tokens() {
+        let mut state = StatusState::new(
+            "default".to_string(),
+            "gpt-test".to_string(),
+            "borland".to_string(),
+            false,
+        );
+        state.begin_turn();
+        let lines = Rc::new(RefCell::new(vec!["> prompt".to_string(), String::new()]));
+        let mut typewriter_state = None;
+        let mut response_in_flight = true;
+        let mut session_picker_state = SessionPickerState::default();
+        let (tx, mut rx) = mpsc::channel(8);
+        tx.try_send(TurnChunk::Typewriter("SPLASH".to_string()))
+            .unwrap();
+        tx.try_send(TurnChunk::Token("answer".to_string())).unwrap();
+        tx.try_send(TurnChunk::Finished(Ok("answer".to_string())))
+            .unwrap();
+
+        assert!(!drain_stream_events(
+            &mut rx,
+            &lines,
+            &mut state,
+            &mut typewriter_state,
+            &mut response_in_flight,
+            &mut session_picker_state
+        ));
+
+        assert!(!response_in_flight);
+        assert!(typewriter_state.is_none());
+        assert_eq!(
+            lines.borrow().as_slice(),
+            ["> prompt".to_string(), "answer".to_string(), String::new()]
+        );
+    }
+
+    #[test]
     fn rendered_command_error_uses_error_path_without_duplicate_chat_line() {
         let mut state = StatusState::new(
             "default".to_string(),
@@ -8775,6 +8822,14 @@ mod tests {
                 std::future::pending::<()>().await;
             }
             Ok(self.submit_response.clone())
+        }
+
+        async fn submit_side_effect_free_splash(
+            &mut self,
+            session_id: &str,
+            message: &str,
+        ) -> anyhow::Result<String> {
+            self.submit_turn(session_id, message).await
         }
 
         fn set_stream_sink(&mut self, sink: Option<StreamSink>) {

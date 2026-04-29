@@ -366,6 +366,19 @@ pub trait AgentClient: Send + Sync {
         false
     }
 
+    /// Submit a cosmetic splash prompt through a backend-specific
+    /// no-tools/no-side-effects path. Callers must check
+    /// `supports_side_effect_free_splash_generation` first; the
+    /// default is deliberately fail-closed so a backend cannot opt in
+    /// by accident through regular chat submission.
+    async fn submit_side_effect_free_splash(
+        &mut self,
+        _session_id: &str,
+        _message: &str,
+    ) -> Result<String> {
+        anyhow::bail!("backend does not support side-effect-free splash generation")
+    }
+
     // ---------- streaming sink ----------
 
     /// Install or clear the streaming sink used by `submit_turn`.
