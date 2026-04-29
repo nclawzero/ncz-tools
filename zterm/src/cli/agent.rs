@@ -192,6 +192,7 @@ pub enum TurnChunk {
     /// changes. Chat renderers should ignore this chunk.
     Status {
         workspace: Option<String>,
+        workspace_id: Option<String>,
         model: Option<String>,
     },
     /// UI-only response for the Turbo Vision session picker. This

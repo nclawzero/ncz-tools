@@ -422,14 +422,19 @@ impl StatusState {
         self.usage = None;
     }
 
-    fn apply_status(&mut self, workspace: Option<String>, model: Option<String>) {
+    fn apply_status(
+        &mut self,
+        workspace: Option<String>,
+        workspace_id: Option<String>,
+        model: Option<String>,
+    ) {
         let mut changed = false;
         if let Some(workspace) = workspace {
             if self.workspace != workspace {
                 self.workspace = workspace;
-                self.workspace_id = None;
                 changed = true;
             }
+            self.workspace_id = workspace_id;
         }
         if let Some(model) = model {
             if self.model != model {
@@ -1193,9 +1198,12 @@ async fn handle_worker_command_request(
                     let _ = worker_sink.send(TurnChunk::ClearUsage);
                 }
                 if workspace_switched || model_switched {
-                    if let Some((workspace, model)) = status_snapshot_for_worker(worker_app).await {
+                    if let Some((workspace, workspace_id, model)) =
+                        status_snapshot_for_worker(worker_app).await
+                    {
                         let _ = worker_sink.send(TurnChunk::Status {
                             workspace: Some(workspace),
+                            workspace_id,
                             model: Some(model),
                         });
                     }
@@ -1263,11 +1271,12 @@ async fn resync_worker_state(
         }
     }
 
-    let (workspace, model) = status_snapshot_for_worker(worker_app)
+    let (workspace, workspace_id, model) = status_snapshot_for_worker(worker_app)
         .await
-        .unwrap_or_else(|| ("<unknown>".to_string(), "<unknown>".to_string()));
+        .unwrap_or_else(|| ("<unknown>".to_string(), None, "<unknown>".to_string()));
     let _ = worker_sink.send(TurnChunk::Status {
         workspace: Some(workspace.clone()),
+        workspace_id,
         model: Some(model.clone()),
     });
     Ok(match session_count {
@@ -1696,15 +1705,21 @@ async fn current_workspace_binding_key(app: &Arc<Mutex<App>>) -> Result<String> 
         .identity())
 }
 
-async fn status_snapshot_for_worker(app: &Arc<Mutex<App>>) -> Option<(String, String)> {
-    let (workspace, client) = {
+async fn status_snapshot_for_worker(
+    app: &Arc<Mutex<App>>,
+) -> Option<(String, Option<String>, String)> {
+    let (workspace, workspace_id, client) = {
         let guard = app.lock().await;
         let workspace = guard.active_workspace()?;
-        (workspace.config.name.clone(), workspace.client.clone()?)
+        (
+            workspace.config.name.clone(),
+            workspace.config.id.clone(),
+            workspace.client.clone()?,
+        )
     };
 
     let model = client.lock().await.current_model_label();
-    Some((workspace, model))
+    Some((workspace, workspace_id, model))
 }
 
 async fn remembered_session_id_for_active_workspace(
@@ -3052,8 +3067,16 @@ fn drain_stream_events(
                     TurnChunk::ClearUsage => {
                         status_state.clear_usage();
                     }
-                    TurnChunk::Status { workspace, model } => {
-                        status_state.apply_status(workspace.clone(), model.clone());
+                    TurnChunk::Status {
+                        workspace,
+                        workspace_id,
+                        model,
+                    } => {
+                        status_state.apply_status(
+                            workspace.clone(),
+                            workspace_id.clone(),
+                            model.clone(),
+                        );
                     }
                     TurnChunk::SessionPickerList(result) => {
                         apply_session_picker_result(
@@ -4799,6 +4822,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(8);
         tx.try_send(TurnChunk::Status {
             workspace: Some("new".to_string()),
+            workspace_id: Some("ws-new".to_string()),
             model: Some("consult".to_string()),
         })
         .unwrap();
@@ -4813,6 +4837,7 @@ mod tests {
         ));
 
         assert_eq!(state.workspace, "new");
+        assert_eq!(state.workspace_id.as_deref(), Some("ws-new"));
         assert_eq!(state.model, "consult");
         assert!(state.usage.is_none());
         assert!(lines.borrow().is_empty());
@@ -5150,7 +5175,11 @@ mod tests {
         );
         assert!(matches!(&picker_state.load, SessionPickerLoad::Ready(_, _)));
 
-        state.apply_status(Some("workspace-b".to_string()), None);
+        state.apply_status(
+            Some("workspace-b".to_string()),
+            Some("ws-b".to_string()),
+            None,
+        );
 
         let status = request_session_picker_load_if_workspace_changed(
             &lines,
@@ -5166,7 +5195,10 @@ mod tests {
         assert_eq!(workspace.name, "workspace-b");
         assert_eq!(
             picker_state.load,
-            SessionPickerLoad::Loading(SessionPickerWorkspace::new("workspace-b", None))
+            SessionPickerLoad::Loading(SessionPickerWorkspace::new(
+                "workspace-b",
+                Some("ws-b".to_string())
+            ))
         );
         assert!(picker_state.open_when_ready);
     }
@@ -5965,6 +5997,53 @@ mod tests {
         assert!(delighters::mutation_fence_for_workspace("id:ws-alpha")
             .unwrap()
             .is_none());
+
+        match old_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    #[test]
+    fn workspace_switch_failure_status_keeps_fence_under_target_id() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+        let mut state = StatusState::new(
+            "alpha".to_string(),
+            "model".to_string(),
+            "borland".to_string(),
+            false,
+        );
+        state.workspace_id = Some("ws-alpha".to_string());
+        let old_key =
+            write_ahead_mutation_fence_for_dispatch(&mut state, "/workspace switch beta").unwrap();
+
+        state.apply_status(Some("beta".to_string()), Some("ws-beta".to_string()), None);
+        set_local_and_persisted_mutation_fence_replacing(
+            &mut state,
+            "slash command outcome unknown for `/workspace switch beta` after session setup failed",
+            Some(&old_key),
+        );
+
+        assert_eq!(state.workspace, "beta");
+        assert_eq!(state.workspace_id.as_deref(), Some("ws-beta"));
+        assert!(delighters::mutation_fence_for_workspace("id:ws-beta")
+            .unwrap()
+            .is_some());
+        assert!(delighters::mutation_fence_for_workspace("name:beta")
+            .unwrap()
+            .is_none());
+        assert!(delighters::mutation_fence_for_workspace("id:ws-alpha")
+            .unwrap()
+            .is_none());
+        let lines = Rc::new(RefCell::new(Vec::new()));
+        assert!(mutation_fence_blocks_submission(
+            &mut state,
+            "/memory post blocked",
+            &lines
+        ));
 
         match old_home {
             Some(home) => std::env::set_var("HOME", home),
