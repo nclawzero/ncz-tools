@@ -13,6 +13,7 @@ mod common;
 pub mod api;
 pub mod backup;
 pub mod channel;
+pub mod cron;
 pub mod health;
 pub mod inspect;
 pub mod integrity;
@@ -46,6 +47,7 @@ pub fn dispatch(command: Command, ctx: &Context) -> Result<i32, NczError> {
         Command::Sessions { action } => sessions::run(ctx, action),
         Command::Mcp { action } => mcp::run(ctx, action),
         Command::Backup { action } => backup::run(ctx, action),
+        Command::Cron { action } => cron::run(ctx, action),
         Command::Sandbox { action } => sandbox::run(ctx, action),
         Command::Integrity => integrity::run(ctx),
         Command::Update { check } => update::run(ctx, check),
