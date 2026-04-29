@@ -64,6 +64,7 @@ use super::wire::{Frame, PendingRequests, RequestFrame, ResponseFrame};
 /// that uses the convenience `send_request` without its own timeout.
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+const SESSION_SEND_ACK_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Channel capacity for the outbound request queue. Small on purpose —
 /// backpressure the caller rather than buffer arbitrary requests.
@@ -512,13 +513,33 @@ impl OpenClawClient {
         if let Some(ms) = opts.timeout_ms {
             params.insert("timeoutMs".into(), serde_json::json!(ms));
         }
-        if let Some(idem) = opts.idempotency_key {
+        let ack_timeout = opts
+            .timeout_ms
+            .map(Duration::from_millis)
+            .unwrap_or(SESSION_SEND_ACK_TIMEOUT);
+        let idempotency_key = opts.idempotency_key.clone();
+        if let Some(idem) = &opts.idempotency_key {
             params.insert("idempotencyKey".into(), serde_json::json!(idem));
         }
 
-        let res = self
-            .send_request("sessions.send", Some(serde_json::Value::Object(params)))
-            .await?;
+        let res = match self
+            .send_request_with_timeout(
+                "sessions.send",
+                Some(serde_json::Value::Object(params)),
+                ack_timeout,
+            )
+            .await
+        {
+            Ok(res) => res,
+            Err(e) if openclaw_request_timeout_error(&e) => {
+                return Err(sessions_send_ack_timeout_error(
+                    ack_timeout,
+                    idempotency_key.as_deref(),
+                    e,
+                ));
+            }
+            Err(e) => return Err(e),
+        };
         if !res.ok {
             let err = res
                 .error
@@ -1613,6 +1634,22 @@ fn duration_millis_u64(duration: Duration) -> u64 {
     duration.as_millis().min(u128::from(u64::MAX)) as u64
 }
 
+fn openclaw_request_timeout_error(error: &anyhow::Error) -> bool {
+    let message = error.to_string();
+    message.contains("openclaw: request ") && message.contains(" timed out after ")
+}
+
+fn sessions_send_ack_timeout_error(
+    timeout: Duration,
+    idempotency_key: Option<&str>,
+    source: anyhow::Error,
+) -> anyhow::Error {
+    let idem = idempotency_key.unwrap_or("<missing>");
+    anyhow::anyhow!(
+        "openclaw: sessions.send ack timed out after {timeout:?}; run state unresolved; idempotency key {idem}; check backend state before retrying: {source}"
+    )
+}
+
 fn display_name_for_row(row: &super::handshake::OpenClawSessionRow) -> String {
     row.derived_title
         .clone()
@@ -2225,6 +2262,47 @@ mod tests {
         // ZeroclawClient in cli/client.rs.
         fn assert_agent_client<T: crate::cli::agent::AgentClient>() {}
         assert_agent_client::<OpenClawClient>();
+    }
+
+    #[tokio::test]
+    async fn rpc_sessions_send_ack_timeout_reports_unresolved_idempotent_state() {
+        let pending = PendingRequests::new();
+        let (outbound_tx, mut outbound_rx) = mpsc::channel::<RequestFrame>(OUTBOUND_CAPACITY);
+        let client = OpenClawClient {
+            pending,
+            outbound_tx: Some(outbound_tx),
+            event_rx: None,
+            connected: Arc::new(AtomicBool::new(true)),
+            hello_ok: None,
+            stream_sink: None,
+            session_namespace: DEFAULT_SESSION_NAMESPACE.to_string(),
+            session_namespace_aliases: Vec::new(),
+            read_task: None,
+            write_task: None,
+        };
+
+        let err = client
+            .rpc_sessions_send(
+                "session-a",
+                "hello",
+                SessionsSendOpts {
+                    timeout_ms: Some(1),
+                    idempotency_key: Some("idem-1".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("missing ack should be reported as unresolved state");
+
+        let req = outbound_rx
+            .recv()
+            .await
+            .expect("send request should enqueue");
+        assert_eq!(req.method, "sessions.send");
+        let message = err.to_string();
+        assert!(message.contains("sessions.send ack timed out"));
+        assert!(message.contains("run state unresolved"));
+        assert!(message.contains("idempotency key idem-1"));
     }
 
     #[tokio::test]

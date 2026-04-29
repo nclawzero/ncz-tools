@@ -124,13 +124,6 @@ const CMD_PALETTE_NEXT: u16 = 1300;
 /// palette itself — just a confirmation write.
 const CMD_PERSIST_THEME: u16 = 1301;
 
-/// `/` key maps to this KeyCode per `crossterm_to_keycode`: plain
-/// ASCII character with no modifiers, so `c as u16` = 0x2F. Plain
-/// slash is intentionally regular text input; the command popup is
-/// reserved for Ctrl-K/menu paths so arbitrary slash commands remain
-/// typeable.
-const KB_SLASH: u16 = b'/' as u16;
-
 /// Depth of the input-line undo/redo ring. 64 snapshots is more
 /// than enough for the longest slash command or turn prompt a
 /// human is going to type while still keeping the memory
@@ -2446,9 +2439,9 @@ fn run_event_loop(
             status_line.handle_event(&mut event);
         }
 
-        // Slash-command popup: Ctrl-K opens it anywhere; `/` opens it
-        // only from an empty prompt so typed slash commands still work
-        // after the first character.
+        // Slash-command popup: Ctrl-K opens it anywhere. Plain `/`
+        // remains ordinary input so direct slash commands with
+        // arguments stay reachable from the keyboard.
         if event.what == EventType::Keyboard
             && should_open_slash_popup(event.key_code, input_data.borrow().is_empty())
         {
@@ -2670,8 +2663,8 @@ fn run_slash_popup(app: &mut Application) -> u16 {
     menu_box.execute(&mut app.terminal)
 }
 
-fn should_open_slash_popup(key_code: u16, input_empty: bool) -> bool {
-    key_code == KB_CTRL_K || (input_empty && key_code == KB_SLASH)
+fn should_open_slash_popup(key_code: u16, _input_empty: bool) -> bool {
+    key_code == KB_CTRL_K
 }
 
 fn should_block_modal_entry_while_busy(event: &Event, input_empty: bool) -> bool {
@@ -5065,11 +5058,11 @@ mod tests {
     }
 
     #[test]
-    fn slash_popup_opens_for_empty_prompt_slash_or_ctrl_k() {
+    fn slash_popup_opens_for_ctrl_k_not_typed_slash() {
         assert!(should_open_slash_popup(KB_CTRL_K, true));
         assert!(should_open_slash_popup(KB_CTRL_K, false));
-        assert!(should_open_slash_popup(KB_SLASH, true));
-        assert!(!should_open_slash_popup(KB_SLASH, false));
+        assert!(!should_open_slash_popup(b'/' as u16, true));
+        assert!(!should_open_slash_popup(b'/' as u16, false));
     }
 
     #[test]
@@ -5597,6 +5590,25 @@ mod tests {
         .unwrap();
         storage::append_scoped_session_history(&scope, "main", "user", "hello").unwrap();
         let reason = "openclaw: turn collection failed for run current-run; abort failed; run state unresolved: openclaw: session.message stream timed out after 1s".to_string();
+
+        assert!(submit_error_requires_incomplete_transcript(&reason, false));
+        let message = mark_turn_transcript_incomplete_reason(&scope, "main", &reason);
+
+        assert!(message.contains("transcript marked incomplete"));
+        assert!(storage::scoped_session_history_is_incomplete(&scope, "main").unwrap());
+    }
+
+    #[test]
+    fn openclaw_ack_timeout_marks_history_incomplete_without_tokens() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let scope = storage::workspace_scope(
+            "openclaw",
+            &format!("openclaw-ack-timeout-transcript-{}", uuid::Uuid::new_v4()),
+            None,
+        )
+        .unwrap();
+        storage::append_scoped_session_history(&scope, "main", "user", "hello").unwrap();
+        let reason = "openclaw: sessions.send ack timed out after 60s; run state unresolved; idempotency key idem-1; check backend state before retrying".to_string();
 
         assert!(submit_error_requires_incomplete_transcript(&reason, false));
         let message = mark_turn_transcript_incomplete_reason(&scope, "main", &reason);
