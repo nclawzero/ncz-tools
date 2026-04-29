@@ -722,7 +722,7 @@ impl ReplLoop {
             self.session.id.clone()
         };
 
-        let mutation_fence_owner = if legacy_slash_command_may_mutate_state(input) {
+        let mutation_fence_owner = if legacy_slash_command_requires_write_ahead_fence(input) {
             match self.write_ahead_mutation_fence_for_dispatch(input).await {
                 Ok(owner) => Some(owner),
                 Err(e) => {
@@ -1045,6 +1045,18 @@ fn legacy_slash_command_may_mutate_state(cmdline: &str) -> bool {
         (Some("/session"), Some(_)) => true,
         _ => false,
     }
+}
+
+fn legacy_slash_command_is_force_clear_recovery(cmdline: &str) -> bool {
+    let Ok(tokens) = tokenize_slash_command(cmdline) else {
+        return false;
+    };
+    tokens.len() == 2 && tokens[0] == "/clear" && matches!(tokens[1].as_str(), "--force" | "force")
+}
+
+fn legacy_slash_command_requires_write_ahead_fence(cmdline: &str) -> bool {
+    legacy_slash_command_may_mutate_state(cmdline)
+        && !legacy_slash_command_is_force_clear_recovery(cmdline)
 }
 
 fn legacy_mutation_fence_workspace_key(workspace: &str, workspace_id: Option<&str>) -> String {
@@ -1889,6 +1901,87 @@ mod tests {
             assert!(delighters::mutation_fence_for_workspace("name:alpha")
                 .unwrap()
                 .is_none());
+        });
+
+        match old_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    #[test]
+    fn legacy_repl_force_clear_runs_under_existing_mutation_fence() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let submitted = Arc::new(StdMutex::new(Vec::new()));
+            let deleted = Arc::new(StdMutex::new(Vec::new()));
+            let alpha = session("alpha-session", "chat");
+            let scope = storage::workspace_scope("zeroclaw", "alpha", None).unwrap();
+            storage::append_scoped_session_history(&scope, &alpha.id, "user", "hello").unwrap();
+            let lock = storage::acquire_scoped_session_history_turn_lock(
+                &scope, &alpha.id, "turn-a", "pending",
+            )
+            .unwrap();
+            storage::mark_scoped_session_history_incomplete(
+                &scope,
+                &alpha.id,
+                "assistant append failed",
+            )
+            .unwrap();
+            std::mem::forget(lock);
+            let history = storage::scoped_session_history_file(&scope, &alpha.id).unwrap();
+            let lock_dir =
+                storage::scoped_session_history_turn_lock_dir(&scope, &alpha.id).unwrap();
+            assert!(history.exists());
+            assert!(lock_dir.exists());
+
+            let existing = delighters::MutationFenceState {
+                command: "/memory post hello".to_string(),
+                reason: "slash command outcome unknown".to_string(),
+                created_at_unix: 42,
+                dispatch_id: "external-dispatch".to_string(),
+            };
+            delighters::set_mutation_fence_for_workspace("name:alpha", existing.clone()).unwrap();
+            let app = Arc::new(Mutex::new(App {
+                workspaces: vec![workspace(
+                    0,
+                    "alpha",
+                    vec![alpha.clone()],
+                    Arc::clone(&submitted),
+                    Arc::clone(&deleted),
+                )],
+                active: 0,
+                shared_mnemos: None,
+                config_path: PathBuf::from("test-config.toml"),
+            }));
+            let mut repl = ReplLoop::new(
+                Arc::clone(&app),
+                alpha,
+                "model".to_string(),
+                "provider".to_string(),
+            )
+            .unwrap();
+
+            let out = repl
+                .handle_slash_command("/clear --force")
+                .await
+                .unwrap()
+                .unwrap();
+
+            assert!(out.contains("force-cleared"));
+            assert!(!history.exists());
+            assert!(!lock_dir.exists());
+            assert_eq!(
+                delighters::mutation_fence_for_workspace("name:alpha").unwrap(),
+                Some(existing)
+            );
+            assert!(submitted.lock().unwrap().is_empty());
+            assert!(deleted.lock().unwrap().is_empty());
         });
 
         match old_home {
