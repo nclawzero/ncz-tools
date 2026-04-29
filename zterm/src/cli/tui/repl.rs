@@ -10,10 +10,14 @@ use crate::cli::commands::{tokenize_slash_command, CommandHandler};
 use crate::cli::input::InputHistory;
 use crate::cli::storage;
 use crate::cli::theme::Theme;
+use crate::cli::tui::delighters;
 use crate::cli::tui::tv_ui::sanitize_terminal_text;
 use crate::cli::ui::{self, StatusBar};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Mutex;
+
+const LEGACY_MUTATING_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// REPL loop state
 pub struct ReplLoop {
@@ -92,6 +96,76 @@ impl ReplLoop {
             &workspace.config.name,
             workspace.config.id.as_deref(),
         )
+    }
+
+    async fn current_mutation_fence_key(&self) -> Result<String> {
+        let app = self.app.lock().await;
+        let workspace = app
+            .active_workspace()
+            .ok_or_else(|| anyhow::anyhow!("no active workspace"))?;
+        Ok(legacy_mutation_fence_workspace_key(
+            &workspace.config.name,
+            workspace.config.id.as_deref(),
+        ))
+    }
+
+    async fn active_mutation_fence_reason(&self) -> Option<String> {
+        let key = self.current_mutation_fence_key().await.ok()?;
+        match delighters::mutation_fence_for_workspace(&key) {
+            Ok(Some(fence)) => Some(fence.reason),
+            Ok(None) => None,
+            Err(e) => Some(format!(
+                "could not read zterm mutation-fence state: {e}; run /resync --force only after manual reconciliation"
+            )),
+        }
+    }
+
+    async fn persist_mutation_fence(&self, reason: &str) -> String {
+        let key = match self.current_mutation_fence_key().await {
+            Ok(key) => key,
+            Err(e) => return format!("{reason}; failed to identify active workspace: {e}"),
+        };
+        let fence = delighters::MutationFenceState {
+            command: legacy_mutation_fence_command_from_reason(reason),
+            reason: reason.to_string(),
+            created_at_unix: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_secs())
+                .unwrap_or(0),
+        };
+        if let Err(e) = delighters::set_mutation_fence_for_workspace(&key, fence) {
+            format!("{reason}; failed to persist fence: {e}")
+        } else {
+            reason.to_string()
+        }
+    }
+
+    async fn handle_legacy_resync(&mut self, input: &str) -> Result<Option<String>> {
+        let Ok(tokens) = tokenize_slash_command(input) else {
+            return Ok(None);
+        };
+        if !matches!(
+            tokens.first().map(String::as_str),
+            Some("/resync" | "/sync")
+        ) {
+            return Ok(None);
+        }
+        let force = matches!(tokens.get(1).map(String::as_str), Some("--force" | "force"));
+        if force {
+            let key = self.current_mutation_fence_key().await?;
+            delighters::clear_mutation_fence_for_workspace(&key)?;
+            return Ok(Some(
+                "[sync] mutation fence cleared by explicit /resync --force\n".to_string(),
+            ));
+        }
+
+        let workspace = self
+            .current_workspace_name()
+            .await
+            .unwrap_or_else(|_| "<unknown>".to_string());
+        Ok(Some(format!(
+            "[sync] refreshed workspace `{workspace}`; mutation fence remains until /resync --force\n"
+        )))
     }
 
     fn remember_active_workspace_session(&mut self, workspace_name: String, session: &Session) {
@@ -366,8 +440,36 @@ impl ReplLoop {
     }
 
     async fn handle_slash_command(&mut self, input: &str) -> Result<Option<String>> {
+        if let Some(output) = self.handle_legacy_resync(input).await? {
+            return Ok(Some(output));
+        }
+        if let Some(reason) = self.active_mutation_fence_reason().await {
+            if !legacy_mutation_fence_allows_input(input) {
+                return Ok(Some(format!(
+                    "[blocked] mutation outcome is unknown; run /resync to inspect state, or /resync --force after manual reconciliation. Last status: {reason}\n"
+                )));
+            }
+        }
+
         if let Some(action) = legacy_session_action(input) {
-            self.apply_legacy_session_action(action).await?;
+            match tokio::time::timeout(
+                LEGACY_MUTATING_COMMAND_TIMEOUT,
+                self.apply_legacy_session_action(action),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    let reason = legacy_mutating_unknown_outcome_message(input, &e.to_string());
+                    let reason = self.persist_mutation_fence(&reason).await;
+                    return Ok(Some(format!("[blocked] {reason}\n")));
+                }
+                Err(_) => {
+                    let reason = legacy_mutating_timeout_message(input);
+                    let reason = self.persist_mutation_fence(&reason).await;
+                    return Ok(Some(format!("[blocked] {reason}\n")));
+                }
+            }
             return Ok(Some(format!(
                 "✅ Active backend session: {}\n",
                 self.session.name
@@ -389,10 +491,28 @@ impl ReplLoop {
             self.session.id.clone()
         };
 
-        let result = self
-            .command_handler
-            .handle(input, &command_session_id)
-            .await?;
+        let command_result = if legacy_slash_command_may_mutate_state(input) {
+            match tokio::time::timeout(
+                LEGACY_MUTATING_COMMAND_TIMEOUT,
+                self.command_handler
+                    .handle_with_outcome(input, &command_session_id),
+            )
+            .await
+            {
+                Ok(result) => result?,
+                Err(_) => {
+                    let reason = legacy_mutating_timeout_message(input);
+                    let reason = self.persist_mutation_fence(&reason).await;
+                    return Ok(Some(format!("[blocked] {reason}\n")));
+                }
+            }
+        } else {
+            self.command_handler
+                .handle_with_outcome(input, &command_session_id)
+                .await?
+        };
+        let mutation_outcome_unknown = command_result.mutation_outcome_unknown;
+        let result = command_result.output;
 
         if preflight == CommandSessionPreflight::AfterWorkspaceSwitch {
             let workspace_after_dispatch = self.current_workspace_name().await.ok();
@@ -407,6 +527,18 @@ impl ReplLoop {
                         anyhow::anyhow!("workspace switched, but session setup failed: {e}")
                     })?;
             }
+        }
+
+        if mutation_outcome_unknown {
+            let rendered = result.as_deref().unwrap_or_default();
+            let reason = legacy_mutating_unknown_outcome_message(input, rendered);
+            let reason = self.persist_mutation_fence(&reason).await;
+            let mut output = result.unwrap_or_default();
+            if !output.ends_with('\n') {
+                output.push('\n');
+            }
+            output.push_str(&format!("[blocked] {reason}\n"));
+            return Ok(Some(output));
         }
 
         Ok(result)
@@ -623,6 +755,70 @@ fn workspace_switch_target(cmdline: &str) -> Option<String> {
     }
 }
 
+fn legacy_mutation_fence_allows_input(input: &str) -> bool {
+    let Ok(tokens) = tokenize_slash_command(input) else {
+        return false;
+    };
+    (tokens.len() == 1 && matches!(tokens[0].as_str(), "/help" | "/resync" | "/sync"))
+        || (tokens.len() == 2
+            && matches!(tokens[0].as_str(), "/resync" | "/sync")
+            && matches!(tokens[1].as_str(), "--force" | "force"))
+}
+
+fn legacy_slash_command_may_mutate_state(cmdline: &str) -> bool {
+    let tokens = match tokenize_slash_command(cmdline) {
+        Ok(tokens) => tokens,
+        Err(_) => return false,
+    };
+    let command = tokens.first().map(String::as_str);
+    let subcommand = tokens.get(1).map(String::as_str);
+    match (command, subcommand) {
+        (Some("/clear" | "/save"), _) => true,
+        (Some("/models" | "/model"), Some("set")) => true,
+        (Some("/workspace" | "/workspaces"), Some("switch")) => true,
+        (Some("/memory"), Some("post" | "add" | "delete" | "rm")) => true,
+        (Some("/cron"), Some("add" | "add-at" | "pause" | "resume" | "delete" | "remove")) => true,
+        (Some("/session"), Some("delete" | "switch" | "create")) => true,
+        (Some("/session"), Some("list" | "info")) => false,
+        (Some("/session"), Some(_)) => true,
+        _ => false,
+    }
+}
+
+fn legacy_mutation_fence_workspace_key(workspace: &str, workspace_id: Option<&str>) -> String {
+    match workspace_id {
+        Some(id) if !id.trim().is_empty() => format!("id:{}", id.trim()),
+        _ => format!("name:{workspace}"),
+    }
+}
+
+fn legacy_mutating_timeout_message(cmdline: &str) -> String {
+    format!(
+        "slash command outcome unknown for `{}` after {:?}; the backend may still have applied the mutation. Run /resync to inspect state, or /resync --force to clear this fence after manual reconciliation.",
+        sanitize_terminal_text(cmdline).replace('`', "'"),
+        LEGACY_MUTATING_COMMAND_TIMEOUT
+    )
+}
+
+fn legacy_mutating_unknown_outcome_message(cmdline: &str, rendered_text: &str) -> String {
+    format!(
+        "{} Backend/client returned an unknown mutating outcome: {}",
+        legacy_mutating_timeout_message(cmdline),
+        sanitize_terminal_text(rendered_text.trim())
+    )
+}
+
+fn legacy_mutation_fence_command_from_reason(reason: &str) -> String {
+    let Some(start) = reason.find(" for `") else {
+        return String::new();
+    };
+    let rest = &reason[start + " for `".len()..];
+    let Some(end) = rest.find('`') else {
+        return String::new();
+    };
+    rest[..end].to_string()
+}
+
 #[derive(Debug)]
 enum LegacySessionResolution {
     Existing(Session),
@@ -769,7 +965,7 @@ fn sanitize_legacy_slash_output(output: &str) -> String {
 mod tests {
     use super::*;
     use crate::cli::agent::{AgentClient, StreamSink};
-    use crate::cli::client::{Config, Model, Provider};
+    use crate::cli::client::{Config, Model, Provider, ZeroclawClient};
     use crate::cli::workspace::{App, Backend, Workspace, WorkspaceConfig};
     use std::path::PathBuf;
     use std::sync::Mutex as StdMutex;
@@ -1018,6 +1214,82 @@ mod tests {
             },
             client: Some(Arc::new(Mutex::new(boxed))),
             cron: None,
+        }
+    }
+
+    #[test]
+    fn legacy_repl_unknown_mutation_persists_and_blocks_fence() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut server = mockito::Server::new_async().await;
+            let _mock = server
+                .mock("POST", "/api/cron/add")
+                .with_status(201)
+                .with_body("{not-json")
+                .create_async()
+                .await;
+            let submitted = Arc::new(StdMutex::new(Vec::new()));
+            let deleted = Arc::new(StdMutex::new(Vec::new()));
+            let alpha = session("alpha-session", "chat");
+            let app = Arc::new(Mutex::new(App {
+                workspaces: vec![workspace(
+                    0,
+                    "alpha",
+                    vec![alpha.clone()],
+                    Arc::clone(&submitted),
+                    Arc::clone(&deleted),
+                )],
+                active: 0,
+                shared_mnemos: None,
+                config_path: PathBuf::from("test-config.toml"),
+            }));
+            app.lock().await.workspaces[0].cron =
+                Some(ZeroclawClient::new(server.url(), "test_token".to_string()));
+            let mut repl = ReplLoop::new(
+                Arc::clone(&app),
+                alpha,
+                "model".to_string(),
+                "provider".to_string(),
+            )
+            .unwrap();
+
+            let out = repl
+                .handle_slash_command("/cron add '0 9 * * *' 'standup'")
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(out.contains("Failed to create cron job"));
+            assert!(out.contains("[blocked]"));
+            assert!(delighters::mutation_fence_for_workspace("name:alpha")
+                .unwrap()
+                .is_some());
+
+            let blocked = repl
+                .handle_slash_command("/cron add '0 9 * * *' 'standup'")
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(blocked.contains("mutation outcome is unknown"));
+
+            let cleared = repl
+                .handle_slash_command("/resync --force")
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(cleared.contains("mutation fence cleared"));
+            assert!(delighters::mutation_fence_for_workspace("name:alpha")
+                .unwrap()
+                .is_none());
+        });
+
+        match old_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
         }
     }
 
