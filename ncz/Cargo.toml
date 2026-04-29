@@ -1,6 +1,6 @@
 [package]
 name = "ncz"
-version = "0.2.0"
+version = "0.3.0-alpha.1"
 description = "nclawzero device-ops umbrella CLI: status, set-agent, logs, api, providers, models, mcp, sandbox, integrity, update, channel, health, inspect, selftest"
 keywords = ["nclawzero", "edge", "device-ops", "podman", "systemd"]
 categories = ["command-line-utilities"]

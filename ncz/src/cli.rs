@@ -63,6 +63,11 @@ pub enum Command {
         #[command(subcommand)]
         action: ModelsAction,
     },
+    /// Aggregate and manage agent sessions.
+    Sessions {
+        #[command(subcommand)]
+        action: SessionsAction,
+    },
     /// Manage MCP server declarations.
     Mcp {
         #[command(subcommand)]
@@ -210,6 +215,47 @@ pub enum ModelsAction {
     Discover {
         /// Provider name.
         provider: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum SessionsAction {
+    /// List sessions across active agent containers.
+    List {
+        /// Limit output to one agent.
+        #[arg(long)]
+        agent: Option<String>,
+    },
+    /// Show one session's messages and metadata.
+    Show {
+        /// Session id to show.
+        session_id: String,
+        /// Disambiguate the session id by agent.
+        #[arg(long)]
+        agent: Option<String>,
+    },
+    /// Export one session bundle to a JSON file.
+    Export {
+        /// Session id to export.
+        session_id: String,
+        /// Destination JSON path.
+        #[arg(long)]
+        to: std::path::PathBuf,
+        /// Disambiguate the session id by agent.
+        #[arg(long)]
+        agent: Option<String>,
+    },
+    /// Delete sessions older than a cutoff date.
+    Prune {
+        /// Delete sessions whose last_modified is before this date.
+        #[arg(long)]
+        before: String,
+        /// Limit pruning to one agent.
+        #[arg(long)]
+        agent: Option<String>,
+        /// Show deletions without deleting.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 

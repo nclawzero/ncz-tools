@@ -24,6 +24,7 @@ pub mod restart;
 pub mod resume;
 pub mod sandbox;
 pub mod selftest;
+pub mod sessions;
 pub mod set_agent;
 pub mod status;
 pub mod update;
@@ -41,6 +42,7 @@ pub fn dispatch(command: Command, ctx: &Context) -> Result<i32, NczError> {
         Command::Api { action } => api::run(ctx, action),
         Command::Providers { action } => providers::run(ctx, action),
         Command::Models { action } => models::run(ctx, action),
+        Command::Sessions { action } => sessions::run(ctx, action),
         Command::Mcp { action } => mcp::run(ctx, action),
         Command::Sandbox { action } => sandbox::run(ctx, action),
         Command::Integrity => integrity::run(ctx),
