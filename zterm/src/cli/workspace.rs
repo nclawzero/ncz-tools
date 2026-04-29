@@ -3186,7 +3186,18 @@ token = "target-token"
 
     #[test]
     fn inventory_snapshot_matches_workspaces() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+
         let app = App::synthesize_single_zeroclaw("http://a", Some("t".to_string())).unwrap();
+
+        match old_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+
         let inv = app.inventory();
         assert_eq!(inv.workspaces.len(), 1);
         assert_eq!(inv.active_index, 0);
