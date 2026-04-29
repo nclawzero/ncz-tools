@@ -1497,6 +1497,19 @@ async fn startup_connect_splash_for_workspace_if_enabled(
 ) -> Option<String> {
     match connect_splash_for_workspace_if_enabled(app, workspace_name, None, policy).await {
         Ok(splash) => splash,
+        Err(e) if is_connect_splash_cleanup_failure(&e) => {
+            let safe_error = sanitize_terminal_text(&e.to_string());
+            warn!(
+                "connect-splash startup cleanup failed: {safe_error}; using local fallback with visible warning"
+            );
+            policy.display.then(|| {
+                format!(
+                    "{}\n[warning] connect-splash backend cleanup failed; scratch session may remain.\n[warning] {}\n",
+                    delighters::local_connect_splash(workspace_name),
+                    safe_error
+                )
+            })
+        }
         Err(e) => {
             warn!("connect-splash startup failed: {e}; using local fallback");
             policy
@@ -6051,7 +6064,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_connect_splash_cleanup_failure_uses_local_fallback() {
+    fn startup_connect_splash_cleanup_failure_renders_warning_and_local_fallback() {
         let _env = crate::cli::test_env_lock().lock().unwrap();
         let home = tempfile::tempdir().unwrap();
         let old_home = std::env::var_os("HOME");
@@ -6111,10 +6124,11 @@ mod tests {
             )
             .await;
 
-            assert_eq!(
-                splash.as_deref(),
-                Some(delighters::local_connect_splash("alpha").as_str())
-            );
+            let splash = splash.expect("startup should render warning fallback");
+            assert!(splash.contains(&delighters::local_connect_splash("alpha")));
+            assert!(splash.contains("connect-splash backend cleanup failed"));
+            assert!(splash.contains("scratch session may remain"));
+            assert!(splash.contains("delete failed"));
             assert_eq!(created.lock().unwrap().len(), 1);
             assert_eq!(submitted.lock().unwrap().len(), 1);
             assert_eq!(deleted.lock().unwrap().len(), 1);
@@ -6962,6 +6976,8 @@ mod tests {
         assert!(mutation_fence_allows_input("/sync"));
         assert!(mutation_fence_allows_input("/resync --force"));
         assert!(mutation_fence_allows_input("/sync force"));
+        assert!(mutation_fence_allows_input("/clear --force"));
+        assert!(mutation_fence_allows_input("/clear force"));
         assert!(mutation_fence_allows_input("/cron list"));
         assert!(mutation_fence_allows_input("/memory list"));
         assert!(mutation_fence_allows_input("/memory search deploy"));
@@ -6986,6 +7002,7 @@ mod tests {
         assert!(!mutation_fence_allows_input("/session create scratch"));
         assert!(!mutation_fence_allows_input("/models set primary"));
         assert!(!mutation_fence_allows_input("/clear"));
+        assert!(!mutation_fence_allows_input("/clear now"));
         assert!(!mutation_fence_allows_input("/save out.txt"));
     }
 

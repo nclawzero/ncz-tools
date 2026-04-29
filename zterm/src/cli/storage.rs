@@ -522,7 +522,7 @@ pub fn acquire_scoped_session_history_turn_lock(
         session_id,
         "turn",
         &format!(
-            "session `{session_id}` already has a turn in progress; wait for it to finish or run /clear if another zterm exited mid-turn"
+            "session `{session_id}` already has a turn in progress; wait for it to finish or run /clear --force if another zterm exited mid-turn"
         ),
     )?;
 
@@ -725,6 +725,38 @@ pub fn clear_scoped_session_history(scope: &LocalWorkspaceScope, session_id: &st
     clear_scoped_session_history_with_sync(scope, session_id, sync_parent_dir)
 }
 
+pub fn force_clear_scoped_session_history(
+    scope: &LocalWorkspaceScope,
+    session_id: &str,
+) -> Result<bool> {
+    if !is_safe_session_id(session_id) {
+        return Err(anyhow!("unsafe session id for local history clear"));
+    }
+
+    let lock_dir = scoped_session_history_turn_lock_dir(scope, session_id)?;
+    let removed_lock = match fs::remove_dir(&lock_dir) {
+        Ok(()) => {
+            sync_parent_dir(&lock_dir).map_err(|e| {
+                anyhow!(
+                    "Failed to sync session history turn lock parent after force clear: {}",
+                    e
+                )
+            })?;
+            true
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => {
+            return Err(anyhow!(
+                "Failed to remove stale session history turn lock: {}",
+                e
+            ))
+        }
+    };
+
+    clear_scoped_session_history(scope, session_id)
+        .map(|removed_history| removed_lock || removed_history)
+}
+
 fn clear_scoped_session_history_with_sync<F>(
     scope: &LocalWorkspaceScope,
     session_id: &str,
@@ -742,7 +774,7 @@ where
         session_id,
         "clear",
         &format!(
-            "session `{session_id}` has a turn in progress; /clear refused to preserve transcript lock"
+            "session `{session_id}` has a turn in progress; /clear refused to preserve transcript lock; use /clear --force only if another zterm exited mid-turn"
         ),
     )?;
 
@@ -1407,6 +1439,36 @@ mod tests {
         assert!(lock.release().unwrap());
         assert!(clear_scoped_session_history(&scope, "main").unwrap());
         assert!(!scoped_session_history_is_incomplete(&scope, "main").unwrap());
+    }
+
+    #[test]
+    fn force_clear_scoped_history_removes_stale_turn_lock_and_pending_markers() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let scope = scope(&format!("force-clear-turn-lock-{}", uuid::Uuid::new_v4()));
+        append_scoped_session_history(&scope, "main", "user", "line").unwrap();
+        let lock =
+            acquire_scoped_session_history_turn_lock(&scope, "main", "turn-a", "turn A pending")
+                .unwrap();
+        mark_scoped_session_history_incomplete(&scope, "main", "incomplete").unwrap();
+        std::mem::forget(lock);
+
+        assert!(scoped_session_history_turn_lock_dir(&scope, "main")
+            .unwrap()
+            .exists());
+        assert!(force_clear_scoped_session_history(&scope, "main").unwrap());
+
+        assert!(!scoped_session_history_turn_lock_dir(&scope, "main")
+            .unwrap()
+            .exists());
+        assert!(!scoped_session_history_file(&scope, "main")
+            .unwrap()
+            .exists());
+        assert!(!scoped_session_history_incomplete_file(&scope, "main")
+            .unwrap()
+            .exists());
+        assert!(!scoped_session_history_pending_dir(&scope, "main")
+            .unwrap()
+            .exists());
     }
 
     #[test]

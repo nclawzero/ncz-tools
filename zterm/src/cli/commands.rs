@@ -188,7 +188,10 @@ impl CommandHandler {
             "/estop" => self.handle_estop(subcommand, args).await,
 
             // Session Management (REPL-specific)
-            "/clear" => self.handle_clear(session_id).await,
+            "/clear" => match parse_clear_force(subcommand, args) {
+                Ok(force) => self.handle_clear(session_id, force).await,
+                Err(message) => Ok(Some(message)),
+            },
             "/save" => match parse_save_filename(subcommand, args) {
                 Ok(filename) => self.handle_save(session_id, filename).await,
                 Err(message) => Ok(Some(message)),
@@ -255,7 +258,7 @@ impl CommandHandler {
             \n\
             Local Session:\n  \
               /config            Show configuration\n  \
-              /clear             Clear local transcript; backend context retained\n  \
+              /clear [--force]   Clear local transcript; backend context retained\n  \
               /save [file]       Export session\n  \
               /history           Show commands\n  \
               /session list      List sessions\n"
@@ -1268,7 +1271,7 @@ impl CommandHandler {
     }
 
     /// Handle /clear command
-    async fn handle_clear(&self, session_id: &str) -> Result<Option<String>> {
+    async fn handle_clear(&self, session_id: &str, force: bool) -> Result<Option<String>> {
         let Some(scope) = self.current_storage_scope().await else {
             return Ok(Some(
                 "No local session transcript found to clear; backend session context retained\n"
@@ -1276,7 +1279,11 @@ impl CommandHandler {
             ));
         };
 
-        let removed_history = storage::clear_scoped_session_history(&scope, session_id)?;
+        let removed_history = if force {
+            storage::force_clear_scoped_session_history(&scope, session_id)?
+        } else {
+            storage::clear_scoped_session_history(&scope, session_id)?
+        };
         let mut touched_metadata = false;
         if let Ok(mut metadata) = storage::load_scoped_session_metadata(&scope, session_id) {
             touched_metadata = true;
@@ -1289,8 +1296,12 @@ impl CommandHandler {
 
         if removed_history || touched_metadata {
             return Ok(Some(
-                "✓ Local session transcript cleared; backend session context retained\n"
-                    .to_string(),
+                if force {
+                    "✓ Local session transcript force-cleared; backend session context retained\n"
+                } else {
+                    "✓ Local session transcript cleared; backend session context retained\n"
+                }
+                .to_string(),
             ));
         }
         Ok(Some(
@@ -2007,6 +2018,17 @@ fn parse_save_filename(
     }
 }
 
+fn parse_clear_force(subcommand: Option<&str>, args: &[&str]) -> std::result::Result<bool, String> {
+    match (subcommand, args) {
+        (None, []) => Ok(false),
+        (Some("--force" | "force"), []) => Ok(true),
+        _ => Err(
+            "Usage: /clear [--force]\n❌ Use --force only to remove a stale local transcript turn lock.\n"
+                .to_string(),
+        ),
+    }
+}
+
 pub(crate) fn tokenize_slash_command(input: &str) -> std::result::Result<Vec<String>, String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
@@ -2540,6 +2562,33 @@ mod tests {
         (command, subcommand, args)
     }
 
+    fn with_isolated_home<T>(f: impl FnOnce() -> T) -> T {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        match old_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+        match result {
+            Ok(value) => value,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
+    fn run_async_with_isolated_home<F, T>(future_factory: impl FnOnce() -> F) -> T
+    where
+        F: std::future::Future<Output = T>,
+    {
+        with_isolated_home(|| {
+            tokio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(future_factory())
+        })
+    }
+
     #[test]
     fn test_command_parsing() {
         let input = "/help";
@@ -2891,6 +2940,20 @@ mod tests {
         let err = super::parse_save_filename(Some("session"), &["backup.txt"]).unwrap_err();
         assert!(err.contains("single token"));
         assert!(err.contains("quote paths containing spaces"));
+    }
+
+    #[test]
+    fn clear_parser_accepts_only_force_flag() {
+        assert!(!super::parse_clear_force(None, &[]).unwrap());
+        assert!(super::parse_clear_force(Some("--force"), &[]).unwrap());
+        assert!(super::parse_clear_force(Some("force"), &[]).unwrap());
+
+        let err = super::parse_clear_force(Some("--force"), &["extra"]).unwrap_err();
+        assert!(err.contains("Usage: /clear [--force]"));
+        assert!(err.contains("stale local transcript turn lock"));
+
+        let err = super::parse_clear_force(Some("now"), &[]).unwrap_err();
+        assert!(err.contains("Usage: /clear [--force]"));
     }
 
     #[test]
@@ -3862,178 +3925,187 @@ provider_settings = { tokens = ["array-token-1", "array-token-2"], name = "kept"
         assert!(deleted.lock().unwrap().is_empty());
     }
 
-    #[tokio::test]
-    async fn command_handler_scopes_clear_save_and_delete_cleanup_to_active_workspace() {
-        let suffix = uuid::Uuid::new_v4();
-        let alpha_name = format!("alpha-{suffix}");
-        let beta_name = format!("beta-{suffix}");
-        let alpha_scope = storage::workspace_scope("zeroclaw", &alpha_name, None).unwrap();
-        let beta_scope = storage::workspace_scope("zeroclaw", &beta_name, None).unwrap();
-        let mut alpha_meta = metadata("main", "Alpha Main");
-        alpha_meta.message_count = 4;
-        let mut beta_meta = metadata("main", "Beta Main");
-        beta_meta.message_count = 8;
-        storage::save_scoped_session_metadata(&alpha_scope, &alpha_meta).unwrap();
-        storage::save_scoped_session_metadata(&beta_scope, &beta_meta).unwrap();
-        std::fs::write(
-            storage::scoped_session_history_file(&alpha_scope, "main").unwrap(),
-            "alpha history\n",
-        )
-        .unwrap();
-        std::fs::write(
-            storage::scoped_session_history_file(&beta_scope, "main").unwrap(),
-            "beta history\n",
-        )
-        .unwrap();
-
-        let alpha_deleted = Arc::new(StdMutex::new(Vec::new()));
-        let beta_deleted = Arc::new(StdMutex::new(Vec::new()));
-        let handler = super::CommandHandler::new(app_with_two_fake_clients(
-            &alpha_name,
-            FakeAgentClient {
-                sessions: vec![session("active", "Active"), session("main", "Main")],
-                deleted: Arc::clone(&alpha_deleted),
-            },
-            &beta_name,
-            FakeAgentClient {
-                sessions: vec![session("main", "Main")],
-                deleted: Arc::clone(&beta_deleted),
-            },
-        ));
-
-        let clear_out = handler.handle("/clear", "main").await.unwrap().unwrap();
-        assert!(clear_out.contains("cleared"));
-        let alpha_history = storage::scoped_session_history_file(&alpha_scope, "main").unwrap();
-        assert_eq!(
-            storage::load_scoped_session_metadata(&alpha_scope, "main")
-                .unwrap()
-                .message_count,
-            0
-        );
-        assert!(
-            !alpha_history.exists(),
-            "/clear must remove persisted transcript history"
-        );
-        assert_eq!(
-            storage::load_scoped_session_metadata(&beta_scope, "main")
-                .unwrap()
-                .message_count,
-            8
-        );
-
-        let tempdir = tempfile::tempdir().unwrap();
-        let save_path = tempdir.path().join("main-session.txt");
-        let save_cmd = format!("/save {}", save_path.display());
-        let save_out = handler.handle(&save_cmd, "main").await.unwrap().unwrap();
-        assert!(save_out.contains("No history to save"));
-        assert!(!save_path.exists());
-
-        std::fs::write(&alpha_history, "alpha after clear\n").unwrap();
-        let save_out = handler.handle(&save_cmd, "main").await.unwrap().unwrap();
-        assert!(save_out.contains("Session saved"));
-        assert_eq!(
-            std::fs::read_to_string(&save_path).unwrap(),
-            "alpha after clear\n"
-        );
-
-        let existing_path = tempdir.path().join("existing.txt");
-        std::fs::write(&existing_path, "keep me\n").unwrap();
-        let save_existing_cmd = format!("/save {}", existing_path.display());
-        let save_existing_out = handler
-            .handle(&save_existing_cmd, "main")
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(save_existing_out.contains("Refusing to overwrite"));
-        assert_eq!(
-            std::fs::read_to_string(&existing_path).unwrap(),
-            "keep me\n"
-        );
-
-        let save_extra_out = handler
-            .handle("/save session backup.txt", "main")
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(save_extra_out.contains("single token"));
-
-        let delete_out = handler
-            .handle("/session delete main", "active")
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(delete_out.contains("Deleted session"));
-        assert_eq!(alpha_deleted.lock().unwrap().as_slice(), ["main"]);
-        assert!(beta_deleted.lock().unwrap().is_empty());
-        assert!(storage::load_scoped_session_metadata(&alpha_scope, "main").is_err());
-        assert!(!storage::scoped_session_history_file(&alpha_scope, "main")
-            .unwrap()
-            .exists());
-        assert_eq!(
-            storage::load_scoped_session_metadata(&beta_scope, "main")
-                .unwrap()
-                .message_count,
-            8
-        );
-        assert_eq!(
-            std::fs::read_to_string(
-                storage::scoped_session_history_file(&beta_scope, "main").unwrap()
+    #[test]
+    fn command_handler_scopes_clear_save_and_delete_cleanup_to_active_workspace() {
+        run_async_with_isolated_home(|| async {
+            let suffix = uuid::Uuid::new_v4();
+            let alpha_name = format!("alpha-{suffix}");
+            let beta_name = format!("beta-{suffix}");
+            let alpha_scope = storage::workspace_scope("zeroclaw", &alpha_name, None).unwrap();
+            let beta_scope = storage::workspace_scope("zeroclaw", &beta_name, None).unwrap();
+            let mut alpha_meta = metadata("main", "Alpha Main");
+            alpha_meta.message_count = 4;
+            let mut beta_meta = metadata("main", "Beta Main");
+            beta_meta.message_count = 8;
+            storage::save_scoped_session_metadata(&alpha_scope, &alpha_meta).unwrap();
+            storage::save_scoped_session_metadata(&beta_scope, &beta_meta).unwrap();
+            std::fs::write(
+                storage::scoped_session_history_file(&alpha_scope, "main").unwrap(),
+                "alpha history\n",
             )
-            .unwrap(),
-            "beta history\n"
-        );
+            .unwrap();
+            std::fs::write(
+                storage::scoped_session_history_file(&beta_scope, "main").unwrap(),
+                "beta history\n",
+            )
+            .unwrap();
 
-        storage::delete_scoped_session(&beta_scope, "main").unwrap();
+            let alpha_deleted = Arc::new(StdMutex::new(Vec::new()));
+            let beta_deleted = Arc::new(StdMutex::new(Vec::new()));
+            let handler = super::CommandHandler::new(app_with_two_fake_clients(
+                &alpha_name,
+                FakeAgentClient {
+                    sessions: vec![session("active", "Active"), session("main", "Main")],
+                    deleted: Arc::clone(&alpha_deleted),
+                },
+                &beta_name,
+                FakeAgentClient {
+                    sessions: vec![session("main", "Main")],
+                    deleted: Arc::clone(&beta_deleted),
+                },
+            ));
+
+            let clear_out = handler.handle("/clear", "main").await.unwrap().unwrap();
+            assert!(clear_out.contains("cleared"));
+            let alpha_history = storage::scoped_session_history_file(&alpha_scope, "main").unwrap();
+            assert_eq!(
+                storage::load_scoped_session_metadata(&alpha_scope, "main")
+                    .unwrap()
+                    .message_count,
+                0
+            );
+            assert!(
+                !alpha_history.exists(),
+                "/clear must remove persisted transcript history"
+            );
+            assert_eq!(
+                storage::load_scoped_session_metadata(&beta_scope, "main")
+                    .unwrap()
+                    .message_count,
+                8
+            );
+
+            let tempdir = tempfile::tempdir().unwrap();
+            let save_path = tempdir.path().join("main-session.txt");
+            let save_cmd = format!("/save {}", save_path.display());
+            let save_out = handler.handle(&save_cmd, "main").await.unwrap().unwrap();
+            assert!(save_out.contains("No history to save"));
+            assert!(!save_path.exists());
+
+            std::fs::write(&alpha_history, "alpha after clear\n").unwrap();
+            let save_out = handler.handle(&save_cmd, "main").await.unwrap().unwrap();
+            assert!(save_out.contains("Session saved"));
+            assert_eq!(
+                std::fs::read_to_string(&save_path).unwrap(),
+                "alpha after clear\n"
+            );
+
+            let existing_path = tempdir.path().join("existing.txt");
+            std::fs::write(&existing_path, "keep me\n").unwrap();
+            let save_existing_cmd = format!("/save {}", existing_path.display());
+            let save_existing_out = handler
+                .handle(&save_existing_cmd, "main")
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(save_existing_out.contains("Refusing to overwrite"));
+            assert_eq!(
+                std::fs::read_to_string(&existing_path).unwrap(),
+                "keep me\n"
+            );
+
+            let save_extra_out = handler
+                .handle("/save session backup.txt", "main")
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(save_extra_out.contains("single token"));
+
+            let delete_out = handler
+                .handle("/session delete main", "active")
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(delete_out.contains("Deleted session"));
+            assert_eq!(alpha_deleted.lock().unwrap().as_slice(), ["main"]);
+            assert!(beta_deleted.lock().unwrap().is_empty());
+            assert!(storage::load_scoped_session_metadata(&alpha_scope, "main").is_err());
+            assert!(!storage::scoped_session_history_file(&alpha_scope, "main")
+                .unwrap()
+                .exists());
+            assert_eq!(
+                storage::load_scoped_session_metadata(&beta_scope, "main")
+                    .unwrap()
+                    .message_count,
+                8
+            );
+            assert_eq!(
+                std::fs::read_to_string(
+                    storage::scoped_session_history_file(&beta_scope, "main").unwrap()
+                )
+                .unwrap(),
+                "beta history\n"
+            );
+
+            storage::delete_scoped_session(&beta_scope, "main").unwrap();
+        });
     }
 
-    #[tokio::test]
-    async fn save_exports_transcript_appended_by_turn_paths() {
-        let suffix = uuid::Uuid::new_v4();
-        let workspace_name = format!("save-{suffix}");
-        let scope = storage::workspace_scope("zeroclaw", &workspace_name, None).unwrap();
-        storage::save_scoped_session_metadata(&scope, &metadata("main", "Main")).unwrap();
-        storage::append_scoped_session_history(&scope, "main", "user", "hello").unwrap();
-        storage::append_scoped_session_history(&scope, "main", "assistant", "hi there").unwrap();
-        let handler = super::CommandHandler::new(app_with_two_fake_clients(
-            &workspace_name,
-            FakeAgentClient {
-                sessions: vec![session("main", "Main")],
-                deleted: Arc::new(StdMutex::new(Vec::new())),
-            },
-            "other",
-            FakeAgentClient::default(),
-        ));
-        let tempdir = tempfile::tempdir().unwrap();
-        let save_path = tempdir.path().join("turn-transcript.txt");
-        let save_cmd = format!("/save {}", save_path.display());
+    #[test]
+    fn save_exports_transcript_appended_by_turn_paths() {
+        run_async_with_isolated_home(|| async {
+            let suffix = uuid::Uuid::new_v4();
+            let workspace_name = format!("save-{suffix}");
+            let scope = storage::workspace_scope("zeroclaw", &workspace_name, None).unwrap();
+            storage::save_scoped_session_metadata(&scope, &metadata("main", "Main")).unwrap();
+            storage::append_scoped_session_history(&scope, "main", "user", "hello").unwrap();
+            storage::append_scoped_session_history(&scope, "main", "assistant", "hi there")
+                .unwrap();
+            let handler = super::CommandHandler::new(app_with_two_fake_clients(
+                &workspace_name,
+                FakeAgentClient {
+                    sessions: vec![session("main", "Main")],
+                    deleted: Arc::new(StdMutex::new(Vec::new())),
+                },
+                "other",
+                FakeAgentClient::default(),
+            ));
+            let tempdir = tempfile::tempdir().unwrap();
+            let save_path = tempdir.path().join("turn-transcript.txt");
+            let save_cmd = format!("/save {}", save_path.display());
 
-        let out = handler.handle(&save_cmd, "main").await.unwrap().unwrap();
+            let out = handler.handle(&save_cmd, "main").await.unwrap().unwrap();
 
-        assert!(out.contains("Session saved"));
-        let saved = std::fs::read_to_string(&save_path).unwrap();
-        assert!(saved.contains(r#""role":"user""#));
-        assert!(saved.contains(r#""content":"hello""#));
-        assert!(saved.contains(r#""role":"assistant""#));
-        assert!(saved.contains(r#""content":"hi there""#));
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
+            assert!(out.contains("Session saved"));
+            let saved = std::fs::read_to_string(&save_path).unwrap();
+            assert!(saved.contains(r#""role":"user""#));
+            assert!(saved.contains(r#""content":"hello""#));
+            assert!(saved.contains(r#""role":"assistant""#));
+            assert!(saved.contains(r#""content":"hi there""#));
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
 
-            assert_eq!(
-                std::fs::metadata(&save_path).unwrap().permissions().mode() & 0o777,
-                0o600
-            );
-        }
+                assert_eq!(
+                    std::fs::metadata(&save_path).unwrap().permissions().mode() & 0o777,
+                    0o600
+                );
+            }
 
-        storage::mark_scoped_session_history_incomplete(&scope, "main", "assistant append failed")
+            storage::mark_scoped_session_history_incomplete(
+                &scope,
+                "main",
+                "assistant append failed",
+            )
             .unwrap();
-        let blocked_path = tempdir.path().join("blocked-transcript.txt");
-        let blocked_cmd = format!("/save {}", blocked_path.display());
-        let blocked = handler.handle(&blocked_cmd, "main").await.unwrap().unwrap();
-        assert!(blocked.contains("transcript is incomplete"));
-        assert!(!blocked_path.exists());
+            let blocked_path = tempdir.path().join("blocked-transcript.txt");
+            let blocked_cmd = format!("/save {}", blocked_path.display());
+            let blocked = handler.handle(&blocked_cmd, "main").await.unwrap().unwrap();
+            assert!(blocked.contains("transcript is incomplete"));
+            assert!(!blocked_path.exists());
 
-        storage::delete_scoped_session(&scope, "main").unwrap();
+            storage::delete_scoped_session(&scope, "main").unwrap();
+        });
     }
 
     #[test]
@@ -4083,34 +4155,93 @@ provider_settings = { tokens = ["array-token-1", "array-token-2"], name = "kept"
         assert!(err.to_string().contains("injected parent sync failure"));
     }
 
-    #[tokio::test]
-    async fn clear_removes_transcript_history_even_when_metadata_is_missing() {
-        let suffix = uuid::Uuid::new_v4();
-        let workspace_name = format!("clear-missing-meta-{suffix}");
-        let scope = storage::workspace_scope("zeroclaw", &workspace_name, None).unwrap();
-        storage::append_scoped_session_history(&scope, "main", "user", "hello").unwrap();
-        storage::mark_scoped_session_history_incomplete(&scope, "main", "assistant append failed")
+    #[test]
+    fn clear_removes_transcript_history_even_when_metadata_is_missing() {
+        run_async_with_isolated_home(|| async {
+            let suffix = uuid::Uuid::new_v4();
+            let workspace_name = format!("clear-missing-meta-{suffix}");
+            let scope = storage::workspace_scope("zeroclaw", &workspace_name, None).unwrap();
+            storage::append_scoped_session_history(&scope, "main", "user", "hello").unwrap();
+            storage::mark_scoped_session_history_incomplete(
+                &scope,
+                "main",
+                "assistant append failed",
+            )
             .unwrap();
-        let history = storage::scoped_session_history_file(&scope, "main").unwrap();
-        let marker = storage::scoped_session_history_incomplete_file(&scope, "main").unwrap();
-        assert!(storage::load_scoped_session_metadata(&scope, "main").is_err());
+            let history = storage::scoped_session_history_file(&scope, "main").unwrap();
+            let marker = storage::scoped_session_history_incomplete_file(&scope, "main").unwrap();
+            assert!(storage::load_scoped_session_metadata(&scope, "main").is_err());
 
-        let handler = super::CommandHandler::new(app_with_two_fake_clients(
-            &workspace_name,
-            FakeAgentClient {
-                sessions: vec![session("main", "Main")],
-                deleted: Arc::new(StdMutex::new(Vec::new())),
-            },
-            "other",
-            FakeAgentClient::default(),
-        ));
+            let handler = super::CommandHandler::new(app_with_two_fake_clients(
+                &workspace_name,
+                FakeAgentClient {
+                    sessions: vec![session("main", "Main")],
+                    deleted: Arc::new(StdMutex::new(Vec::new())),
+                },
+                "other",
+                FakeAgentClient::default(),
+            ));
 
-        let out = handler.handle("/clear", "main").await.unwrap().unwrap();
+            let out = handler.handle("/clear", "main").await.unwrap().unwrap();
 
-        assert!(out.contains("cleared"));
-        assert!(out.contains("backend session context retained"));
-        assert!(!history.exists());
-        assert!(!marker.exists());
+            assert!(out.contains("cleared"));
+            assert!(out.contains("backend session context retained"));
+            assert!(!history.exists());
+            assert!(!marker.exists());
+        });
+    }
+
+    #[test]
+    fn clear_force_removes_stale_turn_lock_and_pending_markers() {
+        run_async_with_isolated_home(|| async {
+            let suffix = uuid::Uuid::new_v4();
+            let workspace_name = format!("clear-force-{suffix}");
+            let scope = storage::workspace_scope("zeroclaw", &workspace_name, None).unwrap();
+            storage::append_scoped_session_history(&scope, "main", "user", "hello").unwrap();
+            let lock = storage::acquire_scoped_session_history_turn_lock(
+                &scope, "main", "turn-a", "pending",
+            )
+            .unwrap();
+            storage::mark_scoped_session_history_incomplete(
+                &scope,
+                "main",
+                "assistant append failed",
+            )
+            .unwrap();
+            std::mem::forget(lock);
+
+            let history = storage::scoped_session_history_file(&scope, "main").unwrap();
+            let marker = storage::scoped_session_history_incomplete_file(&scope, "main").unwrap();
+            let pending_dir = storage::scoped_session_history_pending_dir(&scope, "main").unwrap();
+            let lock_dir = storage::scoped_session_history_turn_lock_dir(&scope, "main").unwrap();
+            assert!(history.exists());
+            assert!(marker.exists());
+            assert!(pending_dir.exists());
+            assert!(lock_dir.exists());
+
+            let handler = super::CommandHandler::new(app_with_two_fake_clients(
+                &workspace_name,
+                FakeAgentClient {
+                    sessions: vec![session("main", "Main")],
+                    deleted: Arc::new(StdMutex::new(Vec::new())),
+                },
+                "other",
+                FakeAgentClient::default(),
+            ));
+
+            let out = handler
+                .handle("/clear --force", "main")
+                .await
+                .unwrap()
+                .unwrap();
+
+            assert!(out.contains("force-cleared"));
+            assert!(out.contains("backend session context retained"));
+            assert!(!history.exists());
+            assert!(!marker.exists());
+            assert!(!pending_dir.exists());
+            assert!(!lock_dir.exists());
+        });
     }
 
     #[test]
