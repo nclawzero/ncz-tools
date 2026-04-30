@@ -630,10 +630,15 @@ pub async fn run(
             .map(|scope| scope.identity())
             .unwrap_or_else(|| workspace_name.clone())
     };
-    let mut worker_sessions = HashMap::from([(
-        worker_workspace_key,
-        WorkerSessionBinding::from_session(&session),
-    )]);
+    let mut worker_sessions = HashMap::new();
+    match WorkerSessionBinding::try_from_session(&session) {
+        Ok(binding) => {
+            worker_sessions.insert(worker_workspace_key, binding);
+        }
+        Err(e) => {
+            warn!("tv_ui: initial session is not bindable for local transcripts: {e}");
+        }
+    }
     let fallback_session_name = session.name.clone();
     let worker_sink = event_tx.clone();
     let worker_cmd_handler = Arc::new(CommandHandler::new(Arc::clone(&app)));
@@ -1385,17 +1390,14 @@ async fn handle_worker_command_request(
             }
         };
         match session_result {
-            Ok(session) => {
-                command_session_id = session.id.clone();
-                match current_workspace_binding_key(worker_app).await {
-                    Ok(workspace_key) => {
-                        remember_worker_session(worker_sessions, workspace_key, &session);
-                        session_switched = true;
-                    }
-                    Err(e) => {
+            Ok(session) => match current_workspace_binding_key(worker_app).await {
+                Ok(workspace_key) => {
+                    if let Err(e) =
+                        remember_worker_session(worker_sessions, workspace_key, &session)
+                    {
                         let detail = format!(
-                            "could not bind session `{target_session}` to workspace after backend session mutation: {e}"
-                        );
+                                "could not bind session `{target_session}` to workspace after backend session mutation: {e}"
+                            );
                         send_worker_finished(
                             worker_sink,
                             Err(mutating_command_unknown_outcome_message(&cmdline, &detail)),
@@ -1403,8 +1405,21 @@ async fn handle_worker_command_request(
                         .await;
                         return;
                     }
+                    command_session_id = session.id.clone();
+                    session_switched = true;
                 }
-            }
+                Err(e) => {
+                    let detail = format!(
+                            "could not bind session `{target_session}` to workspace after backend session mutation: {e}"
+                        );
+                    send_worker_finished(
+                        worker_sink,
+                        Err(mutating_command_unknown_outcome_message(&cmdline, &detail)),
+                    )
+                    .await;
+                    return;
+                }
+            },
             Err(e) => {
                 let detail = format!("could not {action_label} `{target_session}`: {e}");
                 send_worker_finished(
@@ -2386,14 +2401,35 @@ impl WorkerSessionBinding {
             name: session.name.clone(),
         }
     }
+
+    fn try_from_session(session: &Session) -> Result<Self> {
+        validate_bindable_session_id(session)?;
+        Ok(Self::from_session(session))
+    }
 }
 
 fn remember_worker_session(
     sessions: &mut HashMap<String, WorkerSessionBinding>,
     workspace_name: String,
     session: &Session,
-) {
-    sessions.insert(workspace_name, WorkerSessionBinding::from_session(session));
+) -> Result<()> {
+    sessions.insert(
+        workspace_name,
+        WorkerSessionBinding::try_from_session(session)?,
+    );
+    Ok(())
+}
+
+fn validate_bindable_session_id(session: &Session) -> Result<()> {
+    if storage::is_safe_session_id(&session.id) {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!(
+            "backend session `{}` has unsafe id `{}` for local transcript storage",
+            session.name,
+            session.id
+        ))
+    }
 }
 
 async fn current_workspace_name(app: &Arc<Mutex<App>>) -> Result<String> {
@@ -2535,7 +2571,7 @@ fn refreshed_active_worker_session_binding(
         .iter()
         .find(|session| session.id == binding.id)
     {
-        return Some(WorkerSessionBinding::from_session(session));
+        return WorkerSessionBinding::try_from_session(session).ok();
     }
 
     let mut name_matches = backend_sessions
@@ -2545,7 +2581,7 @@ fn refreshed_active_worker_session_binding(
     if name_matches.next().is_some() {
         return None;
     }
-    Some(WorkerSessionBinding::from_session(session))
+    WorkerSessionBinding::try_from_session(session).ok()
 }
 
 fn canonical_session_id_for_delete_target(
@@ -2575,7 +2611,7 @@ async fn ensure_session_for_active_workspace(
     if let Some(binding) = sessions.get(&workspace_key).cloned() {
         match load_session_for_worker(app, &binding.id).await {
             Ok(session) => {
-                remember_worker_session(sessions, workspace_key, &session);
+                remember_worker_session(sessions, workspace_key, &session)?;
                 return Ok(session.id);
             }
             Err(load_err) => {
@@ -2588,14 +2624,14 @@ async fn ensure_session_for_active_workspace(
                             binding.id
                         )
                     })?;
-                remember_worker_session(sessions, workspace_key, &session);
+                remember_worker_session(sessions, workspace_key, &session)?;
                 return Ok(session.id);
             }
         }
     }
 
     let session = resolve_or_create_session_for_worker(app, fallback_session_name).await?;
-    remember_worker_session(sessions, workspace_key, &session);
+    remember_worker_session(sessions, workspace_key, &session)?;
     Ok(session.id)
 }
 
@@ -2617,7 +2653,7 @@ async fn verify_session_for_active_workspace(
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("no active session binding for workspace"))?;
     let session = load_session_for_worker(app, &binding.id).await?;
-    remember_worker_session(sessions, workspace_key, &session);
+    remember_worker_session(sessions, workspace_key, &session)?;
     Ok(session.id)
 }
 
@@ -9520,7 +9556,8 @@ mod tests {
                 model: "m".to_string(),
                 provider: "p".to_string(),
             },
-        );
+        )
+        .unwrap();
         let backend_sessions = vec![Session {
             id: "sess-123".to_string(),
             name: "Renamed Display".to_string(),
@@ -9579,7 +9616,8 @@ mod tests {
                 model: "m".to_string(),
                 provider: "p".to_string(),
             },
-        );
+        )
+        .unwrap();
 
         assert_eq!(
             active_worker_session_delete_target_for_workspace(
@@ -9712,7 +9750,7 @@ mod tests {
             .unwrap();
             let workspace_key = scope.identity();
             let mut worker_sessions = HashMap::new();
-            remember_worker_session(&mut worker_sessions, workspace_key, &session);
+            remember_worker_session(&mut worker_sessions, workspace_key, &session).unwrap();
             let handler = CommandHandler::new(Arc::clone(&app));
             let (sink, mut rx) = StreamSink::channel(8);
 
@@ -10021,7 +10059,7 @@ mod tests {
             };
             let workspace_key = current_workspace_binding_key(&app).await.unwrap();
             let mut bindings = HashMap::new();
-            remember_worker_session(&mut bindings, workspace_key, &active_session);
+            remember_worker_session(&mut bindings, workspace_key, &active_session).unwrap();
             let handler = CommandHandler::new(Arc::clone(&app));
             let (sink, mut rx) = StreamSink::channel(32);
 
@@ -10175,7 +10213,7 @@ mod tests {
             };
             let workspace_key = current_workspace_binding_key(&app).await.unwrap();
             let mut bindings = HashMap::new();
-            remember_worker_session(&mut bindings, workspace_key, &active_session);
+            remember_worker_session(&mut bindings, workspace_key, &active_session).unwrap();
             let handler = CommandHandler::new(Arc::clone(&app));
             let (sink, mut rx) = StreamSink::channel(32);
 
@@ -10343,7 +10381,7 @@ mod tests {
             };
             let workspace_key = current_workspace_binding_key(&app).await.unwrap();
             let mut bindings = HashMap::new();
-            remember_worker_session(&mut bindings, workspace_key, &active_session);
+            remember_worker_session(&mut bindings, workspace_key, &active_session).unwrap();
             let handler = CommandHandler::new(Arc::clone(&app));
             let (sink, mut rx) = StreamSink::channel(32);
 
@@ -10470,6 +10508,137 @@ mod tests {
     }
 
     #[test]
+    fn unsafe_created_session_id_is_not_bound_before_turn_or_clear() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let created = Arc::new(StdMutex::new(Vec::new()));
+            let fake = WorkerSessionFakeClient {
+                listed_sessions: Vec::new(),
+                list_sessions_error: None,
+                loadable_sessions: vec![Session {
+                    id: "main".to_string(),
+                    name: "Main".to_string(),
+                    model: "model".to_string(),
+                    provider: "provider".to_string(),
+                }],
+                load_reject_ids: Vec::new(),
+                created: Arc::clone(&created),
+                deleted: Arc::new(StdMutex::new(Vec::new())),
+                submitted: Arc::new(StdMutex::new(Vec::new())),
+                list_calls: Arc::new(StdMutex::new(0)),
+                load_calls: Arc::new(StdMutex::new(Vec::new())),
+                submit_response: String::new(),
+                submit_error: None,
+                submit_never: false,
+                cancellation_safe: true,
+                sink_set_states: Arc::new(StdMutex::new(Vec::new())),
+                delete_error: None,
+            };
+            let boxed: Box<dyn crate::cli::agent::AgentClient + Send + Sync> = Box::new(fake);
+            let app = Arc::new(Mutex::new(App {
+                workspaces: vec![crate::cli::workspace::Workspace {
+                    id: 0,
+                    config: crate::cli::workspace::WorkspaceConfig {
+                        id: Some("ws-openclaw".to_string()),
+                        name: "openclaw".to_string(),
+                        backend: crate::cli::workspace::Backend::Openclaw,
+                        url: "ws://gateway.example".to_string(),
+                        token_env: None,
+                        token: None,
+                        label: None,
+                        namespace_aliases: Vec::new(),
+                    },
+                    client: Some(Arc::new(Mutex::new(boxed))),
+                    cron: None,
+                }],
+                active: 0,
+                shared_mnemos: None,
+                config_path: std::path::PathBuf::from("test-config.toml"),
+            }));
+            let active = Session {
+                id: "main".to_string(),
+                name: "Main".to_string(),
+                model: "model".to_string(),
+                provider: "provider".to_string(),
+            };
+            let workspace_key = current_workspace_binding_key(&app).await.unwrap();
+            let mut bindings = HashMap::new();
+            remember_worker_session(&mut bindings, workspace_key.clone(), &active).unwrap();
+            let handler = CommandHandler::new(Arc::clone(&app));
+            let (sink, mut rx) = StreamSink::channel(16);
+
+            handle_worker_command_request(
+                "/session create nested/session".to_string(),
+                &app,
+                &mut bindings,
+                &active.name,
+                &sink,
+                &handler,
+                ConnectSplashPolicy {
+                    display: true,
+                    backend: true,
+                },
+            )
+            .await;
+
+            let mut terminal_error = None;
+            while let Ok(chunk) = rx.try_recv() {
+                if let TurnChunk::Finished(Err(message)) = chunk {
+                    terminal_error = Some(message);
+                }
+            }
+            let terminal_error = terminal_error.expect("unsafe create should fail terminally");
+            assert!(terminal_error.contains("outcome unknown"));
+            assert!(terminal_error.contains("unsafe id"));
+            assert_eq!(created.lock().unwrap()[0].id, "created-nested/session");
+            assert_eq!(bindings[&workspace_key].id, "main");
+
+            let turn_session_id = turn_session_id_for_active_workspace(&app, &mut bindings, "Main")
+                .await
+                .unwrap();
+            assert_eq!(turn_session_id, "main");
+
+            let (clear_sink, mut clear_rx) = StreamSink::channel(16);
+            handle_worker_command_request(
+                "/clear".to_string(),
+                &app,
+                &mut bindings,
+                &active.name,
+                &clear_sink,
+                &handler,
+                ConnectSplashPolicy {
+                    display: true,
+                    backend: true,
+                },
+            )
+            .await;
+            let mut clear_terminal_ok = false;
+            let mut clear_terminal_error = None;
+            while let Ok(chunk) = clear_rx.try_recv() {
+                match chunk {
+                    TurnChunk::Finished(Ok(_)) => clear_terminal_ok = true,
+                    TurnChunk::Finished(Err(message)) => clear_terminal_error = Some(message),
+                    _ => {}
+                }
+            }
+            assert!(clear_terminal_ok);
+            assert!(!clear_terminal_error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("outcome unknown"));
+        });
+
+        match old_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    #[test]
     fn turn_session_fails_closed_when_remembered_binding_cannot_be_validated() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
@@ -10524,7 +10693,7 @@ mod tests {
             }));
             let workspace_key = current_workspace_binding_key(&app).await.unwrap();
             let mut bindings = HashMap::new();
-            remember_worker_session(&mut bindings, workspace_key.clone(), &active);
+            remember_worker_session(&mut bindings, workspace_key.clone(), &active).unwrap();
 
             let err = turn_session_id_for_active_workspace(&app, &mut bindings, "fallback")
                 .await
@@ -10601,7 +10770,7 @@ mod tests {
             }));
             let workspace_key = current_workspace_binding_key(&app).await.unwrap();
             let mut bindings = HashMap::new();
-            remember_worker_session(&mut bindings, workspace_key.clone(), &stale);
+            remember_worker_session(&mut bindings, workspace_key.clone(), &stale).unwrap();
 
             let turn_session_id = turn_session_id_for_active_workspace(&app, &mut bindings, "Main")
                 .await
@@ -10680,7 +10849,7 @@ mod tests {
             }));
             let workspace_key = current_workspace_binding_key(&app).await.unwrap();
             let mut bindings = HashMap::new();
-            remember_worker_session(&mut bindings, workspace_key.clone(), &stale);
+            remember_worker_session(&mut bindings, workspace_key.clone(), &stale).unwrap();
             let (sink, _rx) = StreamSink::channel(8);
 
             resync_worker_state(&app, &mut bindings, &sink)
@@ -10758,7 +10927,7 @@ mod tests {
             }));
             let workspace_key = current_workspace_binding_key(&app).await.unwrap();
             let mut bindings = HashMap::new();
-            remember_worker_session(&mut bindings, workspace_key, &stale);
+            remember_worker_session(&mut bindings, workspace_key, &stale).unwrap();
             let handler = CommandHandler::new(Arc::clone(&app));
             let (sink, mut rx) = StreamSink::channel(8);
 
@@ -10854,7 +11023,7 @@ mod tests {
             .block_on(current_workspace_binding_key(&app))
             .unwrap();
         let mut worker_sessions = HashMap::new();
-        remember_worker_session(&mut worker_sessions, workspace_key, &active);
+        remember_worker_session(&mut worker_sessions, workspace_key, &active).unwrap();
 
         let lines = Rc::new(RefCell::new(Vec::new()));
         let (req_tx, mut req_rx) = mpsc::channel(4);
@@ -10950,8 +11119,8 @@ mod tests {
             provider: "p".to_string(),
         };
 
-        remember_worker_session(&mut bindings, "alpha".to_string(), &alpha);
-        remember_worker_session(&mut bindings, "beta".to_string(), &beta);
+        remember_worker_session(&mut bindings, "alpha".to_string(), &alpha).unwrap();
+        remember_worker_session(&mut bindings, "beta".to_string(), &beta).unwrap();
 
         assert_eq!(bindings["alpha"].id, "alpha-id");
         assert_eq!(bindings["beta"].id, "beta-id");
