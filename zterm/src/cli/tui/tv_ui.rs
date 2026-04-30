@@ -1030,6 +1030,21 @@ impl SlashCommandDeadline {
             }
         }
     }
+
+    fn pending_timeout_message(self, command_label: Option<&str>) -> String {
+        let command = command_label
+            .map(|command| {
+                format!(
+                    " for `{}`",
+                    mutation_fence_command_descriptor(command).replace('`', "'")
+                )
+            })
+            .unwrap_or_default();
+        format!(
+            "slash command is still reconciling{command} after {:?}; zterm is keeping it in flight so local state can catch up before more backend actions run.",
+            self.timeout
+        )
+    }
 }
 
 async fn run_worker_command_with_deadline<F>(
@@ -1040,11 +1055,32 @@ async fn run_worker_command_with_deadline<F>(
 ) where
     F: Future<Output = ()>,
 {
-    if tokio::time::timeout(deadline.timeout, command)
-        .await
-        .is_err()
-    {
-        send_worker_finished(worker_sink, Err(deadline.timeout_message(command_label))).await;
+    match deadline.kind {
+        SlashCommandDeadlineKind::ReadOnly => {
+            if tokio::time::timeout(deadline.timeout, command)
+                .await
+                .is_err()
+            {
+                send_worker_finished(worker_sink, Err(deadline.timeout_message(command_label)))
+                    .await;
+            }
+        }
+        SlashCommandDeadlineKind::Mutating => {
+            tokio::pin!(command);
+            let timeout = tokio::time::sleep(deadline.timeout);
+            tokio::pin!(timeout);
+            tokio::select! {
+                () = &mut command => {}
+                _ = &mut timeout => {
+                    let message = format!(
+                        "[pending] {}\n",
+                        deadline.pending_timeout_message(command_label)
+                    );
+                    let _ = send_worker_chunk_reliably(worker_sink, TurnChunk::Token(message)).await;
+                    command.await;
+                }
+            }
+        }
     }
 }
 
@@ -7414,59 +7450,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn timed_out_mutating_worker_command_sets_resync_fence() {
-        let (sink, mut rx) = StreamSink::channel(4);
+    async fn timed_out_mutating_worker_command_warns_without_cancelling() {
+        let (sink, mut rx) = StreamSink::channel(8);
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let run_sink = sink.clone();
+        let command_sink = sink.clone();
 
-        run_worker_command_with_deadline(
-            &sink,
-            SlashCommandDeadline::mutating(Duration::from_millis(1)),
-            Some("/memory post hello"),
-            std::future::pending::<()>(),
-        )
-        .await;
+        let worker = tokio::spawn(async move {
+            run_worker_command_with_deadline(
+                &run_sink,
+                SlashCommandDeadline::mutating(Duration::from_millis(1)),
+                Some("/memory post hello"),
+                async move {
+                    let _ = release_rx.await;
+                    send_worker_finished(&command_sink, Ok(String::new())).await;
+                },
+            )
+            .await;
+        });
 
-        let _env = crate::cli::test_env_lock().lock().unwrap();
-        let home = tempfile::tempdir().unwrap();
-        let old_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", home.path());
-        let mut state = StatusState::new(
-            "default".to_string(),
-            "gpt-test".to_string(),
-            "borland".to_string(),
-            false,
-        );
-        state.begin_turn();
-        let lines = Rc::new(RefCell::new(vec!["> /memory post hello".to_string()]));
-        let mut typewriter_state = None;
-        let mut response_in_flight = true;
-        let mut session_picker_state = SessionPickerState::default();
-
-        assert!(drain_stream_events(
-            &mut rx,
-            &lines,
-            &mut state,
-            &mut typewriter_state,
-            &mut response_in_flight,
-            &mut session_picker_state
-        ));
-
-        assert!(!response_in_flight);
-        assert!(state.turn_start.is_none());
-        assert!(state.mutation_fence.is_some());
-        let key = mutation_fence_key_for_status(&state);
-        assert!(delighters::mutation_fence_for_workspace(&key)
-            .unwrap()
-            .unwrap()
-            .reason
-            .contains("/memory post args#"));
-        let rendered = lines.borrow().join("\n");
-        assert!(rendered.contains("outcome unknown"));
-        assert!(rendered.contains("/resync --force"));
-
-        match old_home {
-            Some(home) => std::env::set_var("HOME", home),
-            None => std::env::remove_var("HOME"),
+        match tokio::time::timeout(Duration::from_millis(100), rx.recv()).await {
+            Ok(Some(TurnChunk::Token(message))) => {
+                assert!(message.contains("still reconciling"));
+                assert!(message.contains("/memory post args#"));
+            }
+            other => panic!("expected pending timeout warning, got {other:?}"),
         }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), rx.recv())
+                .await
+                .is_err(),
+            "mutating timeout must not emit a terminal frame before reconciliation completes"
+        );
+
+        release_tx.send(()).unwrap();
+        match tokio::time::timeout(Duration::from_millis(100), rx.recv()).await {
+            Ok(Some(TurnChunk::Finished(Ok(message)))) => assert!(message.is_empty()),
+            other => panic!("expected command terminal frame after release, got {other:?}"),
+        }
+        worker.await.unwrap();
     }
 
     #[test]
