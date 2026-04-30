@@ -1183,8 +1183,15 @@ async fn run_mutating_worker_command_task_with_deadline(
                     deadline.pending_timeout_message(command_label)
                 );
                 send_worker_finished(worker_sink, Err(message)).await;
+                let post_timeout_status_sink = command_label
+                    .filter(|cmdline| {
+                        command_session_preflight(cmdline)
+                            == CommandSessionPreflight::AfterWorkspaceSwitch
+                    })
+                    .map(|_| worker_sink.clone());
                 tokio::spawn(async move {
-                    drain_mutating_command_proxy(command_rx).await;
+                    drain_timed_out_mutating_command_proxy(command_rx, post_timeout_status_sink)
+                        .await;
                     let _ = command_task.await;
                 });
                 return None;
@@ -1195,6 +1202,36 @@ async fn run_mutating_worker_command_task_with_deadline(
 
 async fn drain_mutating_command_proxy(mut command_rx: mpsc::Receiver<TurnChunk>) {
     while command_rx.recv().await.is_some() {}
+}
+
+async fn drain_timed_out_mutating_command_proxy(
+    mut command_rx: mpsc::Receiver<TurnChunk>,
+    mut post_timeout_status_sink: Option<StreamSink>,
+) {
+    while let Some(chunk) = command_rx.recv().await {
+        if let (
+            Some(worker_sink),
+            TurnChunk::Status {
+                workspace,
+                workspace_id,
+                model,
+            },
+        ) = (post_timeout_status_sink.as_ref(), chunk)
+        {
+            let forwarded = send_worker_chunk_reliably(
+                worker_sink,
+                TurnChunk::Status {
+                    workspace,
+                    workspace_id,
+                    model,
+                },
+            )
+            .await;
+            if !forwarded {
+                post_timeout_status_sink = None;
+            }
+        }
+    }
 }
 
 async fn forward_mutating_command_proxy(
@@ -3920,11 +3957,25 @@ fn drain_stream_events(
                         workspace_id,
                         model,
                     } => {
+                        let prior_key = mutation_fence_key_for_status(status_state);
+                        let prior_timeout_fence = status_state
+                            .mutation_fence
+                            .as_deref()
+                            .filter(|_| status_state.in_flight_request.is_none())
+                            .filter(|reason| mutation_timeout_requires_fence(reason))
+                            .map(str::to_string);
                         status_state.apply_status(
                             workspace.clone(),
                             workspace_id.clone(),
                             model.clone(),
                         );
+                        if let Some(reason) = prior_timeout_fence.as_deref() {
+                            relocate_timed_out_mutation_fence_after_status(
+                                status_state,
+                                &prior_key,
+                                reason,
+                            );
+                        }
                     }
                     TurnChunk::SessionPickerList(result) => {
                         apply_session_picker_result(
@@ -4043,6 +4094,64 @@ fn drain_stream_events(
 
 fn mutation_timeout_requires_fence(message: &str) -> bool {
     message.contains("slash command outcome unknown")
+}
+
+fn relocate_timed_out_mutation_fence_after_status(
+    status_state: &mut StatusState,
+    prior_key: &str,
+    prior_reason: &str,
+) {
+    let refreshed_key = mutation_fence_key_for_status(status_state);
+    if prior_key == refreshed_key {
+        return;
+    }
+
+    let fence = match delighters::mutation_fence_for_workspace(prior_key) {
+        Ok(Some(fence)) if fence.reason == prior_reason => fence,
+        Ok(Some(_)) | Ok(None) => {
+            status_state.mutation_fence = Some(cap_sanitized_text(
+                &format!(
+                    "{prior_reason}; failed to persist fence under refreshed workspace: durable timeout fence is no longer owned by the previous workspace"
+                ),
+                MUTATION_FENCE_REASON_MAX_CHARS,
+            ));
+            status_state.set_toast(MUTATION_FENCE_TOAST);
+            return;
+        }
+        Err(e) => {
+            status_state.mutation_fence = Some(cap_sanitized_text(
+                &format!("{prior_reason}; failed to persist fence under refreshed workspace: {e}"),
+                MUTATION_FENCE_REASON_MAX_CHARS,
+            ));
+            status_state.set_toast(MUTATION_FENCE_TOAST);
+            return;
+        }
+    };
+
+    match delighters::replace_mutation_fence_for_workspace_if_dispatch(
+        prior_key,
+        &fence.dispatch_id,
+        &refreshed_key,
+        fence.clone(),
+    ) {
+        Ok(true) => status_state.mutation_fence = Some(fence.reason),
+        Ok(false) => {
+            status_state.mutation_fence = Some(cap_sanitized_text(
+                &format!(
+                    "{prior_reason}; failed to persist fence under refreshed workspace: durable timeout fence is no longer owned by this dispatch"
+                ),
+                MUTATION_FENCE_REASON_MAX_CHARS,
+            ));
+            status_state.set_toast(MUTATION_FENCE_TOAST);
+        }
+        Err(e) => {
+            status_state.mutation_fence = Some(cap_sanitized_text(
+                &format!("{prior_reason}; failed to persist fence under refreshed workspace: {e}"),
+                MUTATION_FENCE_REASON_MAX_CHARS,
+            ));
+            status_state.set_toast(MUTATION_FENCE_TOAST);
+        }
+    }
 }
 
 fn mutation_fence_reason_for_terminal_failure(
@@ -7697,6 +7806,133 @@ mod tests {
                 .is_err(),
             "timed-out command proxy output must be drained, not delivered to the foreground UI"
         );
+    }
+
+    #[test]
+    fn timed_out_workspace_switch_status_rehomes_timeout_fence() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut state = StatusState::new(
+                "alpha".to_string(),
+                "gpt-test".to_string(),
+                "borland".to_string(),
+                false,
+            );
+            state.workspace_id = Some("ws-alpha".to_string());
+            let owner =
+                write_ahead_mutation_fence_for_dispatch(&mut state, "/workspace switch beta")
+                    .unwrap();
+            state.begin_turn();
+            state.in_flight_request = Some(InFlightRequest {
+                label: "/workspace switch beta".to_string(),
+                mutating_slash: true,
+                mutation_fence_owner: Some(owner),
+            });
+            let lines = Rc::new(RefCell::new(vec!["> /workspace switch beta".to_string()]));
+            let mut typewriter_state = None;
+            let mut response_in_flight = true;
+            let mut session_picker_state = SessionPickerState::default();
+            let source_key = "id:ws-alpha".to_string();
+            let target_key = "id:ws-beta".to_string();
+
+            let (sink, mut rx) = StreamSink::channel(8);
+            let (command_sink, command_rx) = StreamSink::channel(8);
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+            let (completed_tx, completed_rx) = tokio::sync::oneshot::channel::<()>();
+            let command_task = tokio::spawn(async move {
+                let _ = release_rx.await;
+                let _ = send_worker_chunk_reliably(
+                    &command_sink,
+                    TurnChunk::Token("late workspace switch output".to_string()),
+                )
+                .await;
+                let _ = send_worker_chunk_reliably(
+                    &command_sink,
+                    TurnChunk::Status {
+                        workspace: Some("beta".to_string()),
+                        workspace_id: Some("ws-beta".to_string()),
+                        model: None,
+                    },
+                )
+                .await;
+                send_worker_finished(&command_sink, Ok(String::new())).await;
+                let _ = completed_tx.send(());
+                HashMap::new()
+            });
+
+            let result = run_mutating_worker_command_task_with_deadline(
+                &sink,
+                SlashCommandDeadline::mutating(Duration::from_millis(1)),
+                Some("/workspace switch beta"),
+                command_rx,
+                command_task,
+            )
+            .await;
+
+            assert!(result.is_none());
+            assert!(drain_stream_events(
+                &mut rx,
+                &lines,
+                &mut state,
+                &mut typewriter_state,
+                &mut response_in_flight,
+                &mut session_picker_state
+            ));
+            assert!(!response_in_flight);
+            assert!(state.in_flight_request.is_none());
+            assert!(delighters::mutation_fence_for_workspace(&source_key)
+                .unwrap()
+                .is_some());
+            assert!(delighters::mutation_fence_for_workspace(&target_key)
+                .unwrap()
+                .is_none());
+
+            release_tx.send(()).unwrap();
+            tokio::time::timeout(Duration::from_millis(100), async {
+                loop {
+                    drain_stream_events(
+                        &mut rx,
+                        &lines,
+                        &mut state,
+                        &mut typewriter_state,
+                        &mut response_in_flight,
+                        &mut session_picker_state,
+                    );
+                    if state.workspace == "beta" {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("post-timeout workspace status should be forwarded");
+            tokio::time::timeout(Duration::from_millis(100), completed_rx)
+                .await
+                .expect("background workspace switch should complete")
+                .expect("completion signal should send");
+
+            let source_after = delighters::mutation_fence_for_workspace(&source_key).unwrap();
+            let target_after = delighters::mutation_fence_for_workspace(&target_key)
+                .unwrap()
+                .unwrap();
+            assert!(source_after.is_none());
+            assert!(target_after.reason.contains("outcome unknown"));
+            assert_eq!(state.mutation_fence, Some(target_after.reason.clone()));
+            assert!(!lines
+                .borrow()
+                .join("\n")
+                .contains("late workspace switch output"));
+        });
+
+        match old_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
     }
 
     #[test]
