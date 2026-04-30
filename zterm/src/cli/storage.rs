@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Write;
 #[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -271,37 +271,60 @@ pub fn ensure_scoped_session_dir(scope: &LocalWorkspaceScope, session_id: &str) 
 }
 
 fn create_private_dir_all(dir: &Path) -> Result<()> {
-    fs::create_dir_all(dir).map_err(|e| anyhow!("Failed to create directory: {}", e))?;
+    create_private_dir_chain(dir)?;
     harden_private_dirs(dir)
 }
 
 #[cfg(unix)]
-fn harden_private_dirs(dir: &Path) -> Result<()> {
-    let root = config_dir()?;
-    let mut dirs: Vec<PathBuf> = dir
-        .ancestors()
-        .filter(|path| path.starts_with(&root))
-        .map(Path::to_path_buf)
-        .collect();
-    dirs.reverse();
-
+fn create_private_dir_chain(dir: &Path) -> Result<()> {
+    let dirs = private_dir_chain(dir)?;
     for path in dirs {
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) => harden_private_dir_metadata(&path, &metadata)?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                match fs::create_dir(&path) {
+                    Ok(()) => {}
+                    Err(create_err) if create_err.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(create_err) => {
+                        return Err(anyhow!(
+                            "Failed to create private directory {}: {}",
+                            path.display(),
+                            create_err
+                        ));
+                    }
+                }
+                let metadata = fs::symlink_metadata(&path).map_err(|inspect_err| {
+                    anyhow!(
+                        "Failed to inspect private directory {}: {}",
+                        path.display(),
+                        inspect_err
+                    )
+                })?;
+                harden_private_dir_metadata(&path, &metadata)?;
+            }
+            Err(e) => {
+                return Err(anyhow!(
+                    "Failed to inspect private directory {}: {}",
+                    path.display(),
+                    e
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn create_private_dir_chain(dir: &Path) -> Result<()> {
+    fs::create_dir_all(dir).map_err(|e| anyhow!("Failed to create directory: {}", e))
+}
+
+#[cfg(unix)]
+fn harden_private_dirs(dir: &Path) -> Result<()> {
+    for path in private_dir_chain(dir)? {
         let metadata = fs::symlink_metadata(&path)
             .map_err(|e| anyhow!("Failed to inspect private directory: {}", e))?;
-        if metadata.file_type().is_symlink() {
-            return Err(anyhow!(
-                "Refusing to use symlinked private directory: {}",
-                path.display()
-            ));
-        }
-        if !metadata.is_dir() {
-            return Err(anyhow!(
-                "Refusing to use non-directory private path: {}",
-                path.display()
-            ));
-        }
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
-            .map_err(|e| anyhow!("Failed to set private directory permissions: {}", e))?;
+        harden_private_dir_metadata(&path, &metadata)?;
     }
 
     Ok(())
@@ -310,6 +333,49 @@ fn harden_private_dirs(dir: &Path) -> Result<()> {
 #[cfg(not(unix))]
 fn harden_private_dirs(_dir: &Path) -> Result<()> {
     Ok(())
+}
+
+#[cfg(unix)]
+fn private_dir_chain(dir: &Path) -> Result<Vec<PathBuf>> {
+    let root = config_dir()?;
+    let mut dirs: Vec<PathBuf> = dir
+        .ancestors()
+        .filter(|path| path.starts_with(&root))
+        .map(Path::to_path_buf)
+        .collect();
+    dirs.reverse();
+    Ok(dirs)
+}
+
+#[cfg(unix)]
+fn harden_private_dir_metadata(path: &Path, metadata: &fs::Metadata) -> Result<()> {
+    if metadata.file_type().is_symlink() {
+        return Err(anyhow!(
+            "Refusing to use symlinked private directory: {}",
+            path.display()
+        ));
+    }
+    if !metadata.is_dir() {
+        return Err(anyhow!(
+            "Refusing to use non-directory private path: {}",
+            path.display()
+        ));
+    }
+    if metadata.uid() != current_euid() {
+        return Err(anyhow!(
+            "Refusing to use private directory {} owned by uid {}",
+            path.display(),
+            metadata.uid()
+        ));
+    }
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .map_err(|e| anyhow!("Failed to set private directory permissions: {}", e))?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn current_euid() -> u32 {
+    unsafe { libc::geteuid() as u32 }
 }
 
 /// Check if config exists
@@ -1455,6 +1521,59 @@ mod tests {
 
         assert!(err.to_string().contains("symlink"));
         assert_eq!(fs::read_to_string(&target).unwrap(), "original\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_session_dir_rejects_symlinked_config_root_before_descent() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+        let root = config_dir().unwrap();
+        let target = home.path().join("shared-root");
+        fs::create_dir(&target).unwrap();
+        std::os::unix::fs::symlink(&target, &root).unwrap();
+
+        let err = ensure_session_dir("main").unwrap_err();
+
+        match old_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+
+        assert!(err.to_string().contains("symlinked private directory"));
+        assert!(
+            !target.join("sessions").exists(),
+            "session directory creation should not descend through symlinked config root"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_session_dir_rejects_symlinked_sessions_root_before_descent() {
+        let _env = crate::cli::test_env_lock().lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+        ensure_config_dir().unwrap();
+        let sessions = sessions_dir().unwrap();
+        let target = home.path().join("shared-sessions");
+        fs::create_dir(&target).unwrap();
+        std::os::unix::fs::symlink(&target, &sessions).unwrap();
+
+        let err = ensure_session_dir("main").unwrap_err();
+
+        match old_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+
+        assert!(err.to_string().contains("symlinked private directory"));
+        assert!(
+            !target.join("main").exists(),
+            "session directory creation should not descend through symlinked sessions root"
+        );
     }
 
     #[test]
