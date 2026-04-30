@@ -636,7 +636,7 @@ pub async fn run(
     )]);
     let fallback_session_name = session.name.clone();
     let worker_sink = event_tx.clone();
-    let worker_cmd_handler = CommandHandler::new(Arc::clone(&app));
+    let worker_cmd_handler = Arc::new(CommandHandler::new(Arc::clone(&app)));
     let worker_connect_splash_policy = connect_splash_policy;
     tokio::spawn(async move {
         while let Some(req) = req_rx.recv().await {
@@ -918,22 +918,56 @@ pub async fn run(
                 WorkerRequest::Command(cmdline) => {
                     let deadline = slash_command_deadline(&cmdline);
                     let command_label = cmdline.clone();
-                    let command = handle_worker_command_request(
-                        cmdline,
-                        &worker_app,
-                        &mut worker_sessions,
-                        &fallback_session_name,
-                        &worker_sink,
-                        &worker_cmd_handler,
-                        worker_connect_splash_policy,
-                    );
-                    run_worker_command_with_deadline(
-                        &worker_sink,
-                        deadline,
-                        Some(&command_label),
-                        command,
-                    )
-                    .await;
+                    if deadline.kind == SlashCommandDeadlineKind::Mutating {
+                        let (command_sink, command_rx) = StreamSink::channel(UI_EVENT_CAPACITY);
+                        let command_app = Arc::clone(&worker_app);
+                        let command_handler = Arc::clone(&worker_cmd_handler);
+                        let command_fallback_session_name = fallback_session_name.clone();
+                        let command_policy = worker_connect_splash_policy;
+                        let mut command_sessions = worker_sessions.clone();
+                        let command_task = tokio::spawn(async move {
+                            handle_worker_command_request(
+                                cmdline,
+                                &command_app,
+                                &mut command_sessions,
+                                &command_fallback_session_name,
+                                &command_sink,
+                                &command_handler,
+                                command_policy,
+                            )
+                            .await;
+                            command_sessions
+                        });
+                        if let Some(updated_sessions) =
+                            run_mutating_worker_command_task_with_deadline(
+                                &worker_sink,
+                                deadline,
+                                Some(&command_label),
+                                command_rx,
+                                command_task,
+                            )
+                            .await
+                        {
+                            worker_sessions = updated_sessions;
+                        }
+                    } else {
+                        let command = handle_worker_command_request(
+                            cmdline,
+                            &worker_app,
+                            &mut worker_sessions,
+                            &fallback_session_name,
+                            &worker_sink,
+                            &worker_cmd_handler,
+                            worker_connect_splash_policy,
+                        );
+                        run_worker_command_with_deadline(
+                            &worker_sink,
+                            deadline,
+                            Some(&command_label),
+                            command,
+                        )
+                        .await;
+                    }
                 }
                 WorkerRequest::Resync => {
                     let result = tokio::time::timeout(
@@ -1066,20 +1100,105 @@ async fn run_worker_command_with_deadline<F>(
             }
         }
         SlashCommandDeadlineKind::Mutating => {
-            tokio::pin!(command);
-            let timeout = tokio::time::sleep(deadline.timeout);
-            tokio::pin!(timeout);
-            tokio::select! {
-                () = &mut command => {}
-                _ = &mut timeout => {
-                    let message = format!(
-                        "[pending] {}\n",
-                        deadline.pending_timeout_message(command_label)
-                    );
-                    let _ = send_worker_chunk_reliably(worker_sink, TurnChunk::Token(message)).await;
-                    command.await;
+            drop(command);
+            send_worker_finished(
+                worker_sink,
+                Err(
+                    "internal error: mutating slash command used read-only timeout path"
+                        .to_string(),
+                ),
+            )
+            .await;
+        }
+    }
+}
+
+async fn run_mutating_worker_command_task_with_deadline(
+    worker_sink: &StreamSink,
+    deadline: SlashCommandDeadline,
+    command_label: Option<&str>,
+    mut command_rx: mpsc::Receiver<TurnChunk>,
+    mut command_task: tokio::task::JoinHandle<HashMap<String, WorkerSessionBinding>>,
+) -> Option<HashMap<String, WorkerSessionBinding>> {
+    debug_assert_eq!(deadline.kind, SlashCommandDeadlineKind::Mutating);
+    let timeout = tokio::time::sleep(deadline.timeout);
+    tokio::pin!(timeout);
+    loop {
+        tokio::select! {
+            maybe_chunk = command_rx.recv() => {
+                match maybe_chunk {
+                    Some(chunk) => {
+                        if !send_worker_chunk_reliably(worker_sink, chunk).await {
+                            tokio::spawn(async move {
+                                drain_mutating_command_proxy(command_rx).await;
+                                let _ = command_task.await;
+                            });
+                            return None;
+                        }
+                    }
+                    None => {
+                        return match command_task.await {
+                            Ok(updated_sessions) => Some(updated_sessions),
+                            Err(e) => {
+                                let _ = send_worker_finished(
+                                    worker_sink,
+                                    Err(format!("mutating slash command worker failed: {e}")),
+                                )
+                                .await;
+                                None
+                            }
+                        };
+                    }
                 }
             }
+            result = &mut command_task => {
+                while let Ok(chunk) = command_rx.try_recv() {
+                    let _ = send_worker_chunk_reliably(worker_sink, chunk).await;
+                }
+                let forward_sink = worker_sink.clone();
+                tokio::spawn(async move {
+                    forward_mutating_command_proxy(command_rx, forward_sink).await;
+                });
+                return match result {
+                    Ok(updated_sessions) => Some(updated_sessions),
+                    Err(e) => {
+                        let _ = send_worker_finished(
+                            worker_sink,
+                            Err(format!("mutating slash command worker failed: {e}")),
+                        )
+                        .await;
+                        None
+                    }
+                };
+            }
+            _ = &mut timeout => {
+                let message = format!(
+                    "{} {}",
+                    deadline.timeout_message(command_label),
+                    deadline.pending_timeout_message(command_label)
+                );
+                send_worker_finished(worker_sink, Err(message)).await;
+                tokio::spawn(async move {
+                    drain_mutating_command_proxy(command_rx).await;
+                    let _ = command_task.await;
+                });
+                return None;
+            }
+        }
+    }
+}
+
+async fn drain_mutating_command_proxy(mut command_rx: mpsc::Receiver<TurnChunk>) {
+    while command_rx.recv().await.is_some() {}
+}
+
+async fn forward_mutating_command_proxy(
+    mut command_rx: mpsc::Receiver<TurnChunk>,
+    worker_sink: StreamSink,
+) {
+    while let Some(chunk) = command_rx.recv().await {
+        if !send_worker_chunk_reliably(&worker_sink, chunk).await {
+            break;
         }
     }
 }
@@ -7450,45 +7569,98 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn timed_out_mutating_worker_command_warns_without_cancelling() {
+    async fn timed_out_mutating_worker_command_unblocks_recovery_without_cancelling() {
         let (sink, mut rx) = StreamSink::channel(8);
+        let (command_sink, command_rx) = StreamSink::channel(8);
         let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
-        let run_sink = sink.clone();
-        let command_sink = sink.clone();
+        let (completed_tx, completed_rx) = tokio::sync::oneshot::channel::<()>();
 
-        let worker = tokio::spawn(async move {
-            run_worker_command_with_deadline(
-                &run_sink,
-                SlashCommandDeadline::mutating(Duration::from_millis(1)),
-                Some("/memory post hello"),
-                async move {
-                    let _ = release_rx.await;
-                    send_worker_finished(&command_sink, Ok(String::new())).await;
-                },
+        let command_task = tokio::spawn(async move {
+            let _ = release_rx.await;
+            let _ = send_worker_chunk_reliably(
+                &command_sink,
+                TurnChunk::Token("late reconciliation output".to_string()),
             )
             .await;
+            send_worker_finished(&command_sink, Ok(String::new())).await;
+            let _ = completed_tx.send(());
+            HashMap::new()
         });
 
-        match tokio::time::timeout(Duration::from_millis(100), rx.recv()).await {
-            Ok(Some(TurnChunk::Token(message))) => {
-                assert!(message.contains("still reconciling"));
-                assert!(message.contains("/memory post args#"));
+        let result = run_mutating_worker_command_task_with_deadline(
+            &sink,
+            SlashCommandDeadline::mutating(Duration::from_millis(1)),
+            Some("/memory post hello"),
+            command_rx,
+            command_task,
+        )
+        .await;
+
+        assert!(result.is_none());
+
+        {
+            let _env = crate::cli::test_env_lock().lock().unwrap();
+            let home = tempfile::tempdir().unwrap();
+            let old_home = std::env::var_os("HOME");
+            std::env::set_var("HOME", home.path());
+            let mut state = StatusState::new(
+                "default".to_string(),
+                "gpt-test".to_string(),
+                "borland".to_string(),
+                false,
+            );
+            state.begin_turn();
+            state.in_flight_request = Some(InFlightRequest {
+                label: "/memory post hello".to_string(),
+                mutating_slash: true,
+                mutation_fence_owner: None,
+            });
+            let lines = Rc::new(RefCell::new(vec!["> /memory post hello".to_string()]));
+            let mut typewriter_state = None;
+            let mut response_in_flight = true;
+            let mut session_picker_state = SessionPickerState::default();
+
+            assert!(drain_stream_events(
+                &mut rx,
+                &lines,
+                &mut state,
+                &mut typewriter_state,
+                &mut response_in_flight,
+                &mut session_picker_state
+            ));
+
+            assert!(!response_in_flight);
+            assert!(state.turn_start.is_none());
+            assert!(state.mutation_fence.is_some());
+            assert!(!mutation_fence_blocks_submission(
+                &mut state, "/resync", &lines
+            ));
+            assert!(!mutation_fence_blocks_submission(
+                &mut state,
+                "/resync --force",
+                &lines
+            ));
+            let rendered = lines.borrow().join("\n");
+            assert!(rendered.contains("outcome unknown"));
+            assert!(rendered.contains("still reconciling"));
+
+            match old_home {
+                Some(home) => std::env::set_var("HOME", home),
+                None => std::env::remove_var("HOME"),
             }
-            other => panic!("expected pending timeout warning, got {other:?}"),
         }
+
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_millis(100), completed_rx)
+            .await
+            .expect("background reconciliation should complete")
+            .expect("completion signal should send");
         assert!(
             tokio::time::timeout(Duration::from_millis(20), rx.recv())
                 .await
                 .is_err(),
-            "mutating timeout must not emit a terminal frame before reconciliation completes"
+            "timed-out command proxy output must be drained, not delivered to the foreground UI"
         );
-
-        release_tx.send(()).unwrap();
-        match tokio::time::timeout(Duration::from_millis(100), rx.recv()).await {
-            Ok(Some(TurnChunk::Finished(Ok(message)))) => assert!(message.is_empty()),
-            other => panic!("expected command terminal frame after release, got {other:?}"),
-        }
-        worker.await.unwrap();
     }
 
     #[test]
