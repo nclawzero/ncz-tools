@@ -2,9 +2,9 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 #[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
@@ -103,7 +103,8 @@ pub fn is_cache_fresh(modified: SystemTime, now: SystemTime, ttl: Duration) -> b
 }
 
 pub fn read_cached_connect_splash(path: &Path, now: SystemTime, ttl: Duration) -> Option<String> {
-    let metadata = fs::metadata(path).ok()?;
+    let mut file = open_private_read_file(path, "connect splash cache").ok()?;
+    let metadata = file.metadata().ok()?;
     let modified = metadata.modified().ok()?;
     if !is_cache_fresh(modified, now, ttl) {
         return None;
@@ -111,7 +112,8 @@ pub fn read_cached_connect_splash(path: &Path, now: SystemTime, ttl: Duration) -
     if metadata.len() > CONNECT_SPLASH_MAX_BYTES {
         return None;
     }
-    let text = fs::read_to_string(path).ok()?;
+    let mut text = String::new();
+    file.read_to_string(&mut text).ok()?;
     let normalized = normalize_connect_splash(&text);
     if normalized.is_empty() {
         None
@@ -124,6 +126,7 @@ pub fn write_connect_splash_cache(path: &Path, text: &str) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         create_private_cache_dir_all(parent)?;
     }
+    harden_existing_private_file(path, "connect splash cache")?;
     let normalized = normalize_connect_splash(text);
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let filename = path
@@ -136,15 +139,20 @@ pub fn write_connect_splash_cache(path: &Path, text: &str) -> io::Result<()> {
     #[cfg(unix)]
     {
         opts.mode(0o600);
+        opts.custom_flags(libc::O_NOFOLLOW);
     }
     let mut file = opts.open(&tmp_path)?;
+    harden_private_open_file(&tmp_path, &file, "connect splash cache temp")?;
     file.write_all(normalized.as_bytes())?;
+    file.sync_all()?;
     drop(file);
+    harden_existing_private_file(path, "connect splash cache")?;
     if let Err(e) = fs::rename(&tmp_path, path) {
         let _ = fs::remove_file(&tmp_path);
         return Err(e);
     }
-    harden_private_cache_file(path)
+    harden_existing_private_file(path, "connect splash cache")?;
+    sync_state_parent_dir(parent)
 }
 
 fn opaque_workspace_cache_key(workspace: &str) -> String {
@@ -156,42 +164,275 @@ fn opaque_workspace_cache_key(workspace: &str) -> String {
 }
 
 fn create_private_cache_dir_all(dir: &Path) -> io::Result<()> {
-    fs::create_dir_all(dir)?;
-    harden_private_cache_dirs(dir)
+    create_private_dir_chain(dir)
 }
 
 #[cfg(unix)]
-fn harden_private_cache_dirs(dir: &Path) -> io::Result<()> {
-    let mut dirs = vec![dir.to_path_buf()];
-    if dir.file_name().and_then(|name| name.to_str()) == Some("connect-splash") {
-        if let Some(cache_dir) = dir.parent() {
-            dirs.push(cache_dir.to_path_buf());
-            if cache_dir.file_name().and_then(|name| name.to_str()) == Some("cache") {
-                if let Some(root_dir) = cache_dir.parent() {
-                    dirs.push(root_dir.to_path_buf());
+fn create_private_dir_chain(dir: &Path) -> io::Result<()> {
+    for path in private_dir_chain(dir) {
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) => harden_private_dir_metadata(&path, &metadata)?,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                match fs::create_dir(&path) {
+                    Ok(()) => {}
+                    Err(create_err) if create_err.kind() == io::ErrorKind::AlreadyExists => {}
+                    Err(create_err) => {
+                        return Err(io::Error::new(
+                            create_err.kind(),
+                            format!(
+                                "failed to create private zterm directory {}: {create_err}",
+                                path.display()
+                            ),
+                        ));
+                    }
                 }
+                let metadata = fs::symlink_metadata(&path).map_err(|inspect_err| {
+                    io::Error::new(
+                        inspect_err.kind(),
+                        format!(
+                            "failed to inspect private zterm directory {}: {inspect_err}",
+                            path.display()
+                        ),
+                    )
+                })?;
+                harden_private_dir_metadata(&path, &metadata)?;
+            }
+            Err(e) => {
+                return Err(io::Error::new(
+                    e.kind(),
+                    format!(
+                        "failed to inspect private zterm directory {}: {e}",
+                        path.display()
+                    ),
+                ));
             }
         }
     }
-    for dir in dirs {
-        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
-    }
     Ok(())
 }
 
 #[cfg(not(unix))]
-fn harden_private_cache_dirs(_dir: &Path) -> io::Result<()> {
+fn create_private_dir_chain(dir: &Path) -> io::Result<()> {
+    fs::create_dir_all(dir)
+}
+
+#[cfg(unix)]
+fn harden_existing_private_dirs(dir: &Path) -> io::Result<bool> {
+    for path in private_dir_chain(dir) {
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) => harden_private_dir_metadata(&path, &metadata)?,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => {
+                return Err(io::Error::new(
+                    e.kind(),
+                    format!(
+                        "failed to inspect private zterm directory {}: {e}",
+                        path.display()
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(true)
+}
+
+#[cfg(not(unix))]
+fn harden_existing_private_dirs(dir: &Path) -> io::Result<bool> {
+    Ok(dir.is_dir())
+}
+
+fn private_dir_chain(dir: &Path) -> Vec<PathBuf> {
+    let root = private_root_dir(dir);
+    let mut dirs = Vec::new();
+    let mut current = dir;
+    loop {
+        dirs.push(current.to_path_buf());
+        if current == root {
+            break;
+        }
+        let Some(parent) = current.parent() else {
+            break;
+        };
+        current = parent;
+    }
+    dirs.reverse();
+    dirs
+}
+
+fn private_root_dir(dir: &Path) -> PathBuf {
+    for ancestor in dir.ancestors() {
+        if ancestor.file_name().and_then(|name| name.to_str()) == Some(".zterm") {
+            return ancestor.to_path_buf();
+        }
+    }
+    if path_component_exists(dir) {
+        return dir.to_path_buf();
+    }
+    let mut first_missing = dir;
+    let mut current = dir;
+    while let Some(parent) = current.parent() {
+        if path_component_exists(parent) {
+            return first_missing.to_path_buf();
+        }
+        first_missing = parent;
+        current = parent;
+    }
+    dir.to_path_buf()
+}
+
+fn path_component_exists(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok()
+}
+
+#[cfg(unix)]
+fn harden_private_dir_metadata(path: &Path, metadata: &fs::Metadata) -> io::Result<()> {
+    if metadata.file_type().is_symlink() {
+        return Err(private_path_error(format!(
+            "refusing to use symlinked private zterm directory {}",
+            path.display()
+        )));
+    }
+    if !metadata.is_dir() {
+        return Err(private_path_error(format!(
+            "refusing to use non-directory private zterm path {}",
+            path.display()
+        )));
+    }
+    if metadata.uid() != current_euid() {
+        return Err(private_path_error(format!(
+            "refusing to use private zterm directory {} owned by uid {}",
+            path.display(),
+            metadata.uid()
+        )));
+    }
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
     Ok(())
 }
 
 #[cfg(unix)]
-fn harden_private_cache_file(path: &Path) -> io::Result<()> {
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+fn harden_existing_private_file(path: &Path, label: &str) -> io::Result<bool> {
+    if let Some(parent) = path.parent() {
+        if !harden_existing_private_dirs(parent)? {
+            return Ok(false);
+        }
+    }
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => {
+            return Err(io::Error::new(
+                e.kind(),
+                format!(
+                    "failed to inspect private zterm {label} {}: {e}",
+                    path.display()
+                ),
+            ));
+        }
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(private_path_error(format!(
+            "refusing to use symlinked private zterm {label} {}",
+            path.display()
+        )));
+    }
+    if !metadata.is_file() {
+        return Err(private_path_error(format!(
+            "refusing to use non-file private zterm {label} {}",
+            path.display()
+        )));
+    }
+    if metadata.uid() != current_euid() {
+        return Err(private_path_error(format!(
+            "refusing to use private zterm {label} {} owned by uid {}",
+            path.display(),
+            metadata.uid()
+        )));
+    }
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    Ok(true)
 }
 
 #[cfg(not(unix))]
-fn harden_private_cache_file(_path: &Path) -> io::Result<()> {
+fn harden_existing_private_file(path: &Path, _label: &str) -> io::Result<bool> {
+    match fs::metadata(path) {
+        Ok(metadata) if metadata.is_file() => Ok(true),
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "refusing to use non-file private zterm path {}",
+                path.display()
+            ),
+        )),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+fn open_private_read_file(path: &Path, label: &str) -> io::Result<fs::File> {
+    if !harden_existing_private_file(path, label)? {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("private zterm {label} not found: {}", path.display()),
+        ));
+    }
+    let mut opts = fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = opts.open(path)?;
+    harden_private_open_file(path, &file, label)?;
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn harden_private_open_file(path: &Path, file: &fs::File, label: &str) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(path).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!(
+                "failed to inspect private zterm {label} {}: {e}",
+                path.display()
+            ),
+        )
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err(private_path_error(format!(
+            "refusing to use symlinked private zterm {label} {}",
+            path.display()
+        )));
+    }
+    if !metadata.is_file() {
+        return Err(private_path_error(format!(
+            "refusing to use non-file private zterm {label} {}",
+            path.display()
+        )));
+    }
+    if metadata.uid() != current_euid() {
+        return Err(private_path_error(format!(
+            "refusing to use private zterm {label} {} owned by uid {}",
+            path.display(),
+            metadata.uid()
+        )));
+    }
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
     Ok(())
+}
+
+#[cfg(not(unix))]
+fn harden_private_open_file(_path: &Path, _file: &fs::File, _label: &str) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn private_path_error(message: String) -> io::Error {
+    io::Error::new(io::ErrorKind::PermissionDenied, message)
+}
+
+#[cfg(unix)]
+fn current_euid() -> u32 {
+    unsafe { libc::geteuid() as u32 }
 }
 
 pub fn normalize_connect_splash(text: &str) -> String {
@@ -229,8 +470,12 @@ pub fn load_state_checked(path: &Path) -> io::Result<ZtermState> {
 }
 
 fn load_state_unlocked(path: &Path) -> io::Result<ZtermState> {
-    match fs::read_to_string(path) {
-        Ok(text) => toml::from_str(&text).map_err(io::Error::other),
+    match open_private_read_file(path, "state") {
+        Ok(mut file) => {
+            let mut text = String::new();
+            file.read_to_string(&mut text)?;
+            toml::from_str(&text).map_err(io::Error::other)
+        }
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(ZtermState::default()),
         Err(e) => Err(e),
     }
@@ -253,6 +498,7 @@ fn save_state_unlocked_with(
     if let Some(parent) = path.parent() {
         create_private_state_dir(parent)?;
     }
+    harden_existing_private_file(path, "state")?;
     let body = toml::to_string_pretty(state).map_err(std::io::Error::other)?;
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let filename = path
@@ -265,8 +511,10 @@ fn save_state_unlocked_with(
     #[cfg(unix)]
     {
         opts.mode(0o600);
+        opts.custom_flags(libc::O_NOFOLLOW);
     }
     let mut file = opts.open(&tmp_path)?;
+    harden_private_open_file(&tmp_path, &file, "state temp")?;
     let write_result = (|| {
         file.write_all(body.as_bytes())?;
         sync_file(&file)
@@ -276,11 +524,12 @@ fn save_state_unlocked_with(
         let _ = fs::remove_file(&tmp_path);
         return Err(e);
     }
+    harden_existing_private_file(path, "state")?;
     if let Err(e) = fs::rename(&tmp_path, path) {
         let _ = fs::remove_file(&tmp_path);
         return Err(e);
     }
-    harden_private_state_file(path)?;
+    harden_existing_private_file(path, "state")?;
     sync_parent(parent)
 }
 
@@ -313,8 +562,11 @@ fn with_state_lock_timeout<T>(
     #[cfg(unix)]
     {
         opts.mode(0o600);
+        opts.custom_flags(libc::O_NOFOLLOW);
     }
+    harden_existing_private_file(&lock_path, "state lock")?;
     let lock_file = opts.open(&lock_path)?;
+    harden_private_open_file(&lock_path, &lock_file, "state lock")?;
     let started = Instant::now();
     loop {
         match lock_file.try_lock() {
@@ -352,28 +604,7 @@ fn state_lock_path(path: &Path) -> PathBuf {
 }
 
 fn create_private_state_dir(dir: &Path) -> io::Result<()> {
-    fs::create_dir_all(dir)?;
-    harden_private_state_dir(dir)
-}
-
-#[cfg(unix)]
-fn harden_private_state_dir(dir: &Path) -> io::Result<()> {
-    fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
-}
-
-#[cfg(not(unix))]
-fn harden_private_state_dir(_dir: &Path) -> io::Result<()> {
-    Ok(())
-}
-
-#[cfg(unix)]
-fn harden_private_state_file(path: &Path) -> io::Result<()> {
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-}
-
-#[cfg(not(unix))]
-fn harden_private_state_file(_path: &Path) -> io::Result<()> {
-    Ok(())
+    create_private_dir_chain(dir)
 }
 
 pub fn record_launch() -> std::io::Result<(u64, Option<String>)> {
@@ -643,6 +874,8 @@ fn quarantine_unreadable_state_file(path: &Path, load_err: &io::Error) -> io::Re
         .and_then(|name| name.to_str())
         .unwrap_or("state.toml");
     let quarantine_path = parent.join(format!("{filename}.corrupt.{}", uuid::Uuid::new_v4()));
+    harden_existing_private_file(path, "state")?;
+    harden_existing_private_file(&quarantine_path, "state quarantine")?;
     fs::rename(path, &quarantine_path).map_err(|rename_err| {
         io::Error::new(
             rename_err.kind(),
@@ -652,7 +885,7 @@ fn quarantine_unreadable_state_file(path: &Path, load_err: &io::Error) -> io::Re
             ),
         )
     })?;
-    harden_private_state_file(&quarantine_path)?;
+    harden_existing_private_file(&quarantine_path, "state quarantine")?;
     sync_state_parent_dir(parent)?;
     Ok(quarantine_path)
 }
@@ -805,6 +1038,47 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn connect_splash_cache_rejects_symlinked_private_root() {
+        let dir = tempdir().unwrap();
+        let base = dir.path().join(".zterm");
+        let target = dir.path().join("shared-zterm");
+        fs::create_dir(&target).unwrap();
+        std::os::unix::fs::symlink(&target, &base).unwrap();
+        let path = connect_splash_cache_path(&base, "prod typhon");
+
+        let err = write_connect_splash_cache(&path, "CONNECT").unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("symlinked private zterm directory"));
+        assert!(
+            fs::read_dir(&target).unwrap().next().is_none(),
+            "cache write should not create files through symlinked private root"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn connect_splash_cache_rejects_symlinked_leaf() {
+        let dir = tempdir().unwrap();
+        let base = dir.path().join(".zterm");
+        let path = connect_splash_cache_path(&base, "prod typhon");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let target = dir.path().join("target-cache.txt");
+        fs::write(&target, "CONNECT").unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+
+        assert!(read_cached_connect_splash(&path, SystemTime::now(), CONNECT_SPLASH_TTL).is_none());
+        let err = write_connect_splash_cache(&path, "REPLACE").unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("symlinked private zterm connect splash cache"));
+        assert_eq!(fs::read_to_string(&target).unwrap(), "CONNECT");
+    }
+
+    #[test]
     fn launch_counter_persists_to_state_toml() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("state.toml");
@@ -815,6 +1089,60 @@ mod tests {
         let state = load_state(&path);
         assert_eq!(state.launches, 2);
         assert!(!state.beep_on_error);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn state_writes_reject_symlinked_private_root() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join(".zterm");
+        let target = dir.path().join("shared-zterm");
+        fs::create_dir(&target).unwrap();
+        std::os::unix::fs::symlink(&target, &root).unwrap();
+        let path = root.join("state.toml");
+
+        let err = record_launch_at(&path).unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("symlinked private zterm directory"));
+        assert!(
+            fs::read_dir(&target).unwrap().next().is_none(),
+            "state write should not create files through symlinked private root"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn state_writes_reject_symlinked_state_leaf() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("state.toml");
+        let target = dir.path().join("target-state.toml");
+        fs::write(&target, "launches = 41\n").unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+
+        let err = record_launch_at(&path).unwrap_err();
+
+        assert!(err.to_string().contains("symlinked private zterm state"));
+        assert_eq!(fs::read_to_string(&target).unwrap(), "launches = 41\n");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn state_lock_rejects_symlinked_leaf() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("state.toml");
+        let lock_path = state_lock_path(&path);
+        let target = dir.path().join("target-lock");
+        fs::write(&target, "").unwrap();
+        std::os::unix::fs::symlink(&target, &lock_path).unwrap();
+
+        let err = record_launch_at(&path).unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("symlinked private zterm state lock"));
+        assert_eq!(fs::read_to_string(&target).unwrap(), "");
     }
 
     #[test]
